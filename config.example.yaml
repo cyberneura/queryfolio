@@ -42,6 +42,20 @@ sql_servers:
     port: 6379
     schema: "0"
 
+  # queryfolio 拡張: elasticsearch (エイリアス: es / opensearch)。
+  # エディタは Kibana Console 風のリクエストブロック
+  # (`GET /index/_search` のメソッド行 + JSON body。# 行はコメント)。
+  # user / password は Basic 認証に使う。SSH トンネルも SQL エンジンと同様。
+  # tls: true (queryfolio 拡張、省略時 false) で https 接続になる。
+  - name: local-elasticsearch
+    description: "ローカルの Elasticsearch"
+    engine: elasticsearch
+    host: localhost
+    port: 9200
+    # tls: true
+    # user: elastic
+    # password: your_es_password
+
   # queryfolio 拡張: readonly: true (省略時 false) を指定すると、
   # 書き込み系の文 (INSERT / UPDATE / DELETE / DDL、CTE 付き DML、
   # SELECT INTO 等) の実行を拒否する。

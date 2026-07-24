@@ -13,7 +13,7 @@ export interface SshTunnelInfo {
 /// UI の出し分けはエンジン名ではなくこのフラグで行う。
 export interface EngineCapabilities {
   /// エディタのシンタックスハイライト言語
-  editor_language: "sql" | "redis";
+  editor_language: "sql" | "redis" | "es";
   /// クエリファイルの拡張子 (ドット無し)
   file_extension: string;
   /// スキーマ (database) の一覧・切替に対応するか

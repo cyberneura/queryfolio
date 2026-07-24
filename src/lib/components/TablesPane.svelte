@@ -137,11 +137,20 @@
     }, CLICK_DELAY_MS);
   };
 
-  /// ダブルクリック: SELECT 文をエディタに挿入する (実行はしない)
+  /// ダブルクリック: クエリスニペットをエディタに挿入する (実行はしない)。
+  /// スニペットはエディタ言語に合わせる (es は検索リクエストブロック、
+  /// それ以外は SELECT 文)
   const onTableDblClick = (table: TableInfo) => {
     if (clickTimer) {
       clearTimeout(clickTimer);
       clickTimer = null;
+    }
+    if (appStore.selectedCapabilities?.editor_language === "es") {
+      appStore.insertSqlSnippet(
+        `GET /${table.qualified_name}/_search\n` +
+          `{\n  "query": { "match_all": {} },\n  "size": 100\n}`,
+      );
+      return;
     }
     appStore.insertSqlSnippet(
       `SELECT * FROM ${table.qualified_name} LIMIT 100;`,
@@ -211,7 +220,7 @@
           </button>
           <button
             class="flex min-w-0 flex-1 items-center gap-1 py-1 pr-2 text-left text-sm text-zinc-200"
-            title="Click: insert the table name / Double-click: insert SELECT * FROM ... LIMIT 100"
+            title="Click: insert the name / Double-click: insert a query snippet"
             data-annotate="button-table-{table.qualified_name}"
             onclick={(e) => onTableClick(table, e)}
             ondblclick={() => onTableDblClick(table)}

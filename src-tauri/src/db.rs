@@ -34,6 +34,9 @@ pub enum DbPool {
     /// Redis は sqlx を使わない。Client は接続情報のみ持ち、
     /// 実行のたびに multiplexed connection を張る (engines::redis)。
     Redis(redis::Client),
+    /// Elasticsearch は sqlx を使わず reqwest で REST API を叩く
+    /// (engines::elasticsearch)。EsClient は base_url と認証情報のみ持つ。
+    Elasticsearch(crate::engines::elasticsearch::EsClient),
 }
 
 #[derive(Debug, Serialize)]
@@ -217,6 +220,7 @@ pub(crate) enum Engine {
     Postgres,
     Sqlite,
     Redis,
+    Elasticsearch,
 }
 
 /// プールから実行専用に確保した 1 本のコネクション。
@@ -236,7 +240,7 @@ impl DbConnection {
             DbPool::Sqlite(p) => DbConnection::Sqlite(p.acquire().await?),
             // 非 SQL エンジンは run_query_cancellable が acquire より前に
             // 各エンジンモジュールへ委譲するため、ここには来ない
-            DbPool::Redis(_) => {
+            DbPool::Redis(_) | DbPool::Elasticsearch(_) => {
                 return Err(AppError::Config(
                     "This engine does not use SQL connections".into(),
                 ));
@@ -417,8 +421,10 @@ pub fn parse_engine(engine: &str) -> Result<Engine, AppError> {
         "postgres" | "postgresql" => Ok(Engine::Postgres),
         "sqlite" | "sqlite3" => Ok(Engine::Sqlite),
         "redis" | "valkey" => Ok(Engine::Redis),
+        "elasticsearch" | "es" | "opensearch" => Ok(Engine::Elasticsearch),
         other => Err(AppError::Config(format!(
-            "Unsupported engine: {other} (supported: mysql / postgres / sqlite / redis)"
+            "Unsupported engine: {other} \
+             (supported: mysql / postgres / sqlite / redis / elasticsearch)"
         ))),
     }
 }
@@ -429,6 +435,7 @@ fn default_port(engine: Engine) -> u16 {
         Engine::Postgres => 5432,
         Engine::Sqlite => 0,
         Engine::Redis => crate::engines::redis::DEFAULT_PORT,
+        Engine::Elasticsearch => crate::engines::elasticsearch::DEFAULT_PORT,
     }
 }
 
@@ -504,6 +511,9 @@ async fn connect(
         Engine::Redis => Ok(DbPool::Redis(
             crate::engines::redis::connect(server, host, port).await?,
         )),
+        Engine::Elasticsearch => Ok(DbPool::Elasticsearch(
+            crate::engines::elasticsearch::connect(server, host, port).await?,
+        )),
     }
 }
 
@@ -552,6 +562,18 @@ pub async fn run_query_cancellable(
     // なので渡さない)
     if let DbPool::Redis(client) = pool {
         return crate::engines::redis::run_query_cancellable(
+            client,
+            registry,
+            connection_name,
+            sql,
+            max_rows,
+            readonly,
+            allow_dangerous,
+        )
+        .await;
+    }
+    if let DbPool::Elasticsearch(client) = pool {
+        return crate::engines::elasticsearch::run_query_cancellable(
             client,
             registry,
             connection_name,
@@ -680,7 +702,7 @@ pub async fn run_statements(
     if statements.is_empty() {
         return Err(AppError::Config("There are no changes to apply".into()));
     }
-    if matches!(pool, DbPool::Redis(_)) {
+    if matches!(pool, DbPool::Redis(_) | DbPool::Elasticsearch(_)) {
         return Err(AppError::Config(
             "Cell editing is not supported for this engine".into(),
         ));
@@ -927,9 +949,10 @@ pub async fn list_schemas(
                 .unwrap_or("main");
             Ok(vec![path.to_string()])
         }
-        // Redis に database 一覧の概念は無い (capabilities.supports_schemas =
-        // false でフロントは呼ばないが、直接呼ばれても壊れないよう空を返す)
-        DbPool::Redis(_) => Ok(vec![]),
+        // Redis / Elasticsearch に database 一覧の概念は無い
+        // (capabilities.supports_schemas = false でフロントは呼ばないが、
+        // 直接呼ばれても壊れないよう空を返す)
+        DbPool::Redis(_) | DbPool::Elasticsearch(_) => Ok(vec![]),
     }
 }
 
@@ -1102,7 +1125,7 @@ fn should_auto_limit(sql: &str, engine: Engine) -> bool {
 /// コスト・行数見積もりが得られる FORMAT=JSON の方が安全で互換性も広い。
 pub fn build_explain_sql(engine: &str, sql: &str) -> Result<String, AppError> {
     let engine = parse_engine(engine)?;
-    if engine == Engine::Redis {
+    if matches!(engine, Engine::Redis | Engine::Elasticsearch) {
         return Err(AppError::Explain(
             "Explain is not available for this engine".into(),
         ));
@@ -1127,8 +1150,8 @@ pub fn build_explain_sql(engine: &str, sql: &str) -> Result<String, AppError> {
         Engine::Postgres => "EXPLAIN (ANALYZE, BUFFERS)",
         Engine::MySql => "EXPLAIN FORMAT=JSON",
         Engine::Sqlite => "EXPLAIN QUERY PLAN",
-        // Redis は冒頭の早期 return で弾いている
-        Engine::Redis => unreachable!(),
+        // Redis / Elasticsearch は冒頭の早期 return で弾いている
+        Engine::Redis | Engine::Elasticsearch => unreachable!(),
     };
     Ok(format!("{prefix}\n{sql}"))
 }
@@ -1271,6 +1294,9 @@ pub fn dangerous_statement_reason(engine: &str, sql: &str) -> Result<Option<Stri
         return Ok(
             crate::engines::redis::dangerous_reason_for_input(sql).map(|s| s.to_string())
         );
+    }
+    if engine == Engine::Elasticsearch {
+        return Ok(crate::engines::elasticsearch::dangerous_reason_for_input(sql));
     }
     Ok(dangerous_reason(sql, engine).map(|s| s.to_string()))
 }
