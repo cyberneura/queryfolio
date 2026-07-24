@@ -72,6 +72,38 @@ const UNSUPPORTED_COMMANDS: &[&str] = &[
     "SUNSUBSCRIBE", "MONITOR",
 ];
 
+/// ブロッキングコマンド。クライアント側キャンセル (future の打ち切り) では
+/// サーバー側の待機は止まらず、応答が来るまで接続 (ソケット/タスク) が
+/// 塞がったままリークするため、実行前に拒否する。
+const BLOCKING_COMMANDS: &[&str] = &[
+    "BLPOP", "BRPOP", "BLMOVE", "BRPOPLPUSH", "BLMPOP",
+    "BZPOPMIN", "BZPOPMAX", "BZMPOP", "WAIT", "WAITAOF",
+];
+
+/// 実行できないコマンドならその理由を返す (pub/sub 系・ブロッキング系・
+/// BLOCK オプション付きの XREAD / XREADGROUP)。
+fn unsupported_reason(args: &[Vec<u8>]) -> Option<String> {
+    let name = command_name(args);
+    if UNSUPPORTED_COMMANDS.contains(&name.as_str()) {
+        return Some(format!("{name} is not supported in QueryFolio"));
+    }
+    if BLOCKING_COMMANDS.contains(&name.as_str()) {
+        return Some(format!(
+            "{name} is a blocking command and is not supported in QueryFolio"
+        ));
+    }
+    if matches!(name.as_str(), "XREAD" | "XREADGROUP")
+        && args[1..]
+            .iter()
+            .any(|arg| arg.eq_ignore_ascii_case(b"BLOCK"))
+    {
+        return Some(format!(
+            "{name} with the BLOCK option is not supported in QueryFolio"
+        ));
+    }
+    None
+}
+
 /// readonly 接続 / Writable スイッチ OFF で実行を許可するコマンドか。
 /// 基本はホワイトリスト (READONLY_COMMANDS) だが、サブコマンドで読み書きが
 /// 分かれる親コマンドはサブコマンド単位で判定する
@@ -318,10 +350,8 @@ pub async fn run_query_cancellable(
     // 何も実行する前に全コマンドを検証する (一部だけ実行される事態を防ぐ)
     for args in &commands {
         let name = command_name(args);
-        if UNSUPPORTED_COMMANDS.contains(&name.as_str()) {
-            return Err(AppError::Redis(format!(
-                "{name} is not supported in QueryFolio"
-            )));
+        if let Some(reason) = unsupported_reason(args) {
+            return Err(AppError::Redis(reason));
         }
         if readonly != ReadonlyGuard::Off && !is_readonly_command(args) {
             return Err(readonly_block_error(readonly));
@@ -607,6 +637,23 @@ mod tests {
         // 通常コマンドは従来どおり
         assert!(is_readonly_command(&args_of("GET key")));
         assert!(!is_readonly_command(&args_of("SET key value")));
+    }
+
+    #[test]
+    fn test_unsupported_reason() {
+        // pub/sub 系
+        assert!(unsupported_reason(&args_of("SUBSCRIBE ch")).is_some());
+        // ブロッキング系は常に拒否
+        assert!(unsupported_reason(&args_of("BLPOP key 0")).is_some());
+        assert!(unsupported_reason(&args_of("blpop key 5")).is_some());
+        assert!(unsupported_reason(&args_of("WAIT 1 1000")).is_some());
+        // XREAD は BLOCK オプション付きのみ拒否
+        assert!(unsupported_reason(&args_of("XREAD BLOCK 0 STREAMS s 0")).is_some());
+        assert!(unsupported_reason(&args_of("XREAD block 100 STREAMS s 0")).is_some());
+        assert!(unsupported_reason(&args_of("XREAD COUNT 10 STREAMS s 0")).is_none());
+        // 通常コマンドは対象外
+        assert!(unsupported_reason(&args_of("GET key")).is_none());
+        assert!(unsupported_reason(&args_of("LPOP key")).is_none());
     }
 
     #[test]
