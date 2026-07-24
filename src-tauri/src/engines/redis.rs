@@ -92,14 +92,29 @@ fn unsupported_reason(args: &[Vec<u8>]) -> Option<String> {
             "{name} is a blocking command and is not supported in QueryFolio"
         ));
     }
-    if matches!(name.as_str(), "XREAD" | "XREADGROUP")
-        && args[1..]
+    if matches!(name.as_str(), "XREAD" | "XREADGROUP") {
+        // BLOCK オプションは STREAMS キーワードより前にしか現れない
+        // (STREAMS 以降はストリーム名 / ID なので、BLOCK という名前の
+        // ストリームを誤検知しない)。XREADGROUP は先頭の GROUP <group>
+        // <consumer> も読み飛ばす (グループ名 / コンシューマ名も対象外)。
+        let mut options: &[Vec<u8>] = &args[1..];
+        if name == "XREADGROUP"
+            && options
+                .first()
+                .is_some_and(|a| a.eq_ignore_ascii_case(b"GROUP"))
+            && options.len() >= 3
+        {
+            options = &options[3..];
+        }
+        let has_block_option = options
             .iter()
-            .any(|arg| arg.eq_ignore_ascii_case(b"BLOCK"))
-    {
-        return Some(format!(
-            "{name} with the BLOCK option is not supported in QueryFolio"
-        ));
+            .take_while(|a| !a.eq_ignore_ascii_case(b"STREAMS"))
+            .any(|a| a.eq_ignore_ascii_case(b"BLOCK"));
+        if has_block_option {
+            return Some(format!(
+                "{name} with the BLOCK option is not supported in QueryFolio"
+            ));
+        }
     }
     None
 }
@@ -719,6 +734,17 @@ mod tests {
         assert!(unsupported_reason(&args_of("XREAD BLOCK 0 STREAMS s 0")).is_some());
         assert!(unsupported_reason(&args_of("XREAD block 100 STREAMS s 0")).is_some());
         assert!(unsupported_reason(&args_of("XREAD COUNT 10 STREAMS s 0")).is_none());
+        // STREAMS 以降のトークン (ストリーム名 / ID) は BLOCK でも誤検知しない
+        assert!(unsupported_reason(&args_of("XREAD STREAMS BLOCK 0")).is_none());
+        // XREADGROUP は GROUP <group> <consumer> も対象外
+        assert!(unsupported_reason(&args_of(
+            "XREADGROUP GROUP BLOCK consumer STREAMS s >"
+        ))
+        .is_none());
+        assert!(unsupported_reason(&args_of(
+            "XREADGROUP GROUP g c BLOCK 0 STREAMS s >"
+        ))
+        .is_some());
         // 通常コマンドは対象外
         assert!(unsupported_reason(&args_of("GET key")).is_none());
         assert!(unsupported_reason(&args_of("LPOP key")).is_none());
