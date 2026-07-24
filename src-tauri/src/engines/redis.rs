@@ -376,10 +376,18 @@ async fn execute_commands(
         let value = run_command(&mut conn, &commands[0]).await?;
         return Ok(shape_single(&commands[0], value, max_rows));
     }
-    // 複数コマンドは「コマンド + 結果」の 2 カラムで 1 行ずつ返す
+    // 複数コマンドは「コマンド + 結果」の 2 カラムで 1 行ずつ返す。
+    // コマンドは全件実行する (書き込みを黙って落とさない) が、結果テーブルは
+    // max_rows で打ち切って truncated を立てる (巨大な選択実行で webview へ
+    // 非有界の結果を送らない)。
     let mut rows = Vec::new();
+    let mut truncated = false;
     for args in commands {
         let value = run_command(&mut conn, args).await?;
+        if rows.len() >= max_rows {
+            truncated = true;
+            continue;
+        }
         rows.push(vec![
             serde_json::Value::String(display_command(args)),
             value_to_json(value),
@@ -388,7 +396,7 @@ async fn execute_commands(
     Ok(shape_result(
         vec!["command".to_string(), "result".to_string()],
         rows,
-        false,
+        truncated,
     ))
 }
 
