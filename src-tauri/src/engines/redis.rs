@@ -315,9 +315,24 @@ pub async fn connect(
         .into_connection_info()?
         .set_redis_settings(redis_settings);
     let client = redis::Client::open(info)?;
-    // sqlx の connect_with と同様、接続時点で到達性と認証を確認する
+    // sqlx の connect_with と同様、接続時点で到達性と認証を確認する。
+    // PING にも接続タイムアウトを掛ける: TCP は繋がるのに応答しない相手
+    // (止まった SSH トンネル / half-open なサービス) で、キャンセル登録前の
+    // get_pool (DbManager のロック保持中) が無期限に停止しないようにする
     let mut conn = open_connection(&client).await?;
-    let _: String = redis::cmd("PING").query_async(&mut conn).await?;
+    let ping_cmd = redis::cmd("PING");
+    let ping = ping_cmd.query_async::<String>(&mut conn);
+    match tokio::time::timeout(CONNECT_TIMEOUT, ping).await {
+        Ok(response) => {
+            response?;
+        }
+        Err(_) => {
+            return Err(AppError::Redis(format!(
+                "The server did not respond to PING within {}s",
+                CONNECT_TIMEOUT.as_secs()
+            )));
+        }
+    }
     Ok(client)
 }
 
@@ -409,7 +424,8 @@ async fn execute_commands(
     // 複数コマンドは「コマンド + 結果」の 2 カラムで 1 行ずつ返す。
     // コマンドは全件実行する (書き込みを黙って落とさない) が、結果テーブルは
     // max_rows で打ち切って truncated を立てる (巨大な選択実行で webview へ
-    // 非有界の結果を送らない)。
+    // 非有界の結果を送らない)。1 セルに入るコレクション (LRANGE / HGETALL 等の
+    // 応答) も value_to_json_limited で要素数を打ち切る。
     let mut rows = Vec::new();
     let mut truncated = false;
     for args in commands {
@@ -420,7 +436,7 @@ async fn execute_commands(
         }
         rows.push(vec![
             serde_json::Value::String(display_command(args)),
-            value_to_json(value),
+            value_to_json_limited(value, max_rows, &mut truncated),
         ]);
     }
     Ok(shape_result(
@@ -561,6 +577,58 @@ fn value_to_json(value: redis::Value) -> serde_json::Value {
     }
 }
 
+/// value_to_json の要素数打ち切り版 (複数コマンド結果の 1 セル用)。
+/// 配列 / Set / Map の要素を max_items で打ち切り、打ち切った場合は末尾に
+/// その旨の文字列要素を足して truncated も立てる (単一コマンドの
+/// shape_single の行打ち切りと同じ上限を、セル内のコレクションにも適用する)。
+fn value_to_json_limited(
+    value: redis::Value,
+    max_items: usize,
+    truncated: &mut bool,
+) -> serde_json::Value {
+    match value {
+        redis::Value::Array(items) | redis::Value::Set(items) => {
+            let total = items.len();
+            let mut out: Vec<serde_json::Value> = items
+                .into_iter()
+                .take(max_items)
+                .map(|item| value_to_json_limited(item, max_items, truncated))
+                .collect();
+            if total > max_items {
+                *truncated = true;
+                out.push(serde_json::Value::String(format!(
+                    "... ({} more items truncated)",
+                    total - max_items
+                )));
+            }
+            serde_json::Value::Array(out)
+        }
+        redis::Value::Map(pairs) => {
+            let total = pairs.len();
+            let mut map = serde_json::Map::new();
+            for (k, v) in pairs.into_iter().take(max_items) {
+                let key = match value_to_json(k) {
+                    serde_json::Value::String(s) => s,
+                    other => other.to_string(),
+                };
+                map.insert(key, value_to_json_limited(v, max_items, truncated));
+            }
+            if total > max_items {
+                *truncated = true;
+                map.insert(
+                    "...".to_string(),
+                    serde_json::Value::String(format!(
+                        "({} more entries truncated)",
+                        total - max_items
+                    )),
+                );
+            }
+            serde_json::Value::Object(map)
+        }
+        other => value_to_json(other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,6 +765,59 @@ mod tests {
     /// テスト用: コマンドライン文字列を引数リストへ
     fn args_of(line: &str) -> Vec<Vec<u8>> {
         parse_command_line(line).unwrap()
+    }
+
+    #[test]
+    fn test_value_to_json_limited() {
+        // 上限内はそのまま
+        let mut truncated = false;
+        let v = value_to_json_limited(
+            redis::Value::Array(vec![redis::Value::Int(1), redis::Value::Int(2)]),
+            10,
+            &mut truncated,
+        );
+        assert_eq!(v, serde_json::json!([1, 2]));
+        assert!(!truncated);
+
+        // 上限超は打ち切り + マーカー + truncated フラグ
+        let mut truncated = false;
+        let v = value_to_json_limited(
+            redis::Value::Array(vec![
+                redis::Value::Int(1),
+                redis::Value::Int(2),
+                redis::Value::Int(3),
+            ]),
+            2,
+            &mut truncated,
+        );
+        assert_eq!(
+            v,
+            serde_json::json!([1, 2, "... (1 more items truncated)"])
+        );
+        assert!(truncated);
+
+        // ネストしたコレクションも打ち切る
+        let mut truncated = false;
+        let v = value_to_json_limited(
+            redis::Value::Array(vec![redis::Value::Array(vec![
+                redis::Value::Int(1),
+                redis::Value::Int(2),
+                redis::Value::Int(3),
+            ])]),
+            2,
+            &mut truncated,
+        );
+        assert_eq!(
+            v,
+            serde_json::json!([[1, 2, "... (1 more items truncated)"]])
+        );
+        assert!(truncated);
+
+        // スカラーはそのまま
+        let mut truncated = false;
+        let v = value_to_json_limited(redis::Value::Int(42), 1, &mut truncated);
+        assert_eq!(v, serde_json::json!(42));
+        assert!(!truncated);
     }
 
     #[test]
