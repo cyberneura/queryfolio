@@ -21,6 +21,7 @@
   import { oneDark } from "@codemirror/theme-one-dark";
   import { formatSql } from "$lib/sqlFormat";
   import { redisLanguage } from "$lib/editor/redisLanguage";
+  import { esLanguage } from "$lib/editor/esLanguage";
 
   interface Props {
     content: string;
@@ -50,6 +51,13 @@
   /// 行単位で実行する言語か (redis: 1 行 = 1 コマンド)。
   /// SQL は構文木の Statement 単位で実行する
   const isLineBased = () => editorLanguage === "redis";
+
+  /// リクエストブロック単位で実行する言語か (es: メソッド行 + JSON body)
+  const isBlockBased = () => editorLanguage === "es";
+
+  /// SQL 言語か (Format 等の SQL 専用処理の対象か)。null は "sql" 扱い
+  const isSqlLanguage = () =>
+    editorLanguage === null || editorLanguage === "sql";
 
   let editorElement: HTMLDivElement;
   let view: EditorView | null = null;
@@ -103,6 +111,9 @@
     if (language === "redis") {
       return redisLanguage;
     }
+    if (language === "es") {
+      return esLanguage;
+    }
     return sql({
       dialect: dialectFor(engineName),
       schema: schemaNamespace(map),
@@ -134,6 +145,51 @@
       }
     }
     return previous;
+  };
+
+  // ES のメソッド行 (リクエストブロックの開始行) か。
+  // バックエンド (elasticsearch.rs の leading_method) と同じ規則:
+  // 行頭トークンが HTTP メソッドならメソッド行 (JSON body の行が
+  // メソッド名で始まることは無い)
+  const ES_METHOD_LINE = /^(GET|POST|PUT|DELETE|HEAD|PATCH)(\s|$)/i;
+
+  // カーソル位置を含む ES リクエストブロックの範囲を返す。
+  // カーソル行から上方向に最初のメソッド行を探し、そこから下方向に
+  // 次のメソッド行の手前 (または EOF) まで。上方向にメソッド行が
+  // 無ければ null (実行対象なし)。
+  const esBlockRange = (
+    state: EditorState,
+    pos: number,
+  ): { from: number; to: number } | null => {
+    const doc = state.doc;
+    const cursorLine = doc.lineAt(pos).number;
+    let startLine: number | null = null;
+    for (let n = cursorLine; n >= 1; n--) {
+      if (ES_METHOD_LINE.test(doc.line(n).text.trimStart())) {
+        startLine = n;
+        break;
+      }
+    }
+    if (startLine === null) {
+      return null;
+    }
+    let endLine = doc.lines;
+    for (let n = startLine + 1; n <= doc.lines; n++) {
+      if (ES_METHOD_LINE.test(doc.line(n).text.trimStart())) {
+        endLine = n - 1;
+        break;
+      }
+    }
+    // 末尾の空行はブロックに含めない (ハイライトが間延びしないように)
+    while (endLine > startLine && doc.line(endLine).text.trim() === "") {
+      endLine--;
+    }
+    const first = trimmedLineRange(state, doc.line(startLine).from);
+    const last = trimmedLineRange(state, doc.line(endLine).from);
+    if (!first || !last) {
+      return null;
+    }
+    return { from: first.from, to: last.to };
   };
 
   // ある行の trim 済みテキストの範囲を返す (空行なら null)
@@ -190,6 +246,15 @@
         }
       }
       return null;
+    }
+    // ブロック単位の言語 (es): 選択があれば選択範囲、無ければカーソル位置を
+    // 含むリクエストブロック (メソッド行 + body)
+    if (isBlockBased()) {
+      const sel = state.selection.main;
+      if (!sel.empty) {
+        return { from: sel.from, to: sel.to };
+      }
+      return esBlockRange(state, pos);
     }
     const range = statementRangeAt(state, pos);
     const cursorLine = trimmedLineRange(state, pos);
@@ -358,7 +423,7 @@
   // 変化がなく、何もしない。
   export function formatCurrentStatement() {
     // SQL 整形器は SQL 専用 (Format ボタン自体も capability で隠れる)
-    if (!view || isLineBased()) {
+    if (!view || !isSqlLanguage()) {
       return;
     }
     const state = view.state;

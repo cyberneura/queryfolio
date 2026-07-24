@@ -118,6 +118,7 @@ mod tests {
             user: Some("app".to_string()),
             password: Some("s3cret".to_string()),
             ssh_tunnel: None,
+            tls: false,
             readonly: true,
             allow_dangerous_statements: false,
             group_name: Some("Production".to_string()),

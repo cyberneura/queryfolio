@@ -8,7 +8,7 @@
 //! パス解決 ([`resolve_open_target`]) はセキュリティ上重要なので Tauri に依存
 //! させず純粋な std だけで書き、単体テストで境界を固める。開けるのは
 //! 「クエリファイル保存ディレクトリ (`sqlfiles_dir`) 直下の接続フォルダにある
-//! クエリファイル (拡張子は [`ALLOWED_EXTENSIONS`]: `.sql` / `.redis`)」だけで、
+//! クエリファイル (拡張子は [`ALLOWED_EXTENSIONS`]: `.sql` / `.redis` / `.es`)」だけで、
 //! `..` によるトラバーサルや保存領域外のパスは拒否する。拡張子が接続エンジンの
 //! ものと一致するかは、接続を解決できる lib.rs (resolve_route_target) 側が
 //! 追加で検証する。
@@ -205,7 +205,7 @@ pub fn resolve_open_target(
 
 /// クエリファイルとして開ける拡張子 (エンジン別。engines::EngineCapabilities の
 /// file_extension と対応させること)。
-const ALLOWED_EXTENSIONS: &[&str] = &["sql", "redis"];
+const ALLOWED_EXTENSIONS: &[&str] = &["sql", "redis", "es"];
 
 /// クエリファイル名として妥当かを検証する
 /// (query_files.rs の validate_component / normalize_file_name と同じ方針: 空・

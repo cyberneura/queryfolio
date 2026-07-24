@@ -259,6 +259,10 @@ pub struct ServerConfig {
     pub password: Option<String>,
     #[serde(default)]
     pub ssh_tunnel: Option<SshTunnelConfig>,
+    /// queryfolio 独自拡張: true の場合、HTTP 系エンジン (elasticsearch) の
+    /// 接続に https を使う。省略時 false。SQL 系エンジンでは無視される。
+    #[serde(default)]
+    pub tls: bool,
     /// queryfolio 独自拡張: true の場合、行を返さない文 (INSERT / UPDATE /
     /// DELETE / DDL 等) の実行を拒否する。省略時 false。
     /// SELECT に副作用のある関数 (nextval 等) までは防げない事故防止ガード。
@@ -1624,6 +1628,7 @@ sql_servers:
             user: Some("u".into()),
             password: Some("secret".into()),
             ssh_tunnel: None,
+            tls: false,
             readonly: false,
             allow_dangerous_statements: false,
             group_name: None,
@@ -1651,6 +1656,7 @@ sql_servers:
             user: user.map(|s| s.to_string()),
             password: None,
             ssh_tunnel: None,
+            tls: false,
             readonly: false,
             allow_dangerous_statements: false,
             group_name: None,

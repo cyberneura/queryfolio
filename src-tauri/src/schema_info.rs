@@ -124,6 +124,10 @@ pub async fn fetch_tables(pool: &DbPool) -> Result<Vec<TableInfo>, AppError> {
         // テーブルの概念が無いエンジン (capabilities.supports_tables = false
         // でフロントは呼ばないが、直接呼ばれても壊れないよう空を返す)
         DbPool::Redis(_) => Ok(vec![]),
+        // Elasticsearch はインデックス一覧を「テーブル」として返す
+        DbPool::Elasticsearch(client) => {
+            crate::engines::elasticsearch::fetch_indices(client).await
+        }
     }
 }
 
@@ -131,6 +135,12 @@ pub async fn fetch_tables(pool: &DbPool) -> Result<Vec<TableInfo>, AppError> {
 /// テーブル名は SQL に埋め込む (PG の regclass / SQLite の PRAGMA) ため、
 /// meta_commands と同じ識別子検証を通す (SQL インジェクション対策)。
 pub async fn fetch_columns(pool: &DbPool, table: &str) -> Result<Vec<ColumnInfo>, AppError> {
+    // Elasticsearch のインデックス名 (ハイフン・ドット等) は SQL 識別子の規則
+    // (validate_relation_name) に合わないため、モジュール側の検証
+    // (URL パスとして安全な文字集合) を使って mapping のフィールドを返す
+    if let DbPool::Elasticsearch(client) = pool {
+        return crate::engines::elasticsearch::fetch_index_columns(client, table).await;
+    }
     let table = validate_relation_name(table)?;
     let columns: Vec<ColumnInfo> = match pool {
         DbPool::Postgres(p) => {
@@ -200,6 +210,8 @@ pub async fn fetch_columns(pool: &DbPool, table: &str) -> Result<Vec<ColumnInfo>
                 "This engine does not have tables".into(),
             ));
         }
+        // 冒頭の早期 return で処理済み
+        DbPool::Elasticsearch(_) => unreachable!(),
     };
     // MySQL / SQLite は存在しないテーブルでもエラーにならず空が返るため、
     // ここで明示的にエラーにする (PG は regclass 解決で先にエラーになる)
@@ -215,6 +227,11 @@ pub async fn fetch_columns(pool: &DbPool, table: &str) -> Result<Vec<ColumnInfo>
 /// テーブル名は SQL に埋め込む箇所があるため fetch_columns と同じ識別子
 /// 検証を通す (SQL インジェクション対策)。
 pub async fn fetch_primary_keys(pool: &DbPool, table: &str) -> Result<Vec<String>, AppError> {
+    // Elasticsearch に主キーの概念は無い (セル編集も非対応)。
+    // インデックス名は SQL 識別子検証に合わないため、検証前に返す
+    if matches!(pool, DbPool::Elasticsearch(_)) {
+        return Ok(vec![]);
+    }
     let table = validate_relation_name(table)?;
     let keys: Vec<String> = match pool {
         DbPool::Postgres(p) => {
@@ -276,6 +293,8 @@ pub async fn fetch_primary_keys(pool: &DbPool, table: &str) -> Result<Vec<String
             rows.into_iter().map(|(_, name)| name).collect()
         }
         DbPool::Redis(_) => vec![],
+        // 冒頭の早期 return で処理済み
+        DbPool::Elasticsearch(_) => unreachable!(),
     };
     Ok(keys)
 }
@@ -354,8 +373,9 @@ pub async fn fetch_all_columns(
                 });
             }
         }
-        // テーブル・カラムの概念が無いエンジンは空のまま返す (SQL 補完なし)
-        DbPool::Redis(_) => {}
+        // テーブル・カラムの概念が無いエンジン、および SQL 補完を使わない
+        // エンジン (Elasticsearch) は空のまま返す
+        DbPool::Redis(_) | DbPool::Elasticsearch(_) => {}
     }
     Ok(map)
 }

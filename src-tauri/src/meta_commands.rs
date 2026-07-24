@@ -23,7 +23,7 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
         return Ok(None);
     }
     // psql 風メタコマンドは SQL 系エンジン専用
-    if matches!(engine, Engine::Redis) {
+    if matches!(engine, Engine::Redis | Engine::Elasticsearch) {
         return Err(AppError::Config(
             "Meta commands (\\...) are not supported for this engine".into(),
         ));
@@ -48,7 +48,7 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
         Engine::MySql => mysql_meta(command, arg)?,
         Engine::Sqlite => sqlite_meta(command, arg)?,
         // 冒頭の早期 return で弾いている
-        Engine::Redis => unreachable!(),
+        Engine::Redis | Engine::Elasticsearch => unreachable!(),
     };
     Ok(Some(MetaCommand::Sql(sql)))
 }

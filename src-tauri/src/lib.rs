@@ -450,7 +450,7 @@ async fn switch_active_schema(
                     "\\c is not supported for SQLite".into(),
                 ));
             }
-            db::Engine::Redis => {
+            db::Engine::Redis | db::Engine::Elasticsearch => {
                 return Err(AppError::Config(
                     "\\c is not supported for this engine".into(),
                 ));

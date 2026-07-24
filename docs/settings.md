@@ -76,13 +76,14 @@ sql_servers:
 | Key | Required | Description |
 |-----|----------|-------------|
 | `name` | yes | Display name shown in the connections list. |
-| `engine` | yes | `postgres` (aliases: `postgresql`), `mysql` (aliases: `mariadb`), `sqlite` (aliases: `sqlite3`), or `redis` (aliases: `valkey`). |
+| `engine` | yes | `postgres` (aliases: `postgresql`), `mysql` (aliases: `mariadb`), `sqlite` (aliases: `sqlite3`), `redis` (aliases: `valkey`), or `elasticsearch` (aliases: `es`, `opensearch`). |
 | `description` | no | Free-text note shown in the UI. |
 | `host` | no | Database host. Defaults to `localhost` when omitted. Not needed for SQLite. When using an SSH tunnel, this is the DB host **as seen from the SSH endpoint** (often `localhost`). |
-| `port` | no | Database port. Defaults per engine when omitted: `5432` (PostgreSQL) / `3306` (MySQL) / `6379` (Redis). |
+| `port` | no | Database port. Defaults per engine when omitted: `5432` (PostgreSQL) / `3306` (MySQL) / `6379` (Redis) / `9200` (Elasticsearch). |
 | `schema` | depends | The database / schema to connect to. For SQLite, this is the **path to the database file** (queryfolio extension; `~` is expanded; if `schema` is omitted, `host` is used as the file path instead). |
 | `user` | no | Database user. |
 | `password` | no | Database password. |
+| `tls` | no | Use `https` for HTTP-based engines (Elasticsearch; queryfolio extension). Default `false`. Ignored by SQL engines. |
 | `readonly` | no | See [Safety guards](#safety-guards). Default `false`. |
 | `allow_dangerous_statements` | no | See [Safety guards](#safety-guards). Default `false`. |
 | `folder_name` | no | Override the query-file folder name. See [Query file storage](#query-file-storage-sqlfiles_dir-folder_name). |
@@ -123,6 +124,35 @@ sql_servers:
     host: localhost
     port: 6379
     schema: "0"
+  ```
+
+- **Elasticsearch** — `engine: elasticsearch` (aliases: `es`, `opensearch`;
+  queryfolio extension). The editor works like the Kibana Console: write
+  **request blocks** — a method line (`GET /books/_search`) optionally followed
+  by a JSON body — and run the block under the cursor with Cmd+Enter, or select
+  multiple blocks to run them in order (results are shown as a
+  request / status / result table). Lines starting with `#` are comments. An
+  NDJSON body (multiple JSON objects, for `_bulk`) is sent as-is. Query files
+  use the `.es` extension. `user` / `password` are used for HTTP Basic auth,
+  and `tls: true` switches to `https`. SSH tunnels work the same way as for
+  SQL engines. The TABLES pane lists indices (system indices starting with `.`
+  are hidden) and expands them into the flattened mapping fields. While the
+  **Writable** switch is off, only `GET` / `HEAD` and a whitelist of search
+  POST endpoints (`_search`, `_msearch`, `_count`, `_analyze`, `_mget`,
+  `_field_caps`, `_validate`, `_explain`, `_termvectors`, `_pit`, `_sql`,
+  `_render`) are allowed; deleting an index (`DELETE /<index>`) and
+  `_delete_by_query` additionally require `allow_dangerous_statements: true`.
+  Schemas, Explain, Format, cell editing, and AI features are not available
+  for Elasticsearch.
+
+  ```yaml
+  - name: local-elasticsearch
+    engine: elasticsearch
+    host: localhost
+    port: 9200
+    # tls: true
+    # user: elastic
+    # password: your_es_password
   ```
 
 ### Safety guards

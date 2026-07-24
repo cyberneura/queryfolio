@@ -47,6 +47,9 @@ pub enum AppError {
 
     #[error("Redis error: {0}")]
     Redis(String),
+
+    #[error("Elasticsearch error: {0}")]
+    Elasticsearch(String),
 }
 
 impl From<redis::RedisError> for AppError {

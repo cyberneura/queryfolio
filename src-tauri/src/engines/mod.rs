@@ -9,6 +9,7 @@
 //!   1 行委譲に留め、エンジン追加時は「モジュールを足す + capability を
 //!   宣言する + enum に variant を足す」だけで済むようにする。
 
+pub mod elasticsearch;
 pub mod redis;
 
 use serde::Serialize;
@@ -60,10 +61,24 @@ const REDIS_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_ai: false,
 };
 
+/// Elasticsearch は Kibana Console 風のリクエストブロックをエディタで扱い、
+/// TABLES ペインにはインデックス一覧 + mapping のフィールドを出す。
+const ELASTICSEARCH_CAPABILITIES: EngineCapabilities = EngineCapabilities {
+    editor_language: "es",
+    file_extension: "es",
+    supports_schemas: false,
+    supports_tables: true,
+    supports_explain: false,
+    supports_format: false,
+    supports_editable_cells: false,
+    supports_ai: false,
+};
+
 pub fn capabilities(engine: Engine) -> EngineCapabilities {
     match engine {
         Engine::MySql | Engine::Postgres | Engine::Sqlite => SQL_CAPABILITIES.clone(),
         Engine::Redis => REDIS_CAPABILITIES.clone(),
+        Engine::Elasticsearch => ELASTICSEARCH_CAPABILITIES.clone(),
     }
 }
 
@@ -97,6 +112,19 @@ mod tests {
         assert!(!redis.supports_format);
         assert!(!redis.supports_editable_cells);
         assert!(!redis.supports_ai);
+
+        let es = capabilities_for_name("elasticsearch");
+        assert_eq!(es.editor_language, "es");
+        assert_eq!(es.file_extension, "es");
+        assert!(!es.supports_schemas);
+        assert!(es.supports_tables);
+        assert!(!es.supports_explain);
+        assert!(!es.supports_format);
+        assert!(!es.supports_editable_cells);
+        assert!(!es.supports_ai);
+        // エイリアスも同じ capability
+        assert_eq!(capabilities_for_name("es").editor_language, "es");
+        assert_eq!(capabilities_for_name("opensearch").editor_language, "es");
 
         // 未知のエンジンは SQL 相当 (エラーは接続時に出す)
         let unknown = capabilities_for_name("oracle");
