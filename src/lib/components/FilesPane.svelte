@@ -20,7 +20,10 @@
   let renamingFile = $state<string | null>(null);
   let renameValue = $state("");
 
-  // デフォルトのファイル名: YYYYMMDD-HHMM (.sql はバックエンドが付与)。
+  /// エンジン別のクエリファイル拡張子 (ドット付き。例 ".sql" / ".redis")
+  const fileSuffix = $derived(`.${appStore.selectedFileExtension}`);
+
+  // デフォルトのファイル名: YYYYMMDD-HHMM (拡張子はバックエンドが付与)。
   // 日付が先頭にあると名前順ソートが時系列になり探しやすい。
   // 同一分内の連続作成で衝突しないよう、既存ファイルと重複する場合は
   // -2, -3 ... を付けて一意化する。
@@ -30,11 +33,11 @@
     const date = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
     const time = `${pad(now.getHours())}${pad(now.getMinutes())}`;
     const base = `${date}-${time}`;
-    if (!appStore.files.includes(`${base}.sql`)) {
+    if (!appStore.files.includes(`${base}${fileSuffix}`)) {
       return base;
     }
     let n = 2;
-    while (appStore.files.includes(`${base}-${n}.sql`)) {
+    while (appStore.files.includes(`${base}-${n}${fileSuffix}`)) {
       n++;
     }
     return `${base}-${n}`;
@@ -56,10 +59,12 @@
     confirmingDelete = null;
   };
 
-  // 名前を正規化する (.sql を保証)。同名判定をバックエンドと揃えるため。
+  // 名前を正規化する (エンジン別拡張子を保証)。同名判定をバックエンドと揃えるため。
   const normalize = (name: string) => {
     const trimmed = name.trim();
-    return trimmed.toLowerCase().endsWith(".sql") ? trimmed : `${trimmed}.sql`;
+    return trimmed.toLowerCase().endsWith(fileSuffix)
+      ? trimmed
+      : `${trimmed}${fileSuffix}`;
   };
 
   const startRename = (fileName: string) => {
@@ -154,14 +159,17 @@
     >
       HISTORY
     </button>
-    <button
-      class="text-xs font-semibold tracking-wide text-zinc-600 hover:text-zinc-300"
-      title="Show tables"
-      data-annotate="tab-tables"
-      onclick={onShowTables}
-    >
-      TABLES
-    </button>
+    <!-- テーブルの概念が無いエンジン (redis 等) では TABLES を出さない -->
+    {#if appStore.selectedCapabilities?.supports_tables ?? true}
+      <button
+        class="text-xs font-semibold tracking-wide text-zinc-600 hover:text-zinc-300"
+        title="Show tables"
+        data-annotate="tab-tables"
+        onclick={onShowTables}
+      >
+        TABLES
+      </button>
+    {/if}
     <button
       class="ml-auto rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
       title="New query file"

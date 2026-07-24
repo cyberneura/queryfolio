@@ -1856,6 +1856,18 @@ export default {
   toggleWritable() {
     writable = !writable;
   },
+  /// 選択中の接続のエンジン能力宣言 (未選択なら null)。
+  /// TABLES ペインの表示可否やクエリファイル拡張子の決定に使う
+  get selectedCapabilities() {
+    return (
+      connections.find((c) => c.name === selectedConnection)?.capabilities ??
+      null
+    );
+  },
+  /// 選択中の接続のクエリファイル拡張子 (ドット無し。未選択なら "sql")
+  get selectedFileExtension() {
+    return this.selectedCapabilities?.file_extension ?? "sql";
+  },
   get files() {
     return files;
   },

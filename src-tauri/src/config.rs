@@ -374,6 +374,9 @@ pub struct ConnectionInfo {
     pub allow_dangerous_statements: bool,
     /// 接続一覧での表示グループ名 (グループ未所属なら null)
     pub group_name: Option<String>,
+    /// エンジンの能力宣言 (エディタ言語・ファイル拡張子・UI の出し分け)。
+    /// フロントはエンジン名ではなくこれで UI を出し分ける。
+    pub capabilities: crate::engines::EngineCapabilities,
 }
 
 impl From<&ServerConfig> for ConnectionInfo {
@@ -391,6 +394,7 @@ impl From<&ServerConfig> for ConnectionInfo {
             readonly: server.readonly,
             allow_dangerous_statements: server.allow_dangerous_statements,
             group_name: server.group_name.clone(),
+            capabilities: crate::engines::capabilities_for_name(&server.engine),
         }
     }
 }

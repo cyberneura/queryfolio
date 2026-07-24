@@ -536,6 +536,15 @@
 
   const aiConfigured = $derived(appStore.aiInfo?.configured ?? false);
 
+  /// アクティブなタブの接続が AI 機能に対応しているか (redis 等は非対応)。
+  /// Fix with AI は SQL 修正プロンプト前提なので、非対応エンジンでは出さない
+  const activeTabSupportsAi = $derived.by(() => {
+    const conn = activeTab?.connection;
+    if (!conn) return true;
+    const info = appStore.connections.find((c) => c.name === conn);
+    return info?.capabilities.supports_ai ?? true;
+  });
+
   /// Fix with AI ボタンの title (未設定・エラー時は設定方法を案内する)。
   /// DB エラーメッセージには値が含まれ得るため、送信内容を明示する
   const aiFixButtonTitle = $derived(
@@ -584,6 +593,8 @@
   });
 
   /// 編集はアクティブ接続かつ Writable ON かつ config readonly でない時のみ。
+  /// セル編集非対応のエンジン (capabilities.supports_editable_cells = false、
+  /// redis 等) では常に不可。
   /// さらにタブの実行時スキーマが現在のアクティブスキーマと一致する時だけ許可する。
   /// 生成する UPDATE はスキーマ未修飾で「接続の現在のアクティブスキーマ」に対して
   /// 走るため、実行後にスキーマを切り替えていると別スキーマの同名テーブルを
@@ -591,6 +602,7 @@
   const canEditActiveConnection = $derived(
     activeTab !== null &&
       activeTab.connection === appStore.selectedConnection &&
+      (appStore.selectedCapabilities?.supports_editable_cells ?? true) &&
       appStore.writable &&
       !appStore.selectedConnectionReadonly &&
       activeTab.schema === appStore.activeSchema,
@@ -1140,24 +1152,26 @@
             <pre
               class="min-w-0 flex-1 whitespace-pre-wrap font-mono text-xs text-red-400"
               data-annotate="text-error-message">{activeTab.error}</pre>
-            <button
-              class="flex shrink-0 items-center gap-1 rounded border border-blue-500/50 bg-blue-500/15 px-2 py-0.5 text-xs text-blue-300 hover:bg-blue-500/25 disabled:cursor-not-allowed disabled:opacity-50"
-              title={aiFixButtonTitle}
-              data-annotate="button-ai-fix"
-              disabled={!aiConfigured || activeTab.fixing}
-              onclick={() => appStore.fixSqlWithAi(activeTab.id)}
-            >
-              {#if activeTab.fixing}
-                <!-- 修正案の生成中スピナー -->
-                <span
-                  class="inline-block size-3 animate-spin rounded-full border-2 border-blue-300 border-t-transparent"
-                  data-annotate="spinner-ai-fixing"
-                ></span>
-                Fixing...
-              {:else}
-                <i class="bi bi-magic" aria-hidden="true"></i> Fix with AI
-              {/if}
-            </button>
+            {#if activeTabSupportsAi}
+              <button
+                class="flex shrink-0 items-center gap-1 rounded border border-blue-500/50 bg-blue-500/15 px-2 py-0.5 text-xs text-blue-300 hover:bg-blue-500/25 disabled:cursor-not-allowed disabled:opacity-50"
+                title={aiFixButtonTitle}
+                data-annotate="button-ai-fix"
+                disabled={!aiConfigured || activeTab.fixing}
+                onclick={() => appStore.fixSqlWithAi(activeTab.id)}
+              >
+                {#if activeTab.fixing}
+                  <!-- 修正案の生成中スピナー -->
+                  <span
+                    class="inline-block size-3 animate-spin rounded-full border-2 border-blue-300 border-t-transparent"
+                    data-annotate="spinner-ai-fixing"
+                  ></span>
+                  Fixing...
+                {:else}
+                  <i class="bi bi-magic" aria-hidden="true"></i> Fix with AI
+                {/if}
+              </button>
+            {/if}
           </div>
 
           <!-- AI の修正案 (元の SQL と並べて表示。Apply までは実行しない) -->

@@ -209,7 +209,7 @@ mod tests {
         let folder = "db.example.com_postgres_orders_app";
 
         // クエリファイルを 1 つ作る (フォルダが作られる)
-        query_files::create_query_file(&sqlfiles_dir, folder, "report").unwrap();
+        query_files::create_query_file(&sqlfiles_dir, folder, "report", "sql").unwrap();
         // メタファイルを書き出す (lib.rs の refresh_folder_meta 相当)
         let dir = query_files::connection_dir(&sqlfiles_dir, folder).unwrap();
         write_folder_meta(&dir, &base_server()).unwrap();
@@ -217,12 +217,12 @@ mod tests {
         // メタファイルは実在する
         assert!(dir.join(META_FILE_NAME).exists());
         // が、クエリファイル一覧には現れない (.sql のみ)
-        let files = query_files::list_query_files(&sqlfiles_dir, folder).unwrap();
+        let files = query_files::list_query_files(&sqlfiles_dir, folder, "sql").unwrap();
         assert_eq!(files, vec!["report.sql"]);
         // 検索にも現れない (中身の "Production" は base_server の group 名だが
         // メタファイルは .sql でないため検索対象外)
         let hits =
-            query_files::search_query_files(&sqlfiles_dir, folder, "Production").unwrap();
+            query_files::search_query_files(&sqlfiles_dir, folder, "Production", "sql").unwrap();
         assert!(hits.is_empty());
 
         let _ = fs::remove_dir_all(&sqlfiles_dir);

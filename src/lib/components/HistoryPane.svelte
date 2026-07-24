@@ -84,14 +84,17 @@
       FILES
     </button>
     <span class="text-xs font-semibold tracking-wide text-zinc-400">HISTORY</span>
-    <button
-      class="text-xs font-semibold tracking-wide text-zinc-600 hover:text-zinc-300"
-      title="Show tables"
-      data-annotate="tab-tables"
-      onclick={onShowTables}
-    >
-      TABLES
-    </button>
+    <!-- テーブルの概念が無いエンジン (redis 等) では TABLES を出さない -->
+    {#if appStore.selectedCapabilities?.supports_tables ?? true}
+      <button
+        class="text-xs font-semibold tracking-wide text-zinc-600 hover:text-zinc-300"
+        title="Show tables"
+        data-annotate="tab-tables"
+        onclick={onShowTables}
+      >
+        TABLES
+      </button>
+    {/if}
     <button
       class="ml-auto rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
       title="Reload history"

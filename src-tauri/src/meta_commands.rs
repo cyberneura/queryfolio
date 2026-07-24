@@ -22,6 +22,12 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
     if !trimmed.starts_with('\\') {
         return Ok(None);
     }
+    // psql 風メタコマンドは SQL 系エンジン専用
+    if matches!(engine, Engine::Redis) {
+        return Err(AppError::Config(
+            "Meta commands (\\...) are not supported for this engine".into(),
+        ));
+    }
     // SQL の癖で末尾に ; を付けても動くよう、末尾のセミコロンは無視する
     let trimmed = trimmed.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
     let mut parts = trimmed.split_whitespace();
@@ -41,6 +47,8 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
         Engine::Postgres => postgres_meta(command, arg)?,
         Engine::MySql => mysql_meta(command, arg)?,
         Engine::Sqlite => sqlite_meta(command, arg)?,
+        // 冒頭の早期 return で弾いている
+        Engine::Redis => unreachable!(),
     };
     Ok(Some(MetaCommand::Sql(sql)))
 }

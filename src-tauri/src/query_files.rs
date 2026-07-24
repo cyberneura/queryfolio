@@ -24,13 +24,16 @@ pub(crate) fn validate_component(name: &str) -> Result<&str, AppError> {
     Ok(name)
 }
 
-/// クエリファイル名を正規化する (.sql 拡張子を保証する)。
-fn normalize_file_name(name: &str) -> Result<String, AppError> {
+/// クエリファイル名を正規化する (接続エンジンの拡張子を保証する)。
+/// ext は "sql" / "redis" などドット無しの拡張子 (engines::EngineCapabilities
+/// の file_extension)。
+fn normalize_file_name(name: &str, ext: &str) -> Result<String, AppError> {
     let name = validate_component(name)?;
-    if name.to_ascii_lowercase().ends_with(".sql") {
+    let suffix = format!(".{}", ext.to_ascii_lowercase());
+    if name.to_ascii_lowercase().ends_with(&suffix) {
         Ok(name.to_string())
     } else {
-        Ok(format!("{name}.sql"))
+        Ok(format!("{name}{suffix}"))
     }
 }
 
@@ -47,27 +50,29 @@ fn file_path(
     sqlfiles_dir: &Path,
     connection: &str,
     file_name: &str,
+    ext: &str,
 ) -> Result<PathBuf, AppError> {
-    let file_name = normalize_file_name(file_name)?;
+    let file_name = normalize_file_name(file_name, ext)?;
     Ok(connection_dir(sqlfiles_dir, connection)?.join(file_name))
 }
 
-/// ディレクトリ直下の .sql ファイル名を昇順で返す。存在しなければ空。
+/// ディレクトリ直下の、拡張子が ext のファイル名を昇順で返す。存在しなければ空。
 /// (list_query_files と search_query_files で列挙条件を共有し、
 ///  隠しファイル/拡張子判定/ソートが片方だけズレるのを防ぐ)
 /// dot 始まりの隠しファイルは除外する。validate_component が dot 始まりの名前を
-/// 拒否する (= CRUD で開けない) のと一貫させ、手動配置された隠し .sql の中身が
+/// 拒否する (= CRUD で開けない) のと一貫させ、手動配置された隠しファイルの中身が
 /// 検索プレビューから漏れないようにする。
-fn list_sql_file_names(dir: &Path) -> Result<Vec<String>, AppError> {
+fn list_query_file_names(dir: &Path, ext: &str) -> Result<Vec<String>, AppError> {
     if !dir.exists() {
         return Ok(vec![]);
     }
+    let suffix = format!(".{}", ext.to_ascii_lowercase());
     let mut names: Vec<String> = fs::read_dir(dir)?
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.path().is_file())
         .filter_map(|entry| entry.file_name().into_string().ok())
         .filter(|name| !name.starts_with('.'))
-        .filter(|name| name.to_ascii_lowercase().ends_with(".sql"))
+        .filter(|name| name.to_ascii_lowercase().ends_with(&suffix))
         .collect();
     names.sort();
     Ok(names)
@@ -77,14 +82,15 @@ fn list_sql_file_names(dir: &Path) -> Result<Vec<String>, AppError> {
 pub fn list_query_files(
     sqlfiles_dir: &Path,
     connection: &str,
+    ext: &str,
 ) -> Result<Vec<String>, AppError> {
-    list_sql_file_names(&connection_dir(sqlfiles_dir, connection)?)
+    list_query_file_names(&connection_dir(sqlfiles_dir, connection)?, ext)
 }
 
 /// クエリファイル検索の 1 ヒット。
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
 pub struct FileSearchHit {
-    /// ヒットしたファイル名 (.sql 付き)
+    /// ヒットしたファイル名 (拡張子付き)
     pub file_name: String,
     /// ファイル名が query に一致したか
     pub name_match: bool,
@@ -118,13 +124,14 @@ pub fn search_query_files(
     sqlfiles_dir: &Path,
     connection: &str,
     query: &str,
+    ext: &str,
 ) -> Result<Vec<FileSearchHit>, AppError> {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
         return Ok(vec![]);
     }
     let dir = connection_dir(sqlfiles_dir, connection)?;
-    let names = list_sql_file_names(&dir)?;
+    let names = list_query_file_names(&dir, ext)?;
 
     let mut hits = Vec::new();
     for name in names {
@@ -164,8 +171,9 @@ pub fn query_file_path(
     sqlfiles_dir: &Path,
     connection: &str,
     file_name: &str,
+    ext: &str,
 ) -> Result<String, AppError> {
-    let path = file_path(sqlfiles_dir, connection, file_name)?;
+    let path = file_path(sqlfiles_dir, connection, file_name, ext)?;
     let path = std::path::absolute(&path)?;
     Ok(path.to_string_lossy().into_owned())
 }
@@ -174,8 +182,9 @@ pub fn read_query_file(
     sqlfiles_dir: &Path,
     connection: &str,
     file_name: &str,
+    ext: &str,
 ) -> Result<String, AppError> {
-    let path = file_path(sqlfiles_dir, connection, file_name)?;
+    let path = file_path(sqlfiles_dir, connection, file_name, ext)?;
     if !path.exists() {
         return Err(AppError::QueryFile(format!(
             "File not found: {}",
@@ -190,8 +199,9 @@ pub fn write_query_file(
     connection: &str,
     file_name: &str,
     content: &str,
+    ext: &str,
 ) -> Result<(), AppError> {
-    let path = file_path(sqlfiles_dir, connection, file_name)?;
+    let path = file_path(sqlfiles_dir, connection, file_name, ext)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -216,8 +226,9 @@ pub fn write_query_file_if_unchanged(
     file_name: &str,
     content: &str,
     expected_base: &str,
+    ext: &str,
 ) -> Result<bool, AppError> {
-    let path = file_path(sqlfiles_dir, connection, file_name)?;
+    let path = file_path(sqlfiles_dir, connection, file_name, ext)?;
     match fs::read_to_string(&path) {
         Ok(current) => {
             if current != expected_base {
@@ -242,9 +253,10 @@ pub fn create_query_file(
     sqlfiles_dir: &Path,
     connection: &str,
     file_name: &str,
+    ext: &str,
 ) -> Result<String, AppError> {
-    let normalized = normalize_file_name(file_name)?;
-    let path = file_path(sqlfiles_dir, connection, &normalized)?;
+    let normalized = normalize_file_name(file_name, ext)?;
+    let path = file_path(sqlfiles_dir, connection, &normalized, ext)?;
     if path.exists() {
         return Err(AppError::QueryFile(format!(
             "A file with the same name already exists: {normalized}"
@@ -261,8 +273,9 @@ pub fn delete_query_file(
     sqlfiles_dir: &Path,
     connection: &str,
     file_name: &str,
+    ext: &str,
 ) -> Result<(), AppError> {
-    let path = file_path(sqlfiles_dir, connection, file_name)?;
+    let path = file_path(sqlfiles_dir, connection, file_name, ext)?;
     if !path.exists() {
         return Err(AppError::QueryFile(format!(
             "File not found: {}",
@@ -280,13 +293,14 @@ pub fn rename_query_file(
     connection: &str,
     old_name: &str,
     new_name: &str,
+    ext: &str,
 ) -> Result<String, AppError> {
-    let old_normalized = normalize_file_name(old_name)?;
-    let new_normalized = normalize_file_name(new_name)?;
+    let old_normalized = normalize_file_name(old_name, ext)?;
+    let new_normalized = normalize_file_name(new_name, ext)?;
     if old_normalized == new_normalized {
         return Ok(new_normalized);
     }
-    let old_path = file_path(sqlfiles_dir, connection, &old_normalized)?;
+    let old_path = file_path(sqlfiles_dir, connection, &old_normalized, ext)?;
     if !old_path.exists() {
         return Err(AppError::QueryFile(format!(
             "File not found: {}",
@@ -310,7 +324,7 @@ pub fn rename_query_file(
             }
         }
     }
-    let new_path = file_path(sqlfiles_dir, connection, &new_normalized)?;
+    let new_path = file_path(sqlfiles_dir, connection, &new_normalized, ext)?;
     fs::rename(&old_path, &new_path)?;
     Ok(new_normalized)
 }
@@ -341,10 +355,46 @@ mod tests {
 
     #[test]
     fn test_normalize_file_name() {
-        assert_eq!(normalize_file_name("query").unwrap(), "query.sql");
-        assert_eq!(normalize_file_name("query.sql").unwrap(), "query.sql");
-        assert_eq!(normalize_file_name("query.SQL").unwrap(), "query.SQL");
-        assert!(normalize_file_name("../evil").is_err());
+        assert_eq!(normalize_file_name("query", "sql").unwrap(), "query.sql");
+        assert_eq!(normalize_file_name("query.sql", "sql").unwrap(), "query.sql");
+        assert_eq!(normalize_file_name("query.SQL", "sql").unwrap(), "query.SQL");
+        assert!(normalize_file_name("../evil", "sql").is_err());
+        // エンジン別拡張子 (redis)
+        assert_eq!(normalize_file_name("keys", "redis").unwrap(), "keys.redis");
+        assert_eq!(
+            normalize_file_name("keys.redis", "redis").unwrap(),
+            "keys.redis"
+        );
+        // 別エンジンの拡張子は付け直す (keys.sql は redis 接続では別名)
+        assert_eq!(
+            normalize_file_name("keys.sql", "redis").unwrap(),
+            "keys.sql.redis"
+        );
+    }
+
+    #[test]
+    fn test_list_query_files_filters_by_extension() {
+        let dir = test_dir().join("ext");
+        let connection = "redis-conn";
+
+        create_query_file(&dir, connection, "commands", "redis").unwrap();
+        // 手動配置された別拡張子のファイルは一覧に出ない
+        fs::write(
+            connection_dir(&dir, connection).unwrap().join("other.sql"),
+            "SELECT 1;",
+        )
+        .unwrap();
+
+        assert_eq!(
+            list_query_files(&dir, connection, "redis").unwrap(),
+            vec!["commands.redis"]
+        );
+        assert_eq!(
+            list_query_files(&dir, connection, "sql").unwrap(),
+            vec!["other.sql"]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -353,30 +403,30 @@ mod tests {
         let connection = "test-conn";
 
         assert_eq!(
-            list_query_files(&dir, connection).unwrap(),
+            list_query_files(&dir, connection, "sql").unwrap(),
             Vec::<String>::new()
         );
 
-        let name = create_query_file(&dir, connection, "my query").unwrap();
+        let name = create_query_file(&dir, connection, "my query", "sql").unwrap();
         assert_eq!(name, "my query.sql");
 
         // 同名の再作成はエラー
-        assert!(create_query_file(&dir, connection, "my query").is_err());
+        assert!(create_query_file(&dir, connection, "my query", "sql").is_err());
 
-        write_query_file(&dir, connection, &name, "SELECT 1;").unwrap();
+        write_query_file(&dir, connection, &name, "SELECT 1;", "sql").unwrap();
         assert_eq!(
-            read_query_file(&dir, connection, &name).unwrap(),
+            read_query_file(&dir, connection, &name, "sql").unwrap(),
             "SELECT 1;"
         );
 
         assert_eq!(
-            list_query_files(&dir, connection).unwrap(),
+            list_query_files(&dir, connection, "sql").unwrap(),
             vec!["my query.sql"]
         );
 
-        delete_query_file(&dir, connection, &name).unwrap();
+        delete_query_file(&dir, connection, &name, "sql").unwrap();
         assert_eq!(
-            list_query_files(&dir, connection).unwrap(),
+            list_query_files(&dir, connection, "sql").unwrap(),
             Vec::<String>::new()
         );
 
@@ -392,34 +442,34 @@ mod tests {
 
         // ファイルが無ければ expected_base に関わらず作成する (外部削除からの復帰)。
         assert_eq!(
-            write_query_file_if_unchanged(&dir, connection, name, "V1", "").unwrap(),
+            write_query_file_if_unchanged(&dir, connection, name, "V1", "", "sql").unwrap(),
             true
         );
-        assert_eq!(read_query_file(&dir, connection, name).unwrap(), "V1");
+        assert_eq!(read_query_file(&dir, connection, name, "sql").unwrap(), "V1");
 
         // base が現在のディスク内容と一致すれば書き込む。
         assert_eq!(
-            write_query_file_if_unchanged(&dir, connection, name, "V2", "V1").unwrap(),
+            write_query_file_if_unchanged(&dir, connection, name, "V2", "V1", "sql").unwrap(),
             true
         );
-        assert_eq!(read_query_file(&dir, connection, name).unwrap(), "V2");
+        assert_eq!(read_query_file(&dir, connection, name, "sql").unwrap(), "V2");
 
         // アプリ外で "EXTERNAL" に変更されたのに、こちらの base が古い ("V2") 場合は
         // 書き込まず false を返す (外部変更を黙って上書きしない)。
-        write_query_file(&dir, connection, name, "EXTERNAL").unwrap();
+        write_query_file(&dir, connection, name, "EXTERNAL", "sql").unwrap();
         assert_eq!(
-            write_query_file_if_unchanged(&dir, connection, name, "MINE", "V2").unwrap(),
+            write_query_file_if_unchanged(&dir, connection, name, "MINE", "V2", "sql").unwrap(),
             false
         );
-        assert_eq!(read_query_file(&dir, connection, name).unwrap(), "EXTERNAL");
+        assert_eq!(read_query_file(&dir, connection, name, "sql").unwrap(), "EXTERNAL");
 
         // base を現在値に合わせれば再び書ける。
         assert_eq!(
-            write_query_file_if_unchanged(&dir, connection, name, "MINE", "EXTERNAL")
+            write_query_file_if_unchanged(&dir, connection, name, "MINE", "EXTERNAL", "sql")
                 .unwrap(),
             true
         );
-        assert_eq!(read_query_file(&dir, connection, name).unwrap(), "MINE");
+        assert_eq!(read_query_file(&dir, connection, name, "sql").unwrap(), "MINE");
 
         // 後始末
         let _ = fs::remove_dir_all(&dir);
@@ -431,7 +481,7 @@ mod tests {
         let connection = "test-conn";
 
         // .sql 補完・接続フォルダ・ディレクトリが連結された絶対パスが返る
-        let path = query_file_path(&dir, connection, "report").unwrap();
+        let path = query_file_path(&dir, connection, "report", "sql").unwrap();
         let expected = dir
             .join(connection)
             .join("report.sql")
@@ -440,12 +490,12 @@ mod tests {
         assert_eq!(path, expected);
 
         // 既に .sql 付きの名前は二重付与しない
-        let path = query_file_path(&dir, connection, "report.sql").unwrap();
+        let path = query_file_path(&dir, connection, "report.sql", "sql").unwrap();
         assert_eq!(path, expected);
 
         // パストラバーサルは拒否
-        assert!(query_file_path(&dir, connection, "../evil").is_err());
-        assert!(query_file_path(&dir, connection, "a/b").is_err());
+        assert!(query_file_path(&dir, connection, "../evil", "sql").is_err());
+        assert!(query_file_path(&dir, connection, "a/b", "sql").is_err());
     }
 
     #[test]
@@ -453,40 +503,40 @@ mod tests {
         let dir = test_dir().join("rename");
         let connection = "test-conn";
 
-        create_query_file(&dir, connection, "old").unwrap();
-        write_query_file(&dir, connection, "old", "SELECT 1;").unwrap();
+        create_query_file(&dir, connection, "old", "sql").unwrap();
+        write_query_file(&dir, connection, "old", "SELECT 1;", "sql").unwrap();
 
         // リネーム成功 (内容は保持される)
-        let renamed = rename_query_file(&dir, connection, "old", "new").unwrap();
+        let renamed = rename_query_file(&dir, connection, "old", "new", "sql").unwrap();
         assert_eq!(renamed, "new.sql");
         assert_eq!(
-            list_query_files(&dir, connection).unwrap(),
+            list_query_files(&dir, connection, "sql").unwrap(),
             vec!["new.sql"]
         );
         assert_eq!(
-            read_query_file(&dir, connection, "new").unwrap(),
+            read_query_file(&dir, connection, "new", "sql").unwrap(),
             "SELECT 1;"
         );
 
         // 既存名への変更は拒否
-        create_query_file(&dir, connection, "other").unwrap();
-        assert!(rename_query_file(&dir, connection, "new", "other").is_err());
+        create_query_file(&dir, connection, "other", "sql").unwrap();
+        assert!(rename_query_file(&dir, connection, "new", "other", "sql").is_err());
 
         // 同名 (正規化後) への変更は no-op
         assert_eq!(
-            rename_query_file(&dir, connection, "new", "new.sql").unwrap(),
+            rename_query_file(&dir, connection, "new", "new.sql", "sql").unwrap(),
             "new.sql"
         );
 
         // 存在しないファイルのリネームはエラー
-        assert!(rename_query_file(&dir, connection, "missing", "x").is_err());
+        assert!(rename_query_file(&dir, connection, "missing", "x", "sql").is_err());
 
         // 不正な新名は拒否 (パストラバーサル)
-        assert!(rename_query_file(&dir, connection, "new", "../evil").is_err());
-        assert!(rename_query_file(&dir, connection, "new", "a/b").is_err());
+        assert!(rename_query_file(&dir, connection, "new", "../evil", "sql").is_err());
+        assert!(rename_query_file(&dir, connection, "new", "a/b", "sql").is_err());
 
         // 大文字小文字違いの別ファイルへの改名は拒否 (case-insensitive 判定)
-        assert!(rename_query_file(&dir, connection, "new", "OTHER").is_err());
+        assert!(rename_query_file(&dir, connection, "new", "OTHER", "sql").is_err());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -496,20 +546,20 @@ mod tests {
         let dir = test_dir().join("rename-case");
         let connection = "test-conn";
 
-        create_query_file(&dir, connection, "Report").unwrap();
-        write_query_file(&dir, connection, "Report", "SELECT 2;").unwrap();
+        create_query_file(&dir, connection, "Report", "sql").unwrap();
+        write_query_file(&dir, connection, "Report", "SELECT 2;", "sql").unwrap();
 
         // 自分自身の大文字小文字だけを変える改名は許可される
         let renamed =
-            rename_query_file(&dir, connection, "Report", "report").unwrap();
+            rename_query_file(&dir, connection, "Report", "report", "sql").unwrap();
         assert_eq!(renamed, "report.sql");
         assert_eq!(
-            read_query_file(&dir, connection, "report").unwrap(),
+            read_query_file(&dir, connection, "report", "sql").unwrap(),
             "SELECT 2;"
         );
         // case-insensitive FS では 1 ファイルのまま、case-sensitive FS でも
         // 旧名は残らない (rename 済み)
-        let files = list_query_files(&dir, connection).unwrap();
+        let files = list_query_files(&dir, connection, "sql").unwrap();
         assert!(files.iter().any(|f| f.eq_ignore_ascii_case("report.sql")));
         assert!(!files.contains(&"Report.sql".to_string()));
 
@@ -521,28 +571,30 @@ mod tests {
         let dir = test_dir().join("search");
         let connection = "test-conn";
 
-        create_query_file(&dir, connection, "users report").unwrap();
+        create_query_file(&dir, connection, "users report", "sql").unwrap();
         write_query_file(
             &dir,
             connection,
             "users report",
             "SELECT * FROM users WHERE active = 1;",
+            "sql",
         )
         .unwrap();
-        create_query_file(&dir, connection, "orders").unwrap();
+        create_query_file(&dir, connection, "orders", "sql").unwrap();
         write_query_file(
             &dir,
             connection,
             "orders",
             "SELECT id, total FROM orders;",
+            "sql",
         )
         .unwrap();
 
         // 空クエリは空
-        assert!(search_query_files(&dir, connection, "  ").unwrap().is_empty());
+        assert!(search_query_files(&dir, connection, "  ", "sql").unwrap().is_empty());
 
         // ファイル名一致 (大文字小文字を区別しない)
-        let hits = search_query_files(&dir, connection, "USERS").unwrap();
+        let hits = search_query_files(&dir, connection, "USERS", "sql").unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].file_name, "users report.sql");
         assert!(hits[0].name_match);
@@ -550,7 +602,7 @@ mod tests {
         assert!(hits[0].content_preview.as_deref().unwrap().contains("users"));
 
         // 中身のみ一致 (ファイル名は "orders" だが中身に total がある)
-        let hits = search_query_files(&dir, connection, "total").unwrap();
+        let hits = search_query_files(&dir, connection, "total", "sql").unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].file_name, "orders.sql");
         assert!(!hits[0].name_match);
@@ -560,7 +612,7 @@ mod tests {
         );
 
         // どちらにも無い語は 0 件
-        assert!(search_query_files(&dir, connection, "zzz").unwrap().is_empty());
+        assert!(search_query_files(&dir, connection, "zzz", "sql").unwrap().is_empty());
 
         // 手動配置された隠し .sql は検索対象外 (中身プレビューを漏らさない)。
         // validate_component が dot 始まりを拒否するため create 経由では作れないので
@@ -570,16 +622,16 @@ mod tests {
             "SELECT secret_total FROM vault;",
         )
         .unwrap();
-        assert!(search_query_files(&dir, connection, "secret")
+        assert!(search_query_files(&dir, connection, "secret", "sql")
             .unwrap()
             .is_empty());
-        assert!(!list_query_files(&dir, connection)
+        assert!(!list_query_files(&dir, connection, "sql")
             .unwrap()
             .iter()
             .any(|f| f.starts_with('.')));
 
         // 存在しない接続ディレクトリは 0 件
-        assert!(search_query_files(&dir, "no-such-conn", "users")
+        assert!(search_query_files(&dir, "no-such-conn", "users", "sql")
             .unwrap()
             .is_empty());
 

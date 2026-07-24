@@ -44,6 +44,15 @@ pub enum AppError {
 
     #[error("Database error: {0}")]
     Db(#[from] sqlx::Error),
+
+    #[error("Redis error: {0}")]
+    Redis(String),
+}
+
+impl From<redis::RedisError> for AppError {
+    fn from(e: redis::RedisError) -> Self {
+        AppError::Redis(e.to_string())
+    }
 }
 
 impl Serialize for AppError {

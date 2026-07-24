@@ -1,9 +1,12 @@
 <script lang="ts">
   import { toast } from "svelte-sonner";
   import appStore from "$lib/stores/app.svelte";
+  import type { EngineCapabilities } from "$lib/api";
 
   interface Props {
     engine: string | null;
+    /// エンジンの能力宣言 (UI の出し分けに使う)。null は SQL 相当
+    capabilities: EngineCapabilities | null;
     readonly: boolean;
     /// Explain ボタン押下時の処理 (+page.svelte がエディタの
     /// カーソル位置の文を取り出して appStore.explainQuery に渡す)
@@ -22,6 +25,7 @@
 
   let {
     engine,
+    capabilities,
     readonly,
     onExplain,
     onExplainSql,
@@ -33,6 +37,12 @@
   const isSqlite = $derived(
     ["sqlite", "sqlite3"].includes((engine ?? "").toLowerCase()),
   );
+
+  /// capability の出し分け (未取得 = null は SQL 相当として全部出す)
+  const supportsSchemas = $derived(capabilities?.supports_schemas ?? true);
+  const supportsExplain = $derived(capabilities?.supports_explain ?? true);
+  const supportsFormat = $derived(capabilities?.supports_format ?? true);
+  const supportsAi = $derived(capabilities?.supports_ai ?? true);
 
   /// AI 生成のインライン入力欄の表示状態と入力内容
   let showAiInput = $state(false);
@@ -173,25 +183,27 @@
     </button>
   {/if}
 
-  <span class="text-xs text-zinc-500">Database:</span>
-  {#if isSqlite || appStore.schemas.length <= 1}
-    <span class="font-mono text-xs text-zinc-300" data-annotate="text-active-schema">
-      {appStore.activeSchema ?? "(default)"}
-    </span>
-  {:else}
-    <select
-      class="max-w-64 rounded border border-zinc-600 bg-zinc-800 px-1.5 py-0.5 font-mono text-xs text-zinc-200 outline-none focus:border-blue-400"
-      data-annotate="select-active-schema"
-      value={appStore.activeSchema ?? ""}
-      onchange={onSchemaChange}
-    >
-      {#if appStore.activeSchema && !appStore.schemas.includes(appStore.activeSchema)}
-        <option value={appStore.activeSchema}>{appStore.activeSchema}</option>
-      {/if}
-      {#each appStore.schemas as schema (schema)}
-        <option value={schema}>{schema}</option>
-      {/each}
-    </select>
+  {#if supportsSchemas}
+    <span class="text-xs text-zinc-500">Database:</span>
+    {#if isSqlite || appStore.schemas.length <= 1}
+      <span class="font-mono text-xs text-zinc-300" data-annotate="text-active-schema">
+        {appStore.activeSchema ?? "(default)"}
+      </span>
+    {:else}
+      <select
+        class="max-w-64 rounded border border-zinc-600 bg-zinc-800 px-1.5 py-0.5 font-mono text-xs text-zinc-200 outline-none focus:border-blue-400"
+        data-annotate="select-active-schema"
+        value={appStore.activeSchema ?? ""}
+        onchange={onSchemaChange}
+      >
+        {#if appStore.activeSchema && !appStore.schemas.includes(appStore.activeSchema)}
+          <option value={appStore.activeSchema}>{appStore.activeSchema}</option>
+        {/if}
+        {#each appStore.schemas as schema (schema)}
+          <option value={schema}>{schema}</option>
+        {/each}
+      </select>
+    {/if}
   {/if}
 
   <div class="ml-auto flex min-w-0 items-center gap-2">
@@ -209,50 +221,58 @@
       </button>
     {/if}
     <!-- カーソル位置の文を整形する (ファイルが開いているときのみ有効) -->
-    <button
-      type="button"
-      class="rounded border border-zinc-600 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
-      data-annotate="button-format"
-      title="Format the SQL statement under the cursor"
-      aria-label="Format the SQL statement under the cursor"
-      disabled={!appStore.selectedFile}
-      onclick={onFormat}
-    >
-      <i class="bi bi-braces" aria-hidden="true"></i> Format
-    </button>
+    {#if supportsFormat}
+      <button
+        type="button"
+        class="rounded border border-zinc-600 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
+        data-annotate="button-format"
+        title="Format the SQL statement under the cursor"
+        aria-label="Format the SQL statement under the cursor"
+        disabled={!appStore.selectedFile}
+        onclick={onFormat}
+      >
+        <i class="bi bi-braces" aria-hidden="true"></i> Format
+      </button>
+    {/if}
     <!-- カーソル位置の文をエンジン別 EXPLAIN で実行する (AI 不要の単体機能) -->
-    <button
-      type="button"
-      class="rounded border border-zinc-600 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
-      data-annotate="button-explain"
-      title="Run EXPLAIN for the SELECT statement under the cursor"
-      aria-label="Run EXPLAIN for the SELECT statement under the cursor"
-      disabled={appStore.running}
-      onclick={onExplain}
-    >
-      <i class="bi bi-diagram-3" aria-hidden="true"></i> Explain
-    </button>
+    {#if supportsExplain}
+      <button
+        type="button"
+        class="rounded border border-zinc-600 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
+        data-annotate="button-explain"
+        title="Run EXPLAIN for the SELECT statement under the cursor"
+        aria-label="Run EXPLAIN for the SELECT statement under the cursor"
+        disabled={appStore.running}
+        onclick={onExplain}
+      >
+        <i class="bi bi-diagram-3" aria-hidden="true"></i> Explain
+      </button>
+    {/if}
     <!-- カーソル位置の文を AI に平易に解説させる (AI 設定済みのときのみ有効) -->
-    <button
-      type="button"
-      class="flex items-center gap-1 rounded border border-zinc-600 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
-      data-annotate="button-ai-explain-sql"
-      title={explainSqlButtonTitle}
-      disabled={!aiConfigured || appStore.aiExplaining}
-      onclick={onExplainSql}
-    >
-      {#if appStore.aiExplaining}
-        <!-- 解説の生成中スピナー -->
-        <span
-          class="inline-block size-3 animate-spin rounded-full border-2 border-zinc-300 border-t-transparent"
-          data-annotate="spinner-ai-explaining"
-        ></span>
-        Explaining...
-      {:else}
-        <i class="bi bi-info-circle" aria-hidden="true"></i> Explain SQL
-      {/if}
-    </button>
-    {#if showAiInput}
+    {#if supportsAi}
+      <button
+        type="button"
+        class="flex items-center gap-1 rounded border border-zinc-600 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
+        data-annotate="button-ai-explain-sql"
+        title={explainSqlButtonTitle}
+        disabled={!aiConfigured || appStore.aiExplaining}
+        onclick={onExplainSql}
+      >
+        {#if appStore.aiExplaining}
+          <!-- 解説の生成中スピナー -->
+          <span
+            class="inline-block size-3 animate-spin rounded-full border-2 border-zinc-300 border-t-transparent"
+            data-annotate="spinner-ai-explaining"
+          ></span>
+          Explaining...
+        {:else}
+          <i class="bi bi-info-circle" aria-hidden="true"></i> Explain SQL
+        {/if}
+      </button>
+    {/if}
+    {#if !supportsAi}
+      <!-- AI 系 UI はこのエンジンでは出さない -->
+    {:else if showAiInput}
       <form
         class="flex min-w-0 items-center gap-1"
         onsubmit={submitAiInstruction}

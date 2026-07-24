@@ -46,9 +46,11 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
 |---------|------|
 | lib.rs | Tauri コマンド定義と AppState (接続設定キャッシュ + DbManager)、メニューバーの組み立て (build_menu / rebuild_menu) |
 | config.rs | config.yml のロード・config_override_command による設定の再帰マージ (load_merged / merge_mapping)・テンプレート展開・expand_tilde・設定エディタの読み書き (read_config_file / write_config_file) |
-| db.rs | sqlx プール管理、クエリ実行・キャンセル (CancelRegistry)、型別 JSON 変換、readonly ガード / 危険な文ガード (dangerous_reason) |
+| db.rs | sqlx プール管理、クエリ実行・キャンセル (CancelRegistry)、型別 JSON 変換、readonly ガード / 危険な文ガード (dangerous_reason)。非 SQL エンジン (Redis) は `DbPool` の variant として持ち、run_query_cancellable の冒頭で engines/ の各モジュールへ委譲する |
+| engines/mod.rs | プラガブルエンジン層の中核。`EngineCapabilities` (エディタ言語・クエリファイル拡張子・schemas/tables/explain/format/セル編集/AI の対応可否) をエンジンごとに宣言し、`ConnectionInfo.capabilities` としてフロントへ渡す。フロントはエンジン名でなく capability で UI を出し分けるため、エンジン追加時は「engines/ にモジュールを足す + capability を宣言 + db.rs の enum に variant を足す」で済む |
+| engines/redis.rs | Redis エンジン (engine: redis / valkey)。1 行 = 1 コマンド (redis-cli 互換のクォート・エスケープのトークナイザ)、複数行は同一コネクションで順次実行。readonly ガードは読み取りコマンドのホワイトリスト方式、危険コマンド (FLUSHALL / FLUSHDB / SHUTDOWN / DEBUG) は SQL の危険文ガードと同じ扱い。RESP 値は Map=field/value、ペア返しコマンド (HGETALL / CONFIG GET) の偶数長フラット配列 (RESP2) も field/value、Array=1要素1行、スカラー=1セル、複数コマンド=command/result の表形式へ変換。引数はバイナリ安全のためバイト列 (\xHH エスケープは生バイト)。キャンセルはクライアント側で future を打ち切る (`CancelTarget::ClientSide`)。接続は実行ごとに multiplexed connection を張る (キャンセルで放棄してもプールが壊れない)。schema は database 番号、SSH トンネル可、pub/sub 系とブロッキング系 (BLPOP / XREAD BLOCK 等。キャンセルしても接続が塞がるため) は拒否 |
 | tunnel.rs | SSH ローカルポートフォワード (known_hosts 検証付き)。ssh-agent 認証時は使う agent socket を `ssh_tunnel.identity_agent` → `~/.ssh/config` の IdentityAgent → SSH_AUTH_SOCK の順で解決し libssh2 の `set_identity_path` で指定する (GUI 起動でシェルの SSH_AUTH_SOCK を継承しなくても 1Password 等の agent に届く)。ssh_config パーサは Include の条件付き展開・glob・Host マッチ・エスケープ/コメント除去に対応 (best-effort)。`ssh_tunnel.ssh_config` (Host エイリアス) 指定時は libssh2 経路を使わず system の `ssh` に委譲 (`start_system_ssh`): 空きローカルポートを確保して `ssh -N -L 127.0.0.1:<port>:<db_host>:<db_port> <alias>` を spawn (`ExitOnForwardFailure=yes` `BatchMode=yes` `ConnectTimeout`)、ローカルポートが接続を受けるまでポーリングして認証成功を確認、Drop で kill。ProxyJump / 多段トンネル / HostName / User 解決は OpenSSH と ~/.ssh/config に委譲する。このモードでは host / user / private_key / identity_agent は無視 (認証・ホスト鍵検証も OpenSSH 任せ)。PATH は GUI 起動対策で /opt/homebrew/bin 等を補完 (config.rs の supplement_path 共用) |
-| query_files.rs | クエリファイル CRUD (パストラバーサル対策) |
+| query_files.rs | クエリファイル CRUD (パストラバーサル対策)。拡張子はエンジン別 (`EngineCapabilities.file_extension`: `.sql` / `.redis`) |
 | router.rs | `queryfolio://` deep link と CLI サブコマンドを共通の `Route` に落とす。`parse_uri` (URI パース) / `route_from_cli_args` (`open <path>` サブコマンド) / `resolve_open_target` (生パス → 接続 + ファイル名。保存ディレクトリ配下の接続フォルダにある `.sql` だけを許可し、`..` トラバーサル・領域外を字句正規化で拒否)。Tauri 非依存の純 std + 単体テストで境界を固める。lib.rs が `Route` を解決してフロントへ `open-query-file` イベント / `frontend_ready` で届ける |
 | folder_meta.rs | クエリファイル保存フォルダに接続を説明するメタファイル (`_queryfolio.md`) を生成する (エージェント/人間がフォルダを見て「どの DB 用のクエリか」を理解できるように)。非機密のみ (パスワード・SSH 鍵は含めない)。`create_query_file` / `write_query_file` / `list_query_files` の後に lib.rs (refresh_folder_meta) が書き出す。フォルダ未作成なら何もしない・内容が同じなら書かない (mtime churn 回避)。`.sql` でないため一覧・検索には出ない |
 | meta_commands.rs | psql 風メタコマンド (\l \dt \dv \dn \du \d) をエンジン別カタログ SQL に変換 (MetaCommand::Sql)。識別子バリデーションでインジェクション拒否。`\c <database>` だけは SQL にならずアクティブスキーマ切替 (MetaCommand::Connect) として lib.rs が処理する |
@@ -59,7 +61,8 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
 
 ### フロントエンド (src/)
 
-- `lib/api.ts` — invoke の型付きラッパー (バックエンドとの境界)
+- `lib/api.ts` — invoke の型付きラッパー (バックエンドとの境界)。`ConnectionInfo.capabilities` (EngineCapabilities) でエンジンの能力宣言を受け取る
+- `lib/editor/redisLanguage.ts` — Redis コマンドの CodeMirror StreamLanguage (コマンド辞書 + サブコマンド + 文字列 + 数値 + `#` コメント)。SqlEditor が `capabilities.editor_language` で lang-sql と切り替える。行単位実行 (選択があれば選択範囲、カーソル行が空なら直前の非空行へフォールバック) も editor_language で分岐
 - `lib/stores/app.svelte.ts` — Svelte 5 runes ストア (getter + メソッドを default export)
 - `lib/components/` — Toolbar (グローバルツールバー。Writable スイッチ・検索ボタンを含む) / ConnectionsPane / FilesPane / HistoryPane / TablesPane (スキーマブラウザ) / SqlEditor / EditorToolbar / ResultsPane / CellInspector / ConfigInfoModal (読み取り専用の設定表示) / ConfigEditorModal (config.yml のアプリ内エディタ) / AiAnalysisModal (EXPLAIN / 選択 SQL の AI 解説表示) / SearchModal (接続・クエリファイル横断検索) / PaneDivider (ドラッグ可能なペイン区切り線)
 - 検索モーダル (SearchModal) — ツールバーの検索ボタン (`data-annotate="button-open-search"`) または Cmd+K / Ctrl+K (`+page.svelte` の `handleGlobalKeydown` + `<svelte:window>`) で開くコマンドパレット風モーダル。接続は `app.svelte.ts` の一覧を名前・説明で絞り込み (フロント)、クエリファイルは選択中接続のものを `search_query_files` コマンド (query_files.rs) でファイル名 + 中身検索 (大小無視の部分一致、中身は最初の一致行をプレビュー)。検索は純 Rust (rg/grep 等の外部プロセスは使わない。クエリファイルは少数のため堅牢・インジェクション面なし)。↑↓ で候補移動・Enter で開く (接続はその接続へ切替、ファイルは選択中接続で開く)・Esc で閉じる。デバウンス 150ms + 世代番号で古い応答の上書きを防ぐ
@@ -102,7 +105,7 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
 - `ai:` (任意) — AI SQL 生成の設定 (`provider: openai` / `api_key` / `model` 任意 / `base_url` 任意)。ローカル config.yml のトップレベルと、`config_override_command` で取得する YAML のトップレベルの両方に書ける。**両方ある場合は取得 YAML 側を優先** (マージの結果。API キーを 1Password に置ける)。`ai` はマッピングなので再帰マージされ、取得側に `api_key` だけ書けばローカルの `model` 等は残る。provider は現状 openai のみで、不明値はエラー。AppState にセッションキャッシュされ reset_connections でクリア。
 - `QUERYFOLIO_CONFIG_YAML` 環境変数は設定ファイル全体を上書きする開発・テスト用フック (実機 E2E 検証で使用)。
 
-`config.example.yaml` 参照。sqlite は `schema` を DB ファイルパスとして扱う独自拡張。
+`config.example.yaml` 参照。sqlite は `schema` を DB ファイルパスとして扱う独自拡張。redis (エイリアス valkey、queryfolio 独自拡張) は `schema` を database 番号として扱い、エディタは 1 行 = 1 コマンド。Writable OFF 中は読み取りコマンドのホワイトリストのみ許可、FLUSHALL / FLUSHDB / SHUTDOWN / DEBUG は `allow_dangerous_statements` が必要。クエリファイルは `.redis` 拡張子で、TABLES / Explain / Format / セル編集 / AI は非対応 (capabilities で UI ごと隠れる)。
 
 ## 開発上の注意
 

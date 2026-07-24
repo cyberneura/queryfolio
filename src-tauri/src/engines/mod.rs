@@ -1,0 +1,112 @@
+//! エンジンごとの差分を差し替え可能にするプラガブル層。
+//!
+//! - `EngineCapabilities`: エンジンの能力宣言 (エディタ言語・クエリファイル
+//!   拡張子・スキーマ/テーブル閲覧・Explain 等の対応可否)。Rust 側を単一の
+//!   真実とし、`ConnectionInfo` に載せてフロントへ渡す。フロントはエンジン名
+//!   ではなく capability で UI を出し分ける。
+//! - `engines::redis` などエンジン別モジュール: sqlx を使わないエンジンの
+//!   接続・実行・ガードの実装。`db.rs` の enum match は各モジュールへの
+//!   1 行委譲に留め、エンジン追加時は「モジュールを足す + capability を
+//!   宣言する + enum に variant を足す」だけで済むようにする。
+
+pub mod redis;
+
+use serde::Serialize;
+
+use crate::db::Engine;
+
+/// エンジンの能力宣言。フロントエンドの UI 出し分けの単一の真実。
+/// 新しいエンジンを追加する時はここに能力を宣言する。
+#[derive(Debug, Clone, Serialize)]
+pub struct EngineCapabilities {
+    /// エディタのシンタックスハイライト言語 ("sql" | "redis")
+    pub editor_language: &'static str,
+    /// クエリファイルの拡張子 (ドット無し)
+    pub file_extension: &'static str,
+    /// スキーマ (database) の一覧・切替に対応するか
+    pub supports_schemas: bool,
+    /// スキーマブラウザ (TABLES ペイン) に対応するか
+    pub supports_tables: bool,
+    /// EXPLAIN (実行計画) に対応するか
+    pub supports_explain: bool,
+    /// エディタの Format (整形) に対応するか
+    pub supports_format: bool,
+    /// 結果グリッドのセル編集 (UPDATE 生成) に対応するか
+    pub supports_editable_cells: bool,
+    /// AI 機能 (SQL 生成 / 解説) に対応するか
+    pub supports_ai: bool,
+}
+
+/// SQL 系エンジン (mysql / postgres / sqlite) の共通 capability。
+const SQL_CAPABILITIES: EngineCapabilities = EngineCapabilities {
+    editor_language: "sql",
+    file_extension: "sql",
+    supports_schemas: true,
+    supports_tables: true,
+    supports_explain: true,
+    supports_format: true,
+    supports_editable_cells: true,
+    supports_ai: true,
+};
+
+const REDIS_CAPABILITIES: EngineCapabilities = EngineCapabilities {
+    editor_language: "redis",
+    file_extension: "redis",
+    supports_schemas: false,
+    supports_tables: false,
+    supports_explain: false,
+    supports_format: false,
+    supports_editable_cells: false,
+    supports_ai: false,
+};
+
+pub fn capabilities(engine: Engine) -> EngineCapabilities {
+    match engine {
+        Engine::MySql | Engine::Postgres | Engine::Sqlite => SQL_CAPABILITIES.clone(),
+        Engine::Redis => REDIS_CAPABILITIES.clone(),
+    }
+}
+
+/// 設定の engine 文字列から capability を解決する。
+/// 未知のエンジンは SQL 相当を返す (設定エラー自体は接続時に
+/// `db::parse_engine` が返すため、ここでは一覧表示を壊さない)。
+pub fn capabilities_for_name(engine: &str) -> EngineCapabilities {
+    match crate::db::parse_engine(engine) {
+        Ok(engine) => capabilities(engine),
+        Err(_) => SQL_CAPABILITIES.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_capabilities_for_name() {
+        let sql = capabilities_for_name("mysql");
+        assert_eq!(sql.editor_language, "sql");
+        assert_eq!(sql.file_extension, "sql");
+        assert!(sql.supports_tables);
+
+        let redis = capabilities_for_name("redis");
+        assert_eq!(redis.editor_language, "redis");
+        assert_eq!(redis.file_extension, "redis");
+        assert!(!redis.supports_schemas);
+        assert!(!redis.supports_tables);
+        assert!(!redis.supports_explain);
+        assert!(!redis.supports_format);
+        assert!(!redis.supports_editable_cells);
+        assert!(!redis.supports_ai);
+
+        // 未知のエンジンは SQL 相当 (エラーは接続時に出す)
+        let unknown = capabilities_for_name("oracle");
+        assert_eq!(unknown.editor_language, "sql");
+    }
+
+    #[test]
+    fn test_capabilities_serialize_snake_case() {
+        let json = serde_json::to_value(capabilities_for_name("redis")).unwrap();
+        assert_eq!(json["editor_language"], "redis");
+        assert_eq!(json["supports_editable_cells"], false);
+    }
+}

@@ -20,10 +20,13 @@
   import type { SQLNamespace } from "@codemirror/lang-sql";
   import { oneDark } from "@codemirror/theme-one-dark";
   import { formatSql } from "$lib/sqlFormat";
+  import { redisLanguage } from "$lib/editor/redisLanguage";
 
   interface Props {
     content: string;
     engine: string | null;
+    /// エディタ言語 (capabilities.editor_language)。null は "sql" 扱い
+    editorLanguage: string | null;
     /// スキーマベース補完用のテーブル名 → カラム名リスト (未取得なら null)
     schemaMap: Record<string, string[]> | null;
     onChange: (content: string) => void;
@@ -37,11 +40,16 @@
   let {
     content,
     engine,
+    editorLanguage,
     schemaMap,
     onChange,
     onRun,
     onSelectionChange,
   }: Props = $props();
+
+  /// 行単位で実行する言語か (redis: 1 行 = 1 コマンド)。
+  /// SQL は構文木の Statement 単位で実行する
+  const isLineBased = () => editorLanguage === "redis";
 
   let editorElement: HTMLDivElement;
   let view: EditorView | null = null;
@@ -84,17 +92,23 @@
     return Object.fromEntries(tables.map((table) => [table, []]));
   };
 
-  // languageCompartment に入れる SQL 言語拡張 (方言 + スキーマ補完)。
-  // 予約語の補完は大文字で挿入する (SQL の慣習に合わせる)
+  // languageCompartment に入れる言語拡張。エンジンの editor_language で切り替える
+  // (sql: 方言 + スキーマ補完。予約語の補完は大文字で挿入する SQL の慣習に合わせる)。
+  // 新しいエディタ言語を追加する時はここに分岐を足す
   const languageExtension = (
+    language: string | null,
     engineName: string | null,
     map: Record<string, string[]> | null,
-  ) =>
-    sql({
+  ) => {
+    if (language === "redis") {
+      return redisLanguage;
+    }
+    return sql({
       dialect: dialectFor(engineName),
       schema: schemaNamespace(map),
       upperCaseKeywords: true,
     });
+  };
 
   // カーソル位置を含む Statement ノードの範囲を返す。
   // カーソルが文と文の間にある場合は直前の文を返す (一般的な SQL エディタと同様の挙動)。
@@ -153,6 +167,30 @@
     state: EditorState,
     pos: number,
   ): { from: number; to: number } | null => {
+    // 行単位の言語 (redis): 選択があれば選択範囲 (複数行の一括実行)、
+    // 無ければカーソル行を実行対象にする。カーソル行が空なら直前の
+    // 非空行へフォールバックする (SQL の「直前の文」と同じ挙動)
+    if (isLineBased()) {
+      const sel = state.selection.main;
+      if (!sel.empty) {
+        return { from: sel.from, to: sel.to };
+      }
+      const current = trimmedLineRange(state, pos);
+      if (current) {
+        return current;
+      }
+      for (
+        let n = state.doc.lineAt(pos).number - 1;
+        n >= 1;
+        n--
+      ) {
+        const range = trimmedLineRange(state, state.doc.line(n).from);
+        if (range) {
+          return range;
+        }
+      }
+      return null;
+    }
     const range = statementRangeAt(state, pos);
     const cursorLine = trimmedLineRange(state, pos);
     const cursorLineText = cursorLine
@@ -319,7 +357,8 @@
   // 整形できない (未対応構文・壊す恐れ) 場合は formatSql が原文を返すため
   // 変化がなく、何もしない。
   export function formatCurrentStatement() {
-    if (!view) {
+    // SQL 整形器は SQL 専用 (Format ボタン自体も capability で隠れる)
+    if (!view || isLineBased()) {
       return;
     }
     const state = view.state;
@@ -411,7 +450,9 @@
             ...completionKeymap,
             indentWithTab,
           ]),
-          languageCompartment.of(languageExtension(engine, schemaMap)),
+          languageCompartment.of(
+            languageExtension(editorLanguage, engine, schemaMap),
+          ),
           oneDark,
           syntaxHighlighting(brightHighlightStyle),
           editorTheme,
@@ -450,10 +491,10 @@
     }
   });
 
-  // エンジン・スキーママップ変更時に SQL 方言と補完スキーマを差し替える
+  // エンジン・スキーママップ変更時にエディタ言語と補完スキーマを差し替える
   $effect(() => {
-    // view のガードより先に評価し、両方をリアクティブ依存として追跡させる
-    const extension = languageExtension(engine, schemaMap);
+    // view のガードより先に評価し、依存をリアクティブ依存として追跡させる
+    const extension = languageExtension(editorLanguage, engine, schemaMap);
     if (!view) {
       return;
     }
