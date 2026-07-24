@@ -402,6 +402,15 @@ fn dangerous_request_reason(method: &str, segments: &[String]) -> Option<String>
             segments[0]
         ));
     }
+    // DELETE /_data_stream/<name> はデータストリームとバッキングインデックスを
+    // まとめて削除する (インデックス削除と同等のデータ消失)
+    if method == "DELETE" && segments.first().is_some_and(|s| s == "_data_stream") {
+        return Some(
+            "DELETE /_data_stream would permanently delete the data stream \
+             and all of its backing indices."
+                .to_string(),
+        );
+    }
     None
 }
 
@@ -1073,6 +1082,11 @@ mod tests {
         assert!(danger("POST", "/books/_delete_by_query?conflicts=proceed").is_some());
         // WHERE 無し UPDATE 相当の _update_by_query も危険
         assert!(danger("POST", "/books/_update_by_query").is_some());
+        // データストリーム削除 (バッキングインデックスごと消える) も危険
+        assert!(danger("DELETE", "/_data_stream/logs").is_some());
+        assert!(danger("DELETE", "/_data_stream/logs-*").is_some());
+        // GET /_data_stream (一覧) は危険でない
+        assert!(danger("GET", "/_data_stream/logs").is_none());
         // 読み取りは対象外
         assert!(danger("GET", "/books/_search").is_none());
         assert!(danger("PUT", "/books/_doc/1").is_none());
