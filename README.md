@@ -9,6 +9,7 @@ https://github.com/user-attachments/assets/90439816-49c8-4ebd-a068-b102cfe9c7aa
 ## Features
 
 - MySQL / PostgreSQL / SQLite support (via sqlx)
+- Redis support (`engine: redis`): one command per line (`GET my-key`, `MGET a b c`) with syntax highlighting, a read-only command whitelist while the Writable switch is off, and guards for destructive commands (`FLUSHALL` etc.)
 - SSH tunnel with known_hosts verification
 - Connection config in YAML, compatible with the sql-agent-mcp-server format
   - Secrets can stay in 1Password: the config YAML is fetched lazily via a getter command like `op read "op://..."`
