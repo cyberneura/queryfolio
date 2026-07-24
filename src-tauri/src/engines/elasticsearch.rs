@@ -91,6 +91,24 @@ impl EsRequest {
     }
 }
 
+/// SSH トンネル + TLS の時に URL へ残すホスト名を返す (無ければ None)。
+/// DbManager はトンネル確立後に接続先を 127.0.0.1:<local_port> に差し替えるが、
+/// URL のホストまで 127.0.0.1 にすると reqwest の SNI / 証明書ホスト名検証が
+/// 127.0.0.1 に対して行われ、実ホスト名で発行された証明書の検証に失敗する。
+/// URL には設定上のホスト名を残し、実際の接続先だけ resolve() で
+/// 127.0.0.1:<local_port> へ向ける。
+fn tls_tunnel_url_host(server: &ServerConfig, dial_host: &str) -> Option<String> {
+    if !(server.tls && server.ssh_tunnel.is_some() && dial_host == "127.0.0.1") {
+        return None;
+    }
+    server
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+}
+
 /// 接続を確立して疎通確認 (GET /) まで行う。
 /// base_url は host / port と `tls: true` (queryfolio 独自拡張) から組み立てる。
 pub async fn connect(
@@ -99,16 +117,29 @@ pub async fn connect(
     port: u16,
 ) -> Result<EsClient, AppError> {
     let scheme = if server.tls { "https" } else { "http" };
-    let base_url = format!("{scheme}://{host}:{port}");
-    // base_url が URL として不正 (ホスト名に変な文字等) なら早期にエラー
-    reqwest::Url::parse(&base_url)
-        .map_err(|e| AppError::Elasticsearch(format!("Invalid server address {base_url}: {e}")))?;
-    let client = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
         // redirect は追わない: build_url の origin 検証は最初の URL にしか
         // 効かないため、追うと 302 で別 origin へ飛ばされ得る (SSRF 的挙動)
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::none());
+    // SSH トンネル + TLS: URL は設定上のホスト名のまま (SNI / 証明書検証と
+    // Host ヘッダを実ホストで行う)、接続先だけトンネルのローカルポートへ向ける
+    let url_host = match tls_tunnel_url_host(server, host) {
+        Some(original) => {
+            builder = builder.resolve(
+                &original,
+                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            );
+            original
+        }
+        None => host.to_string(),
+    };
+    let base_url = format!("{scheme}://{url_host}:{port}");
+    // base_url が URL として不正 (ホスト名に変な文字等) なら早期にエラー
+    reqwest::Url::parse(&base_url)
+        .map_err(|e| AppError::Elasticsearch(format!("Invalid server address {base_url}: {e}")))?;
+    let client = builder
         .build()
         .map_err(|e| {
             AppError::Elasticsearch(format!("Failed to build the HTTP client: {e}"))
@@ -1031,6 +1062,47 @@ mod tests {
         }
         // pretty JSON の複数行 body は NDJSON API では行単位で不正 → エラー
         assert!(classify_body("{\n  \"a\": 1\n}", true).is_err());
+    }
+
+    #[test]
+    fn test_tls_tunnel_url_host() {
+        use crate::config::SshTunnelConfig;
+        let mut server = ServerConfig {
+            name: "es".into(),
+            description: None,
+            folder_name: None,
+            engine: "elasticsearch".into(),
+            host: Some("es.example.com".into()),
+            port: Some(9200),
+            schema: None,
+            user: None,
+            password: None,
+            ssh_tunnel: None,
+            readonly: false,
+            allow_dangerous_statements: false,
+            group_name: None,
+            tls: true,
+        };
+        // トンネル無しなら URL ホストは差し替えない
+        assert_eq!(tls_tunnel_url_host(&server, "es.example.com"), None);
+        // トンネルあり + TLS + 接続先がローカルポートなら元ホスト名を返す
+        server.ssh_tunnel = Some(SshTunnelConfig {
+            host: "bastion".into(),
+            port: 22,
+            user: "u".into(),
+            ssh_config: None,
+            password: None,
+            private_key_path: None,
+            private_key_passphrase: None,
+            identity_agent: None,
+        });
+        assert_eq!(
+            tls_tunnel_url_host(&server, "127.0.0.1"),
+            Some("es.example.com".to_string())
+        );
+        // TLS 無しなら差し替え不要 (証明書検証が無い)
+        server.tls = false;
+        assert_eq!(tls_tunnel_url_host(&server, "127.0.0.1"), None);
     }
 
     #[test]
