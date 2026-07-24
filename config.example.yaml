@@ -31,6 +31,17 @@ sql_servers:
     engine: sqlite
     schema: ~/data/example.sqlite3
 
+  # queryfolio 拡張: redis (エイリアス: valkey)。
+  # エディタは 1 行 = 1 コマンド (GET my-key / MGET a b c ...)。
+  # schema は database 番号 (省略時 0)。user / password は ACL / AUTH に使う。
+  # SSH トンネルも SQL エンジンと同様に使える。
+  - name: local-redis
+    description: "ローカルの Redis"
+    engine: redis
+    host: localhost
+    port: 6379
+    schema: "0"
+
   # queryfolio 拡張: readonly: true (省略時 false) を指定すると、
   # 書き込み系の文 (INSERT / UPDATE / DELETE / DDL、CTE 付き DML、
   # SELECT INTO 等) の実行を拒否する。

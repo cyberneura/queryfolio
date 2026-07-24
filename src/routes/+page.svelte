@@ -166,6 +166,21 @@
       null,
   );
   const selectedEngine = $derived(selectedConnectionInfo?.engine ?? null);
+  const selectedCapabilities = $derived(
+    selectedConnectionInfo?.capabilities ?? null,
+  );
+
+  // TABLES ペインを開いたままテーブル非対応エンジン (redis 等) の接続へ
+  // 切り替えた場合は FILES へ戻す (TablesPane が listTables を呼ばないように)
+  $effect(() => {
+    if (
+      leftPaneTab === "tables" &&
+      selectedCapabilities &&
+      !selectedCapabilities.supports_tables
+    ) {
+      leftPaneTab = "files";
+    }
+  });
 
   onMount(() => {
     // 開いているクエリファイルが外部で変更されたら自動リロード / マージする
@@ -352,6 +367,7 @@
       {#if appStore.selectedConnection}
         <EditorToolbar
           engine={selectedEngine}
+          capabilities={selectedCapabilities}
           readonly={selectedConnectionInfo?.readonly ?? false}
           onExplain={() =>
             appStore.explainQuery(editor?.getCurrentStatement() ?? "")}
@@ -383,6 +399,7 @@
                     bind:this={editor}
                     content={appStore.editorContent}
                     engine={selectedEngine}
+                    editorLanguage={selectedCapabilities?.editor_language ?? null}
                     schemaMap={appStore.schemaMap}
                     onChange={(content) => appStore.updateEditorContent(content)}
                     onRun={(sql) => appStore.runQuery(sql)}

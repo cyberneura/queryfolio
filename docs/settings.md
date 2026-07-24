@@ -76,10 +76,10 @@ sql_servers:
 | Key | Required | Description |
 |-----|----------|-------------|
 | `name` | yes | Display name shown in the connections list. |
-| `engine` | yes | `postgres` (aliases: `postgresql`), `mysql` (aliases: `mariadb`), or `sqlite` (aliases: `sqlite3`). |
+| `engine` | yes | `postgres` (aliases: `postgresql`), `mysql` (aliases: `mariadb`), `sqlite` (aliases: `sqlite3`), or `redis` (aliases: `valkey`). |
 | `description` | no | Free-text note shown in the UI. |
 | `host` | no | Database host. Defaults to `localhost` when omitted. Not needed for SQLite. When using an SSH tunnel, this is the DB host **as seen from the SSH endpoint** (often `localhost`). |
-| `port` | no | Database port. Defaults per engine when omitted: `5432` (PostgreSQL) / `3306` (MySQL). |
+| `port` | no | Database port. Defaults per engine when omitted: `5432` (PostgreSQL) / `3306` (MySQL) / `6379` (Redis). |
 | `schema` | depends | The database / schema to connect to. For SQLite, this is the **path to the database file** (queryfolio extension; `~` is expanded; if `schema` is omitted, `host` is used as the file path instead). |
 | `user` | no | Database user. |
 | `password` | no | Database password. |
@@ -103,6 +103,26 @@ sql_servers:
   - name: local-sqlite
     engine: sqlite
     schema: ~/data/example.sqlite3
+  ```
+
+- **Redis** — `engine: redis` (alias: `valkey`; queryfolio extension). The
+  editor runs **one command per line** (`GET my-key`, `MGET a b c`, ...). Run
+  the line under the cursor with Cmd+Enter, or select multiple lines to run
+  them in order. Lines starting with `#` are comments. Query files use the
+  `.redis` extension. `schema` is the **database number** (default `0`).
+  `user` / `password` are used for ACL / AUTH. SSH tunnels work the same way
+  as for SQL engines. While the **Writable** switch is off, only known
+  read-only commands (GET / MGET / HGETALL / SCAN / ZRANGE, ...) are allowed;
+  `FLUSHALL` / `FLUSHDB` / `SHUTDOWN` / `DEBUG` additionally require
+  `allow_dangerous_statements: true`. Schema browsing (TABLES), Explain,
+  Format, cell editing, and AI features are not available for Redis.
+
+  ```yaml
+  - name: local-redis
+    engine: redis
+    host: localhost
+    port: 6379
+    schema: "0"
   ```
 
 ### Safety guards

@@ -31,6 +31,9 @@ pub enum DbPool {
     MySql(sqlx::MySqlPool),
     Postgres(sqlx::PgPool),
     Sqlite(sqlx::SqlitePool),
+    /// Redis は sqlx を使わない。Client は接続情報のみ持ち、
+    /// 実行のたびに multiplexed connection を張る (engines::redis)。
+    Redis(redis::Client),
 }
 
 #[derive(Debug, Serialize)]
@@ -213,6 +216,7 @@ pub(crate) enum Engine {
     MySql,
     Postgres,
     Sqlite,
+    Redis,
 }
 
 /// プールから実行専用に確保した 1 本のコネクション。
@@ -230,6 +234,13 @@ impl DbConnection {
             DbPool::MySql(p) => DbConnection::MySql(p.acquire().await?),
             DbPool::Postgres(p) => DbConnection::Postgres(p.acquire().await?),
             DbPool::Sqlite(p) => DbConnection::Sqlite(p.acquire().await?),
+            // 非 SQL エンジンは run_query_cancellable が acquire より前に
+            // 各エンジンモジュールへ委譲するため、ここには来ない
+            DbPool::Redis(_) => {
+                return Err(AppError::Config(
+                    "This engine does not use SQL connections".into(),
+                ));
+            }
         })
     }
 
@@ -247,13 +258,16 @@ impl DbConnection {
 /// から停止させる (接続自体は切断しないため、実行側のコネクションは
 /// 健全なままプールへ戻る)。SQLite は progress handler が cancelled
 /// フラグを監視して文を SQLITE_INTERRUPT で中断する。
-enum CancelTarget {
+pub(crate) enum CancelTarget {
     /// SELECT pg_cancel_backend($pid) を別接続から発行する
     Postgres { pid: i32, pool: sqlx::PgPool },
     /// KILL QUERY <connection_id> を別接続から発行する
     MySql { connection_id: u64, pool: sqlx::MySqlPool },
     /// cancelled フラグを立てるだけ (progress handler が中断する)
     Sqlite,
+    /// クライアント側で実行の future を打ち切る (サーバー側で文を止める
+    /// 手段が無いエンジン用。Redis 等)。notify で実行側の select を起こす
+    ClientSide { notify: Arc<tokio::sync::Notify> },
 }
 
 /// 実行中クエリ 1 件分の登録情報
@@ -276,7 +290,7 @@ pub struct CancelRegistry {
 
 impl CancelRegistry {
     /// 実行開始を登録する。返り値のガードの drop で登録が解除される。
-    fn register(
+    pub(crate) fn register(
         &self,
         connection: &str,
         target: CancelTarget,
@@ -310,6 +324,7 @@ impl CancelRegistry {
         enum CancelAction {
             Postgres { pid: i32, pool: sqlx::PgPool },
             MySql { connection_id: u64, pool: sqlx::MySqlPool },
+            Notify { notify: Arc<tokio::sync::Notify> },
             None,
         }
         let action = {
@@ -331,6 +346,9 @@ impl CancelRegistry {
                     pool: pool.clone(),
                 },
                 CancelTarget::Sqlite => CancelAction::None,
+                CancelTarget::ClientSide { notify } => CancelAction::Notify {
+                    notify: notify.clone(),
+                },
             }
         };
         match action {
@@ -350,6 +368,7 @@ impl CancelRegistry {
                     .execute(&pool)
                     .await?;
             }
+            CancelAction::Notify { notify } => notify.notify_waiters(),
             CancelAction::None => {}
         }
         Ok(true)
@@ -365,7 +384,7 @@ impl CancelRegistry {
 /// 実行終了時にレジストリから登録を外すガード。
 /// 登録後に同じ接続で新しい実行が登録し直された場合 (id 不一致) は
 /// 新しい登録を消さないよう何もしない。
-struct RunningQueryGuard<'a> {
+pub(crate) struct RunningQueryGuard<'a> {
     registry: &'a CancelRegistry,
     connection: String,
     id: u64,
@@ -374,7 +393,7 @@ struct RunningQueryGuard<'a> {
 
 impl RunningQueryGuard<'_> {
     /// この実行にキャンセル要求があったかを返す
-    fn was_cancelled(&self) -> bool {
+    pub(crate) fn was_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
 }
@@ -397,8 +416,9 @@ pub fn parse_engine(engine: &str) -> Result<Engine, AppError> {
         "mysql" | "mariadb" => Ok(Engine::MySql),
         "postgres" | "postgresql" => Ok(Engine::Postgres),
         "sqlite" | "sqlite3" => Ok(Engine::Sqlite),
+        "redis" | "valkey" => Ok(Engine::Redis),
         other => Err(AppError::Config(format!(
-            "Unsupported engine: {other} (supported: mysql / postgres / sqlite)"
+            "Unsupported engine: {other} (supported: mysql / postgres / sqlite / redis)"
         ))),
     }
 }
@@ -408,6 +428,7 @@ fn default_port(engine: Engine) -> u16 {
         Engine::MySql => 3306,
         Engine::Postgres => 5432,
         Engine::Sqlite => 0,
+        Engine::Redis => crate::engines::redis::DEFAULT_PORT,
     }
 }
 
@@ -480,6 +501,9 @@ async fn connect(
                 .await?;
             Ok(DbPool::Sqlite(pool))
         }
+        Engine::Redis => Ok(DbPool::Redis(
+            crate::engines::redis::connect(server, host, port).await?,
+        )),
     }
 }
 
@@ -524,6 +548,21 @@ pub async fn run_query_cancellable(
     readonly: ReadonlyGuard,
     allow_dangerous: bool,
 ) -> Result<QueryResult, AppError> {
+    // 非 SQL エンジンは各エンジンモジュールへ委譲する (auto_limit は SQL 固有
+    // なので渡さない)
+    if let DbPool::Redis(client) = pool {
+        return crate::engines::redis::run_query_cancellable(
+            client,
+            registry,
+            connection_name,
+            sql,
+            max_rows,
+            readonly,
+            allow_dangerous,
+        )
+        .await;
+    }
+
     let mut conn = DbConnection::acquire(pool).await?;
     let cancelled = Arc::new(AtomicBool::new(false));
 
@@ -594,7 +633,7 @@ pub async fn run_query_cancellable(
 
 /// 読み取り専用ガードでブロックする際のエラー (由来別メッセージ)。
 /// run_query_on と run_statements で共有する。
-fn readonly_block_error(readonly: ReadonlyGuard) -> AppError {
+pub(crate) fn readonly_block_error(readonly: ReadonlyGuard) -> AppError {
     let message = match readonly {
         ReadonlyGuard::Config => {
             "This connection is read-only (readonly: true in config). \
@@ -611,7 +650,7 @@ fn readonly_block_error(readonly: ReadonlyGuard) -> AppError {
 }
 
 /// 危険な文 (WHERE 無しの UPDATE/DELETE 等) でブロックする際のエラー。
-fn dangerous_block_error(reason: &str) -> AppError {
+pub(crate) fn dangerous_block_error(reason: &str) -> AppError {
     AppError::Dangerous(format!(
         "{reason} Set \"allow_dangerous_statements: true\" for this connection \
          in config to run it. Statement was not executed."
@@ -640,6 +679,11 @@ pub async fn run_statements(
 ) -> Result<u64, AppError> {
     if statements.is_empty() {
         return Err(AppError::Config("There are no changes to apply".into()));
+    }
+    if matches!(pool, DbPool::Redis(_)) {
+        return Err(AppError::Config(
+            "Cell editing is not supported for this engine".into(),
+        ));
     }
     let mut conn = DbConnection::acquire(pool).await?;
     let engine = conn.engine();
@@ -883,6 +927,9 @@ pub async fn list_schemas(
                 .unwrap_or("main");
             Ok(vec![path.to_string()])
         }
+        // Redis に database 一覧の概念は無い (capabilities.supports_schemas =
+        // false でフロントは呼ばないが、直接呼ばれても壊れないよう空を返す)
+        DbPool::Redis(_) => Ok(vec![]),
     }
 }
 
@@ -1055,6 +1102,11 @@ fn should_auto_limit(sql: &str, engine: Engine) -> bool {
 /// コスト・行数見積もりが得られる FORMAT=JSON の方が安全で互換性も広い。
 pub fn build_explain_sql(engine: &str, sql: &str) -> Result<String, AppError> {
     let engine = parse_engine(engine)?;
+    if engine == Engine::Redis {
+        return Err(AppError::Explain(
+            "Explain is not available for this engine".into(),
+        ));
+    }
     if !matches!(leading_keyword(sql).as_str(), "select" | "with") {
         return Err(AppError::Explain(
             "Explain is available only for SELECT / WITH statements".into(),
@@ -1075,6 +1127,8 @@ pub fn build_explain_sql(engine: &str, sql: &str) -> Result<String, AppError> {
         Engine::Postgres => "EXPLAIN (ANALYZE, BUFFERS)",
         Engine::MySql => "EXPLAIN FORMAT=JSON",
         Engine::Sqlite => "EXPLAIN QUERY PLAN",
+        // Redis は冒頭の早期 return で弾いている
+        Engine::Redis => unreachable!(),
     };
     Ok(format!("{prefix}\n{sql}"))
 }
@@ -1213,6 +1267,11 @@ pub(crate) fn dangerous_reason(sql: &str, engine: Engine) -> Option<&'static str
 /// ユーザーへ確認を出すかどうかの判断に使う。
 pub fn dangerous_statement_reason(engine: &str, sql: &str) -> Result<Option<String>, AppError> {
     let engine = parse_engine(engine)?;
+    if engine == Engine::Redis {
+        return Ok(
+            crate::engines::redis::dangerous_reason_for_input(sql).map(|s| s.to_string())
+        );
+    }
     Ok(dangerous_reason(sql, engine).map(|s| s.to_string()))
 }
 
@@ -1233,7 +1292,7 @@ fn is_fetch_statement(sql: &str) -> bool {
     )
 }
 
-fn bytes_to_json(bytes: Vec<u8>) -> serde_json::Value {
+pub(crate) fn bytes_to_json(bytes: Vec<u8>) -> serde_json::Value {
     match String::from_utf8(bytes) {
         Ok(s) => serde_json::Value::String(s),
         Err(e) => serde_json::Value::String(format!(
@@ -1279,7 +1338,7 @@ fn json_number_f64(v: f64) -> serde_json::Value {
 /// 安全範囲を超える 64bit 整数は文字列で返して精度を保つ。
 const JS_MAX_SAFE_INTEGER: i64 = (1 << 53) - 1;
 
-fn json_i64(v: i64) -> serde_json::Value {
+pub(crate) fn json_i64(v: i64) -> serde_json::Value {
     if (-JS_MAX_SAFE_INTEGER..=JS_MAX_SAFE_INTEGER).contains(&v) {
         serde_json::json!(v)
     } else {

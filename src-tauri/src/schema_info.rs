@@ -121,6 +121,9 @@ pub async fn fetch_tables(pool: &DbPool) -> Result<Vec<TableInfo>, AppError> {
                 })
                 .collect())
         }
+        // テーブルの概念が無いエンジン (capabilities.supports_tables = false
+        // でフロントは呼ばないが、直接呼ばれても壊れないよう空を返す)
+        DbPool::Redis(_) => Ok(vec![]),
     }
 }
 
@@ -191,6 +194,11 @@ pub async fn fetch_columns(pool: &DbPool, table: &str) -> Result<Vec<ColumnInfo>
                     nullable: row.try_get::<i64, _>(3).map(|v| v == 0).unwrap_or(true),
                 })
                 .collect()
+        }
+        DbPool::Redis(_) => {
+            return Err(AppError::Config(
+                "This engine does not have tables".into(),
+            ));
         }
     };
     // MySQL / SQLite は存在しないテーブルでもエラーにならず空が返るため、
@@ -267,6 +275,7 @@ pub async fn fetch_primary_keys(pool: &DbPool, table: &str) -> Result<Vec<String
             rows.sort_by_key(|(pk, _)| *pk);
             rows.into_iter().map(|(_, name)| name).collect()
         }
+        DbPool::Redis(_) => vec![],
     };
     Ok(keys)
 }
@@ -345,6 +354,8 @@ pub async fn fetch_all_columns(
                 });
             }
         }
+        // テーブル・カラムの概念が無いエンジンは空のまま返す (SQL 補完なし)
+        DbPool::Redis(_) => {}
     }
     Ok(map)
 }

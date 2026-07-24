@@ -1,6 +1,7 @@
 mod ai;
 mod config;
 mod db;
+mod engines;
 mod history;
 mod meta_commands;
 mod error;
@@ -104,7 +105,12 @@ impl AppState {
     }
 
     /// ルート (deep link / CLI) を、開く対象のクエリファイル (接続 + ファイル名) へ
-    /// 解決する。保存ディレクトリ配下の接続フォルダにある `.sql` でなければエラー。
+    /// 解決する。保存ディレクトリ配下の接続フォルダにある、接続エンジンの拡張子の
+    /// クエリファイルでなければエラー。
+    /// 既知の限界: ここでの検証と実際の読み込み (read_query_file) は別呼び出しで、
+    /// その間に設定リロードが挟まると folder / 拡張子の解決結果がズレ得る
+    /// (検証済み設定と読込時設定の狭い TOCTOU)。リロードはユーザーの明示操作で、
+    /// どちらの解決も設定由来の保存領域内に閉じるため許容する。
     /// `cwd` は相対パスを解決する基準ディレクトリ。deep link / CLI を実行中
     /// インスタンスが受け取った時は「起動元ディレクトリ」を渡す (single-instance の
     /// callback cwd)。None の時はこのプロセスのカレントディレクトリを使う。
@@ -135,15 +141,30 @@ impl AppState {
                     raw_cwd.as_deref(),
                 )
                 .map_err(|e| AppError::QueryFile(e.to_string()))?;
+                let server = self.find_server(&target.connection).await?;
+                // 拡張子が接続エンジンのものと一致することを検証する。
+                // 一致しないと「router / verify_within_dir が検証したパス」と
+                // 「query_files が拡張子を付け直して実際に開くパス」がズレて、
+                // symlink 防御が実 I/O 対象に効かなくなる (例: SQL 接続に
+                // foo.redis を渡すと検証は foo.redis、実 I/O は foo.redis.sql)。
+                let ext = engines::capabilities_for_name(&server.engine).file_extension;
+                if !target
+                    .file_name
+                    .to_ascii_lowercase()
+                    .ends_with(&format!(".{ext}"))
+                {
+                    return Err(AppError::QueryFile(format!(
+                        "The file extension does not match the connection's engine \
+                         (expected .{ext}): {}",
+                        target.file_name
+                    )));
+                }
                 // 多重防御: 字句検証 (router) を通っても、接続フォルダやファイルが
                 // シンボリックリンクで保存領域外の実体を指していることがある。
                 // 実際に開くパス (sqlfiles_dir/<folder>/<file>) を canonicalize して、
                 // リンク解決後も保存ディレクトリ配下に留まることを確かめる
                 // (「queryfolio のデータ保存パスのみ対象」の要件を実体レベルで担保)。
-                let folder = self
-                    .find_server(&target.connection)
-                    .await?
-                    .sqlfiles_folder_name();
+                let folder = server.sqlfiles_folder_name();
                 let concrete = sqlfiles_dir.join(&folder).join(&target.file_name);
                 verify_within_dir(&sqlfiles_dir, &concrete)?;
                 Ok(target)
@@ -167,11 +188,20 @@ impl AppState {
             })
     }
 
-    /// クエリファイルの保存フォルダ名を接続設定から解決する。
-    /// folder_name → <host>_<engine>_<schema>_<user> の順で決まる
+    /// クエリファイル操作に必要なコンテキストを解決する:
+    /// 保存ディレクトリ・接続フォルダ名・エンジン別のファイル拡張子。
+    /// フォルダ名は folder_name → <host>_<engine>_<schema>_<user> の順で決まる
     /// (接続 name はフォルダ名には使わない)。
-    async fn resolve_sqlfiles_folder(&self, connection: &str) -> Result<String, AppError> {
-        Ok(self.find_server(connection).await?.sqlfiles_folder_name())
+    async fn resolve_files_ctx(
+        &self,
+        connection: &str,
+    ) -> Result<(PathBuf, String, &'static str), AppError> {
+        let server = self.find_server(connection).await?;
+        Ok((
+            self.resolve_sqlfiles_dir().await?,
+            server.sqlfiles_folder_name(),
+            engines::capabilities_for_name(&server.engine).file_extension,
+        ))
     }
 
     /// 接続のクエリファイルフォルダに、接続を説明するメタファイルを書き出す。
@@ -414,10 +444,15 @@ async fn switch_active_schema(
         let sql = match db::parse_engine(&server.engine)? {
             db::Engine::MySql => "SELECT DATABASE() AS `database`",
             db::Engine::Postgres => "SELECT current_database() AS database",
-            // sqlite は meta_commands 側で弾いているのでここには来ない
+            // sqlite / redis は meta_commands 側で弾いているのでここには来ない
             db::Engine::Sqlite => {
                 return Err(AppError::Config(
                     "\\c is not supported for SQLite".into(),
+                ));
+            }
+            db::Engine::Redis => {
+                return Err(AppError::Config(
+                    "\\c is not supported for this engine".into(),
                 ));
             }
         };
@@ -505,9 +540,11 @@ async fn list_query_files(
     connection: String,
 ) -> Result<Vec<String>, AppError> {
     let server = state.find_server(&connection).await?;
+    let ext = engines::capabilities_for_name(&server.engine).file_extension;
     let files = query_files::list_query_files(
         &state.resolve_sqlfiles_dir().await?,
         &server.sqlfiles_folder_name(),
+        ext,
     )?;
     // フォルダを開いた時に接続の説明メタファイルを最新化する (ベストエフォート:
     // メタ書き込みの失敗で一覧取得を壊さない)。フォルダ未作成時は何もしない。
@@ -522,12 +559,8 @@ async fn search_query_files(
     connection: String,
     query: String,
 ) -> Result<Vec<query_files::FileSearchHit>, AppError> {
-    let folder = state.resolve_sqlfiles_folder(&connection).await?;
-    query_files::search_query_files(
-        &state.resolve_sqlfiles_dir().await?,
-        &folder,
-        &query,
-    )
+    let (dir, folder, ext) = state.resolve_files_ctx(&connection).await?;
+    query_files::search_query_files(&dir, &folder, &query, ext)
 }
 
 #[tauri::command]
@@ -536,12 +569,8 @@ async fn read_query_file(
     connection: String,
     file_name: String,
 ) -> Result<String, AppError> {
-    let folder = state.resolve_sqlfiles_folder(&connection).await?;
-    query_files::read_query_file(
-        &state.resolve_sqlfiles_dir().await?,
-        &folder,
-        &file_name,
-    )
+    let (dir, folder, ext) = state.resolve_files_ctx(&connection).await?;
+    query_files::read_query_file(&dir, &folder, &file_name, ext)
 }
 
 /// クエリファイルの絶対パスを返す (FilesPane の「Copy full path」用)。
@@ -551,12 +580,8 @@ async fn query_file_path(
     connection: String,
     file_name: String,
 ) -> Result<String, AppError> {
-    let folder = state.resolve_sqlfiles_folder(&connection).await?;
-    query_files::query_file_path(
-        &state.resolve_sqlfiles_dir().await?,
-        &folder,
-        &file_name,
-    )
+    let (dir, folder, ext) = state.resolve_files_ctx(&connection).await?;
+    query_files::query_file_path(&dir, &folder, &file_name, ext)
 }
 
 #[tauri::command]
@@ -567,11 +592,13 @@ async fn write_query_file(
     content: String,
 ) -> Result<(), AppError> {
     let server = state.find_server(&connection).await?;
+    let ext = engines::capabilities_for_name(&server.engine).file_extension;
     query_files::write_query_file(
         &state.resolve_sqlfiles_dir().await?,
         &server.sqlfiles_folder_name(),
         &file_name,
         &content,
+        ext,
     )?;
     // 保存でフォルダが確実に存在するタイミングで説明メタファイルを最新化する
     // (ベストエフォート: メタ書き込みの失敗で保存を壊さない)。
@@ -592,12 +619,14 @@ async fn write_query_file_if_unchanged(
     expected_base: String,
 ) -> Result<bool, AppError> {
     let server = state.find_server(&connection).await?;
+    let ext = engines::capabilities_for_name(&server.engine).file_extension;
     let wrote = query_files::write_query_file_if_unchanged(
         &state.resolve_sqlfiles_dir().await?,
         &server.sqlfiles_folder_name(),
         &file_name,
         &content,
         &expected_base,
+        ext,
     )?;
     if wrote {
         let _ = state.refresh_folder_meta(&server).await;
@@ -612,10 +641,12 @@ async fn create_query_file(
     file_name: String,
 ) -> Result<String, AppError> {
     let server = state.find_server(&connection).await?;
+    let ext = engines::capabilities_for_name(&server.engine).file_extension;
     let normalized = query_files::create_query_file(
         &state.resolve_sqlfiles_dir().await?,
         &server.sqlfiles_folder_name(),
         &file_name,
+        ext,
     )?;
     // フォルダ新規作成のタイミングで接続の説明メタファイルを書き出す
     // (ベストエフォート: メタ書き込みの失敗で作成を壊さない)。
@@ -629,12 +660,8 @@ async fn delete_query_file(
     connection: String,
     file_name: String,
 ) -> Result<(), AppError> {
-    let folder = state.resolve_sqlfiles_folder(&connection).await?;
-    query_files::delete_query_file(
-        &state.resolve_sqlfiles_dir().await?,
-        &folder,
-        &file_name,
-    )
+    let (dir, folder, ext) = state.resolve_files_ctx(&connection).await?;
+    query_files::delete_query_file(&dir, &folder, &file_name, ext)
 }
 
 #[tauri::command]
@@ -644,13 +671,8 @@ async fn rename_query_file(
     old_name: String,
     new_name: String,
 ) -> Result<String, AppError> {
-    let folder = state.resolve_sqlfiles_folder(&connection).await?;
-    query_files::rename_query_file(
-        &state.resolve_sqlfiles_dir().await?,
-        &folder,
-        &old_name,
-        &new_name,
-    )
+    let (dir, folder, ext) = state.resolve_files_ctx(&connection).await?;
+    query_files::rename_query_file(&dir, &folder, &old_name, &new_name, ext)
 }
 
 /// 接続先サーバー上の database (スキーマ) 一覧を返す。

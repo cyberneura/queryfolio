@@ -8,7 +8,10 @@
 //! パス解決 ([`resolve_open_target`]) はセキュリティ上重要なので Tauri に依存
 //! させず純粋な std だけで書き、単体テストで境界を固める。開けるのは
 //! 「クエリファイル保存ディレクトリ (`sqlfiles_dir`) 直下の接続フォルダにある
-//! `.sql` ファイル」だけで、`..` によるトラバーサルや保存領域外のパスは拒否する。
+//! クエリファイル (拡張子は [`ALLOWED_EXTENSIONS`]: `.sql` / `.redis`)」だけで、
+//! `..` によるトラバーサルや保存領域外のパスは拒否する。拡張子が接続エンジンの
+//! ものと一致するかは、接続を解決できる lib.rs (resolve_route_target) 側が
+//! 追加で検証する。
 
 use std::path::{Component, Path, PathBuf};
 
@@ -18,7 +21,7 @@ pub const URI_SCHEME: &str = "queryfolio";
 /// URI / CLI から解釈されたアクション (まだ検証していない生の入力を保持する)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
-    /// SQL ファイルをパス指定で開く。`path` は未検証の生パス
+    /// クエリファイルをパス指定で開く。`path` は未検証の生パス
     /// (`resolve_open_target` で保存領域配下かを検証してから使う)。
     OpenFile { path: String },
 }
@@ -30,7 +33,7 @@ pub enum Route {
 pub struct OpenTarget {
     /// 対象ファイルが属する接続の名前 (`ServerConfig::name`)。
     pub connection: String,
-    /// 開くファイル名 (`.sql` 付き。接続フォルダ内の 1 要素)。
+    /// 開くファイル名 (拡張子付き。接続フォルダ内の 1 要素)。
     pub file_name: String,
 }
 
@@ -52,7 +55,7 @@ pub enum RouteError {
     UnknownFolder(String),
     /// 同じフォルダに複数の接続が対応していて、どの接続で開くか一意に決められない。
     AmbiguousFolder(String),
-    /// ファイル名が不正 (`.sql` でない・ドット始まり等)。
+    /// ファイル名が不正 (既知のクエリファイル拡張子でない・ドット始まり等)。
     InvalidFileName(String),
 }
 
@@ -200,22 +203,30 @@ pub fn resolve_open_target(
     })
 }
 
-/// `.sql` のクエリファイル名として妥当かを検証する
+/// クエリファイルとして開ける拡張子 (エンジン別。engines::EngineCapabilities の
+/// file_extension と対応させること)。
+const ALLOWED_EXTENSIONS: &[&str] = &["sql", "redis"];
+
+/// クエリファイル名として妥当かを検証する
 /// (query_files.rs の validate_component / normalize_file_name と同じ方針: 空・
-/// ドット始まり・区切り文字を拒否し、拡張子が `.sql` であることを要求する)。
+/// ドット始まり・区切り文字を拒否し、拡張子が既知のクエリファイル拡張子で
+/// あることを要求する)。
 fn validate_sql_file_name(name: &str) -> Result<(), RouteError> {
     // 前後に空白がある名前は拒否する。query_files.rs の normalize_file_name は
     // 読み込み時に名前を trim するため、空白付きを許すと「検証したパス
     // (verify_within_dir が canonicalize したパス)」と「実際に開くパス (trim 後)」が
     // 食い違い、検証を通した別ファイル (symlink 等) を開けてしまう。ここで拒否して
     // 検証対象と開く対象を必ず同一にする。
+    let lower = name.to_ascii_lowercase();
     let invalid = name.is_empty()
         || name != name.trim()
         || name.starts_with('.')
         || name.contains('/')
         || name.contains('\\')
         || name.contains('\0')
-        || !name.to_ascii_lowercase().ends_with(".sql");
+        || !ALLOWED_EXTENSIONS
+            .iter()
+            .any(|ext| lower.ends_with(&format!(".{ext}")));
     if invalid {
         return Err(RouteError::InvalidFileName(name.to_string()));
     }

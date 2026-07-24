@@ -9,6 +9,25 @@ export interface SshTunnelInfo {
   ssh_config: string | null;
 }
 
+/// エンジンの能力宣言 (バックエンドの engines::EngineCapabilities に対応)。
+/// UI の出し分けはエンジン名ではなくこのフラグで行う。
+export interface EngineCapabilities {
+  /// エディタのシンタックスハイライト言語
+  editor_language: "sql" | "redis";
+  /// クエリファイルの拡張子 (ドット無し)
+  file_extension: string;
+  /// スキーマ (database) の一覧・切替に対応するか
+  supports_schemas: boolean;
+  /// スキーマブラウザ (TABLES ペイン) に対応するか
+  supports_tables: boolean;
+  supports_explain: boolean;
+  supports_format: boolean;
+  /// 結果グリッドのセル編集 (UPDATE 生成) に対応するか
+  supports_editable_cells: boolean;
+  /// AI 機能 (SQL 生成 / 解説) に対応するか
+  supports_ai: boolean;
+}
+
 export interface ConnectionInfo {
   name: string;
   description: string | null;
@@ -29,6 +48,8 @@ export interface ConnectionInfo {
   allow_dangerous_statements: boolean;
   /// 接続一覧での表示グループ名 (グループ未所属なら null)
   group_name: string | null;
+  /// エンジンの能力宣言 (UI の出し分けに使う)
+  capabilities: EngineCapabilities;
 }
 
 export interface QueryResult {
@@ -130,7 +151,7 @@ export const listQueryFiles = (connection: string) =>
 
 /// クエリファイル検索の 1 ヒット (バックエンドの query_files::FileSearchHit に対応)
 export interface FileSearchHit {
-  /// ヒットしたファイル名 (.sql 付き)
+  /// ヒットしたファイル名 (拡張子付き。.sql / .redis)
   file_name: string;
   /// ファイル名が query に一致したか
   name_match: boolean;
@@ -260,7 +281,7 @@ export const aiExplainSql = (connection: string, sql: string) =>
 export interface OpenTarget {
   /// 対象ファイルが属する接続名
   connection: string;
-  /// 開くファイル名 (.sql 付き)
+  /// 開くファイル名 (拡張子付き。.sql / .redis)
   fileName: string;
 }
 

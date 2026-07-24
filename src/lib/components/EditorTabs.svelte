@@ -2,9 +2,10 @@
   import appStore from "$lib/stores/app.svelte";
   import type { EditorTab } from "$lib/stores/app.svelte";
 
-  // Show the file name without the trailing ".sql" for a compact label.
+  // Show the file name without the trailing query-file extension for a
+  // compact label (extension varies by engine: .sql / .redis).
   const tabLabel = (tab: EditorTab): string =>
-    tab.file.replace(/\.sql$/i, "");
+    tab.file.replace(/\.(sql|redis)$/i, "");
 
   // Tabs are global across connections, so disambiguate with the connection
   // name whenever more than one connection has open tabs.
