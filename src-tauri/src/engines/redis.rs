@@ -41,7 +41,7 @@ const READONLY_COMMANDS: &[&str] = &[
     // keys / generic
     "GET", "MGET", "STRLEN", "GETRANGE", "SUBSTR", "EXISTS", "TYPE", "TTL", "PTTL",
     "EXPIRETIME", "PEXPIRETIME", "KEYS", "SCAN", "RANDOMKEY", "DBSIZE", "DUMP",
-    "OBJECT", "MEMORY",
+    "OBJECT",
     // hash
     "HGET", "HMGET", "HGETALL", "HKEYS", "HVALS", "HLEN", "HEXISTS", "HSTRLEN",
     "HRANDFIELD", "HSCAN",
@@ -71,6 +71,24 @@ const UNSUPPORTED_COMMANDS: &[&str] = &[
     "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE", "SSUBSCRIBE",
     "SUNSUBSCRIBE", "MONITOR",
 ];
+
+/// readonly 接続 / Writable スイッチ OFF で実行を許可するコマンドか。
+/// 基本はホワイトリスト (READONLY_COMMANDS) だが、サブコマンドで読み書きが
+/// 分かれる親コマンドはサブコマンド単位で判定する
+/// (MEMORY PURGE はサーバー側のメンテナンス操作なので許可しない)。
+fn is_readonly_command(args: &[Vec<u8>]) -> bool {
+    let name = command_name(args);
+    if name == "MEMORY" {
+        const MEMORY_READONLY_SUBCOMMANDS: &[&[u8]] =
+            &[b"USAGE", b"STATS", b"DOCTOR", b"HELP"];
+        return args.get(1).is_some_and(|sub| {
+            MEMORY_READONLY_SUBCOMMANDS
+                .iter()
+                .any(|allowed| sub.eq_ignore_ascii_case(allowed))
+        });
+    }
+    READONLY_COMMANDS.contains(&name.as_str())
+}
 
 /// 誤操作で全キー消失やサーバー停止を招く危険コマンドの理由を返す。
 /// SQL の dangerous_reason と同じ扱い (allow_dangerous_statements が無効なら
@@ -305,7 +323,7 @@ pub async fn run_query_cancellable(
                 "{name} is not supported in QueryFolio"
             )));
         }
-        if readonly != ReadonlyGuard::Off && !READONLY_COMMANDS.contains(&name.as_str()) {
+        if readonly != ReadonlyGuard::Off && !is_readonly_command(args) {
             return Err(readonly_block_error(readonly));
         }
         if !allow_dangerous {
@@ -566,6 +584,21 @@ mod tests {
         for cmd in ["SET", "DEL", "HSET", "LPUSH", "EXPIRE", "FLUSHDB", "CONFIG"] {
             assert!(!READONLY_COMMANDS.contains(&cmd), "{cmd} should not be readonly");
         }
+    }
+
+    #[test]
+    fn test_is_readonly_command_memory_subcommands() {
+        // MEMORY はサブコマンド単位: 読み取り系のみ許可
+        assert!(is_readonly_command(&args_of("MEMORY USAGE key")));
+        assert!(is_readonly_command(&args_of("memory stats")));
+        assert!(is_readonly_command(&args_of("MEMORY DOCTOR")));
+        // MEMORY PURGE はサーバー側のメンテナンス操作なので拒否
+        assert!(!is_readonly_command(&args_of("MEMORY PURGE")));
+        // サブコマンド無しの MEMORY も拒否 (安全側)
+        assert!(!is_readonly_command(&args_of("MEMORY")));
+        // 通常コマンドは従来どおり
+        assert!(is_readonly_command(&args_of("GET key")));
+        assert!(!is_readonly_command(&args_of("SET key value")));
     }
 
     #[test]
