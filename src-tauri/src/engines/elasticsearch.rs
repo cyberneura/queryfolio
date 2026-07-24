@@ -273,8 +273,12 @@ enum EsBody {
 /// body を JSON / NDJSON として検証・分類する。
 /// どちらでもなければ実行前にエラーにする (サーバーに送ってから
 /// 分かりにくいエラーを受け取るより早い)。
-fn classify_body(body: &str) -> Result<EsBody, AppError> {
-    if serde_json::from_str::<serde_json::Value>(body).is_ok() {
+fn classify_body(body: &str, ndjson_api: bool) -> Result<EsBody, AppError> {
+    // NDJSON 系 API (_bulk / _msearch) は body が 1 行でも NDJSON として送る。
+    // 「JSON としてパースできたら Json」の推定に任せると、1 アクションだけの
+    // _bulk body が application/json + 末尾改行なしで送られ、Bulk API の
+    // 「末尾に改行必須」の仕様に反して失敗する
+    if !ndjson_api && serde_json::from_str::<serde_json::Value>(body).is_ok() {
         return Ok(EsBody::Json(body.to_string()));
     }
     for (i, line) in body.lines().enumerate() {
@@ -291,6 +295,18 @@ fn classify_body(body: &str) -> Result<EsBody, AppError> {
     }
     // NDJSON (_bulk) は末尾の改行が必須
     Ok(EsBody::Ndjson(format!("{}\n", body.trim_end())))
+}
+
+/// パスが NDJSON body を要求する API (_bulk / _msearch) か。
+/// guard_segments が失敗するパスは実行前の検証で先に弾かれるため false でよい。
+fn path_is_ndjson_api(path: &str) -> bool {
+    guard_segments(path)
+        .map(|segments| {
+            segments
+                .iter()
+                .any(|s| s == "_bulk" || s == "_msearch")
+        })
+        .unwrap_or(false)
 }
 
 /// ガード判定用にパスをセグメント列へ分解する。
@@ -455,7 +471,7 @@ pub async fn run_query_cancellable(
         // URL として不正なパスも実行前に検出する
         client.build_url(&req.path)?;
         if let Some(body) = &req.body {
-            classify_body(body)?;
+            classify_body(body, path_is_ndjson_api(&req.path))?;
         }
     }
 
@@ -543,7 +559,7 @@ async fn send_request(
         builder = builder.basic_auth(user, client.password.as_deref());
     }
     if let Some(body) = &req.body {
-        builder = match classify_body(body)? {
+        builder = match classify_body(body, path_is_ndjson_api(&req.path))? {
             EsBody::Json(b) => builder
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(b),
@@ -965,7 +981,7 @@ mod tests {
         let body = requests[0].body.as_deref().unwrap();
         assert_eq!(body.lines().count(), 4);
         // NDJSON として分類され、末尾に改行が付く
-        match classify_body(body).unwrap() {
+        match classify_body(body, true).unwrap() {
             EsBody::Ndjson(b) => assert!(b.ends_with('\n')),
             EsBody::Json(_) => panic!("expected NDJSON"),
         }
@@ -993,20 +1009,38 @@ mod tests {
     #[test]
     fn test_classify_body() {
         assert!(matches!(
-            classify_body("{\"a\": 1}").unwrap(),
+            classify_body("{\"a\": 1}", false).unwrap(),
             EsBody::Json(_)
         ));
         // pretty JSON も単一ドキュメント
         assert!(matches!(
-            classify_body("{\n  \"a\": 1\n}").unwrap(),
+            classify_body("{\n  \"a\": 1\n}", false).unwrap(),
             EsBody::Json(_)
         ));
         assert!(matches!(
-            classify_body("{\"a\":1}\n{\"b\":2}").unwrap(),
+            classify_body("{\"a\":1}\n{\"b\":2}", false).unwrap(),
             EsBody::Ndjson(_)
         ));
-        assert!(classify_body("not json").is_err());
-        assert!(classify_body("{\"a\":1}\nbroken").is_err());
+        assert!(classify_body("not json", false).is_err());
+        assert!(classify_body("{\"a\":1}\nbroken", false).is_err());
+        // NDJSON 系 API (_bulk / _msearch) は 1 行の body でも NDJSON として
+        // 分類し、末尾に改行を付ける (Bulk API の末尾改行必須の仕様)
+        match classify_body("{\"delete\":{\"_id\":\"1\"}}", true).unwrap() {
+            EsBody::Ndjson(b) => assert_eq!(b, "{\"delete\":{\"_id\":\"1\"}}\n"),
+            EsBody::Json(_) => panic!("expected NDJSON for a bulk body"),
+        }
+        // pretty JSON の複数行 body は NDJSON API では行単位で不正 → エラー
+        assert!(classify_body("{\n  \"a\": 1\n}", true).is_err());
+    }
+
+    #[test]
+    fn test_path_is_ndjson_api() {
+        assert!(path_is_ndjson_api("/_bulk"));
+        assert!(path_is_ndjson_api("/books/_bulk"));
+        assert!(path_is_ndjson_api("/_msearch"));
+        assert!(path_is_ndjson_api("/books/_msearch?typed_keys=true"));
+        assert!(!path_is_ndjson_api("/books/_search"));
+        assert!(!path_is_ndjson_api("/"));
     }
 
     #[test]
