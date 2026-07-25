@@ -341,15 +341,18 @@ impl ServerConfig {
         // 落ちてクエリファイルが混ざるのを防ぐ
         let dynamodb_discriminator;
         let user = if self.engine.eq_ignore_ascii_case("dynamodb") {
-            if let Some(profile) =
-                self.aws_profile.as_deref().map(str::trim).filter(|s| !s.is_empty())
-            {
-                profile
-            } else if let Some(user) =
+            // 認証の解決順 (user/password → aws_profile → 既定チェーン) と
+            // 同じ優先順で識別子を選ぶ。逆にすると「静的キーが実効・profile は
+            // 無視」の 2 接続が同じ profile 名フォルダに落ちて混ざる
+            if let Some(user) =
                 self.user.as_deref().map(str::trim).filter(|s| !s.is_empty())
             {
                 dynamodb_discriminator = format!("key-{}", stable_hash_hex(user));
                 &dynamodb_discriminator
+            } else if let Some(profile) =
+                self.aws_profile.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            {
+                profile
             } else {
                 ""
             }
@@ -1767,6 +1770,12 @@ sql_servers:
         server.aws_profile = Some("myprofile".into());
         let folder = server.sqlfiles_folder_name();
         assert!(folder.contains("myprofile"), "{folder}");
+        // 両方ある時は認証の優先順に合わせて静的キー側 (ハッシュ) を使う
+        server.user = Some("AKIAEXAMPLEKEYID".into());
+        server.password = Some("secret".into());
+        let folder = server.sqlfiles_folder_name();
+        assert!(folder.contains("key-"), "{folder}");
+        assert!(!folder.contains("myprofile"), "{folder}");
         // 同一ハッシュの安定性
         assert_eq!(stable_hash_hex("abc"), stable_hash_hex("abc"));
         assert_ne!(stable_hash_hex("abc"), stable_hash_hex("abd"));
