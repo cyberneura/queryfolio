@@ -261,8 +261,14 @@ pub struct ServerConfig {
     pub ssh_tunnel: Option<SshTunnelConfig>,
     /// queryfolio 独自拡張: true の場合、HTTP 系エンジン (elasticsearch) の
     /// 接続に https を使う。省略時 false。SQL 系エンジンでは無視される。
+    /// dynamodb ではエンドポイント上書き (host 指定) 時のスキームに使う。
     #[serde(default)]
     pub tls: bool,
+    /// queryfolio 独自拡張 (dynamodb 用): aws-config に渡す AWS プロファイル名
+    /// (~/.aws/config / credentials)。省略時は既定の credentials chain
+    /// (環境変数 → default プロファイル → IMDS)。他のエンジンでは無視される。
+    #[serde(default)]
+    pub aws_profile: Option<String>,
     /// queryfolio 独自拡張: true の場合、行を返さない文 (INSERT / UPDATE /
     /// DELETE / DDL 等) の実行を拒否する。省略時 false。
     /// SELECT に副作用のある関数 (nextval 等) までは防げない事故防止ガード。
@@ -316,11 +322,18 @@ impl ServerConfig {
                 return sanitize_folder_component(folder);
             }
         }
+        // dynamodb の user は AWS アクセスキー ID (資格情報の識別子) なので
+        // フォルダ名に出さない。複数キー設定の一意性は folder_name で担保する
+        let user = if self.engine.eq_ignore_ascii_case("dynamodb") {
+            ""
+        } else {
+            self.user.as_deref().unwrap_or("")
+        };
         let joined = [
             self.host.as_deref().unwrap_or(""),
             self.engine.as_str(),
             self.schema.as_deref().unwrap_or(""),
-            self.user.as_deref().unwrap_or(""),
+            user,
         ]
         .join("_");
         sanitize_folder_component(&joined)
@@ -1629,6 +1642,7 @@ sql_servers:
             password: Some("secret".into()),
             ssh_tunnel: None,
             tls: false,
+            aws_profile: None,
             readonly: false,
             allow_dangerous_statements: false,
             group_name: None,
@@ -1657,6 +1671,7 @@ sql_servers:
             password: None,
             ssh_tunnel: None,
             tls: false,
+            aws_profile: None,
             readonly: false,
             allow_dangerous_statements: false,
             group_name: None,

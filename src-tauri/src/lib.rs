@@ -455,7 +455,7 @@ async fn switch_active_schema(
                     "\\c is not supported for DuckDB".into(),
                 ));
             }
-            db::Engine::Redis | db::Engine::Elasticsearch => {
+            db::Engine::Redis | db::Engine::Elasticsearch | db::Engine::DynamoDb => {
                 return Err(AppError::Config(
                     "\\c is not supported for this engine".into(),
                 ));

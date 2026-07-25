@@ -1082,6 +1082,7 @@ mod tests {
             allow_dangerous_statements: false,
             group_name: None,
             tls: true,
+            aws_profile: None,
         };
         // トンネル無しなら URL ホストは差し替えない
         assert_eq!(tls_tunnel_url_host(&server, "es.example.com"), None);

@@ -40,6 +40,9 @@ pub enum DbPool {
     /// DuckDB は sqlx を使わず duckdb crate で結線する (engines::duckdb)。
     /// SQL エンジンだがコネクションは 1 本を Mutex で維持する。
     DuckDb(crate::engines::duckdb::DuckDbHandle),
+    /// DynamoDB は sqlx を使わず AWS SDK で PartiQL (ExecuteStatement) を
+    /// 実行する (engines::dynamodb)。DynamoClient は SDK クライアントのみ持つ。
+    DynamoDb(crate::engines::dynamodb::DynamoClient),
 }
 
 #[derive(Debug, Serialize)]
@@ -102,6 +105,13 @@ impl DbManager {
             (Some(_), Engine::DuckDb) => {
                 return Err(AppError::Config(
                     "ssh_tunnel cannot be used with duckdb".into(),
+                ));
+            }
+            // DynamoDB は HTTPS の AWS エンドポイントへ直接繋ぐ (SigV4 署名に
+            // リージョンのエンドポイントが前提)。トンネルは非対応
+            (Some(_), Engine::DynamoDb) => {
+                return Err(AppError::Config(
+                    "ssh_tunnel cannot be used with dynamodb".into(),
                 ));
             }
             (Some(tunnel_config), _) => {
@@ -231,6 +241,7 @@ pub(crate) enum Engine {
     Redis,
     Elasticsearch,
     DuckDb,
+    DynamoDb,
 }
 
 /// プールから実行専用に確保した 1 本のコネクション。
@@ -250,7 +261,10 @@ impl DbConnection {
             DbPool::Sqlite(p) => DbConnection::Sqlite(p.acquire().await?),
             // sqlx を使わないエンジンは run_query_cancellable が acquire より
             // 前に各エンジンモジュールへ委譲するため、ここには来ない
-            DbPool::Redis(_) | DbPool::Elasticsearch(_) | DbPool::DuckDb(_) => {
+            DbPool::Redis(_)
+            | DbPool::Elasticsearch(_)
+            | DbPool::DuckDb(_)
+            | DbPool::DynamoDb(_) => {
                 return Err(AppError::Config(
                     "This engine does not use SQL connections".into(),
                 ));
@@ -442,9 +456,11 @@ pub fn parse_engine(engine: &str) -> Result<Engine, AppError> {
         "redis" | "valkey" => Ok(Engine::Redis),
         "elasticsearch" | "es" | "opensearch" => Ok(Engine::Elasticsearch),
         "duckdb" => Ok(Engine::DuckDb),
+        "dynamodb" => Ok(Engine::DynamoDb),
         other => Err(AppError::Config(format!(
             "Unsupported engine: {other} \
-             (supported: mysql / postgres / sqlite / duckdb / redis / elasticsearch)"
+             (supported: mysql / postgres / sqlite / duckdb / redis / \
+             elasticsearch / dynamodb)"
         ))),
     }
 }
@@ -453,7 +469,8 @@ fn default_port(engine: Engine) -> u16 {
     match engine {
         Engine::MySql => 3306,
         Engine::Postgres => 5432,
-        Engine::Sqlite | Engine::DuckDb => 0,
+        // DynamoDb はエンドポイント解決を engines::dynamodb::connect が行う
+        Engine::Sqlite | Engine::DuckDb | Engine::DynamoDb => 0,
         Engine::Redis => crate::engines::redis::DEFAULT_PORT,
         Engine::Elasticsearch => crate::engines::elasticsearch::DEFAULT_PORT,
     }
@@ -538,6 +555,11 @@ async fn connect(
         Engine::DuckDb => Ok(DbPool::DuckDb(
             crate::engines::duckdb::connect(server).await?,
         )),
+        // dynamodb はリージョン (schema) とエンドポイント上書き (host / port) を
+        // モジュール側で解決するため、ここで計算した host / port は使わない
+        Engine::DynamoDb => Ok(DbPool::DynamoDb(
+            crate::engines::dynamodb::connect(server).await?,
+        )),
     }
 }
 
@@ -618,6 +640,21 @@ pub async fn run_query_cancellable(
             sql,
             max_rows,
             auto_limit,
+            readonly,
+            allow_dangerous,
+        )
+        .await;
+    }
+    // DynamoDB (PartiQL) もモジュールへ委譲する。PartiQL に LIMIT 句は無いため
+    // auto_limit は渡さず、ExecuteStatement の limit パラメータ + max_rows で
+    // 行数を抑える (モジュール側)
+    if let DbPool::DynamoDb(client) = pool {
+        return crate::engines::dynamodb::run_query_cancellable(
+            client,
+            registry,
+            connection_name,
+            sql,
+            max_rows,
             readonly,
             allow_dangerous,
         )
@@ -745,7 +782,10 @@ pub async fn run_statements(
     // ため、capabilities.supports_editable_cells = false と合わせて拒否する
     if matches!(
         pool,
-        DbPool::Redis(_) | DbPool::Elasticsearch(_) | DbPool::DuckDb(_)
+        DbPool::Redis(_)
+            | DbPool::Elasticsearch(_)
+            | DbPool::DuckDb(_)
+            | DbPool::DynamoDb(_)
     ) {
         return Err(AppError::Config(
             "Cell editing is not supported for this engine".into(),
@@ -994,10 +1034,10 @@ pub async fn list_schemas(
                 .unwrap_or("main");
             Ok(vec![path.to_string()])
         }
-        // Redis / Elasticsearch に database 一覧の概念は無い
+        // Redis / Elasticsearch / DynamoDB に database 一覧の概念は無い
         // (capabilities.supports_schemas = false でフロントは呼ばないが、
         // 直接呼ばれても壊れないよう空を返す)
-        DbPool::Redis(_) | DbPool::Elasticsearch(_) => Ok(vec![]),
+        DbPool::Redis(_) | DbPool::Elasticsearch(_) | DbPool::DynamoDb(_) => Ok(vec![]),
     }
 }
 
@@ -1176,7 +1216,11 @@ pub(crate) fn should_auto_limit(sql: &str, engine: Engine) -> bool {
 /// コスト・行数見積もりが得られる FORMAT=JSON の方が安全で互換性も広い。
 pub fn build_explain_sql(engine: &str, sql: &str) -> Result<String, AppError> {
     let engine = parse_engine(engine)?;
-    if matches!(engine, Engine::Redis | Engine::Elasticsearch) {
+    // DynamoDB (PartiQL) に EXPLAIN は無い
+    if matches!(
+        engine,
+        Engine::Redis | Engine::Elasticsearch | Engine::DynamoDb
+    ) {
         return Err(AppError::Explain(
             "Explain is not available for this engine".into(),
         ));
@@ -1203,8 +1247,8 @@ pub fn build_explain_sql(engine: &str, sql: &str) -> Result<String, AppError> {
         Engine::Sqlite => "EXPLAIN QUERY PLAN",
         // DuckDB の EXPLAIN ANALYZE は対象文を実際に実行するため使わない
         Engine::DuckDb => "EXPLAIN",
-        // Redis / Elasticsearch は冒頭の早期 return で弾いている
-        Engine::Redis | Engine::Elasticsearch => unreachable!(),
+        // Redis / Elasticsearch / DynamoDb は冒頭の早期 return で弾いている
+        Engine::Redis | Engine::Elasticsearch | Engine::DynamoDb => unreachable!(),
     };
     Ok(format!("{prefix}\n{sql}"))
 }

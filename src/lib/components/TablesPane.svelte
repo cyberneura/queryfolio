@@ -138,8 +138,8 @@
   };
 
   /// ダブルクリック: クエリスニペットをエディタに挿入する (実行はしない)。
-  /// スニペットはエディタ言語に合わせる (es は検索リクエストブロック、
-  /// それ以外は SELECT 文)
+  /// スニペットはエディタ言語・エンジンに合わせる (es は検索リクエスト
+  /// ブロック、dynamodb は LIMIT 句の無い PartiQL、それ以外は SELECT 文)
   const onTableDblClick = (table: TableInfo) => {
     if (clickTimer) {
       clearTimeout(clickTimer);
@@ -150,6 +150,15 @@
         `GET /${table.qualified_name}/_search\n` +
           `{\n  "query": { "match_all": {} },\n  "size": 100\n}`,
       );
+      return;
+    }
+    const engine = appStore.connections.find(
+      (c) => c.name === appStore.selectedConnection,
+    )?.engine;
+    if (engine === "dynamodb") {
+      // PartiQL に LIMIT 句は無い (行数はバックエンドの max_rows で抑える)。
+      // テーブル名はハイフン等を含み得るためダブルクォートで括る
+      appStore.insertSqlSnippet(`SELECT * FROM "${table.qualified_name}";`);
       return;
     }
     appStore.insertSqlSnippet(

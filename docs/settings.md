@@ -76,14 +76,15 @@ sql_servers:
 | Key | Required | Description |
 |-----|----------|-------------|
 | `name` | yes | Display name shown in the connections list. |
-| `engine` | yes | `postgres` (aliases: `postgresql`), `mysql` (aliases: `mariadb`), `sqlite` (aliases: `sqlite3`), `duckdb`, `redis` (aliases: `valkey`), or `elasticsearch` (aliases: `es`, `opensearch`). |
+| `engine` | yes | `postgres` (aliases: `postgresql`), `mysql` (aliases: `mariadb`), `sqlite` (aliases: `sqlite3`), `duckdb`, `redis` (aliases: `valkey`), `elasticsearch` (aliases: `es`, `opensearch`), or `dynamodb`. |
 | `description` | no | Free-text note shown in the UI. |
-| `host` | no | Database host. Defaults to `localhost` when omitted. Not needed for SQLite / DuckDB. When using an SSH tunnel, this is the DB host **as seen from the SSH endpoint** (often `localhost`). |
-| `port` | no | Database port. Defaults per engine when omitted: `5432` (PostgreSQL) / `3306` (MySQL) / `6379` (Redis) / `9200` (Elasticsearch). |
-| `schema` | depends | The database / schema to connect to. For SQLite / DuckDB, this is the **path to the database file** (queryfolio extension; `~` is expanded; if `schema` is omitted, `host` is used as the file path instead). |
-| `user` | no | Database user. |
+| `host` | no | Database host. Defaults to `localhost` when omitted. Not needed for SQLite / DuckDB. For DynamoDB it is an **endpoint override** (dynamodb-local); omit it to use the standard AWS endpoint. When using an SSH tunnel, this is the DB host **as seen from the SSH endpoint** (often `localhost`). |
+| `port` | no | Database port. Defaults per engine when omitted: `5432` (PostgreSQL) / `3306` (MySQL) / `6379` (Redis) / `9200` (Elasticsearch) / `8000` (DynamoDB endpoint override). |
+| `schema` | depends | The database / schema to connect to. For SQLite / DuckDB, this is the **path to the database file** (queryfolio extension; `~` is expanded; if `schema` is omitted, `host` is used as the file path instead). For DynamoDB, this is the **AWS region** (required, e.g. `ap-northeast-1`). |
+| `user` | no | Database user. For DynamoDB, a static **access key ID** (paired with `password` as the secret access key). |
 | `password` | no | Database password. |
-| `tls` | no | Use `https` for HTTP-based engines (Elasticsearch; queryfolio extension). Default `false`. Ignored by SQL engines. |
+| `tls` | no | Use `https` for HTTP-based engines (Elasticsearch, and the DynamoDB endpoint override; queryfolio extension). Default `false`. Ignored by SQL engines. |
+| `aws_profile` | no | DynamoDB only (queryfolio extension): the AWS profile name (`~/.aws/config` / `credentials`) used for credentials. Ignored when `user` / `password` are set. SSO-based profiles (`sso_session` etc.) are not supported yet — use static keys or the default credential chain. |
 | `readonly` | no | See [Safety guards](#safety-guards). Default `false`. |
 | `allow_dangerous_statements` | no | See [Safety guards](#safety-guards). Default `false`. |
 | `folder_name` | no | Override the query-file folder name. See [Query file storage](#query-file-storage-sqlfiles_dir-folder_name). |
@@ -168,6 +169,44 @@ sql_servers:
     # tls: true
     # user: elastic
     # password: your_es_password
+  ```
+
+- **DynamoDB** — `engine: dynamodb` (queryfolio extension). The editor runs
+  **PartiQL** (DynamoDB's SQL-compatible language: `SELECT` / `INSERT` /
+  `UPDATE` / `DELETE`) through the ExecuteStatement API, so the regular SQL
+  editor, Format, and the `.sql` query-file extension are used. PartiQL has no
+  `LIMIT` clause; QueryFolio bounds the result with the API's page limit and
+  reports truncation instead (no auto LIMIT is appended). `schema` is the
+  **AWS region** (required). Credentials are resolved in this order:
+  1. `user` / `password` as a static access key ID / secret access key,
+  2. `aws_profile` (queryfolio extension) naming a profile in `~/.aws`
+     (static-key profiles only; SSO-based profiles are not supported yet),
+  3. the default AWS credentials chain (environment variables → `default`
+     profile → IMDS).
+  `host` / `port` override the endpoint for
+  [dynamodb-local](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.html)
+  (`tls: true` for https; dynamodb-local does not verify credentials, so
+  alphanumeric dummy values are fine). The TABLES pane lists tables and
+  expands them into the key schema (partition / sort key) and the indexed
+  attribute definitions — DynamoDB is schemaless, so non-key attributes are
+  not listed. While the **Writable** switch is off only `SELECT` runs, and
+  `UPDATE` / `DELETE` without a `WHERE` clause require
+  `allow_dangerous_statements: true`. Meta commands, schemas, Explain, cell
+  editing, AI features, and SSH tunnels are not available for DynamoDB.
+
+  ```yaml
+  - name: aws-dynamodb
+    engine: dynamodb
+    schema: ap-northeast-1
+    # aws_profile: my-profile
+
+  - name: local-dynamodb
+    engine: dynamodb
+    schema: us-east-1
+    host: 127.0.0.1
+    port: 8000
+    user: dummyAccessKey
+    password: dummySecretKey
   ```
 
 ### Safety guards
