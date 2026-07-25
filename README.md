@@ -10,6 +10,9 @@ https://github.com/user-attachments/assets/90439816-49c8-4ebd-a068-b102cfe9c7aa
 
 - MySQL / PostgreSQL / SQLite support (via sqlx)
 - Redis support (`engine: redis`): one command per line (`GET my-key`, `MGET a b c`) with syntax highlighting, a read-only command whitelist while the Writable switch is off, and guards for destructive commands (`FLUSHALL` etc.)
+- Elasticsearch support (`engine: elasticsearch`): Kibana-Console-style request blocks (`GET /index/_search` + JSON body, NDJSON `_bulk`), hits rendered as a table, an index browser with mapping fields, and guards for destructive requests (index deletion, `_delete_by_query` etc.)
+- DuckDB support (`engine: duckdb`): a local-file SQL engine (like the SQLite support) with the full SQL feature set (meta commands, EXPLAIN, auto LIMIT incl. `FROM`-first queries)
+- DynamoDB support (`engine: dynamodb`): PartiQL statements in the SQL editor, a table browser with key attributes, AWS credentials via static keys / `aws_profile` / the default chain, and the same read-only / dangerous guards
 - SSH tunnel with known_hosts verification
 - Connection config in YAML, compatible with the sql-agent-mcp-server format
   - Secrets can stay in 1Password: the config YAML is fetched lazily via a getter command like `op read "op://..."`
