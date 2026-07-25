@@ -142,7 +142,10 @@ pub async fn run_query_cancellable(
 
     // メタコマンド変換後の SQL にもガードを適用する (すり抜け防止。
     // 変換結果は読み取り系のみなので常に通るが、順序として明示する)
-    if readonly != ReadonlyGuard::Off && !is_readonly_allowed(sql, Engine::DuckDb) {
+    if readonly != ReadonlyGuard::Off
+        && !is_readonly_allowed(sql, Engine::DuckDb)
+        && !is_duckdb_readonly_statement(sql)
+    {
         return Err(readonly_block_error(readonly));
     }
     if !allow_dangerous {
@@ -184,7 +187,9 @@ pub async fn run_query_cancellable(
 
     let conn = handle.conn.clone();
     let sql_owned = sql.to_string();
-    let fetch = is_fetch_statement(sql) || contains_returning(sql);
+    let fetch = is_fetch_statement(sql)
+        || is_duckdb_readonly_statement(sql)
+        || contains_returning(sql);
     // spawn_blocking は future の drop では止まらないが、キャンセル時は
     // CancelRegistry が interrupt を発行して実行中の文をエラーで終わらせる
     // ため、この await が無期限に残ることはない
@@ -206,6 +211,18 @@ pub async fn run_query_cancellable(
     result.applied_limit = applied_limit;
     result.elapsed_ms = started.elapsed().as_millis() as u64;
     Ok(result)
+}
+
+/// DuckDB 固有の行を返す読み取り文か。共通の is_fetch_statement は
+/// SQL 標準の先頭キーワードしか知らないため、DuckDB の FROM-first 構文
+/// (`FROM t`) / SUMMARIZE / PIVOT / UNPIVOT をここで補完する。
+/// いずれも読み取り専用の問い合わせ形で書き込みは表現できない
+/// (DuckDB に SELECT INTO は無い) ため、readonly 判定にも使う。
+fn is_duckdb_readonly_statement(sql: &str) -> bool {
+    matches!(
+        leading_keyword(sql).as_str(),
+        "from" | "summarize" | "pivot" | "unpivot"
+    )
 }
 
 /// blocking スレッドで 1 文を実行する。
@@ -334,7 +351,10 @@ fn time_to_json(unit: duckdb::types::TimeUnit, v: i64) -> serde_json::Value {
 /// - LIST / STRUCT / MAP / ARRAY は JSON 化するが、要素数を
 ///   MAX_COLLECTION_ELEMENTS で打ち切り、打ち切ったら truncated を立てる
 fn value_to_json_limited(value: Value, truncated: &mut bool) -> serde_json::Value {
-    value_to_json_at_depth(value, truncated, 0)
+    // 要素数の上限はセル全体で共有する予算にする: 階層ごとの独立上限だと
+    // 1,000 要素 × 1,000 要素のネストで 100 万値を直列化してしまう
+    let mut budget = MAX_COLLECTION_ELEMENTS;
+    value_to_json_at_depth(value, truncated, 0, &mut budget)
 }
 
 /// 文字列を文字数上限で打ち切る (超えたら truncated を立てて省略記号を付ける)。
@@ -351,6 +371,7 @@ fn value_to_json_at_depth(
     value: Value,
     truncated: &mut bool,
     depth: usize,
+    budget: &mut usize,
 ) -> serde_json::Value {
     // データ由来 (read_json_auto 等) の任意深度ネストでスタックを溢れさせない
     if depth >= MAX_NESTING_DEPTH
@@ -406,47 +427,49 @@ fn value_to_json_at_depth(
             nanos as f64 / 1_000_000_000.0
         )),
         Value::List(items) | Value::Array(items) => {
-            if items.len() > MAX_COLLECTION_ELEMENTS {
-                *truncated = true;
+            let mut out = Vec::new();
+            for item in items {
+                if *budget == 0 {
+                    *truncated = true;
+                    break;
+                }
+                *budget -= 1;
+                out.push(value_to_json_at_depth(item, truncated, depth + 1, budget));
             }
-            serde_json::Value::Array(
-                items
-                    .into_iter()
-                    .take(MAX_COLLECTION_ELEMENTS)
-                    .map(|v| value_to_json_at_depth(v, truncated, depth + 1))
-                    .collect(),
-            )
+            serde_json::Value::Array(out)
         }
         Value::Enum(v) => serde_json::Value::String(v),
         Value::Struct(map) => {
             let mut obj = serde_json::Map::new();
-            for (i, (key, value)) in map.iter().enumerate() {
-                if i >= MAX_COLLECTION_ELEMENTS {
+            for (key, value) in map.iter() {
+                if *budget == 0 {
                     *truncated = true;
                     break;
                 }
+                *budget -= 1;
                 obj.insert(
                     key.clone(),
-                    value_to_json_at_depth(value.clone(), truncated, depth + 1),
+                    value_to_json_at_depth(value.clone(), truncated, depth + 1, budget),
                 );
             }
             serde_json::Value::Object(obj)
         }
         Value::Map(map) => {
             let mut obj = serde_json::Map::new();
-            for (i, (key, value)) in map.iter().enumerate() {
-                if i >= MAX_COLLECTION_ELEMENTS {
+            for (key, value) in map.iter() {
+                if *budget == 0 {
                     *truncated = true;
                     break;
                 }
+                *budget -= 1;
                 obj.insert(
                     map_key_to_string(key),
-                    value_to_json_at_depth(value.clone(), truncated, depth + 1),
+                    value_to_json_at_depth(value.clone(), truncated, depth + 1, budget),
                 );
             }
             serde_json::Value::Object(obj)
         }
-        Value::Union(inner) => value_to_json_at_depth(*inner, truncated, depth + 1),
+        Value::Union(inner) => value_to_json_at_depth(*inner, truncated, depth + 1, budget),
     }
 }
 
@@ -467,6 +490,10 @@ async fn query_rows(
     sql: &'static str,
     params: Vec<String>,
 ) -> Result<Vec<Vec<Value>>, AppError> {
+    // クエリ実行と同じ直列化に参加する: これが無いと、カタログ照会が
+    // conn を握っている間にユーザークエリが exec を取って登録し、
+    // そのキャンセル (interrupt) が実行中のカタログ文を巻き込む
+    let _exec = handle.exec.lock().await;
     let conn = handle.conn.clone();
     tokio::task::spawn_blocking(move || {
         let conn = conn.lock().map_err(|_| {
@@ -968,6 +995,44 @@ mod tests {
         );
         assert!(truncated);
         assert!(v.as_str().unwrap().ends_with('…'));
+    }
+
+    #[test]
+    fn test_collection_budget_is_shared_across_nesting() {
+        // 1,000 × 2 のネストでも総量 (予算) で打ち切られる
+        let inner: Vec<Value> = (0..600).map(Value::Int).collect();
+        let value = Value::List(vec![
+            Value::List(inner.clone()),
+            Value::List(inner),
+        ]);
+        let mut truncated = false;
+        let v = value_to_json_limited(value, &mut truncated);
+        assert!(truncated);
+        // 直列化される値の総数が予算 (1,000) を大きく超えない
+        fn count(v: &serde_json::Value) -> usize {
+            match v {
+                serde_json::Value::Array(items) => {
+                    1 + items.iter().map(count).sum::<usize>()
+                }
+                serde_json::Value::Object(map) => {
+                    1 + map.values().map(count).sum::<usize>()
+                }
+                _ => 1,
+            }
+        }
+        assert!(count(&v) <= MAX_COLLECTION_ELEMENTS + 10);
+    }
+
+    #[test]
+    fn test_is_duckdb_readonly_statement() {
+        assert!(is_duckdb_readonly_statement("FROM books"));
+        assert!(is_duckdb_readonly_statement("from books SELECT title"));
+        assert!(is_duckdb_readonly_statement("SUMMARIZE books"));
+        assert!(is_duckdb_readonly_statement("PIVOT sales ON month"));
+        assert!(is_duckdb_readonly_statement("UNPIVOT t ON a, b"));
+        assert!(!is_duckdb_readonly_statement("SELECT 1"));
+        assert!(!is_duckdb_readonly_statement("INSERT INTO t VALUES (1)"));
+        assert!(!is_duckdb_readonly_statement("DELETE FROM t"));
     }
 
     #[test]
