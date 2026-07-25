@@ -95,6 +95,7 @@ fn dialect_name(engine: &str) -> String {
         "postgres" | "postgresql" => "PostgreSQL".to_string(),
         "mysql" | "mariadb" => "MySQL".to_string(),
         "sqlite" | "sqlite3" => "SQLite".to_string(),
+        "duckdb" => "DuckDB".to_string(),
         other => other.to_string(),
     }
 }

@@ -31,6 +31,14 @@ sql_servers:
     engine: sqlite
     schema: ~/data/example.sqlite3
 
+  # queryfolio 拡張: duckdb は sqlite と同じく schema に DB ファイルパスを
+  # 指定する (ファイルが存在しない場合はエラー。新規作成はしない)。
+  # SQL エンジンとして SELECT / メタコマンド / EXPLAIN / auto LIMIT が使える。
+  - name: local-duckdb
+    description: "ローカルの DuckDB ファイル"
+    engine: duckdb
+    schema: ~/data/example.duckdb
+
   # queryfolio 拡張: redis (エイリアス: valkey)。
   # エディタは 1 行 = 1 コマンド (GET my-key / MGET a b c ...)。
   # schema は database 番号 (省略時 0)。user / password は ACL / AUTH に使う。

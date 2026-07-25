@@ -76,11 +76,11 @@ sql_servers:
 | Key | Required | Description |
 |-----|----------|-------------|
 | `name` | yes | Display name shown in the connections list. |
-| `engine` | yes | `postgres` (aliases: `postgresql`), `mysql` (aliases: `mariadb`), `sqlite` (aliases: `sqlite3`), `redis` (aliases: `valkey`), or `elasticsearch` (aliases: `es`, `opensearch`). |
+| `engine` | yes | `postgres` (aliases: `postgresql`), `mysql` (aliases: `mariadb`), `sqlite` (aliases: `sqlite3`), `duckdb`, `redis` (aliases: `valkey`), or `elasticsearch` (aliases: `es`, `opensearch`). |
 | `description` | no | Free-text note shown in the UI. |
-| `host` | no | Database host. Defaults to `localhost` when omitted. Not needed for SQLite. When using an SSH tunnel, this is the DB host **as seen from the SSH endpoint** (often `localhost`). |
+| `host` | no | Database host. Defaults to `localhost` when omitted. Not needed for SQLite / DuckDB. When using an SSH tunnel, this is the DB host **as seen from the SSH endpoint** (often `localhost`). |
 | `port` | no | Database port. Defaults per engine when omitted: `5432` (PostgreSQL) / `3306` (MySQL) / `6379` (Redis) / `9200` (Elasticsearch). |
-| `schema` | depends | The database / schema to connect to. For SQLite, this is the **path to the database file** (queryfolio extension; `~` is expanded; if `schema` is omitted, `host` is used as the file path instead). |
+| `schema` | depends | The database / schema to connect to. For SQLite / DuckDB, this is the **path to the database file** (queryfolio extension; `~` is expanded; if `schema` is omitted, `host` is used as the file path instead). |
 | `user` | no | Database user. |
 | `password` | no | Database password. |
 | `tls` | no | Use `https` for HTTP-based engines (Elasticsearch; queryfolio extension). Default `false`. Ignored by SQL engines. |
@@ -104,6 +104,21 @@ sql_servers:
   - name: local-sqlite
     engine: sqlite
     schema: ~/data/example.sqlite3
+  ```
+
+- **DuckDB** — `engine: duckdb` (queryfolio extension). A SQL engine, so the
+  SQL editor, meta commands (`\l` `\dt` `\dv` `\dn` `\d [table]`), Explain,
+  Format, auto LIMIT, AI features, and the TABLES pane all work as for the
+  other SQL engines. Like SQLite, put the **file path** in `schema` (`~` is
+  expanded; if `schema` is omitted, `host` is used as the file path instead).
+  The file must already exist — QueryFolio does not create a new database
+  file. `port` / `user` / `password` / `ssh_tunnel` are not used. Cell editing
+  in the results grid is not available for DuckDB.
+
+  ```yaml
+  - name: local-duckdb
+    engine: duckdb
+    schema: ~/data/example.duckdb
   ```
 
 - **Redis** — `engine: redis` (alias: `valkey`; queryfolio extension). The

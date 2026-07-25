@@ -47,6 +47,7 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
         Engine::Postgres => postgres_meta(command, arg)?,
         Engine::MySql => mysql_meta(command, arg)?,
         Engine::Sqlite => sqlite_meta(command, arg)?,
+        Engine::DuckDb => duckdb_meta(command, arg)?,
         // 冒頭の早期 return で弾いている
         Engine::Redis | Engine::Elasticsearch => unreachable!(),
     };
@@ -55,17 +56,22 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
 
 /// `\c <schema>` の引数を検証する。
 ///
-/// sqlite は schema が DB ファイルパスで、切り替えは別の DB ファイルを開くことに
-/// なるため対象外にする (設定ファイルで接続を分ける方が明快)。
+/// sqlite / duckdb は schema が DB ファイルパスで、切り替えは別の DB ファイルを
+/// 開くことになるため対象外にする (設定ファイルで接続を分ける方が明快)。
 fn parse_connect_arg(
     engine: Engine,
     command: &str,
     arg: Option<&str>,
     extra: &[&str],
 ) -> Result<String, AppError> {
-    if matches!(engine, Engine::Sqlite) {
+    if matches!(engine, Engine::Sqlite | Engine::DuckDb) {
+        let label = if engine == Engine::Sqlite {
+            "SQLite"
+        } else {
+            "DuckDB"
+        };
         return Err(AppError::Config(format!(
-            "{command} is not supported for SQLite \
+            "{command} is not supported for {label} \
              (the schema is a database file path; define another connection instead)"
         )));
     }
@@ -249,6 +255,40 @@ fn sqlite_meta(command: &str, arg: Option<&str>) -> Result<String, AppError> {
     Ok(sql)
 }
 
+/// DuckDB は information_schema と PRAGMA (sqlite 互換) の両方を持つ。
+/// 一覧系は information_schema、カラム定義は PRAGMA table_info を使う。
+fn duckdb_meta(command: &str, arg: Option<&str>) -> Result<String, AppError> {
+    let sql = match (command, arg) {
+        ("\\l" | "\\list", _) => "PRAGMA database_list".to_string(),
+        ("\\dt", _) => "SELECT table_schema AS schema, table_name AS name, \
+             'table' AS type FROM information_schema.tables \
+             WHERE table_type = 'BASE TABLE' ORDER BY 1, 2"
+            .to_string(),
+        ("\\dv", _) => "SELECT table_schema AS schema, table_name AS name, \
+             'view' AS type FROM information_schema.tables \
+             WHERE table_type = 'VIEW' ORDER BY 1, 2"
+            .to_string(),
+        ("\\dn", _) => "SELECT schema_name AS name \
+             FROM information_schema.schemata ORDER BY 1"
+            .to_string(),
+        ("\\d", None) => "SELECT table_schema AS schema, table_name AS name, \
+             lower(table_type) AS type FROM information_schema.tables \
+             ORDER BY 1, 2"
+            .to_string(),
+        ("\\d", Some(name)) => {
+            let name = validate_relation_name(name)?;
+            format!("PRAGMA table_info('{name}')")
+        }
+        _ => {
+            return Err(unsupported(
+                command,
+                "\\l \\list \\dt \\dv \\dn \\d [table]",
+            ));
+        }
+    };
+    Ok(sql)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +369,29 @@ mod tests {
             sql_of(Engine::Sqlite, "\\d users"),
             "PRAGMA table_info(\"users\")"
         );
+    }
+
+    #[test]
+    fn test_duckdb_meta() {
+        assert_eq!(sql_of(Engine::DuckDb, "\\l"), "PRAGMA database_list");
+        let sql = sql_of(Engine::DuckDb, "\\dt");
+        assert!(sql.contains("information_schema.tables"));
+        assert!(sql.contains("BASE TABLE"));
+        let sql = sql_of(Engine::DuckDb, "\\dv");
+        assert!(sql.contains("'VIEW'"));
+        let sql = sql_of(Engine::DuckDb, "\\dn");
+        assert!(sql.contains("schemata"));
+        assert_eq!(
+            sql_of(Engine::DuckDb, "\\d users"),
+            "PRAGMA table_info('users')"
+        );
+        // インジェクションにつながる引数は拒否
+        assert!(translate(Engine::DuckDb, "\\d users'; DROP TABLE x; --").is_err());
+        // \c は DB ファイルパスなので拒否
+        let err = translate(Engine::DuckDb, "\\c other").unwrap_err();
+        assert!(err.to_string().contains("not supported for DuckDB"));
+        // 未対応コマンド
+        assert!(translate(Engine::DuckDb, "\\du").is_err());
     }
 
     #[test]

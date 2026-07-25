@@ -50,6 +50,12 @@ reqwest = { version = "0.12", default-features = false, features = [
 thiserror = "2"
 # Redis エンジン用クライアント (tokio ランタイムで任意コマンドを実行する)
 redis = { version = "1.4", default-features = false, features = ["tokio-comp"] }
+# DuckDB エンジン用クライアント (sqlx に DuckDB ドライバが無いため独自結線)。
+# bundled で C++ ソースを静的リンクする (Homebrew の libduckdb を動的リンクすると
+# ssh2 と同じく Developer ID 署名アプリの library validation で起動できないため)。
+# 同期 API のため実行は spawn_blocking で包む (engines/duckdb.rs)。
+# バージョンは 7 日ルールで 1 つ前の安定版に固定 (1.10505.0 は 2026-07-22 リリース)
+duckdb = { version = "=1.10504.0", features = ["bundled"] }
 # vendored-openssl: OpenSSL を静的リンクする。Homebrew の libssl を動的リンクすると
 # Developer ID 署名アプリで library validation により起動時 abort するため
 # (異なる Team ID の dylib はロード不可)。副次的に Homebrew 未導入環境でも動く。
