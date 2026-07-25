@@ -303,6 +303,13 @@ async fn execute_statement(
     // 書き込み文 (INSERT / UPDATE / DELETE) は単一アイテム操作で 1 回で終わる
     let is_select = leading_keyword(sql) == "select";
     let started = Instant::now();
+    let deadline_error = || {
+        AppError::DynamoDb(format!(
+            "The query did not finish within {}s \
+             (narrow the statement, e.g. with a key condition)",
+            REQUEST_TIMEOUT.as_secs()
+        ))
+    };
     let mut items: Vec<HashMap<String, AttributeValue>> = Vec::new();
     let mut next_token: Option<String> = None;
     loop {
@@ -314,23 +321,22 @@ async fn execute_statement(
             req = req.limit(remaining.min(i32::MAX as usize) as i32);
         }
         req = req.set_next_token(next_token.take());
-        let out = req
-            .send()
+        // フィルタの強い SELECT はスキャンの空ページが延々続き得るため、
+        // ページネーション全体に締切を置く。各ページのリクエストを残余時間の
+        // timeout で包むことで、締切をページ間だけでなくリクエスト実行中にも
+        // 効かせる (1 操作の SDK タイムアウトと合算して ~2 倍待たされない)
+        let remaining_time = REQUEST_TIMEOUT
+            .checked_sub(started.elapsed())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(deadline_error)?;
+        let out = tokio::time::timeout(remaining_time, req.send())
             .await
+            .map_err(|_| deadline_error())?
             .map_err(|e| sdk_error("ExecuteStatement failed", e))?;
         items.extend(out.items.unwrap_or_default());
         next_token = out.next_token;
         if !is_select || next_token.is_none() || items.len() > max_rows {
             break;
-        }
-        // フィルタの強い SELECT はスキャンの空ページが延々続き得るため、
-        // ページネーション全体に締切を置く (1 操作ごとの SDK タイムアウトとは別)
-        if started.elapsed() > REQUEST_TIMEOUT {
-            return Err(AppError::DynamoDb(format!(
-                "The query did not finish within {}s \
-                 (narrow the statement, e.g. with a key condition)",
-                REQUEST_TIMEOUT.as_secs()
-            )));
         }
     }
     Ok(shape_items(items, max_rows))
