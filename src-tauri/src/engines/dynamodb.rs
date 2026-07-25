@@ -173,7 +173,16 @@ async fn build_client(server: &ServerConfig) -> Result<DynamoClient, AppError> {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                loader = loader.profile_name(profile);
+                // profile_name だけでは既定チェーンの参照先を変えるだけで、
+                // 環境変数 (AWS_ACCESS_KEY_ID 等) のプロバイダが先勝ちする。
+                // aws_profile 指定時は明示のプロファイルプロバイダを立てて、
+                // 「user/password → aws_profile → 既定チェーン」の優先順を
+                // 環境に依らず成立させる
+                loader = loader.credentials_provider(
+                    aws_config::profile::ProfileFileCredentialsProvider::builder()
+                        .profile_name(profile)
+                        .build(),
+                );
             }
         }
     }

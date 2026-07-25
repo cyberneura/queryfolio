@@ -289,6 +289,18 @@ pub struct ServerConfig {
     pub group_name: Option<String>,
 }
 
+/// 文字列の安定した短いハッシュ (FNV-1a 64bit の先頭 8 hex)。
+/// AWS アクセスキー ID のような「そのまま出したくないが接続の区別には使いたい」
+/// 識別子をフォルダ名に落とすために使う (非可逆・依存クレート不要)。
+fn stable_hash_hex(input: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{:08x}", (hash >> 32) as u32)
+}
+
 /// フォルダ名としてファイルシステム上安全になるようサニタイズする。
 /// パス区切り (/ \) や NUL を _ に置換し、先頭ドット (不可視/相対) を避ける。
 /// query_files::validate_component が拒否する文字を事前に潰しておく。
@@ -323,9 +335,24 @@ impl ServerConfig {
             }
         }
         // dynamodb の user は AWS アクセスキー ID (資格情報の識別子) なので
-        // フォルダ名に出さない。複数キー設定の一意性は folder_name で担保する
+        // フォルダ名にそのまま出さない。代わりに非機密の識別子
+        // (aws_profile 名、静的キーなら短いハッシュ) で接続を区別する —
+        // 同一リージョンでプロファイル/キーだけ違う 2 接続が同じフォルダに
+        // 落ちてクエリファイルが混ざるのを防ぐ
+        let dynamodb_discriminator;
         let user = if self.engine.eq_ignore_ascii_case("dynamodb") {
-            ""
+            if let Some(profile) =
+                self.aws_profile.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            {
+                profile
+            } else if let Some(user) =
+                self.user.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            {
+                dynamodb_discriminator = format!("key-{}", stable_hash_hex(user));
+                &dynamodb_discriminator
+            } else {
+                ""
+            }
         } else {
             self.user.as_deref().unwrap_or("")
         };
@@ -1705,5 +1732,43 @@ sql_servers:
         // 先頭ドットは避ける (不可視/相対パス化を防ぐ)
         let s = server_with(Some(".hidden"), None, "sqlite", None, None);
         assert_eq!(s.sqlfiles_folder_name(), "_.hidden");
+    }
+
+    #[test]
+    fn test_sqlfiles_folder_name_dynamodb_discriminator() {
+        let mut server = ServerConfig {
+            name: "ddb".into(),
+            description: None,
+            folder_name: None,
+            engine: "dynamodb".into(),
+            host: None,
+            port: None,
+            schema: Some("ap-northeast-1".into()),
+            user: Some("AKIAEXAMPLEKEYID".into()),
+            password: Some("secret".into()),
+            ssh_tunnel: None,
+            readonly: false,
+            allow_dangerous_statements: false,
+            group_name: None,
+            tls: false,
+            aws_profile: None,
+        };
+        // アクセスキー ID はフォルダ名に出さず、短いハッシュで区別する
+        let folder = server.sqlfiles_folder_name();
+        assert!(!folder.contains("AKIAEXAMPLEKEYID"), "{folder}");
+        assert!(folder.contains("key-"), "{folder}");
+        // 別のキーなら別のフォルダになる
+        let mut other = server.clone();
+        other.user = Some("AKIAOTHERKEYID".into());
+        assert_ne!(folder, other.sqlfiles_folder_name());
+        // aws_profile があればプロファイル名 (非機密) を使う
+        server.user = None;
+        server.password = None;
+        server.aws_profile = Some("myprofile".into());
+        let folder = server.sqlfiles_folder_name();
+        assert!(folder.contains("myprofile"), "{folder}");
+        // 同一ハッシュの安定性
+        assert_eq!(stable_hash_hex("abc"), stable_hash_hex("abc"));
+        assert_ne!(stable_hash_hex("abc"), stable_hash_hex("abd"));
     }
 }
