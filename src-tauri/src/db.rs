@@ -37,6 +37,9 @@ pub enum DbPool {
     /// Elasticsearch は sqlx を使わず reqwest で REST API を叩く
     /// (engines::elasticsearch)。EsClient は base_url と認証情報のみ持つ。
     Elasticsearch(crate::engines::elasticsearch::EsClient),
+    /// DuckDB は sqlx を使わず duckdb crate で結線する (engines::duckdb)。
+    /// SQL エンジンだがコネクションは 1 本を Mutex で維持する。
+    DuckDb(crate::engines::duckdb::DuckDbHandle),
 }
 
 #[derive(Debug, Serialize)]
@@ -90,9 +93,15 @@ impl DbManager {
 
         // SSH トンネルが必要なら先に確立し、接続先をローカルポートに差し替える
         let (host, port) = match (&server.ssh_tunnel, engine) {
+            // ファイルベースのエンジンにトンネルの意味は無い
             (Some(_), Engine::Sqlite) => {
                 return Err(AppError::Config(
                     "ssh_tunnel cannot be used with sqlite".into(),
+                ));
+            }
+            (Some(_), Engine::DuckDb) => {
+                return Err(AppError::Config(
+                    "ssh_tunnel cannot be used with duckdb".into(),
                 ));
             }
             (Some(tunnel_config), _) => {
@@ -221,6 +230,7 @@ pub(crate) enum Engine {
     Sqlite,
     Redis,
     Elasticsearch,
+    DuckDb,
 }
 
 /// プールから実行専用に確保した 1 本のコネクション。
@@ -238,9 +248,9 @@ impl DbConnection {
             DbPool::MySql(p) => DbConnection::MySql(p.acquire().await?),
             DbPool::Postgres(p) => DbConnection::Postgres(p.acquire().await?),
             DbPool::Sqlite(p) => DbConnection::Sqlite(p.acquire().await?),
-            // 非 SQL エンジンは run_query_cancellable が acquire より前に
-            // 各エンジンモジュールへ委譲するため、ここには来ない
-            DbPool::Redis(_) | DbPool::Elasticsearch(_) => {
+            // sqlx を使わないエンジンは run_query_cancellable が acquire より
+            // 前に各エンジンモジュールへ委譲するため、ここには来ない
+            DbPool::Redis(_) | DbPool::Elasticsearch(_) | DbPool::DuckDb(_) => {
                 return Err(AppError::Config(
                     "This engine does not use SQL connections".into(),
                 ));
@@ -272,6 +282,10 @@ pub(crate) enum CancelTarget {
     /// クライアント側で実行の future を打ち切る (サーバー側で文を止める
     /// 手段が無いエンジン用。Redis 等)。notify で実行側の select を起こす
     ClientSide { notify: Arc<tokio::sync::Notify> },
+    /// duckdb の InterruptHandle で実行中の文を中断させる。
+    /// spawn_blocking の実行は future の drop では止まらないため、
+    /// エンジン側の interrupt が必須 (実行中の文が無ければ no-op)
+    DuckDb { interrupt: Arc<duckdb::InterruptHandle> },
 }
 
 /// 実行中クエリ 1 件分の登録情報
@@ -329,6 +343,7 @@ impl CancelRegistry {
             Postgres { pid: i32, pool: sqlx::PgPool },
             MySql { connection_id: u64, pool: sqlx::MySqlPool },
             Notify { notify: Arc<tokio::sync::Notify> },
+            DuckDbInterrupt { interrupt: Arc<duckdb::InterruptHandle> },
             None,
         }
         let action = {
@@ -353,6 +368,9 @@ impl CancelRegistry {
                 CancelTarget::ClientSide { notify } => CancelAction::Notify {
                     notify: notify.clone(),
                 },
+                CancelTarget::DuckDb { interrupt } => CancelAction::DuckDbInterrupt {
+                    interrupt: interrupt.clone(),
+                },
             }
         };
         match action {
@@ -373,6 +391,7 @@ impl CancelRegistry {
                     .await?;
             }
             CancelAction::Notify { notify } => notify.notify_waiters(),
+            CancelAction::DuckDbInterrupt { interrupt } => interrupt.interrupt(),
             CancelAction::None => {}
         }
         Ok(true)
@@ -422,9 +441,10 @@ pub fn parse_engine(engine: &str) -> Result<Engine, AppError> {
         "sqlite" | "sqlite3" => Ok(Engine::Sqlite),
         "redis" | "valkey" => Ok(Engine::Redis),
         "elasticsearch" | "es" | "opensearch" => Ok(Engine::Elasticsearch),
+        "duckdb" => Ok(Engine::DuckDb),
         other => Err(AppError::Config(format!(
             "Unsupported engine: {other} \
-             (supported: mysql / postgres / sqlite / redis / elasticsearch)"
+             (supported: mysql / postgres / sqlite / duckdb / redis / elasticsearch)"
         ))),
     }
 }
@@ -433,7 +453,7 @@ fn default_port(engine: Engine) -> u16 {
     match engine {
         Engine::MySql => 3306,
         Engine::Postgres => 5432,
-        Engine::Sqlite => 0,
+        Engine::Sqlite | Engine::DuckDb => 0,
         Engine::Redis => crate::engines::redis::DEFAULT_PORT,
         Engine::Elasticsearch => crate::engines::elasticsearch::DEFAULT_PORT,
     }
@@ -514,6 +534,10 @@ async fn connect(
         Engine::Elasticsearch => Ok(DbPool::Elasticsearch(
             crate::engines::elasticsearch::connect(server, host, port).await?,
         )),
+        // duckdb は sqlite と同じくファイルベースなので host / port は使わない
+        Engine::DuckDb => Ok(DbPool::DuckDb(
+            crate::engines::duckdb::connect(server).await?,
+        )),
     }
 }
 
@@ -579,6 +603,21 @@ pub async fn run_query_cancellable(
             connection_name,
             sql,
             max_rows,
+            readonly,
+            allow_dangerous,
+        )
+        .await;
+    }
+    // DuckDB は SQL エンジンだが sqlx 非対応のためモジュールへ委譲する
+    // (auto_limit を含む SQL 系の共通ガードはモジュール側で適用する)
+    if let DbPool::DuckDb(handle) = pool {
+        return crate::engines::duckdb::run_query_cancellable(
+            handle,
+            registry,
+            connection_name,
+            sql,
+            max_rows,
+            auto_limit,
             readonly,
             allow_dangerous,
         )
@@ -702,7 +741,12 @@ pub async fn run_statements(
     if statements.is_empty() {
         return Err(AppError::Config("There are no changes to apply".into()));
     }
-    if matches!(pool, DbPool::Redis(_) | DbPool::Elasticsearch(_)) {
+    // DuckDb はセル編集の適用経路 (sqlx のトランザクション実行) を持たない
+    // ため、capabilities.supports_editable_cells = false と合わせて拒否する
+    if matches!(
+        pool,
+        DbPool::Redis(_) | DbPool::Elasticsearch(_) | DbPool::DuckDb(_)
+    ) {
         return Err(AppError::Config(
             "Cell editing is not supported for this engine".into(),
         ));
@@ -941,7 +985,8 @@ pub async fn list_schemas(
                 .filter_map(|row| row.try_get::<String, _>(0).ok())
                 .collect())
         }
-        DbPool::Sqlite(_) => {
+        // duckdb も sqlite と同じくファイルパスをそのまま返す
+        DbPool::Sqlite(_) | DbPool::DuckDb(_) => {
             let path = server
                 .schema
                 .as_deref()
@@ -957,7 +1002,7 @@ pub async fn list_schemas(
 }
 
 /// SQL の先頭キーワード (コメントを除く) を小文字で返す。
-fn leading_keyword(sql: &str) -> String {
+pub(crate) fn leading_keyword(sql: &str) -> String {
     let mut rest = sql;
     loop {
         rest = rest.trim_start();
@@ -984,9 +1029,9 @@ fn leading_keyword(sql: &str) -> String {
 /// SQL の走査結果。cleaned はキーワード判定用 (文字列リテラルとコメントを
 /// 空白化して小文字化したもの)、body_end は自動 LIMIT の挿入位置
 /// (末尾のコメント・セミコロン・空白を除いた本体の終了位置)。
-struct SqlScan {
+pub(crate) struct SqlScan {
     cleaned: String,
-    body_end: usize,
+    pub(crate) body_end: usize,
 }
 
 /// エンジンごとのコメント・クォート規則で SQL を 1 パス走査する。
@@ -994,9 +1039,10 @@ struct SqlScan {
 ///   ($tag$ ... $tag$) にも対応 (# は Postgres では XOR 演算子なので
 ///   コメント扱いしない)
 /// - コメント: -- と /* */。MySQL は # 行コメントも対象
-fn scan_sql(sql: &str, engine: Engine) -> SqlScan {
+pub(crate) fn scan_sql(sql: &str, engine: Engine) -> SqlScan {
     let hash_comments = matches!(engine, Engine::MySql);
-    let dollar_quotes = matches!(engine, Engine::Postgres);
+    // DuckDB はドル引用に対応しており方言は Postgres 相当
+    let dollar_quotes = matches!(engine, Engine::Postgres | Engine::DuckDb);
     let chars: Vec<char> = sql.chars().collect();
     let mut cleaned = String::with_capacity(sql.len());
     let mut body_end = 0;
@@ -1099,10 +1145,15 @@ fn scan_sql(sql: &str, engine: Engine) -> SqlScan {
 /// WITH ... INSERT 等の語を含む場合は、構文エラーや意味の変化を避けるため
 /// 付与しない (保守的側に倒す。スキップしてもクライアント側の max_rows
 /// 打ち切りが安全網になる)。
-fn should_auto_limit(sql: &str, engine: Engine) -> bool {
+pub(crate) fn should_auto_limit(sql: &str, engine: Engine) -> bool {
     // VALUES (SQLite では LIMIT 不可) や TABLE は対象にせず、
-    // SELECT / WITH のみに限定する
-    if !matches!(leading_keyword(sql).as_str(), "select" | "with") {
+    // SELECT / WITH のみに限定する。DuckDB は FROM-first 構文
+    // (`FROM t`) も SELECT と同じ問い合わせ形なので対象にする
+    // (SUMMARIZE / PIVOT は末尾 LIMIT の可否が形に依存するため付けない)
+    let kw = leading_keyword(sql);
+    let applicable = matches!(kw.as_str(), "select" | "with")
+        || (engine == Engine::DuckDb && kw == "from");
+    if !applicable {
         return false;
     }
     let cleaned = scan_sql(sql, engine).cleaned;
@@ -1150,6 +1201,8 @@ pub fn build_explain_sql(engine: &str, sql: &str) -> Result<String, AppError> {
         Engine::Postgres => "EXPLAIN (ANALYZE, BUFFERS)",
         Engine::MySql => "EXPLAIN FORMAT=JSON",
         Engine::Sqlite => "EXPLAIN QUERY PLAN",
+        // DuckDB の EXPLAIN ANALYZE は対象文を実際に実行するため使わない
+        Engine::DuckDb => "EXPLAIN",
         // Redis / Elasticsearch は冒頭の早期 return で弾いている
         Engine::Redis | Engine::Elasticsearch => unreachable!(),
     };
@@ -1161,7 +1214,7 @@ pub fn build_explain_sql(engine: &str, sql: &str) -> Result<String, AppError> {
 /// 取りこぼさないための判定。文字列リテラル内の単語にも反応する可能性が
 /// あるが、その場合も fetch 経路で正しく実行される (affected 表示が
 /// 行数表示になるだけ) ため許容する。
-fn contains_returning(sql: &str) -> bool {
+pub(crate) fn contains_returning(sql: &str) -> bool {
     let lower = sql.to_ascii_lowercase();
     let bytes = lower.as_bytes();
     let mut start = 0;
@@ -1201,7 +1254,7 @@ fn contains_returning(sql: &str) -> bool {
 /// 弱点: SELECT に副作用のある関数 (nextval 等) や CALL のプロシージャ内の
 /// 書き込み、括弧形の設定 PRAGMA (`PRAGMA journal_mode(WAL)` 等) までは
 /// 防げない。あくまで事故防止のガードである。
-fn is_readonly_allowed(sql: &str, engine: Engine) -> bool {
+pub(crate) fn is_readonly_allowed(sql: &str, engine: Engine) -> bool {
     if !is_fetch_statement(sql) {
         return false;
     }
@@ -1302,7 +1355,7 @@ pub fn dangerous_statement_reason(engine: &str, sql: &str) -> Result<Option<Stri
 }
 
 /// 行を返す文かどうかを先頭キーワードで判定する。
-fn is_fetch_statement(sql: &str) -> bool {
+pub(crate) fn is_fetch_statement(sql: &str) -> bool {
     matches!(
         leading_keyword(sql).as_str(),
         "select"
@@ -1372,7 +1425,7 @@ pub(crate) fn json_i64(v: i64) -> serde_json::Value {
     }
 }
 
-fn json_u64(v: u64) -> serde_json::Value {
+pub(crate) fn json_u64(v: u64) -> serde_json::Value {
     if v <= JS_MAX_SAFE_INTEGER as u64 {
         serde_json::json!(v)
     } else {

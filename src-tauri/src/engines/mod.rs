@@ -9,6 +9,7 @@
 //!   1 行委譲に留め、エンジン追加時は「モジュールを足す + capability を
 //!   宣言する + enum に variant を足す」だけで済むようにする。
 
+pub mod duckdb;
 pub mod elasticsearch;
 pub mod redis;
 
@@ -74,11 +75,19 @@ const ELASTICSEARCH_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_ai: false,
 };
 
+/// DuckDB は SQL エンジンだが、セル編集の適用経路 (run_statements) が
+/// sqlx 前提のため supports_editable_cells のみ false にする。
+const DUCKDB_CAPABILITIES: EngineCapabilities = EngineCapabilities {
+    supports_editable_cells: false,
+    ..SQL_CAPABILITIES
+};
+
 pub fn capabilities(engine: Engine) -> EngineCapabilities {
     match engine {
         Engine::MySql | Engine::Postgres | Engine::Sqlite => SQL_CAPABILITIES.clone(),
         Engine::Redis => REDIS_CAPABILITIES.clone(),
         Engine::Elasticsearch => ELASTICSEARCH_CAPABILITIES.clone(),
+        Engine::DuckDb => DUCKDB_CAPABILITIES.clone(),
     }
 }
 
@@ -125,6 +134,17 @@ mod tests {
         // エイリアスも同じ capability
         assert_eq!(capabilities_for_name("es").editor_language, "es");
         assert_eq!(capabilities_for_name("opensearch").editor_language, "es");
+
+        // DuckDB は SQL 系だがセル編集のみ非対応
+        let duckdb = capabilities_for_name("duckdb");
+        assert_eq!(duckdb.editor_language, "sql");
+        assert_eq!(duckdb.file_extension, "sql");
+        assert!(duckdb.supports_schemas);
+        assert!(duckdb.supports_tables);
+        assert!(duckdb.supports_explain);
+        assert!(duckdb.supports_format);
+        assert!(!duckdb.supports_editable_cells);
+        assert!(duckdb.supports_ai);
 
         // 未知のエンジンは SQL 相当 (エラーは接続時に出す)
         let unknown = capabilities_for_name("oracle");

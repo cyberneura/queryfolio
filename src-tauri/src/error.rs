@@ -50,11 +50,20 @@ pub enum AppError {
 
     #[error("Elasticsearch error: {0}")]
     Elasticsearch(String),
+
+    #[error("DuckDB error: {0}")]
+    DuckDb(String),
 }
 
 impl From<redis::RedisError> for AppError {
     fn from(e: redis::RedisError) -> Self {
         AppError::Redis(e.to_string())
+    }
+}
+
+impl From<duckdb::Error> for AppError {
+    fn from(e: duckdb::Error) -> Self {
+        AppError::DuckDb(e.to_string())
     }
 }
 

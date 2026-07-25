@@ -128,6 +128,7 @@ pub async fn fetch_tables(pool: &DbPool) -> Result<Vec<TableInfo>, AppError> {
         DbPool::Elasticsearch(client) => {
             crate::engines::elasticsearch::fetch_indices(client).await
         }
+        DbPool::DuckDb(handle) => crate::engines::duckdb::fetch_tables(handle).await,
     }
 }
 
@@ -142,6 +143,11 @@ pub async fn fetch_columns(pool: &DbPool, table: &str) -> Result<Vec<ColumnInfo>
         return crate::engines::elasticsearch::fetch_index_columns(client, table).await;
     }
     let table = validate_relation_name(table)?;
+    // DuckDB はテーブル名をバインドして information_schema を照会する
+    // (識別子検証は SQL 系と同じ規則を通す)
+    if let DbPool::DuckDb(handle) = pool {
+        return crate::engines::duckdb::fetch_columns(handle, table).await;
+    }
     let columns: Vec<ColumnInfo> = match pool {
         DbPool::Postgres(p) => {
             let sql = format!(
@@ -211,7 +217,7 @@ pub async fn fetch_columns(pool: &DbPool, table: &str) -> Result<Vec<ColumnInfo>
             ));
         }
         // 冒頭の早期 return で処理済み
-        DbPool::Elasticsearch(_) => unreachable!(),
+        DbPool::Elasticsearch(_) | DbPool::DuckDb(_) => unreachable!(),
     };
     // MySQL / SQLite は存在しないテーブルでもエラーにならず空が返るため、
     // ここで明示的にエラーにする (PG は regclass 解決で先にエラーになる)
@@ -233,6 +239,9 @@ pub async fn fetch_primary_keys(pool: &DbPool, table: &str) -> Result<Vec<String
         return Ok(vec![]);
     }
     let table = validate_relation_name(table)?;
+    if let DbPool::DuckDb(handle) = pool {
+        return crate::engines::duckdb::fetch_primary_keys(handle, table).await;
+    }
     let keys: Vec<String> = match pool {
         DbPool::Postgres(p) => {
             // pg_index.indisprimary で主キー索引の対象カラムを引く。
@@ -294,7 +303,7 @@ pub async fn fetch_primary_keys(pool: &DbPool, table: &str) -> Result<Vec<String
         }
         DbPool::Redis(_) => vec![],
         // 冒頭の早期 return で処理済み
-        DbPool::Elasticsearch(_) => unreachable!(),
+        DbPool::Elasticsearch(_) | DbPool::DuckDb(_) => unreachable!(),
     };
     Ok(keys)
 }
@@ -376,6 +385,9 @@ pub async fn fetch_all_columns(
         // テーブル・カラムの概念が無いエンジン、および SQL 補完を使わない
         // エンジン (Elasticsearch) は空のまま返す
         DbPool::Redis(_) | DbPool::Elasticsearch(_) => {}
+        DbPool::DuckDb(handle) => {
+            return crate::engines::duckdb::fetch_all_columns(handle).await;
+        }
     }
     Ok(map)
 }
