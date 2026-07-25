@@ -1147,8 +1147,13 @@ pub(crate) fn scan_sql(sql: &str, engine: Engine) -> SqlScan {
 /// 打ち切りが安全網になる)。
 pub(crate) fn should_auto_limit(sql: &str, engine: Engine) -> bool {
     // VALUES (SQLite では LIMIT 不可) や TABLE は対象にせず、
-    // SELECT / WITH のみに限定する
-    if !matches!(leading_keyword(sql).as_str(), "select" | "with") {
+    // SELECT / WITH のみに限定する。DuckDB は FROM-first 構文
+    // (`FROM t`) も SELECT と同じ問い合わせ形なので対象にする
+    // (SUMMARIZE / PIVOT は末尾 LIMIT の可否が形に依存するため付けない)
+    let kw = leading_keyword(sql);
+    let applicable = matches!(kw.as_str(), "select" | "with")
+        || (engine == Engine::DuckDb && kw == "from");
+    if !applicable {
         return false;
     }
     let cleaned = scan_sql(sql, engine).cleaned;

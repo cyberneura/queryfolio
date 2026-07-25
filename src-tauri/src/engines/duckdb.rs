@@ -947,6 +947,34 @@ mod tests {
         .unwrap();
         assert_eq!(result.row_count, 10);
         assert!(result.truncated);
+
+        // FROM-first 構文 (DuckDB 固有) にも auto LIMIT が付与される
+        let result = run(
+            &handle,
+            "FROM range(100)",
+            1000,
+            Some(3),
+            ReadonlyGuard::Switch,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.applied_limit, Some(3));
+        assert_eq!(result.row_count, 3);
+
+        // FROM-first でも LIMIT 指定済みなら付与しない
+        let result = run(
+            &handle,
+            "FROM range(100) LIMIT 4",
+            1000,
+            Some(3),
+            ReadonlyGuard::Switch,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.applied_limit, None);
+        assert_eq!(result.row_count, 4);
     }
 
     #[tokio::test]
