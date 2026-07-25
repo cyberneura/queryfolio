@@ -64,6 +64,33 @@ sql_servers:
     # user: elastic
     # password: your_es_password
 
+  # queryfolio 拡張: dynamodb。PartiQL (SQL 互換サブセット) を
+  # ExecuteStatement API で実行する。エディタは SQL (SELECT / INSERT / UPDATE /
+  # DELETE。PartiQL に LIMIT 句は無く、行数はアプリ側の上限で抑える)。
+  # schema = AWS リージョン (必須)。認証は次の順で解決する:
+  #   1. user / password (静的なアクセスキー ID / シークレットアクセスキー)
+  #   2. aws_profile (queryfolio 拡張。~/.aws のプロファイル名)
+  #   3. 既定の credentials chain (環境変数 → default プロファイル → IMDS)
+  - name: aws-dynamodb
+    description: "AWS の DynamoDB (ap-northeast-1)"
+    engine: dynamodb
+    schema: ap-northeast-1
+    # aws_profile: my-profile
+    # readonly: true   # SELECT のみ許可したい場合
+
+  # dynamodb-local (docker run -p 8000:8000 amazon/dynamodb-local) の例。
+  # host / port でエンドポイントを上書きする (tls: true で https)。
+  # dynamodb-local は認証を検証しないため user / password はダミーでよい
+  # (英数字のみ。dynamodb-local はハイフン等を含むキーを拒否する)。
+  - name: local-dynamodb
+    description: "ローカルの dynamodb-local"
+    engine: dynamodb
+    schema: us-east-1
+    host: 127.0.0.1
+    port: 8000
+    user: dummyAccessKey
+    password: dummySecretKey
+
   # queryfolio 拡張: readonly: true (省略時 false) を指定すると、
   # 書き込み系の文 (INSERT / UPDATE / DELETE / DDL、CTE 付き DML、
   # SELECT INTO 等) の実行を拒否する。

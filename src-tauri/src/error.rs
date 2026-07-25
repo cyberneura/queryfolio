@@ -53,6 +53,9 @@ pub enum AppError {
 
     #[error("DuckDB error: {0}")]
     DuckDb(String),
+
+    #[error("DynamoDB error: {0}")]
+    DynamoDb(String),
 }
 
 impl From<redis::RedisError> for AppError {

@@ -23,7 +23,11 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
         return Ok(None);
     }
     // psql 風メタコマンドは SQL 系エンジン専用
-    if matches!(engine, Engine::Redis | Engine::Elasticsearch) {
+    // (DynamoDB は PartiQL = SQL 風だがカタログ照会 SQL を持たないため対象外)
+    if matches!(
+        engine,
+        Engine::Redis | Engine::Elasticsearch | Engine::DynamoDb
+    ) {
         return Err(AppError::Config(
             "Meta commands (\\...) are not supported for this engine".into(),
         ));
@@ -49,7 +53,7 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
         Engine::Sqlite => sqlite_meta(command, arg)?,
         Engine::DuckDb => duckdb_meta(command, arg)?,
         // 冒頭の早期 return で弾いている
-        Engine::Redis | Engine::Elasticsearch => unreachable!(),
+        Engine::Redis | Engine::Elasticsearch | Engine::DynamoDb => unreachable!(),
     };
     Ok(Some(MetaCommand::Sql(sql)))
 }

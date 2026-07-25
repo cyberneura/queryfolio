@@ -10,6 +10,7 @@
 //!   宣言する + enum に variant を足す」だけで済むようにする。
 
 pub mod duckdb;
+pub mod dynamodb;
 pub mod elasticsearch;
 pub mod redis;
 
@@ -82,12 +83,25 @@ const DUCKDB_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     ..SQL_CAPABILITIES
 };
 
+/// DynamoDB は PartiQL (SQL 互換サブセット) をエディタで扱う。
+/// schema はリージョン (一覧・切替の対象外)、EXPLAIN は存在しない。
+/// セル編集 (run_statements) と AI (SQL 方言前提) も対象外。
+/// TABLES ペインにはテーブル一覧 + キースキーマ・属性定義を出す。
+const DYNAMODB_CAPABILITIES: EngineCapabilities = EngineCapabilities {
+    supports_schemas: false,
+    supports_explain: false,
+    supports_editable_cells: false,
+    supports_ai: false,
+    ..SQL_CAPABILITIES
+};
+
 pub fn capabilities(engine: Engine) -> EngineCapabilities {
     match engine {
         Engine::MySql | Engine::Postgres | Engine::Sqlite => SQL_CAPABILITIES.clone(),
         Engine::Redis => REDIS_CAPABILITIES.clone(),
         Engine::Elasticsearch => ELASTICSEARCH_CAPABILITIES.clone(),
         Engine::DuckDb => DUCKDB_CAPABILITIES.clone(),
+        Engine::DynamoDb => DYNAMODB_CAPABILITIES.clone(),
     }
 }
 
@@ -145,6 +159,17 @@ mod tests {
         assert!(duckdb.supports_format);
         assert!(!duckdb.supports_editable_cells);
         assert!(duckdb.supports_ai);
+
+        // DynamoDB は SQL エディタだが schema / EXPLAIN / セル編集 / AI 非対応
+        let dynamodb = capabilities_for_name("dynamodb");
+        assert_eq!(dynamodb.editor_language, "sql");
+        assert_eq!(dynamodb.file_extension, "sql");
+        assert!(!dynamodb.supports_schemas);
+        assert!(dynamodb.supports_tables);
+        assert!(!dynamodb.supports_explain);
+        assert!(dynamodb.supports_format);
+        assert!(!dynamodb.supports_editable_cells);
+        assert!(!dynamodb.supports_ai);
 
         // 未知のエンジンは SQL 相当 (エラーは接続時に出す)
         let unknown = capabilities_for_name("oracle");

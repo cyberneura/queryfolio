@@ -59,7 +59,14 @@ overwritten. No secrets (passwords, SSH keys) are included.\n\n",
         "- **Database (schema):** {}\n",
         field(server.schema.as_deref())
     ));
-    out.push_str(&format!("- **User:** {}\n", field(server.user.as_deref())));
+    // dynamodb の user は AWS アクセスキー ID (資格情報の識別子) なので
+    // メタファイルには出さない
+    let user_display = if server.engine.eq_ignore_ascii_case("dynamodb") {
+        server.user.as_ref().map(|_| "(aws access key, hidden)")
+    } else {
+        server.user.as_deref()
+    };
+    out.push_str(&format!("- **User:** {}\n", field(user_display)));
     out.push_str(&format!(
         "- **Read-only:** {}\n",
         if server.readonly { "yes" } else { "no" }
@@ -119,6 +126,7 @@ mod tests {
             password: Some("s3cret".to_string()),
             ssh_tunnel: None,
             tls: false,
+            aws_profile: None,
             readonly: true,
             allow_dangerous_statements: false,
             group_name: Some("Production".to_string()),

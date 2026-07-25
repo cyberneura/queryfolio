@@ -56,6 +56,23 @@ redis = { version = "1.4", default-features = false, features = ["tokio-comp"] }
 # 同期 API のため実行は spawn_blocking で包む (engines/duckdb.rs)。
 # バージョンは 7 日ルールで 1 つ前の安定版に固定 (1.10505.0 は 2026-07-22 リリース)
 duckdb = { version = "=1.10504.0", features = ["bundled"] }
+# DynamoDB エンジン用の AWS SDK (PartiQL を ExecuteStatement API で実行する)。
+# AWS SDK はほぼ毎日リリースされるため、7 日ルールに合わせて = で固定する
+# (キャレット指定だと cargo が当日リリースへ解決してしまう)。
+# default-features = false: 既定の HTTPS クライアント (rustls + aws-lc) を使わず、
+# 既存依存 (reqwest / rustls) と同じ ring ベースのクライアントを明示的に組む
+# (aws-lc-sys のネイティブビルドを増やさない。engines/dynamodb.rs 参照)。
+aws-config = { version = "=1.9.0", default-features = false, features = [
+  "behavior-version-latest",
+  "rt-tokio",
+  "credentials-process",
+] }
+aws-sdk-dynamodb = { version = "=1.117.0", default-features = false, features = [
+  "rt-tokio",
+] }
+aws-smithy-http-client = { version = "=1.2.0", default-features = false, features = [
+  "rustls-ring",
+] }
 # vendored-openssl: OpenSSL を静的リンクする。Homebrew の libssl を動的リンクすると
 # Developer ID 署名アプリで library validation により起動時 abort するため
 # (異なる Team ID の dylib はロード不可)。副次的に Homebrew 未導入環境でも動く。
