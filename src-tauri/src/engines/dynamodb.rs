@@ -348,21 +348,24 @@ fn shape_items(
     let mut truncated = items.len() > max_rows;
     let items = &items[..items.len().min(max_rows)];
 
-    let mut columns: Vec<String> = Vec::new();
+    // カラム union は BTreeSet で収集しながら MAX_COLUMNS に抑える:
+    // 上限超過のたびに最大要素を落とすことで、全 union を実体化せずに
+    // 「名前昇順の先頭 MAX_COLUMNS 個」を O(N log MAX_COLUMNS) で確定させる
+    // (スキーマレス由来の疎な属性群でも中間メモリと走査が有界)
+    let mut column_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for item in items {
         for key in item.keys() {
-            if !columns.iter().any(|c| c == key) {
-                columns.push(key.clone());
+            if column_set.contains(key) {
+                continue;
+            }
+            column_set.insert(key.clone());
+            if column_set.len() > MAX_COLUMNS {
+                column_set.pop_last();
+                truncated = true;
             }
         }
     }
-    columns.sort();
-    // スキーマレス由来のカラム爆発を止める (NULL 充填のセル数は
-    // 最大でも max_rows × MAX_COLUMNS に収まる)
-    if columns.len() > MAX_COLUMNS {
-        truncated = true;
-        columns.truncate(MAX_COLUMNS);
-    }
+    let columns: Vec<String> = column_set.into_iter().collect();
 
     let mut rows = Vec::with_capacity(items.len());
     for item in items {

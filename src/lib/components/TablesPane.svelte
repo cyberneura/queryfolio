@@ -152,9 +152,10 @@
       );
       return;
     }
-    const engine = appStore.connections.find(
-      (c) => c.name === appStore.selectedConnection,
-    )?.engine;
+    const engine = appStore.connections
+      .find((c) => c.name === appStore.selectedConnection)
+      ?.engine.toLowerCase();
+    // バックエンドの parse_engine と同じく大文字小文字を区別しない
     if (engine === "dynamodb") {
       // PartiQL に LIMIT 句は無い (行数はバックエンドの max_rows で抑える)。
       // テーブル名はハイフン等を含み得るためダブルクォートで括る
