@@ -20,6 +20,7 @@
   import AiAnalysisModal from "$lib/components/AiAnalysisModal.svelte";
   import DangerousConfirmModal from "$lib/components/DangerousConfirmModal.svelte";
   import SearchModal from "$lib/components/SearchModal.svelte";
+  import ChatPane from "$lib/components/ChatPane.svelte";
   import PaneDivider from "$lib/components/PaneDivider.svelte";
 
   let showSettings = $state(false);
@@ -112,6 +113,9 @@
   const LAYOUT_PREFIX = "queryfolio.layout.";
   const SIDEBAR_MIN = 140;
   const SIDEBAR_MAX = 500;
+  /// AI チャットペインは本文が長いので、サイドバーより広い範囲を許す
+  const CHAT_MIN = 240;
+  const CHAT_MAX = 720;
   const EDITOR_FRAC_MIN = 0.15;
   const EDITOR_FRAC_MAX = 0.85;
 
@@ -155,11 +159,19 @@
   let editorPaneEl: HTMLDivElement | undefined = $state();
   let resultsPaneEl: HTMLDivElement | undefined = $state();
 
+  /// AI チャットペイン (右) の幅 (px)
+  let chatWidth = $state(
+    clamp(loadLayoutValue("chatWidth", 360), CHAT_MIN, CHAT_MAX),
+  );
+  /// AI チャットペインを開いているか (表示状態も次回起動へ引き継ぐ)
+  let showChat = $state(loadLayoutValue("chatOpen", 0) === 1);
+
   // ドラッグ開始時の基準サイズ。PaneDivider は開始位置からの累積 delta を
   // 渡すので、基準 + delta で計算するとクランプ飽和後もポインタと同期する
   let dragBaseConnections = 0;
   let dragBaseSidebar = 0;
   let dragBaseEditorFrac = 0;
+  let dragBaseChat = 0;
 
   const selectedConnectionInfo = $derived(
     appStore.connections.find((c) => c.name === appStore.selectedConnection) ??
@@ -299,6 +311,11 @@
     }}
     onOpenSettings={() => {
       showSettings = true;
+    }}
+    chatOpen={showChat}
+    onToggleChat={() => {
+      showChat = !showChat;
+      saveLayoutValue("chatOpen", showChat ? 1 : 0);
     }}
   />
 
@@ -459,6 +476,32 @@
         <ResultsPane />
       </div>
     </div>
+
+    <!-- AI チャットペイン。エディタ / 結果の右側に縦いっぱいで並ぶ -->
+    {#if showChat}
+      <PaneDivider
+        direction="vertical"
+        annotate="pane-divider-chat"
+        onDragStart={() => {
+          dragBaseChat = chatWidth;
+        }}
+        onDrag={(delta) => {
+          // 右端のペインなので、ドラッグ方向と幅の増減は逆になる
+          chatWidth = clamp(dragBaseChat - delta, CHAT_MIN, CHAT_MAX);
+        }}
+        onDragEnd={() => saveLayoutValue("chatWidth", chatWidth)}
+      />
+      <div class="shrink-0" style="width: {chatWidth}px">
+        <ChatPane
+          supportsAi={selectedCapabilities?.supports_ai ?? false}
+          onClose={() => {
+            showChat = false;
+            saveLayoutValue("chatOpen", 0);
+          }}
+          onInsert={(sql) => appStore.insertSqlSnippet(sql)}
+        />
+      </div>
+    {/if}
   </div>
 </div>
 

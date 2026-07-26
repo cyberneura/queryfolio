@@ -63,6 +63,74 @@ struct AppState {
     launch_route: std::sync::Mutex<Option<router::Route>>,
     /// 実行中に届いた開く対象の受け渡し (listener 準備前の取りこぼし対策)。
     live: std::sync::Mutex<LiveDelivery>,
+    /// AI チャットの中断要求 (接続名単位)。
+    chat_cancels: ChatCancels,
+}
+
+/// 中断要求を覚えておく ID の上限 (開始しなかった要求の取りこぼし対策で
+/// 残るため、古いものから捨てて無制限に増えないようにする)。
+const CHAT_CANCEL_HISTORY_MAX: usize = 256;
+
+/// エージェントのクエリ実行中に中断要求を見に行く間隔 (ms)。
+/// run_query_cancellable がキャンセルレジストリへ登録するまでの間に
+/// 届いた中断はレジストリ経由では効かないため、自前で監視する。
+const CHAT_CANCEL_POLL_INTERVAL_MS: u64 = 200;
+
+/// AI チャット (エージェント) の中断要求を**リクエスト単位**で保持する。
+///
+/// クエリのキャンセル (CancelRegistry) は「実行中の 1 本」を止めるだけで、
+/// モデルの応答待ちや次のツール往復は止められないため、往復そのものを
+/// 止める仕組みが要る。接続単位のカウンタにすると (1) 同じ接続で 2 本が
+/// 同時に走る時にどちらを止めるか区別できず、(2) 開始直後に届いた中断が
+/// 「開始時の基準値」に吸収されてしまうため、フロントが採番した
+/// リクエスト ID をそのまま使う。ID を控えておけば、コマンドが走り出す
+/// 前に届いた中断も入口の判定で拾える。
+#[derive(Default)]
+struct ChatCancels {
+    inner: tokio::sync::Mutex<ChatCancelState>,
+}
+
+#[derive(Default)]
+struct ChatCancelState {
+    cancelled: std::collections::HashSet<String>,
+    /// 挿入順 (上限超過時に古いものから捨てる)
+    order: std::collections::VecDeque<String>,
+}
+
+impl ChatCancels {
+    /// リクエストの中断を要求する (まだ開始していなくても記録を残す)。
+    async fn request(&self, request_id: &str) {
+        let mut state = self.inner.lock().await;
+        if state.cancelled.insert(request_id.to_string()) {
+            state.order.push_back(request_id.to_string());
+            while state.order.len() > CHAT_CANCEL_HISTORY_MAX {
+                if let Some(old) = state.order.pop_front() {
+                    state.cancelled.remove(&old);
+                }
+            }
+        }
+    }
+
+    /// このリクエストに中断が要求されているか。
+    async fn is_cancelled(&self, request_id: &str) -> bool {
+        self.inner.lock().await.cancelled.contains(request_id)
+    }
+
+    /// 終了したリクエストの記録を捨てる。
+    async fn finish(&self, request_id: &str) {
+        let mut state = self.inner.lock().await;
+        if state.cancelled.remove(request_id) {
+            state.order.retain(|id| id != request_id);
+        }
+    }
+}
+
+/// AI チャットのツール実行を登録するキャンセルレジストリのキー。
+/// ユーザーのクエリ (接続名がキー) と衝突せず、かつ同じ接続で複数の
+/// 往復が走っても互いのエントリを上書きしないようリクエスト ID を含める
+/// (CancelRegistry は同じキーの登録を置き換えるため)。
+fn chat_cancel_key(connection: &str, request_id: &str) -> String {
+    format!("{connection}\u{1}ai-chat\u{1}{request_id}")
 }
 
 impl AppState {
@@ -521,6 +589,49 @@ async fn cancel_query(
     connection: String,
 ) -> Result<bool, AppError> {
     state.query_cancels.cancel(&connection).await
+}
+
+/// AI チャットのエージェントの往復を中断する。
+/// request_ids はフロントが採番した実行中リクエストの ID
+/// (同じ接続で複数の往復が走りうるため、まとめて渡す)。
+///
+/// 実行中のクエリを止める (CancelRegistry) だけでなく、ID を控えて
+/// 次のモデル呼び出し・ツール実行も行わせない。まだ ai_chat が走り
+/// 出していないリクエストの ID も控えられるので、送信直後の中断も効く。
+/// 戻り値は「実行中のクエリを実際に止めたか」。
+#[tauri::command]
+async fn cancel_ai_chat(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    request_ids: Vec<String>,
+) -> Result<bool, AppError> {
+    // 先に**全ての ID を記録する**。クエリのキャンセルは DB へ問い合わせる
+    // ため失敗しうるが、そこで打ち切ると残りの往復が中断されないまま
+    // 切替後のバックエンドで動き続けてしまう
+    for request_id in &request_ids {
+        state.chat_cancels.request(request_id).await;
+    }
+    let mut cancelled_query = false;
+    let mut first_error: Option<AppError> = None;
+    for request_id in &request_ids {
+        match state
+            .query_cancels
+            .cancel(&chat_cancel_key(&connection, request_id))
+            .await
+        {
+            Ok(true) => cancelled_query = true,
+            Ok(false) => {}
+            // 1 本の失敗で残りのキャンセルを止めない (記録は済んでいるので
+            // 往復自体は次の判定で止まる)。エラーは最初の 1 件だけ返す
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(cancelled_query),
+    }
 }
 
 /// 接続のクエリ実行履歴を新しい順に返す。
@@ -1007,6 +1118,317 @@ async fn ai_explain_sql(
     Ok(response.trim().to_string())
 }
 
+/// エージェントの run_sql の結果を LLM 向けのテキストに整形する。
+/// 行数を明示し、列名 + 各行を 1 行の JSON にして渡す (トークン効率と
+/// パースのしやすさの両立)。
+fn format_chat_tool_result(result: &QueryResult) -> String {
+    let mut text = format!(
+        "{} row(s){}",
+        result.row_count,
+        if result.truncated {
+            " (truncated)"
+        } else {
+            ""
+        }
+    );
+    if let Some(affected) = result.affected_rows {
+        text.push_str(&format!(", {affected} affected"));
+    }
+    text.push_str(&format!("\ncolumns: {}\n", result.columns.join(", ")));
+    for row in &result.rows {
+        let line = serde_json::to_string(row).unwrap_or_else(|_| "[unserializable row]".into());
+        text.push_str(&line);
+        text.push('\n');
+    }
+    ai::truncate_tool_result(&text)
+}
+
+/// AI チャット (エージェント) の 1 往復を実行する。
+/// フロントは会話履歴を毎回そのまま渡し、バックエンドが system prompt の
+/// 組み立てとツール実行ループを担う。
+///
+/// ツールは読み取り専用の `run_sql` のみで、実行は**常に読み取り専用**
+/// (ツールバーの Writable スイッチが ON でも書き込みは許可しない)。
+/// エージェントが自分の判断で書き込む事故を構造的に防ぐため。
+/// LLM に送るのはスキーマ情報・方言・アクティブスキーマ名・会話履歴と、
+/// エージェント自身が実行した読み取りクエリの結果のみ。接続情報
+/// (ホスト・認証情報) は送らない。
+#[tauri::command]
+async fn ai_chat(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    history: Vec<ai::ChatTurn>,
+    request_id: String,
+) -> Result<ai::ChatReply, AppError> {
+    // 実行したツール呼び出しは失敗時にも返す (途中まで実行したクエリを
+    // 隠さない。特に中断・タイムアウトはツール実行の後に起きやすい)
+    let mut tool_calls: Vec<ai::ChatToolCall> = Vec::new();
+    let result =
+        run_ai_chat(&state, &connection, &history, &request_id, &mut tool_calls).await;
+    // 中断記録は往復の終了時に掃除する (残っても上限で捨てられるが、
+    // 同じ ID が再利用されることはないので溜めておく意味が無い)
+    state.chat_cancels.finish(&request_id).await;
+    Ok(match result {
+        Ok(content) => ai::ChatReply {
+            content,
+            tool_calls,
+            error: None,
+        },
+        Err(e) => ai::ChatReply {
+            content: String::new(),
+            tool_calls,
+            error: Some(e.to_string()),
+        },
+    })
+}
+
+/// ai_chat の本体。アシスタントの最終メッセージを返し、実行したツール
+/// 呼び出しは (失敗時も呼び出し側が拾えるよう) 引数の Vec へ積む。
+async fn run_ai_chat(
+    state: &AppState,
+    connection: &str,
+    history: &[ai::ChatTurn],
+    request_id: &str,
+    tool_calls: &mut Vec<ai::ChatToolCall>,
+) -> Result<String, AppError> {
+    let connection = connection.to_string();
+    let mut messages = ai::chat_history_messages(history);
+    if messages.is_empty() {
+        return Err(AppError::Ai("The chat history is empty".into()));
+    }
+    // 中断はリクエスト ID で判定する。接続単位のカウンタだと、同じ接続で
+    // 2 本走る時に区別できず、開始直後に届いた中断も「開始時の基準値」に
+    // 吸収されてしまう。ID なら、このコマンドが走り出す前に届いた中断も
+    // ここで拾える
+    let cancelled = || async { state.chat_cancels.is_cancelled(&request_id).await };
+    if cancelled().await {
+        return Err(AppError::Cancelled);
+    }
+
+    let (ai_config, server, active_schema, schema_map) =
+        state.resolve_ai_context(&connection).await?;
+    // コンテキスト解決の間に中断されていたら、ここで打ち切る
+    // (この時点の schema_map / プロンプトは既に古い可能性がある)
+    if cancelled().await {
+        return Err(AppError::Cancelled);
+    }
+    // AI 非対応のエンジン (redis / elasticsearch / dynamodb) はフロントでも
+    // 入力を塞いでいるが、コマンド側でも拒否する (プロンプトが SQL 前提のため)
+    if !engines::capabilities_for_name(&server.engine).supports_ai {
+        return Err(AppError::Ai(format!(
+            "The AI features are not available for the '{}' engine",
+            server.engine
+        )));
+    }
+    let system_prompt =
+        ai::build_chat_system_prompt(&server.engine, active_schema.as_deref(), &schema_map);
+    messages.insert(
+        0,
+        serde_json::json!({ "role": "system", "content": system_prompt }),
+    );
+
+    // config が readonly ならその案内を出したいので Config を使い、
+    // それ以外でも Switch (= 読み取り専用) に固定する。
+    let readonly_guard = if server.readonly {
+        db::ReadonlyGuard::Config
+    } else {
+        db::ReadonlyGuard::Switch
+    };
+    // ユーザーのクエリのキャンセル (接続名がキー) と衝突せず、同じ接続の
+    // 別の往復とも衝突しないキーを使う
+    let cancel_key = chat_cancel_key(&connection, &request_id);
+
+    let engine = db::parse_engine(&server.engine)?;
+    // ツール実行の累計。1 応答が複数の tool_calls を並べられるため、
+    // 往復回数 (ラウンド) とは別に累計でも上限を課す
+    let mut executed_calls = 0usize;
+    for _ in 0..ai::CHAT_MAX_TOOL_ROUNDS {
+        // 累計上限に達したら、ツールを渡さず最後の回答を書かせる
+        // (上限超過をエラーにせず、そこまでに読めた内容で答えさせる)
+        let allow_tools = executed_calls < ai::CHAT_MAX_TOOL_CALLS;
+        // 会話が破棄された (接続 / スキーマ切替・Clear・Stop) なら、
+        // 次のモデル呼び出しもツール実行も行わずに打ち切る
+        if cancelled().await {
+            return Err(AppError::Cancelled);
+        }
+        let message = ai::chat_step(&ai_config, &messages, allow_tools).await?;
+        // モデルの応答を待つ間に中断された場合、その応答は採用しない
+        // (ツール無しの応答で終わる往復が最も多いため、ここを見落とすと
+        //  Stop を押しても普通の回答が返ってくる)
+        if cancelled().await {
+            return Err(AppError::Cancelled);
+        }
+        let requested = ai::parse_tool_calls(&message);
+        if requested.is_empty() {
+            let content = ai::message_content(&message);
+            if content.is_empty() {
+                return Err(AppError::Ai(
+                    "The AI returned an empty message".into(),
+                ));
+            }
+            return Ok(content);
+        }
+        // ツール呼び出しを含むアシスタントメッセージはそのまま履歴へ積む
+        // (tool メッセージは直前の tool_calls と対応していなければならない)
+        messages.push(message);
+        for (id, name, arguments) in requested {
+            // 1 応答内で複数の tool_calls を並べられるため、累計でも打ち切る。
+            // 打ち切った分にも tool メッセージは返す (tool_calls と対応する
+            // tool メッセージが欠けると API がエラーになる)
+            if executed_calls >= ai::CHAT_MAX_TOOL_CALLS {
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": format!(
+                        "Error: the tool call budget ({}) for this reply is exhausted. \
+                         Answer with what you have.",
+                        ai::CHAT_MAX_TOOL_CALLS
+                    ),
+                }));
+                continue;
+            }
+            if cancelled().await {
+                return Err(AppError::Cancelled);
+            }
+            executed_calls += 1;
+            let (ok, argument, result_text) = if name == "run_sql" {
+                match ai::parse_run_sql_argument(&arguments) {
+                    Ok(sql) => {
+                        // DB へ実際に投げたか (投げていない中断を「実行した」
+                        // と記録しないための目印)
+                        let mut started = false;
+                        let outcome = async {
+                            // エージェント経路は通常の readonly ガードより狭い
+                            // ホワイトリストを課す (CALL / PRAGMA / 複文を落とす)
+                            if let Some(reason) = db::agent_rejection_reason(&sql, engine) {
+                                return Err(AppError::Readonly(reason));
+                            }
+                            // プール取得 (SSH トンネルの確立を含む) は待ちが
+                            // 長い。その間に届いた中断は CancelRegistry には
+                            // 届かない (run_query_cancellable がまだ登録して
+                            // いない) ので、実行の直前にもう一度確認する
+                            let pool = state.db.get_pool(&server).await?;
+                            if cancelled().await {
+                                return Err(AppError::Cancelled);
+                            }
+                            started = true;
+                            // run_query_cancellable は内部で登録するまでの間
+                            // (コネクション取得・セッション ID 照会) キャンセル
+                            // レジストリに現れないため、そこへ届いた中断は
+                            // 空振りする。ポーリングで自前に監視し、中断されたら
+                            // クエリの future を drop して待つのをやめる
+                            // (サーバー側は登録済みなら停止し、未登録なら
+                            //  クライアント側の打ち切りになる)
+                            let query = db::run_query_cancellable(
+                                &pool,
+                                &state.query_cancels,
+                                &cancel_key,
+                                &sql,
+                                ai::CHAT_TOOL_MAX_ROWS,
+                                None,
+                                readonly_guard,
+                                // エージェントには危険な文も許可しない
+                                false,
+                            );
+                            tokio::pin!(query);
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    result = &mut query => break result,
+                                    _ = tokio::time::sleep(
+                                        std::time::Duration::from_millis(
+                                            CHAT_CANCEL_POLL_INTERVAL_MS,
+                                        ),
+                                    ) => {
+                                        if cancelled().await {
+                                            // future を drop するだけでは
+                                            // spawn_blocking で走るエンジン
+                                            // (DuckDB) は止まらない。この時点
+                                            // では登録が済んでいるはずなので、
+                                            // エンジン別のキャンセル
+                                            // (DuckDB の InterruptHandle 等) を
+                                            // 改めて要求してから待つのをやめる
+                                            let _ = state
+                                                .query_cancels
+                                                .cancel(&cancel_key)
+                                                .await;
+                                            break Err(AppError::Cancelled);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        .await;
+                        // 中断で終える場合も、DB へ投げた SQL は記録に残す
+                        // (結果はモデルにもユーザーにも見せないが、「何を
+                        //  実行したか」を隠さない)。中断の狙いは「破棄した /
+                        // 切り替えた後のデータを AI プロバイダへ送らないこと」
+                        // なので、結果だけを捨てて往復ごと終える
+                        let cancelled_now = cancelled().await;
+                        if cancelled_now || matches!(outcome, Err(AppError::Cancelled)) {
+                            // DB へ投げる前に中断した分は「実行した」と
+                            // 記録しない (実行していないクエリを一覧に
+                            // 出すと、監査としてかえって誤解を招く)
+                            if started {
+                                tool_calls.push(ai::ChatToolCall {
+                                    name: name.clone(),
+                                    argument: sql,
+                                    ok: false,
+                                    // 実行に入ったことは分かるが、コネクション
+                                    // 取得の途中で止まった可能性もあるため
+                                    // 「実行した」と断定はしない
+                                    summary: "Cancelled (may not have run)".to_string(),
+                                });
+                            }
+                            return Err(AppError::Cancelled);
+                        }
+                        match outcome {
+                            Ok(result) => (true, sql, format_chat_tool_result(&result)),
+                            Err(e) => (false, sql, format!("Error: {e}")),
+                        }
+                    }
+                    Err(e) => (false, arguments.clone(), format!("Error: {e}")),
+                }
+            } else {
+                (
+                    false,
+                    arguments.clone(),
+                    format!("Error: unknown tool '{name}'"),
+                )
+            };
+            tool_calls.push(ai::ChatToolCall {
+                name: name.clone(),
+                argument,
+                ok,
+                // 要約は 1 行に収める (フロントのツールチップ表示用)
+                summary: result_text.lines().next().unwrap_or("").to_string(),
+            });
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": id,
+                "content": result_text,
+            }));
+        }
+    }
+    // 往復の上限に達した場合も、ツールを渡さない最後の 1 回で回答を書かせる
+    // (ここまでのツール結果は履歴に載っているので、調べた内容を無駄にしない)
+    if cancelled().await {
+        return Err(AppError::Cancelled);
+    }
+    let message = ai::chat_step(&ai_config, &messages, false).await?;
+    if cancelled().await {
+        return Err(AppError::Cancelled);
+    }
+    let content = ai::message_content(&message);
+    if content.is_empty() {
+        return Err(AppError::Ai(format!(
+            "The AI kept calling tools without answering (stopped after {} rounds)",
+            ai::CHAT_MAX_TOOL_ROUNDS
+        )));
+    }
+    Ok(content)
+}
+
 /// 設定の解決結果を返す (情報表示用。機密を含まない)。
 /// マージ済み設定 (キャッシュ) から作るので、config_override_command で
 /// 上書きされた sqlfiles_dir 等も実際に使われている値が表示される。
@@ -1471,6 +1893,8 @@ pub fn run() {
             ai_explain_plan,
             ai_explain_sql,
             ai_fix_sql,
+            ai_chat,
+            cancel_ai_chat,
             get_config_info,
             ensure_config_file,
             read_config_file,

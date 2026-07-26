@@ -1,7 +1,13 @@
 import { toast } from "svelte-sonner";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import * as api from "$lib/api";
-import type { AiInfo, ConnectionInfo, QueryResult } from "$lib/api";
+import type {
+  AiInfo,
+  ChatToolCall,
+  ChatTurn,
+  ConnectionInfo,
+  QueryResult,
+} from "$lib/api";
 import { merge3 } from "$lib/mergeText";
 
 const AUTO_SAVE_DELAY_MS = 1000;
@@ -32,6 +38,18 @@ export interface ResultTab {
   /// AI が返した修正案の SQL (無ければ null)。自動実行はせず、
   /// ユーザーの Apply でエディタに挿入する
   fixSuggestion: string | null;
+}
+
+/// AI チャットペインに表示する 1 メッセージ。
+/// LLM へ送るのは role / content だけで、それ以外は表示用の付随情報。
+export interface ChatMessage {
+  id: number;
+  role: "user" | "assistant";
+  content: string;
+  /// この応答を作る過程でエージェントが実行した読み取りクエリ (assistant のみ)
+  toolCalls?: ChatToolCall[];
+  /// 応答の取得に失敗した (エラー文言を content に入れて赤く表示する)
+  failed?: boolean;
 }
 
 /// タブの SQL が EXPLAIN 由来かを判定する (Analyze with AI ボタンの表示用)。
@@ -89,6 +107,31 @@ let aiAnalysis = $state<string | null>(null);
 let aiExplaining = $state(false);
 /// AI による選択 SQL 解説の Markdown (モーダル表示中のみ非 null)
 let aiExplanation = $state<string | null>(null);
+/// AI チャット (右ペイン) の表示中メッセージ。
+/// 接続ごとにスキーマが変わるため、接続を切り替えたら破棄する。
+let chatMessages = $state<ChatMessage[]>([]);
+/// 応答待ちの往復が属するチャット世代 (待機中でなければ null)。
+/// 会話を破棄した後も古い往復のスピナーが新しい会話に残らないよう、
+/// 表示上の「送信中」は現在の世代と一致する時だけとする (chatSending)。
+let chatSendingGen = $state<number | null>(null);
+/// 応答待ちの往復を実行している接続 → その往復のリクエスト ID の集合。
+/// クエリ実行と同じく「実行中の接続」として扱い、エディタタブが無いだけで
+/// トンネル / プールが切られる (maybeDisconnectIfIdle) のを防ぐ。
+/// 会話を破棄すると古い往復が走ったまま次の送信を許すため、同じ接続で
+/// 複数本が同時に走りうる。どれを中断するかを指定できるよう、本数ではなく
+/// ID の集合で持つ (Map は毎回作り直して反応性を保つ)。
+let chatRunningConnections = $state<Map<string, Set<string>>>(new Map());
+
+/// チャットの往復に付ける ID の採番 (プロセス内で一意なら十分)。
+let nextChatRequestSeq = 1;
+
+/// 進行中の「会話の破棄 → 中断の到達待ち → バックエンドの切替」の本数。
+/// この間は新しい送信を受け付けない: 中断要求は「その時点の実行中 ID」を
+/// 対象にするため、待っている隙に送られた往復は中断されないまま、
+/// 切替後のプールを古いプロンプトで使ってしまう。
+/// 真偽値だと、遷移が重なった時 (スキーマを続けて切り替えた等) に先に
+/// 終わった方が後続の分まで解除してしまうためカウンタで持つ。
+let chatTransitions = $state(0);
 /// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得・取得失敗は null)
 let schemaMap = $state<Record<string, string[]> | null>(null);
 /// 危険な文 (allow_dangerous_statements 有効な接続) の実行前確認ダイアログ。
@@ -187,12 +230,21 @@ const reloadConnections = async (): Promise<boolean> => {
   if (!(await saveAllDirtyTabs())) {
     return false;
   }
+  // 応答待ちのチャットは resetConnections の**前に**中断し、要求が届くまで
+  // 待つ。後回し / 投げっぱなしだと、リロード前の接続設定を握ったままの
+  // エージェントが破棄済みのプールを開き直し、古い認証情報 / スキーマで
+  // ツール実行を続けうる
+  await clearChatAndWait();
   try {
     await api.resetConnections();
   } catch (e) {
+    endChatTransition();
     errorMessage = toErrorMessage(e);
     return false;
   }
+  // バックエンドの入れ替えは済んだので、チャットの遷移は終わり
+  // (以降に送られる往復は新しい設定で動く)
+  endChatTransition();
   const previousConnection = selectedConnection;
   selectedConnection = null;
   // 設定リロードで接続が入れ替わるため、Writable も安全側 (OFF) へ戻す
@@ -227,6 +279,7 @@ const reloadConnections = async (): Promise<boolean> => {
   aiError = null;
   aiAnalysis = null;
   aiExplanation = null;
+  // チャットの中断と破棄は resetConnections の前に済ませてある (clearChat)
   // 実行中の取得が後から古いマップを書き込まないよう世代を進めて破棄する
   schemaMapGeneration++;
   schemaMap = null;
@@ -353,6 +406,10 @@ const applyConnectionContext = async (name: string): Promise<boolean> => {
   // 同一接続の再選択 (同接続のエディタタブ切替など) では維持する。
   if (selectedConnection !== name) {
     writable = false;
+    // AI チャットの会話も破棄し、走っているエージェントを中断する。
+    // system prompt に載るスキーマが接続ごとに違うため会話は引き継げず、
+    // 破棄するだけではバックエンドが切替前の接続でツール実行を続ける
+    clearChat();
   }
   selectedConnection = name;
   errorMessage = filesError;
@@ -574,6 +631,11 @@ const changeActiveSchema = async (schema: string): Promise<boolean> => {
   }
   // 未保存タブは best-effort で保存 (失敗してもスキーマ切替は止めない)
   await flushPendingSave();
+  // AI チャットの会話は切替の**前に**破棄し、中断が届くまで待つ。
+  // system prompt に載るスキーマが変わるため会話は引き継げず、切替が
+  // 先行すると応答待ちの往復が古いプロンプトのまま新しいスキーマの
+  // プールでクエリを実行してしまう
+  await clearChatAndWait();
   try {
     await api.setActiveSchema(connection, schema);
     // 切替中に別接続へ移っていたら、そのスキーマ表示を新接続に適用しない
@@ -588,6 +650,9 @@ const changeActiveSchema = async (schema: string): Promise<boolean> => {
   } catch (e) {
     errorMessage = toErrorMessage(e);
     return false;
+  } finally {
+    // 成否によらず遷移を終える (失敗時に入力が塞がったままにならないように)
+    endChatTransition();
   }
 };
 
@@ -1161,7 +1226,11 @@ let applyingConnections = $state(new Set<string>());
 /// セル編集の適用中 (applyingConnections) も実行中として扱う。
 const isConnectionRunning = (connection: string): boolean =>
   resultTabs.some((t) => t.running && t.connection === connection) ||
-  applyingConnections.has(connection);
+  applyingConnections.has(connection) ||
+  // AI チャットのツール実行もこの接続のプールを使う。実行中に切られると
+  // 途中のコネクションが壊れ、次のツール往復が追跡されないトンネルを
+  // 開き直してしまう
+  chatRunningConnections.has(connection);
 
 /// 実行結果の書き込み先タブを決める。
 /// アクティブな非ピン留めタブがあれば使い回し、無ければ新規タブを作る。
@@ -1274,6 +1343,11 @@ const applySwitchedSchema = (connection: string, schema: string) => {
     return;
   }
   activeSchema = schema;
+  // changeActiveSchema と同じ理由で AI チャットの会話は破棄する。
+  // ただし `\c` はクエリの実行そのものが切替なので、切替の前に中断する
+  // ことはできない (実行後に結果として知る)。中断要求が届くまでの短い間、
+  // 応答待ちのエージェントが切替後のスキーマを読みうる
+  clearChat();
   // 補完候補は切替先のものを取り直す (待たない)
   void loadSchemaMap();
   toast.success(`Switched to ${schema}`);
@@ -1503,6 +1577,173 @@ const explainSql = async (sql: string) => {
 /// AI による選択 SQL 解説のモーダルを閉じる
 const closeAiExplanation = () => {
   aiExplanation = null;
+};
+
+/// チャットメッセージの ID 採番 (表示用の key。バックエンドへは送らない)
+let nextChatMessageId = 1;
+
+/// チャットの世代。会話を破棄するたびに進める
+/// (接続切替・スキーマ切替・Clear・設定リロード)。
+/// 応答待ちの間に会話が破棄されたかを、接続名の比較だけでなくこの世代でも見る:
+/// 設定リロードは同じ名前の接続を作り直すため、名前だけでは「リロードを挟んだ
+/// 古い接続の応答」を弾けない (バックエンドはリロード前の接続設定・スキーマの
+/// まま応答を返す)。スキーマ切替も接続名は変わらないため同様。
+let chatGeneration = $state(0);
+
+/// チャットの往復の開始を記録する。
+const retainChatRequest = (connection: string, requestId: string) => {
+  const next = new Map(chatRunningConnections);
+  next.set(connection, new Set(next.get(connection)).add(requestId));
+  chatRunningConnections = next;
+};
+
+/// チャットの往復の終了を記録する。
+/// その接続で走っている最後の 1 本だった場合だけ true を返す
+/// (切断の再判定は最後の 1 本の完了時にだけ行う)。
+const releaseChatRequest = (connection: string, requestId: string): boolean => {
+  const next = new Map(chatRunningConnections);
+  const ids = new Set(next.get(connection));
+  ids.delete(requestId);
+  if (ids.size > 0) {
+    next.set(connection, ids);
+  } else {
+    next.delete(connection);
+  }
+  chatRunningConnections = next;
+  return ids.size === 0;
+};
+
+/// AI チャット (右ペイン) にユーザーの発言を積み、応答を 1 往復もらう。
+/// 会話履歴は毎回まるごとバックエンドへ送る (会話状態はフロントが持つ)。
+const sendChatMessage = async (text: string) => {
+  const message = text.trim();
+  if (!message) {
+    return;
+  }
+  if (!selectedConnection) {
+    toast.warning("Select a connection first");
+    return;
+  }
+  // 二重送信防止 (送信ボタンも disabled にしているが防御的にガードする)。
+  // 破棄済みの往復が残っている間は送信を許す (新しい会話を待たせない)
+  if (chatSendingGen !== null && chatSendingGen === chatGeneration) {
+    return;
+  }
+  // 接続 / スキーマ切替・設定リロードの遷移中は受け付けない
+  if (chatTransitions > 0) {
+    return;
+  }
+  const connection = selectedConnection;
+  const generation = chatGeneration;
+  chatMessages = [
+    ...chatMessages,
+    { id: nextChatMessageId++, role: "user", content: message },
+  ];
+  // 失敗した応答は履歴に残すが LLM へは送らない (エラー文言を会話の一部と
+  // 誤解させないため)
+  const history: ChatTurn[] = chatMessages
+    .filter((m) => !m.failed)
+    .map((m) => ({ role: m.role, content: m.content }));
+  chatSendingGen = generation;
+  // 中断はこの ID を指定して行う (同じ接続で複数の往復が走りうる)
+  const requestId = `chat-${nextChatRequestSeq++}`;
+  // エージェントのツール実行中はこの接続を「実行中」として扱い、
+  // エディタタブが無いだけでトンネル / プールを切られないようにする
+  retainChatRequest(connection, requestId);
+  try {
+    const reply = await api.aiChat(connection, history, requestId);
+    // 応答待ちの間に会話が破棄されていたら捨てる (接続切替・Clear・設定
+    // リロード)。設定リロードは同名の接続を作り直すため、接続名の比較だけ
+    // では弾けない
+    if (selectedConnection !== connection || chatGeneration !== generation) {
+      return;
+    }
+    // 失敗した往復も (reject ではなく) error 付きで返る。実行した
+    // クエリは成功時と同じく表示する
+    chatMessages = [
+      ...chatMessages,
+      {
+        id: nextChatMessageId++,
+        role: "assistant",
+        content: reply.error ?? reply.content,
+        toolCalls: reply.tool_calls,
+        failed: reply.error !== null,
+      },
+    ];
+  } catch (e) {
+    if (selectedConnection !== connection || chatGeneration !== generation) {
+      return;
+    }
+    chatMessages = [
+      ...chatMessages,
+      {
+        id: nextChatMessageId++,
+        role: "assistant",
+        content: toErrorMessage(e),
+        failed: true,
+      },
+    ];
+  } finally {
+    // より新しい往復が始まっていたら、その待機状態を消さない
+    if (chatSendingGen === generation) {
+      chatSendingGen = null;
+    }
+    // クエリ実行と同じく、実行が終わった時点で切断を再判定する
+    // (実行中は切れないので、他の接続へ移った後もトンネルが残っている)。
+    // 同じ接続で別の往復がまだ走っているなら判定しない
+    if (releaseChatRequest(connection, requestId)) {
+      maybeDisconnectIfIdle(connection);
+    }
+  }
+};
+
+/// 走っているエージェントに中断を要求し、要求がバックエンドに届くまで待つ。
+/// 中断要求の失敗で呼び出し側の処理を止めない (実行はいずれ終わる)。
+const requestChatCancel = async () => {
+  await Promise.all(
+    [...chatRunningConnections.entries()].map(([connection, ids]) =>
+      api.cancelAiChat(connection, [...ids]).catch(() => {}),
+    ),
+  );
+};
+
+/// 応答待ちのエージェントを止める (Stop ボタン)。会話は残すので、
+/// 中断されたことは失敗メッセージとして会話に出る。
+const stopChat = () => {
+  void requestChatCancel();
+};
+
+/// AI チャットの会話を捨てる
+/// (Clear ボタン / 接続切替 / スキーマ切替 / 設定リロード)。
+/// 世代を進めて、応答待ちの往復が破棄後の会話へ書き込むのを防ぐ。
+/// 待機表示 (chatSending) も世代で判定するため、破棄と同時に消える。
+///
+/// 応答を捨てるだけではバックエンドのエージェントは走り続け、重いクエリや
+/// 次のツール往復 (切替後のスキーマを読む) がそのまま実行されてしまうため、
+/// 実行中の接続には中断も要求する。
+const clearChat = () => {
+  chatGeneration++;
+  chatMessages = [];
+  void requestChatCancel();
+};
+
+/// 会話を破棄し、中断要求がバックエンドに届くまで待つ。
+/// バックエンドの状態を書き換える操作 (スキーマ切替・設定リロード) の
+/// **前**に使う: 投げっぱなしだと、中断カウンタが進む前に切替が先行し、
+/// 古いエージェントが新しいスキーマ / プールでツール実行を続けうる。
+const clearChatAndWait = async () => {
+  chatGeneration++;
+  chatMessages = [];
+  // 中断の到達を待つ間に新しい往復を始めさせない (始まってしまうと、
+  // その往復は中断対象に入らないまま切替後のプールを使う)。
+  // 呼び出し側は切替の完了後に endChatTransition() を呼ぶ
+  chatTransitions++;
+  await requestChatCancel();
+};
+
+/// clearChatAndWait で始めた遷移の終了 (成否によらず必ず 1 回だけ呼ぶ)。
+const endChatTransition = () => {
+  chatTransitions = Math.max(0, chatTransitions - 1);
 };
 
 /// タブに記録された SQL を同じ接続で再実行する
@@ -1943,6 +2184,18 @@ export default {
   get aiExplanation() {
     return aiExplanation;
   },
+  /// AI チャット (右ペイン) の表示中メッセージ
+  get chatMessages() {
+    return chatMessages;
+  },
+  /// AI チャットの応答待ち (破棄済みの往復は待機扱いにしない)。
+  /// 切替の遷移中も入力を塞ぐため true にする
+  get chatSending() {
+    return (
+      chatTransitions > 0 ||
+      (chatSendingGen !== null && chatSendingGen === chatGeneration)
+    );
+  },
   /// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得なら null)
   get schemaMap() {
     return schemaMap;
@@ -1986,6 +2239,9 @@ export default {
   closeAiAnalysis,
   explainSql,
   closeAiExplanation,
+  sendChatMessage,
+  clearChat,
+  stopChat,
   cancelQuery,
   rerunTab,
   submitCellEdits,

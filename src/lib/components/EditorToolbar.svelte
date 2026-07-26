@@ -131,8 +131,10 @@
   };
 </script>
 
+<!-- 狭いウインドウ (チャットペインを開いた時など) でボタン列がはみ出して
+     見えなくなるのを防ぐため、収まらない分は折り返す -->
 <div
-  class="flex shrink-0 items-center gap-2 border-b border-zinc-700 bg-zinc-900 px-3 py-1"
+  class="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-zinc-700 bg-zinc-900 px-3 py-1"
 >
   {#if engine}
     <span
@@ -206,7 +208,9 @@
     {/if}
   {/if}
 
-  <div class="ml-auto flex min-w-0 items-center gap-2">
+  <div
+    class="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-x-2 gap-y-1"
+  >
     <!-- 複数行選択中のみ表示。行単位の一括置換ペインを開く -->
     {#if showReplaceMultiline}
       <button

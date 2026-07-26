@@ -276,6 +276,51 @@ export const aiExplainPlan = (
 export const aiExplainSql = (connection: string, sql: string) =>
   invoke<string>("ai_explain_sql", { connection, sql });
 
+/// AI チャットの 1 ターン (バックエンドの ai::ChatTurn に対応)。
+/// role は "user" / "assistant" のみ (system はバックエンドが組み立てる)。
+export interface ChatTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
+/// AI エージェントが実行したツール呼び出しの記録
+/// (バックエンドの ai::ChatToolCall に対応)。
+export interface ChatToolCall {
+  name: string;
+  /// 実行した SQL (引数のパースに失敗した場合は生の引数)
+  argument: string;
+  ok: boolean;
+  /// 結果の要約 (行数 / エラーメッセージの 1 行目)
+  summary: string;
+}
+
+/// AI チャット 1 往復の応答 (バックエンドの ai::ChatReply に対応)。
+/// 失敗した往復も reject ではなくこの形で返る (途中まで実行したクエリを
+/// 隠さないため)。error が非 null なら失敗で、content は空。
+export interface ChatReply {
+  content: string;
+  tool_calls: ChatToolCall[];
+  error: string | null;
+}
+
+/// AI チャット (エージェント) の 1 往復を実行する。会話履歴は毎回そのまま
+/// 送り、system prompt の組み立てとツール実行ループはバックエンドが行う。
+/// エージェントが実行できるのは読み取り専用の SQL のみ。
+/// requestId はフロントが採番する往復の識別子 (中断はこの ID を指定する。
+/// 同じ接続で複数の往復が走りうるため接続名だけでは区別できない)。
+export const aiChat = (
+  connection: string,
+  history: ChatTurn[],
+  requestId: string,
+) => invoke<ChatReply>("ai_chat", { connection, history, requestId });
+
+/// AI チャットのエージェントの往復を中断する (実行中のクエリを止め、
+/// 次のモデル呼び出し・ツール往復も行わせない)。まだ ai_chat が走り出す
+/// 前の ID も指定でき、その場合は開始時に中断される。
+/// 実行中のクエリを実際に止めたら true。
+export const cancelAiChat = (connection: string, requestIds: string[]) =>
+  invoke<boolean>("cancel_ai_chat", { connection, requestIds });
+
 /// `queryfolio://open/<path>` deep link / CLI で指定された「開く対象」
 /// (バックエンドの router::OpenTarget に対応)。
 export interface OpenTarget {

@@ -449,6 +449,39 @@ message can itself embed data values (for example, a unique-constraint violation
 often includes the conflicting key value), so it is not strictly free of row data.
 Generated SQL is inserted into the editor, never auto-executed.
 
+### AI chat pane
+
+The toolbar's **Chat** button opens a chat pane on the right. Unlike the helpers
+above, the assistant there can **run SQL itself** (a `run_sql` tool) to answer
+questions about your data, so the rows it reads are sent back to the model as
+tool results. Everything else it receives is the same: schema, dialect, active
+schema name, and your messages — never connection details.
+
+Those queries go through a **read-only guard** that ignores the Writable switch.
+The agent path is stricter than read-only mode itself: only `SELECT` / `WITH` /
+`SHOW` / `DESCRIBE` / `DESC` / `EXPLAIN` / `VALUES` / `TABLE` statements are
+accepted (`CALL` is refused because a stored procedure can write, and `PRAGMA`
+because it can change database settings), `EXPLAIN ANALYZE` is refused (it
+executes the statement it explains), multiple statements in one call are
+refused, and `allow_dangerous_statements` is never applied. Results are capped
+at 50 rows, and per reply the assistant may go at most 6 rounds and run at most
+12 queries in total.
+
+> **The guard is statement-level, not database-enforced.** It shares the known
+> limit of read-only mode: a `SELECT` that calls a side-effecting function
+> (`nextval()`, a user-defined function that writes) is not detected. If you
+> need a hard guarantee, point the connection at **read-only credentials** —
+> that is the only thing this client cannot talk its way around.
+
+While the assistant is working, a **Stop** button cancels the query it is
+running and ends the round trip. Switching connections or schemas, clearing the
+conversation, and reloading the config cancel it too, so a discarded reply does
+not leave a query running.
+
+Every query it ran is listed above the answer,
+so you can check what it looked at. The conversation is cleared when you switch
+connections (the schema in the prompt changes) and is not persisted to disk.
+
 ## Auto `LIMIT` (`default_limit`)
 
 `default_limit` appends `LIMIT n` to `SELECT` statements that do not already have
