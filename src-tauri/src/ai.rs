@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::AppError;
 
 /// model 省略時に使う OpenAI のデフォルトモデル。
-pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.1";
+pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.6-luna";
 
 /// base_url 省略時の OpenAI API ベース URL。
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";

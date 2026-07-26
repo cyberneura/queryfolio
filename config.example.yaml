@@ -226,7 +226,7 @@ server_templates:
 # ai:
 #   provider: openai   # 現状 openai のみ対応
 #   api_key: sk-your-api-key
-#   model: gpt-5.1     # 任意 (省略時 gpt-5.1)
+#   model: gpt-5.6-luna   # 任意 (省略時 gpt-5.6-luna)
 #   base_url: https://api.openai.com/v1  # 任意 (OpenAI 互換 API 用)
 
 # --- LIMIT 未指定の SELECT に自動付与する行数上限 (任意。デフォルト 500、0 で無効) ---
