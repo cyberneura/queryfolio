@@ -10,7 +10,7 @@ in the repository root.
 
 - [File location](#file-location)
 - [Editing the config](#editing-the-config)
-- [Connections (`sql_servers`)](#connections-sql_servers)
+- [Connections (`servers`)](#connections-servers)
   - [Common keys](#common-keys)
   - [Engines](#engines)
   - [Safety guards (`readonly`, `allow_dangerous_statements`)](#safety-guards)
@@ -53,14 +53,18 @@ You can edit the file with any text editor, or from inside the app:
 After editing the file directly, reload connections (reopen the app or use the
 menu) to pick up the changes.
 
-## Connections (`sql_servers`)
+## Connections (`servers`)
 
-`sql_servers` is a **list** of connection definitions. This format is compatible
-with `sql-agent-mcp-server`. Writing a mapping here (instead of a list) is an
-error.
+`servers` is a **list** of connection definitions. Each entry has the same
+shape as `sql-agent-mcp-server` (where the top-level key is `sql_servers`).
+Writing a mapping here (instead of a list) is an error.
+
+> **Renamed:** this key used to be `sql_servers`, and `server_templates` used to
+> be `sql_server_templates`. The old names are rejected with an error, so rename
+> them in your config file.
 
 ```yaml
-sql_servers:
+servers:
   - name: dev-postgres
     description: "Development PostgreSQL"
     engine: postgres
@@ -332,16 +336,16 @@ works).
 
 ## Connection groups
 
-Wrap servers in a `group_name` + nested `sql_servers` entry to show them under a
+Wrap servers in a `group_name` + nested `servers` entry to show them under a
 group heading in the connections list (queryfolio extension). Grouped and plain
 (ungrouped) servers can be mixed; the display order follows the config order.
 Groups cannot be nested (a group inside a group is an error), and a group entry
-may only contain `group_name` and `sql_servers`.
+may only contain `group_name` and `servers`.
 
 ```yaml
-sql_servers:
+servers:
   - group_name: production
-    sql_servers:
+    servers:
       - name: prod-main
         engine: mysql
         host: prod.example.com
@@ -359,12 +363,12 @@ Templates (see below) still work inside a group.
 
 ## Connection templates
 
-Define reusable defaults under `sql_server_templates`, then reference one with
+Define reusable defaults under `server_templates`, then reference one with
 `template: <name>` on a server. Keys set on the server override the same key in
 the template (shallow merge).
 
 ```yaml
-sql_server_templates:
+server_templates:
   - name: my-awesome-sql-host
     engine: mysql
     host: db.example.com
@@ -372,7 +376,7 @@ sql_server_templates:
     user: shared_user
     password: shared_password
 
-sql_servers:
+servers:
   - name: reporting
     template: my-awesome-sql-host
     schema: reporting_db      # host/port/user/password inherited
@@ -392,10 +396,10 @@ Merge rules (`config.rs > merge_mapping`):
 
 - **Mappings are merged recursively** — e.g. you can override just `ai.api_key`
   and keep the local `ai.model`.
-- **Scalars and lists (including `sql_servers`) are replaced wholesale** — lists
+- **Scalars and lists (including `servers`) are replaced wholesale** — lists
   are not merged element-by-element, because there is no reliable element
   identity.
-- **Any key** can be overridden this way, not just `sql_servers`.
+- **Any key** can be overridden this way, not just `servers`.
 
 Notes:
 
