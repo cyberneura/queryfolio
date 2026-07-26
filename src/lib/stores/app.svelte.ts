@@ -124,6 +124,12 @@ let chatRunningConnections = $state<Map<string, Set<string>>>(new Map());
 
 /// チャットの往復に付ける ID の採番 (プロセス内で一意なら十分)。
 let nextChatRequestSeq = 1;
+
+/// 会話の破棄 → 中断の到達待ち → バックエンドの切替、の遷移中。
+/// この間は新しい送信を受け付けない: 中断要求は「その時点の実行中 ID」を
+/// 対象にするため、待っている隙に送られた往復は中断されないまま、
+/// 切替後のプールを古いプロンプトで使ってしまう。
+let chatTransitioning = $state(false);
 /// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得・取得失敗は null)
 let schemaMap = $state<Record<string, string[]> | null>(null);
 /// 危険な文 (allow_dangerous_statements 有効な接続) の実行前確認ダイアログ。
@@ -230,9 +236,13 @@ const reloadConnections = async (): Promise<boolean> => {
   try {
     await api.resetConnections();
   } catch (e) {
+    endChatTransition();
     errorMessage = toErrorMessage(e);
     return false;
   }
+  // バックエンドの入れ替えは済んだので、チャットの遷移は終わり
+  // (以降に送られる往復は新しい設定で動く)
+  endChatTransition();
   const previousConnection = selectedConnection;
   selectedConnection = null;
   // 設定リロードで接続が入れ替わるため、Writable も安全側 (OFF) へ戻す
@@ -638,6 +648,9 @@ const changeActiveSchema = async (schema: string): Promise<boolean> => {
   } catch (e) {
     errorMessage = toErrorMessage(e);
     return false;
+  } finally {
+    // 成否によらず遷移を終える (失敗時に入力が塞がったままにならないように)
+    endChatTransition();
   }
 };
 
@@ -1614,6 +1627,10 @@ const sendChatMessage = async (text: string) => {
   if (chatSendingGen !== null && chatSendingGen === chatGeneration) {
     return;
   }
+  // 接続 / スキーマ切替・設定リロードの遷移中は受け付けない
+  if (chatTransitioning) {
+    return;
+  }
   const connection = selectedConnection;
   const generation = chatGeneration;
   chatMessages = [
@@ -1712,7 +1729,16 @@ const clearChat = () => {
 const clearChatAndWait = async () => {
   chatGeneration++;
   chatMessages = [];
+  // 中断の到達を待つ間に新しい往復を始めさせない (始まってしまうと、
+  // その往復は中断対象に入らないまま切替後のプールを使う)。
+  // 呼び出し側は切替の完了後に endChatTransition() を呼ぶ
+  chatTransitioning = true;
   await requestChatCancel();
+};
+
+/// clearChatAndWait で始めた遷移の終了 (成否によらず必ず呼ぶ)。
+const endChatTransition = () => {
+  chatTransitioning = false;
 };
 
 /// タブに記録された SQL を同じ接続で再実行する
@@ -2157,9 +2183,13 @@ export default {
   get chatMessages() {
     return chatMessages;
   },
-  /// AI チャットの応答待ち (破棄済みの往復は待機扱いにしない)
+  /// AI チャットの応答待ち (破棄済みの往復は待機扱いにしない)。
+  /// 切替の遷移中も入力を塞ぐため true にする
   get chatSending() {
-    return chatSendingGen !== null && chatSendingGen === chatGeneration;
+    return (
+      chatTransitioning ||
+      (chatSendingGen !== null && chatSendingGen === chatGeneration)
+    );
   },
   /// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得なら null)
   get schemaMap() {

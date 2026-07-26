@@ -1267,7 +1267,14 @@ async fn run_ai_chat(
                             if let Some(reason) = db::agent_rejection_reason(&sql, engine) {
                                 return Err(AppError::Readonly(reason));
                             }
+                            // プール取得 (SSH トンネルの確立を含む) は待ちが
+                            // 長い。その間に届いた中断は CancelRegistry には
+                            // 届かない (run_query_cancellable がまだ登録して
+                            // いない) ので、実行の直前にもう一度確認する
                             let pool = state.db.get_pool(&server).await?;
+                            if cancelled().await {
+                                return Err(AppError::Cancelled);
+                            }
                             db::run_query_cancellable(
                                 &pool,
                                 &state.query_cancels,
@@ -1282,6 +1289,14 @@ async fn run_ai_chat(
                             .await
                         }
                         .await;
+                        // 登録の隙間 (登録前に届いた中断) をすり抜けて実行
+                        // まで至った場合でも、読んだ行はモデルへ送らない。
+                        // 中断の狙いは「破棄した / 切り替えた後のデータを
+                        // AI プロバイダへ送らないこと」なので、結果を捨てて
+                        // 往復ごと終える
+                        if cancelled().await {
+                            return Err(AppError::Cancelled);
+                        }
                         match outcome {
                             Ok(result) => (true, sql, format_chat_tool_result(&result)),
                             // キャンセル要求で止まったクエリは、モデルに
