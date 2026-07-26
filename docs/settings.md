@@ -430,7 +430,7 @@ putting just `api_key` in the fetched YAML keeps your local `model`.
 ai:
   provider: openai   # only "openai" is supported for now
   api_key: sk-your-api-key
-  model: gpt-5.1                        # optional (default: gpt-5.1)
+  model: gpt-5.6-luna                   # optional (default: gpt-5.6-luna)
   base_url: https://api.openai.com/v1   # optional (for OpenAI-compatible APIs)
 ```
 
@@ -438,7 +438,7 @@ ai:
 |-----|----------|-------------|
 | `provider` | no | Currently only `openai` (default). An unknown value is an error. |
 | `api_key` | yes | The API key. It is not exposed through the app's AI status (which reports only whether AI is `configured` and the `model`), though the in-app config editor naturally shows the whole file, including this key. |
-| `model` | no | Model name (default `gpt-5.1`). |
+| `model` | no | Model name (default `gpt-5.6-luna`). |
 | `base_url` | no | Base URL for OpenAI-compatible APIs (default `https://api.openai.com/v1`). |
 
 What is sent to the AI: the schema (table / column names), the engine dialect,
