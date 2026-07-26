@@ -1080,9 +1080,16 @@ async fn ai_chat(
     // エージェントの実行には別のキーを使う
     let cancel_key = format!("{connection}\u{1}ai-chat");
 
+    let engine = db::parse_engine(&server.engine)?;
     let mut tool_calls: Vec<ai::ChatToolCall> = Vec::new();
+    // ツール実行の累計。1 応答が複数の tool_calls を並べられるため、
+    // 往復回数 (ラウンド) とは別に累計でも上限を課す
+    let mut executed_calls = 0usize;
     for _ in 0..ai::CHAT_MAX_TOOL_ROUNDS {
-        let message = ai::chat_step(&ai_config, &messages).await?;
+        // 累計上限に達したら、ツールを渡さず最後の回答を書かせる
+        // (上限超過をエラーにせず、そこまでに読めた内容で答えさせる)
+        let allow_tools = executed_calls < ai::CHAT_MAX_TOOL_CALLS;
+        let message = ai::chat_step(&ai_config, &messages, allow_tools).await?;
         let requested = ai::parse_tool_calls(&message);
         if requested.is_empty() {
             let content = ai::message_content(&message);
@@ -1100,10 +1107,31 @@ async fn ai_chat(
         // (tool メッセージは直前の tool_calls と対応していなければならない)
         messages.push(message);
         for (id, name, arguments) in requested {
+            // 1 応答内で複数の tool_calls を並べられるため、累計でも打ち切る。
+            // 打ち切った分にも tool メッセージは返す (tool_calls と対応する
+            // tool メッセージが欠けると API がエラーになる)
+            if executed_calls >= ai::CHAT_MAX_TOOL_CALLS {
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": format!(
+                        "Error: the tool call budget ({}) for this reply is exhausted. \
+                         Answer with what you have.",
+                        ai::CHAT_MAX_TOOL_CALLS
+                    ),
+                }));
+                continue;
+            }
+            executed_calls += 1;
             let (ok, argument, result_text) = if name == "run_sql" {
                 match ai::parse_run_sql_argument(&arguments) {
                     Ok(sql) => {
                         let outcome = async {
+                            // エージェント経路は通常の readonly ガードより狭い
+                            // ホワイトリストを課す (CALL / PRAGMA / 複文を落とす)
+                            if let Some(reason) = db::agent_rejection_reason(&sql, engine) {
+                                return Err(AppError::Readonly(reason));
+                            }
                             let pool = state.db.get_pool(&server).await?;
                             db::run_query_cancellable(
                                 &pool,

@@ -250,6 +250,9 @@ const reloadConnections = async (): Promise<boolean> => {
   aiError = null;
   aiAnalysis = null;
   aiExplanation = null;
+  // 設定リロードは同名の接続を作り直すため、in-flight のチャット応答を
+  // 名前比較では弾けない。世代を進めて破棄する
+  chatGeneration++;
   chatMessages = [];
   // 実行中の取得が後から古いマップを書き込まないよう世代を進めて破棄する
   schemaMapGeneration++;
@@ -379,6 +382,7 @@ const applyConnectionContext = async (name: string): Promise<boolean> => {
     writable = false;
     // AI チャットの会話も破棄する。system prompt に載るスキーマが接続ごとに
     // 違うため、別接続の会話を引き継ぐと噛み合わない回答になる
+    chatGeneration++;
     chatMessages = [];
   }
   selectedConnection = name;
@@ -1535,6 +1539,13 @@ const closeAiExplanation = () => {
 /// チャットメッセージの ID 採番 (表示用の key。バックエンドへは送らない)
 let nextChatMessageId = 1;
 
+/// チャットの世代。会話を破棄するたびに進める (接続切替・Clear・設定リロード)。
+/// 応答待ちの間に会話が破棄されたかを、接続名の比較だけでなくこの世代でも見る:
+/// 設定リロードは同じ名前の接続を作り直すため、名前だけでは「リロードを挟んだ
+/// 古い接続の応答」を弾けない (バックエンドはリロード前の接続設定・スキーマの
+/// まま応答を返す)。
+let chatGeneration = 0;
+
 /// AI チャット (右ペイン) にユーザーの発言を積み、応答を 1 往復もらう。
 /// 会話履歴は毎回まるごとバックエンドへ送る (会話状態はフロントが持つ)。
 const sendChatMessage = async (text: string) => {
@@ -1551,6 +1562,7 @@ const sendChatMessage = async (text: string) => {
     return;
   }
   const connection = selectedConnection;
+  const generation = chatGeneration;
   chatMessages = [
     ...chatMessages,
     { id: nextChatMessageId++, role: "user", content: message },
@@ -1563,9 +1575,10 @@ const sendChatMessage = async (text: string) => {
   chatSending = true;
   try {
     const reply = await api.aiChat(connection, history);
-    // 応答待ちの間に接続が切り替わった場合、この会話はもう破棄されている
-    // (別スキーマの回答を新しい会話に混ぜない)
-    if (selectedConnection !== connection) {
+    // 応答待ちの間に会話が破棄されていたら捨てる (接続切替・Clear・設定
+    // リロード)。設定リロードは同名の接続を作り直すため、接続名の比較だけ
+    // では弾けない
+    if (selectedConnection !== connection || chatGeneration !== generation) {
       return;
     }
     chatMessages = [
@@ -1578,7 +1591,7 @@ const sendChatMessage = async (text: string) => {
       },
     ];
   } catch (e) {
-    if (selectedConnection !== connection) {
+    if (selectedConnection !== connection || chatGeneration !== generation) {
       return;
     }
     chatMessages = [
@@ -1595,8 +1608,10 @@ const sendChatMessage = async (text: string) => {
   }
 };
 
-/// AI チャットの会話を捨てる (Clear ボタン / 接続切替)。
+/// AI チャットの会話を捨てる (Clear ボタン / 接続切替 / 設定リロード)。
+/// 世代を進めて、応答待ちの往復が破棄後の会話へ書き込むのを防ぐ。
 const clearChat = () => {
+  chatGeneration++;
   chatMessages = [];
 };
 

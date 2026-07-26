@@ -1399,6 +1399,48 @@ pub fn dangerous_statement_reason(engine: &str, sql: &str) -> Result<Option<Stri
 }
 
 /// 行を返す文かどうかを先頭キーワードで判定する。
+/// AI エージェント (チャットの run_sql ツール) に許可する文の先頭キーワード。
+/// ユーザー操作時の readonly ガード (is_fetch_statement) より意図的に狭い:
+/// - `call`: ストアドプロシージャは中で DML を実行できる (readonly ガードは
+///   中身を見られないため素通りする)
+/// - `pragma`: 括弧形など、代入検出をすり抜けて DB 設定を変えうる形がある
+///
+/// エージェントは「読むだけ」を構造的に保証したいので、少しでも書き込みが
+/// 走りうる入口は落とす (人間の操作と違い、拒否されても本人が直せない)。
+const AGENT_ALLOWED_KEYWORDS: &[&str] = &[
+    "select",
+    "with",
+    "show",
+    "describe",
+    "desc",
+    "explain",
+    "values",
+    "table",
+];
+
+/// AI エージェントが実行しようとした SQL を拒否すべきなら理由を返す。
+/// 通常の readonly ガードに加えて、上記の狭いホワイトリストと
+/// 複文 (`;` 区切り) の禁止を課す。
+pub(crate) fn agent_rejection_reason(sql: &str, engine: Engine) -> Option<String> {
+    let keyword = leading_keyword(sql);
+    if !AGENT_ALLOWED_KEYWORDS.contains(&keyword.as_str()) {
+        return Some(format!(
+            "The assistant may only run read-only statements ({}); rejected.",
+            AGENT_ALLOWED_KEYWORDS.join(" / ").to_uppercase()
+        ));
+    }
+    // 複文はドライバ次第で通ることがあり、1 文目だけを見るガードを
+    // すり抜けうるため、エージェント経路では一律に拒否する
+    let cleaned = scan_sql(sql, engine).cleaned;
+    if cleaned.trim_end().trim_end_matches(';').contains(';') {
+        return Some("The assistant may only run one statement at a time; rejected.".to_string());
+    }
+    if !is_readonly_allowed(sql, engine) {
+        return Some("The statement is not read-only; rejected.".to_string());
+    }
+    None
+}
+
 pub(crate) fn is_fetch_statement(sql: &str) -> bool {
     matches!(
         leading_keyword(sql).as_str(),
@@ -1657,6 +1699,33 @@ mod tests {
         assert!(!is_fetch_statement("UPDATE t SET a = 1"));
         assert!(!is_fetch_statement("DELETE FROM t"));
         assert!(!is_fetch_statement("CREATE TABLE t (a int)"));
+    }
+
+    #[test]
+    fn test_agent_rejection_reason() {
+        let f = |s: &str| agent_rejection_reason(s, Engine::Sqlite);
+        // 読み取り系は通す
+        assert!(f("SELECT * FROM t").is_none());
+        assert!(f("WITH x AS (SELECT 1) SELECT * FROM x").is_none());
+        assert!(f("EXPLAIN SELECT 1").is_none());
+        assert!(f("SHOW TABLES").is_none());
+        // 末尾のセミコロン 1 つは複文ではない
+        assert!(f("SELECT 1;").is_none());
+        assert!(f("SELECT 1;  ").is_none());
+        // CALL は readonly ガードを素通りするが (ストアドが中で DML を実行
+        // できる)、エージェント経路では拒否する
+        assert!(is_readonly_allowed("CALL do_something()", Engine::MySql));
+        assert!(f("CALL do_something()").is_some());
+        // PRAGMA も readonly ガードは読み取り形を通すが、エージェントには不要
+        assert!(is_readonly_allowed("PRAGMA user_version", Engine::Sqlite));
+        assert!(f("PRAGMA user_version").is_some());
+        // 書き込み系は当然拒否
+        assert!(f("UPDATE t SET a = 1").is_some());
+        assert!(f("DROP TABLE t").is_some());
+        // 複文は 1 文目が読み取りでも拒否する
+        assert!(f("SELECT 1; DELETE FROM t").is_some());
+        // リテラル内のセミコロンは複文ではない
+        assert!(f("SELECT 'a; b' FROM t").is_none());
     }
 
     #[test]

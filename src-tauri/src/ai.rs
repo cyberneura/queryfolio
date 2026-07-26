@@ -362,6 +362,12 @@ pub fn build_explain_sql_user_message(sql: &str) -> String {
 /// 無限ループと API 課金の暴走を防ぐための上限。
 pub const CHAT_MAX_TOOL_ROUNDS: usize = 6;
 
+/// 1 応答で実行できるツール呼び出しの累計上限。
+/// 1 回のアシスタントメッセージが複数の tool_calls を並べられるため、
+/// 往復回数の上限だけでは実行クエリ数を縛れない (実行数と、モデルへ送り返す
+/// データ量の両方を抑えるための上限)。
+pub const CHAT_MAX_TOOL_CALLS: usize = 12;
+
 /// 1 リクエストで LLM に送るチャット履歴の最大ターン数 (古い方を捨てる)。
 pub const CHAT_MAX_HISTORY_TURNS: usize = 40;
 
@@ -518,12 +524,16 @@ pub fn truncate_tool_result(text: &str) -> String {
     format!("{truncated}\n... (result truncated)")
 }
 
-/// チャットの 1 ステップ (ツール込み) を実行し、アシスタントメッセージを返す。
+/// チャットの 1 ステップを実行し、アシスタントメッセージを返す。
+/// allow_tools = false ではツールを渡さず、本文だけの応答を強制する
+/// (ツール実行の上限に達した後、最後の回答を書かせるために使う)。
 pub async fn chat_step(
     config: &AiConfig,
     messages: &[serde_json::Value],
+    allow_tools: bool,
 ) -> Result<serde_json::Value, AppError> {
-    request_chat_completion(config, messages, Some(&chat_tools_spec())).await
+    let tools = allow_tools.then(chat_tools_spec);
+    request_chat_completion(config, messages, tools.as_ref()).await
 }
 
 /// アシスタントメッセージの本文 (content) を取り出す (無ければ空文字)。
