@@ -303,13 +303,20 @@ export interface ChatReply {
 /// AI チャット (エージェント) の 1 往復を実行する。会話履歴は毎回そのまま
 /// 送り、system prompt の組み立てとツール実行ループはバックエンドが行う。
 /// エージェントが実行できるのは読み取り専用の SQL のみ。
-export const aiChat = (connection: string, history: ChatTurn[]) =>
-  invoke<ChatReply>("ai_chat", { connection, history });
+/// requestId はフロントが採番する往復の識別子 (中断はこの ID を指定する。
+/// 同じ接続で複数の往復が走りうるため接続名だけでは区別できない)。
+export const aiChat = (
+  connection: string,
+  history: ChatTurn[],
+  requestId: string,
+) => invoke<ChatReply>("ai_chat", { connection, history, requestId });
 
-/// AI チャットのエージェントの実行を中断する (実行中のクエリを止め、
-/// 次のツール往復も行わせない)。実行中のクエリがあれば true。
-export const cancelAiChat = (connection: string) =>
-  invoke<boolean>("cancel_ai_chat", { connection });
+/// AI チャットのエージェントの往復を中断する (実行中のクエリを止め、
+/// 次のモデル呼び出し・ツール往復も行わせない)。まだ ai_chat が走り出す
+/// 前の ID も指定でき、その場合は開始時に中断される。
+/// 実行中のクエリを実際に止めたら true。
+export const cancelAiChat = (connection: string, requestIds: string[]) =>
+  invoke<boolean>("cancel_ai_chat", { connection, requestIds });
 
 /// `queryfolio://open/<path>` deep link / CLI で指定された「開く対象」
 /// (バックエンドの router::OpenTarget に対応)。

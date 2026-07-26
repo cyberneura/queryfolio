@@ -67,38 +67,65 @@ struct AppState {
     chat_cancels: ChatCancels,
 }
 
-/// AI チャット (エージェント) の中断要求を接続ごとに数えるカウンタ。
+/// 中断要求を覚えておく ID の上限 (開始しなかった要求の取りこぼし対策で
+/// 残るため、古いものから捨てて無制限に増えないようにする)。
+const CHAT_CANCEL_HISTORY_MAX: usize = 256;
+
+/// AI チャット (エージェント) の中断要求を**リクエスト単位**で保持する。
+///
 /// クエリのキャンセル (CancelRegistry) は「実行中の 1 本」を止めるだけで、
-/// モデルの応答待ちや次のツール往復は止められない。ai_chat は開始時の
-/// カウンタを控え、各ステップの前に増えていれば往復ごと中断する。
+/// モデルの応答待ちや次のツール往復は止められないため、往復そのものを
+/// 止める仕組みが要る。接続単位のカウンタにすると (1) 同じ接続で 2 本が
+/// 同時に走る時にどちらを止めるか区別できず、(2) 開始直後に届いた中断が
+/// 「開始時の基準値」に吸収されてしまうため、フロントが採番した
+/// リクエスト ID をそのまま使う。ID を控えておけば、コマンドが走り出す
+/// 前に届いた中断も入口の判定で拾える。
 #[derive(Default)]
 struct ChatCancels {
-    inner: tokio::sync::Mutex<std::collections::HashMap<String, u64>>,
+    inner: tokio::sync::Mutex<ChatCancelState>,
+}
+
+#[derive(Default)]
+struct ChatCancelState {
+    cancelled: std::collections::HashSet<String>,
+    /// 挿入順 (上限超過時に古いものから捨てる)
+    order: std::collections::VecDeque<String>,
 }
 
 impl ChatCancels {
-    /// 中断を要求する (実行中でなくても記録だけ残す。次の往復が
-    /// 開始時のカウンタと比較して中断する)。
-    async fn request(&self, connection: &str) {
-        let mut map = self.inner.lock().await;
-        *map.entry(connection.to_string()).or_insert(0) += 1;
+    /// リクエストの中断を要求する (まだ開始していなくても記録を残す)。
+    async fn request(&self, request_id: &str) {
+        let mut state = self.inner.lock().await;
+        if state.cancelled.insert(request_id.to_string()) {
+            state.order.push_back(request_id.to_string());
+            while state.order.len() > CHAT_CANCEL_HISTORY_MAX {
+                if let Some(old) = state.order.pop_front() {
+                    state.cancelled.remove(&old);
+                }
+            }
+        }
     }
 
-    /// 現在のカウンタ値。
-    async fn epoch(&self, connection: &str) -> u64 {
-        self.inner
-            .lock()
-            .await
-            .get(connection)
-            .copied()
-            .unwrap_or(0)
+    /// このリクエストに中断が要求されているか。
+    async fn is_cancelled(&self, request_id: &str) -> bool {
+        self.inner.lock().await.cancelled.contains(request_id)
+    }
+
+    /// 終了したリクエストの記録を捨てる。
+    async fn finish(&self, request_id: &str) {
+        let mut state = self.inner.lock().await;
+        if state.cancelled.remove(request_id) {
+            state.order.retain(|id| id != request_id);
+        }
     }
 }
 
 /// AI チャットのツール実行を登録するキャンセルレジストリのキー。
-/// ユーザーのクエリ (接続名がキー) と衝突させない。
-fn chat_cancel_key(connection: &str) -> String {
-    format!("{connection}\u{1}ai-chat")
+/// ユーザーのクエリ (接続名がキー) と衝突せず、かつ同じ接続で複数の
+/// 往復が走っても互いのエントリを上書きしないようリクエスト ID を含める
+/// (CancelRegistry は同じキーの登録を置き換えるため)。
+fn chat_cancel_key(connection: &str, request_id: &str) -> String {
+    format!("{connection}\u{1}ai-chat\u{1}{request_id}")
 }
 
 impl AppState {
@@ -559,17 +586,32 @@ async fn cancel_query(
     state.query_cancels.cancel(&connection).await
 }
 
-/// AI チャットのエージェントが実行中のクエリにキャンセルを要求する。
-/// 実行中のクエリが無ければ false を返す (この時点でモデルの応答待ちなら
-/// クエリは走っていないが、ai_chat 側が中断フラグを見て次のツール実行を
-/// 行わないため、往復そのものも間もなく終わる)。
+/// AI チャットのエージェントの往復を中断する。
+/// request_ids はフロントが採番した実行中リクエストの ID
+/// (同じ接続で複数の往復が走りうるため、まとめて渡す)。
+///
+/// 実行中のクエリを止める (CancelRegistry) だけでなく、ID を控えて
+/// 次のモデル呼び出し・ツール実行も行わせない。まだ ai_chat が走り
+/// 出していないリクエストの ID も控えられるので、送信直後の中断も効く。
+/// 戻り値は「実行中のクエリを実際に止めたか」。
 #[tauri::command]
 async fn cancel_ai_chat(
     state: tauri::State<'_, AppState>,
     connection: String,
+    request_ids: Vec<String>,
 ) -> Result<bool, AppError> {
-    state.chat_cancels.request(&connection).await;
-    state.query_cancels.cancel(&chat_cancel_key(&connection)).await
+    let mut cancelled_query = false;
+    for request_id in &request_ids {
+        state.chat_cancels.request(request_id).await;
+        if state
+            .query_cancels
+            .cancel(&chat_cancel_key(&connection, request_id))
+            .await?
+        {
+            cancelled_query = true;
+        }
+    }
+    Ok(cancelled_query)
 }
 
 /// 接続のクエリ実行履歴を新しい順に返す。
@@ -1096,20 +1138,35 @@ async fn ai_chat(
     state: tauri::State<'_, AppState>,
     connection: String,
     history: Vec<ai::ChatTurn>,
+    request_id: String,
 ) -> Result<ai::ChatReply, AppError> {
-    let mut messages = ai::chat_history_messages(&history);
+    let result = run_ai_chat(&state, &connection, &history, &request_id).await;
+    // 中断記録は往復の終了時に掃除する (残っても上限で捨てられるが、
+    // 同じ ID が再利用されることはないので溜めておく意味が無い)
+    state.chat_cancels.finish(&request_id).await;
+    result
+}
+
+/// ai_chat の本体 (中断記録の掃除を呼び出し側に任せるための分離)。
+async fn run_ai_chat(
+    state: &AppState,
+    connection: &str,
+    history: &[ai::ChatTurn],
+    request_id: &str,
+) -> Result<ai::ChatReply, AppError> {
+    let connection = connection.to_string();
+    let mut messages = ai::chat_history_messages(history);
     if messages.is_empty() {
         return Err(AppError::Ai("The chat history is empty".into()));
     }
-    // 中断要求はカウンタで見る (実行中のクエリを止めるだけでは、モデルの
-    // 応答待ちや次のツール往復は止まらない)。基準値は**コマンド入口で**
-    // 控える: resolve_ai_context は接続とスキーマ取得で待つため、その間に
-    // 来た中断要求を後から控えると基準値に取り込んでしまい、以降の判定が
-    // すべて「中断されていない」になる
-    let cancel_epoch = state.chat_cancels.epoch(&connection).await;
-    let cancelled = || async {
-        state.chat_cancels.epoch(&connection).await != cancel_epoch
-    };
+    // 中断はリクエスト ID で判定する。接続単位のカウンタだと、同じ接続で
+    // 2 本走る時に区別できず、開始直後に届いた中断も「開始時の基準値」に
+    // 吸収されてしまう。ID なら、このコマンドが走り出す前に届いた中断も
+    // ここで拾える
+    let cancelled = || async { state.chat_cancels.is_cancelled(&request_id).await };
+    if cancelled().await {
+        return Err(AppError::Cancelled);
+    }
 
     let (ai_config, server, active_schema, schema_map) =
         state.resolve_ai_context(&connection).await?;
@@ -1140,9 +1197,9 @@ async fn ai_chat(
     } else {
         db::ReadonlyGuard::Switch
     };
-    // ユーザーのクエリのキャンセル (接続名がキー) と衝突しないよう、
-    // エージェントの実行には別のキーを使う
-    let cancel_key = chat_cancel_key(&connection);
+    // ユーザーのクエリのキャンセル (接続名がキー) と衝突せず、同じ接続の
+    // 別の往復とも衝突しないキーを使う
+    let cancel_key = chat_cancel_key(&connection, &request_id);
 
     let engine = db::parse_engine(&server.engine)?;
     let mut tool_calls: Vec<ai::ChatToolCall> = Vec::new();

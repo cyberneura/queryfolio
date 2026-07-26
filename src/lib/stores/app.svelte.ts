@@ -114,13 +114,16 @@ let chatMessages = $state<ChatMessage[]>([]);
 /// 会話を破棄した後も古い往復のスピナーが新しい会話に残らないよう、
 /// 表示上の「送信中」は現在の世代と一致する時だけとする (chatSending)。
 let chatSendingGen = $state<number | null>(null);
-/// 応答待ちの往復を実行している接続 → 実行本数。
+/// 応答待ちの往復を実行している接続 → その往復のリクエスト ID の集合。
 /// クエリ実行と同じく「実行中の接続」として扱い、エディタタブが無いだけで
 /// トンネル / プールが切られる (maybeDisconnectIfIdle) のを防ぐ。
 /// 会話を破棄すると古い往復が走ったまま次の送信を許すため、同じ接続で
-/// 複数本が同時に走りうる。スカラーだと先に終わった 1 本が残りの目印を
-/// 消してしまうので参照カウントで持つ (Map は毎回作り直して反応性を保つ)。
-let chatRunningConnections = $state<Map<string, number>>(new Map());
+/// 複数本が同時に走りうる。どれを中断するかを指定できるよう、本数ではなく
+/// ID の集合で持つ (Map は毎回作り直して反応性を保つ)。
+let chatRunningConnections = $state<Map<string, Set<string>>>(new Map());
+
+/// チャットの往復に付ける ID の採番 (プロセス内で一意なら十分)。
+let nextChatRequestSeq = 1;
 /// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得・取得失敗は null)
 let schemaMap = $state<Record<string, string[]> | null>(null);
 /// 危険な文 (allow_dangerous_statements 有効な接続) の実行前確認ダイアログ。
@@ -1572,26 +1575,27 @@ let nextChatMessageId = 1;
 /// まま応答を返す)。スキーマ切替も接続名は変わらないため同様。
 let chatGeneration = $state(0);
 
-/// チャットの往復が始まったことを接続に対して数える。
-const retainChatConnection = (connection: string) => {
+/// チャットの往復の開始を記録する。
+const retainChatRequest = (connection: string, requestId: string) => {
   const next = new Map(chatRunningConnections);
-  next.set(connection, (next.get(connection) ?? 0) + 1);
+  next.set(connection, new Set(next.get(connection)).add(requestId));
   chatRunningConnections = next;
 };
 
-/// チャットの往復が終わったことを接続に対して数える。
+/// チャットの往復の終了を記録する。
 /// その接続で走っている最後の 1 本だった場合だけ true を返す
 /// (切断の再判定は最後の 1 本の完了時にだけ行う)。
-const releaseChatConnection = (connection: string): boolean => {
+const releaseChatRequest = (connection: string, requestId: string): boolean => {
   const next = new Map(chatRunningConnections);
-  const remaining = (next.get(connection) ?? 0) - 1;
-  if (remaining > 0) {
-    next.set(connection, remaining);
+  const ids = new Set(next.get(connection));
+  ids.delete(requestId);
+  if (ids.size > 0) {
+    next.set(connection, ids);
   } else {
     next.delete(connection);
   }
   chatRunningConnections = next;
-  return remaining <= 0;
+  return ids.size === 0;
 };
 
 /// AI チャット (右ペイン) にユーザーの発言を積み、応答を 1 往復もらう。
@@ -1622,11 +1626,13 @@ const sendChatMessage = async (text: string) => {
     .filter((m) => !m.failed)
     .map((m) => ({ role: m.role, content: m.content }));
   chatSendingGen = generation;
+  // 中断はこの ID を指定して行う (同じ接続で複数の往復が走りうる)
+  const requestId = `chat-${nextChatRequestSeq++}`;
   // エージェントのツール実行中はこの接続を「実行中」として扱い、
   // エディタタブが無いだけでトンネル / プールを切られないようにする
-  retainChatConnection(connection);
+  retainChatRequest(connection, requestId);
   try {
-    const reply = await api.aiChat(connection, history);
+    const reply = await api.aiChat(connection, history, requestId);
     // 応答待ちの間に会話が破棄されていたら捨てる (接続切替・Clear・設定
     // リロード)。設定リロードは同名の接続を作り直すため、接続名の比較だけ
     // では弾けない
@@ -1663,7 +1669,7 @@ const sendChatMessage = async (text: string) => {
     // クエリ実行と同じく、実行が終わった時点で切断を再判定する
     // (実行中は切れないので、他の接続へ移った後もトンネルが残っている)。
     // 同じ接続で別の往復がまだ走っているなら判定しない
-    if (releaseChatConnection(connection)) {
+    if (releaseChatRequest(connection, requestId)) {
       maybeDisconnectIfIdle(connection);
     }
   }
@@ -1673,8 +1679,8 @@ const sendChatMessage = async (text: string) => {
 /// 中断要求の失敗で呼び出し側の処理を止めない (実行はいずれ終わる)。
 const requestChatCancel = async () => {
   await Promise.all(
-    [...chatRunningConnections.keys()].map((connection) =>
-      api.cancelAiChat(connection).catch(() => {}),
+    [...chatRunningConnections.entries()].map(([connection, ids]) =>
+      api.cancelAiChat(connection, [...ids]).catch(() => {}),
     ),
   );
 };
