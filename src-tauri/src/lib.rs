@@ -71,6 +71,11 @@ struct AppState {
 /// 残るため、古いものから捨てて無制限に増えないようにする)。
 const CHAT_CANCEL_HISTORY_MAX: usize = 256;
 
+/// エージェントのクエリ実行中に中断要求を見に行く間隔 (ms)。
+/// run_query_cancellable がキャンセルレジストリへ登録するまでの間に
+/// 届いた中断はレジストリ経由では効かないため、自前で監視する。
+const CHAT_CANCEL_POLL_INTERVAL_MS: u64 = 200;
+
 /// AI チャット (エージェント) の中断要求を**リクエスト単位**で保持する。
 ///
 /// クエリのキャンセル (CancelRegistry) は「実行中の 1 本」を止めるだけで、
@@ -1289,6 +1294,9 @@ async fn run_ai_chat(
             let (ok, argument, result_text) = if name == "run_sql" {
                 match ai::parse_run_sql_argument(&arguments) {
                     Ok(sql) => {
+                        // DB へ実際に投げたか (投げていない中断を「実行した」
+                        // と記録しないための目印)
+                        let mut started = false;
                         let outcome = async {
                             // エージェント経路は通常の readonly ガードより狭い
                             // ホワイトリストを課す (CALL / PRAGMA / 複文を落とす)
@@ -1303,7 +1311,15 @@ async fn run_ai_chat(
                             if cancelled().await {
                                 return Err(AppError::Cancelled);
                             }
-                            db::run_query_cancellable(
+                            started = true;
+                            // run_query_cancellable は内部で登録するまでの間
+                            // (コネクション取得・セッション ID 照会) キャンセル
+                            // レジストリに現れないため、そこへ届いた中断は
+                            // 空振りする。ポーリングで自前に監視し、中断されたら
+                            // クエリの future を drop して待つのをやめる
+                            // (サーバー側は登録済みなら停止し、未登録なら
+                            //  クライアント側の打ち切りになる)
+                            let query = db::run_query_cancellable(
                                 &pool,
                                 &state.query_cancels,
                                 &cancel_key,
@@ -1313,8 +1329,23 @@ async fn run_ai_chat(
                                 readonly_guard,
                                 // エージェントには危険な文も許可しない
                                 false,
-                            )
-                            .await
+                            );
+                            tokio::pin!(query);
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    result = &mut query => break result,
+                                    _ = tokio::time::sleep(
+                                        std::time::Duration::from_millis(
+                                            CHAT_CANCEL_POLL_INTERVAL_MS,
+                                        ),
+                                    ) => {
+                                        if cancelled().await {
+                                            break Err(AppError::Cancelled);
+                                        }
+                                    }
+                                }
+                            }
                         }
                         .await;
                         // 中断で終える場合も、DB へ投げた SQL は記録に残す
@@ -1324,12 +1355,17 @@ async fn run_ai_chat(
                         // なので、結果だけを捨てて往復ごと終える
                         let cancelled_now = cancelled().await;
                         if cancelled_now || matches!(outcome, Err(AppError::Cancelled)) {
-                            tool_calls.push(ai::ChatToolCall {
-                                name: name.clone(),
-                                argument: sql,
-                                ok: false,
-                                summary: "Cancelled".to_string(),
-                            });
+                            // DB へ投げる前に中断した分は「実行した」と
+                            // 記録しない (実行していないクエリを一覧に
+                            // 出すと、監査としてかえって誤解を招く)
+                            if started {
+                                tool_calls.push(ai::ChatToolCall {
+                                    name: name.clone(),
+                                    argument: sql,
+                                    ok: false,
+                                    summary: "Cancelled".to_string(),
+                                });
+                            }
                             return Err(AppError::Cancelled);
                         }
                         match outcome {
