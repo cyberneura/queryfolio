@@ -219,6 +219,10 @@ const reloadConnections = async (): Promise<boolean> => {
   if (!(await saveAllDirtyTabs())) {
     return false;
   }
+  // 応答待ちのチャットは resetConnections の**前に**中断する。後回しにすると、
+  // リロード前の接続設定を握ったままのエージェントが破棄済みのプールを
+  // 開き直し、古い認証情報 / スキーマでツール実行を続けうる
+  clearChat();
   try {
     await api.resetConnections();
   } catch (e) {
@@ -259,10 +263,7 @@ const reloadConnections = async (): Promise<boolean> => {
   aiError = null;
   aiAnalysis = null;
   aiExplanation = null;
-  // 設定リロードは同名の接続を作り直すため、in-flight のチャット応答を
-  // 名前比較では弾けない。世代を進めて破棄する
-  chatGeneration++;
-  chatMessages = [];
+  // チャットの中断と破棄は resetConnections の前に済ませてある (clearChat)
   // 実行中の取得が後から古いマップを書き込まないよう世代を進めて破棄する
   schemaMapGeneration++;
   schemaMap = null;
@@ -389,10 +390,10 @@ const applyConnectionContext = async (name: string): Promise<boolean> => {
   // 同一接続の再選択 (同接続のエディタタブ切替など) では維持する。
   if (selectedConnection !== name) {
     writable = false;
-    // AI チャットの会話も破棄する。system prompt に載るスキーマが接続ごとに
-    // 違うため、別接続の会話を引き継ぐと噛み合わない回答になる
-    chatGeneration++;
-    chatMessages = [];
+    // AI チャットの会話も破棄し、走っているエージェントを中断する。
+    // system prompt に載るスキーマが接続ごとに違うため会話は引き継げず、
+    // 破棄するだけではバックエンドが切替前の接続でツール実行を続ける
+    clearChat();
   }
   selectedConnection = name;
   errorMessage = filesError;
