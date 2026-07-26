@@ -41,13 +41,13 @@ pnpm tauri dev
 
 ## Configuration
 
-Everything lives in one file: `~/.config/queryfolio/config.yml` (see `config.example.yaml`). Connections are written under `sql_servers`, and any key can be overridden from an external source with `config_override_command`:
+Everything lives in one file: `~/.config/queryfolio/config.yml` (see `config.example.yaml`). Connections are written under `servers`, and any key can be overridden from an external source with `config_override_command`:
 
 > 📖 **See [docs/settings.md](docs/settings.md) for the full settings reference** — every key, SSH tunnel modes, groups, templates, `config_override_command`, AI, and more.
 
 ```yaml
-# Inline (sql-agent-mcp-server compatible)
-sql_servers:
+# Inline (entry format is sql-agent-mcp-server compatible)
+servers:
   - name: dev-postgres
     engine: postgres
     host: localhost
@@ -56,16 +56,16 @@ sql_servers:
 
 # Servers can be grouped for the connections list (queryfolio extension).
 # Group entries and plain servers can be mixed; order is preserved.
-# sql_servers:
+# servers:
 #   - group_name: production
-#     sql_servers:
+#     servers:
 #       - name: prod-main
 #         ...
 #   - name: ungrouped-db
 #     ...
 
 # Optional: run a command whose stdout is YAML, and merge it over this file.
-# Mappings are merged recursively; scalars and lists (including sql_servers)
+# Mappings are merged recursively; scalars and lists (including servers)
 # are replaced wholesale. Any key can be overridden this way.
 # config_override_command: op read "op://development/queryfolio/config-yaml"
 

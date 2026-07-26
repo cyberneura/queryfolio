@@ -4,9 +4,12 @@
 # 開発・テスト用に QUERYFOLIO_CONFIG_YAML 環境変数でこのファイル全体の内容を
 # 上書きできる (GUI を Finder / Dock から起動した場合、shell の環境変数は渡らない)。
 
-# --- sql_servers (接続定義。sql-agent-mcp-server 互換) ---
+# --- servers (接続定義。各エントリの形式は sql-agent-mcp-server 互換) ---
+#
+# 注意: このキーは以前 sql_servers という名前だった (server_templates も
+# 旧名 sql_server_templates)。旧名のままだと起動時にエラーになる。
 
-sql_servers:
+servers:
   - name: dev-postgres
     description: "開発環境の PostgreSQL サーバー"
     engine: postgres
@@ -163,15 +166,15 @@ sql_servers:
       # checking are handled entirely by OpenSSH).
       ssh_config: pop-three-ec2-staging
 
-# --- sql_servers: グループ機能 (queryfolio 拡張) ---
-# リスト項目に group_name + sql_servers を書くと、その中のサーバーが
+# --- servers: グループ機能 (queryfolio 拡張) ---
+# リスト項目に group_name + servers を書くと、その中のサーバーが
 # 接続一覧でグループ見出し付きで表示される。直書きサーバーとの混在も可
 # (設定した順序のまま表示される)。グループの中にさらにグループは書けない。
 # グループ内でも template: による雛形継承は使える。
 #
-# sql_servers:
+# servers:
 #   - group_name: production
-#     sql_servers:
+#     servers:
 #       - name: prod-main
 #         engine: mysql
 #         host: prod.example.com
@@ -181,7 +184,7 @@ sql_servers:
 #         host: replica.example.com
 #         ...
 #   - group_name: development
-#     sql_servers:
+#     servers:
 #       - name: dev-db
 #         engine: postgres
 #         host: localhost
@@ -196,8 +199,8 @@ sql_servers:
 #
 # マージ規則:
 #   - マッピング同士は再帰的に混ざる (例: ai の api_key だけ差し替え)
-#   - スカラーとリスト (sql_servers を含む) は丸ごと置き換わる
-#   - sql_servers に限らずどのキーでも上書きできる
+#   - スカラーとリスト (servers を含む) は丸ごと置き換わる
+#   - servers に限らずどのキーでも上書きできる
 #
 # 取得した YAML の中に config_override_command があっても再帰取得はしない。
 # コマンドはシェル非経由で実行される (パイプやリダイレクトは使えない)。
@@ -206,9 +209,9 @@ sql_servers:
 # config_override_command: op read "op://development/queryfolio/config-yaml"
 
 # --- 接続情報の雛形 ---
-# sql_servers 側で template: <名前> を指定して継承できる。
+# servers 側で template: <名前> を指定して継承できる。
 # サーバー側で指定したキーはテンプレートの同名キーを上書きする (シャローマージ)。
-sql_server_templates:
+server_templates:
   - name: my-awesome-sql-host
     engine: mysql
     host: db.example.com

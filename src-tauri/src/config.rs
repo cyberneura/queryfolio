@@ -39,7 +39,7 @@ const CONFIG_TEMPLATE: &str = r#"# QueryFolio config file
 
 # Connection definitions.
 #
-# sql_servers:
+# servers:
 #   - name: local-sqlite
 #     description: "Local SQLite file"
 #     engine: sqlite
@@ -52,14 +52,14 @@ const CONFIG_TEMPLATE: &str = r#"# QueryFolio config file
 #     user: dev_user
 #     password: your_password
 
-sql_servers: []
+servers: []
 
 # Keep secrets out of this file by fetching them from elsewhere.
 #
 # config_override_command runs a command whose stdout must be YAML, and merges
 # that YAML over this file. The merge is recursive for mappings; scalars and
-# lists (including sql_servers) are replaced wholesale. Any key can be
-# overridden this way, not just sql_servers.
+# lists (including servers) are replaced wholesale. Any key can be
+# overridden this way, not just servers.
 #
 # config_override_command: op read "op://development/queryfolio/config-yaml"
 
@@ -281,7 +281,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub allow_dangerous_statements: bool,
     /// queryfolio 独自拡張: 接続一覧での表示グループ名。
-    /// sql_servers のグループエントリ (group_name + sql_servers) に
+    /// servers のグループエントリ (group_name + servers) に
     /// 属するサーバーへ parse_server_entries が設定する。
     /// サーバーエントリ直下の group_name: はグループエントリの検証
     /// (空チェック・未知キー拒否) を迂回するため受け付けない (無視される)。
@@ -462,8 +462,8 @@ pub struct ConfigInfo {
 /// ~/.config/queryfolio/config.yml (無ければ config.yaml) のパース結果。
 ///
 /// トップレベルキー:
-/// - sql_servers: サーバー定義リスト
-/// - sql_server_templates: 接続情報の雛形
+/// - servers: サーバー定義リスト
+/// - server_templates: 接続情報の雛形
 /// - sqlfiles_dir: クエリファイル保存ディレクトリ (任意)
 /// - config_override_command: 設定を上書きする YAML を取得するコマンド (任意)
 ///
@@ -522,7 +522,7 @@ impl AppConfig {
     /// 取得 YAML を再帰マージした設定を返す。
     ///
     /// マージは取得 YAML 側が優先。マッピング同士は再帰的に混ぜ、
-    /// スカラー・シーケンス (sql_servers を含む) は丸ごと置き換える
+    /// スカラー・シーケンス (servers を含む) は丸ごと置き換える
     /// (リストの要素単位マージは、どれが「同じ項目」かを決められないため行わない)。
     pub async fn load_merged() -> Result<Self, AppError> {
         let mut config = Self::load()?;
@@ -594,16 +594,17 @@ impl AppConfig {
     pub fn resolve_servers(&self) -> Result<Vec<ServerConfig>, AppError> {
         let servers = self
             .doc
-            .get("sql_servers")
-            .ok_or_else(|| AppError::Config("The config has no sql_servers key".into()))?
+            .get("servers")
+            .ok_or_else(|| AppError::Config("The config has no servers key".into()))?
             .as_sequence()
             .cloned()
             .ok_or_else(|| {
                 // 旧方式 (sql_servers: {command|env|file: ...}) からの移行案内。
                 // 単に「リストであるべき」とだけ言われても、どう直すか分からない
+                // (旧キー名のままの設定は reject_renamed_keys 側で同じ案内を出す)
                 AppError::Config(format!(
-                    "sql_servers must be a list of server definitions. \
-                     Source declarations (command / env / file) under sql_servers were \
+                    "servers must be a list of server definitions. \
+                     Source declarations (command / env / file) were \
                      removed; use the top-level {CONFIG_OVERRIDE_COMMAND_KEY} instead \
                      (note: it runs without a shell, so use an absolute path, e.g. \
                      `{CONFIG_OVERRIDE_COMMAND_KEY}: /bin/cat /Users/you/secrets/servers.yaml`)"
@@ -611,7 +612,7 @@ impl AppConfig {
             })?;
         let templates = self
             .doc
-            .get("sql_server_templates")
+            .get("server_templates")
             .and_then(|v| v.as_sequence())
             .cloned()
             .unwrap_or_default();
@@ -768,7 +769,7 @@ pub async fn fetch_override_config_yaml() -> Result<String, AppError> {
 
 /// 取得 YAML (over) をローカル設定 (base) へ再帰的にマージする。over 側が優先。
 /// 値がどちらもマッピングの時だけ中へ入って混ぜ、それ以外 (スカラー・
-/// シーケンス) は over で丸ごと置き換える。sql_servers のようなリストを
+/// シーケンス) は over で丸ごと置き換える。servers のようなリストを
 /// 要素単位でマージしないのは、どの要素が「同じ項目」かを決める安定した
 /// 同一性が無いため (name 一致で混ぜると意図しない部分適用が起きる)。
 fn merge_mapping(base: &mut serde_yaml::Mapping, over: &serde_yaml::Mapping) {
@@ -787,14 +788,61 @@ fn merge_mapping(base: &mut serde_yaml::Mapping, over: &serde_yaml::Mapping) {
 fn parse_mapping(yaml_text: &str, source: &str) -> Result<serde_yaml::Mapping, AppError> {
     let doc: serde_yaml::Value = serde_yaml::from_str(yaml_text)
         .map_err(|e| AppError::Config(format!("Failed to parse YAML from {source}: {e}")))?;
-    doc.as_mapping().cloned().ok_or_else(|| {
+    let mapping = doc.as_mapping().cloned().ok_or_else(|| {
         AppError::Config(format!("{source} is not a YAML mapping"))
-    })
+    })?;
+    reject_renamed_keys(&mapping, source)?;
+    Ok(mapping)
 }
 
-/// sql_servers のリスト項目をパースする。項目は次のどちらか:
+/// 旧キー名 (sql_servers / sql_server_templates) を明示的に拒否する。
+/// 黙って無視すると「接続が 1 件も出てこない」だけの状態になり原因が分からない
+/// ため、リネームを案内するエラーにする。
+fn reject_renamed_keys(doc: &serde_yaml::Mapping, source: &str) -> Result<(), AppError> {
+    for (old, new) in [
+        ("sql_servers", "servers"),
+        ("sql_server_templates", "server_templates"),
+    ] {
+        let Some(value) = doc.get(old) else {
+            continue;
+        };
+        let mut message = format!("'{old}' in {source} was renamed to '{new}'");
+        if old == "sql_servers" {
+            message.push_str(" (group entries use 'servers' too)");
+            // 旧方式 (sql_servers: {command|env|file: ...}) は改名より前に廃止済み。
+            // 改名だけ案内すると「リストに直したのに動かない」で二度詰まるため、
+            // 値がマッピングならソース宣言の移行先も同時に伝える
+            if value.is_mapping() {
+                message.push_str(&format!(
+                    ". Source declarations (command / env / file) were also removed; \
+                     write a list of server definitions and fetch secrets with the \
+                     top-level {CONFIG_OVERRIDE_COMMAND_KEY}"
+                ));
+            }
+        }
+        return Err(AppError::Config(message));
+    }
+    Ok(())
+}
+
+/// サーバーエントリ (グループの内外を問わない) に残った旧キーを拒否する。
+/// トップレベルの reject_renamed_keys ではネスト位置まで届かないため、
+/// parse_server_entries の各エントリでここを通す。
+fn reject_renamed_server_key(entry: &serde_yaml::Value, source: &str) -> Result<(), AppError> {
+    let has_old_key = entry
+        .as_mapping()
+        .is_some_and(|m| m.contains_key("sql_servers"));
+    if has_old_key {
+        return Err(AppError::Config(format!(
+            "'sql_servers' in a servers entry in {source} was renamed to 'servers'"
+        )));
+    }
+    Ok(())
+}
+
+/// servers のリスト項目をパースする。項目は次のどちらか:
 /// - サーバー定義そのもの
-/// - グループエントリ (group_name + ネストした sql_servers リスト)。
+/// - グループエントリ (group_name + ネストした servers リスト)。
 ///   ネストしたサーバーへフラット化し、各サーバーの group_name に記録する。
 ///   グループの中にさらにグループを書く再帰は禁止 (深さ 1 まで)。
 fn parse_server_entries(
@@ -805,9 +853,10 @@ fn parse_server_entries(
     let mut result = Vec::new();
     for entry_value in servers {
         let entry = entry_value.as_mapping().ok_or_else(|| {
-            AppError::Config(format!("A sql_servers entry in {source} is not a mapping"))
+            AppError::Config(format!("A servers entry in {source} is not a mapping"))
         })?;
-        if !entry.contains_key("sql_servers") {
+        reject_renamed_server_key(entry_value, source)?;
+        if !entry.contains_key("servers") {
             result.push(parse_server_entry(entry_value, templates, source)?);
             continue;
         }
@@ -815,10 +864,10 @@ fn parse_server_entries(
         // グループエントリ。typo をサイレントに飲み込まないよう未知キーは拒否する
         for (key, _) in entry {
             let key = key.as_str().unwrap_or_default();
-            if key != "group_name" && key != "sql_servers" {
+            if key != "group_name" && key != "servers" {
                 return Err(AppError::Config(format!(
-                    "Unknown key '{key}' in a sql_servers group entry in {source} \
-                     (only group_name / sql_servers are allowed)"
+                    "Unknown key '{key}' in a servers group entry in {source} \
+                     (only group_name / servers are allowed)"
                 )));
             }
         }
@@ -829,21 +878,25 @@ fn parse_server_entries(
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 AppError::Config(format!(
-                    "A sql_servers group entry in {source} requires a non-empty group_name"
+                    "A servers group entry in {source} requires a non-empty group_name"
                 ))
             })?;
         let grouped = entry
-            .get("sql_servers")
+            .get("servers")
             .and_then(|v| v.as_sequence())
             .ok_or_else(|| {
                 AppError::Config(format!(
-                    "sql_servers in group '{group_name}' in {source} must be a list"
+                    "servers in group '{group_name}' in {source} must be a list"
                 ))
             })?;
         for server_value in grouped {
+            // グループ内のサーバーに残った旧キーもここで拾う。素通りさせると
+            // ServerConfig の unknown field として捨てられ、`missing field
+            // \`name\`` という無関係なエラーになってしまう
+            reject_renamed_server_key(server_value, source)?;
             let is_nested_group = server_value
                 .as_mapping()
-                .is_some_and(|m| m.contains_key("sql_servers"));
+                .is_some_and(|m| m.contains_key("servers"));
             if is_nested_group {
                 return Err(AppError::Config(format!(
                     "Nested groups are not allowed in group '{group_name}' in {source}"
@@ -865,7 +918,7 @@ fn parse_server_entry(
     let expanded = expand_template(server_value, templates)?;
     serde_yaml::from_value(expanded).map_err(|e| {
         AppError::Config(format!(
-            "Failed to parse a sql_servers entry in {source}: {e}"
+            "Failed to parse a servers entry in {source}: {e}"
         ))
     })
 }
@@ -945,7 +998,7 @@ pub(crate) fn supplement_path(base: &str) -> String {
     path
 }
 
-/// `template: <名前>` を持つサーバーエントリに、sql_server_templates の
+/// `template: <名前>` を持つサーバーエントリに、server_templates の
 /// 同名テンプレートをシャローマージで継承させる。
 /// サーバー側で指定したキーはテンプレートの同名キーを上書きする。
 fn expand_template(
@@ -954,7 +1007,7 @@ fn expand_template(
 ) -> Result<serde_yaml::Value, AppError> {
     let server_map = server_value
         .as_mapping()
-        .ok_or_else(|| AppError::Config("A sql_servers entry is not a mapping".into()))?;
+        .ok_or_else(|| AppError::Config("A servers entry is not a mapping".into()))?;
 
     let template_name = match server_map.get("template").and_then(|v| v.as_str()) {
         Some(name) => name.to_string(),
@@ -969,7 +1022,7 @@ fn expand_template(
         })
         .ok_or_else(|| {
             AppError::Config(format!(
-                "Template '{template_name}' not found in sql_server_templates"
+                "Template '{template_name}' not found in server_templates"
             ))
         })?;
 
@@ -1001,7 +1054,7 @@ mod tests {
     async fn test_inline_servers() {
         let config = config_from_yaml(
             r#"
-sql_servers:
+servers:
   - name: dev-postgres
     description: "dev"
     engine: postgres
@@ -1026,9 +1079,9 @@ sql_servers:
         // グループと直書きサーバーの混在も設定順のまま解決される
         let config = config_from_yaml(
             r#"
-sql_servers:
+servers:
   - group_name: production
-    sql_servers:
+    servers:
       - name: prod-main
         engine: mysql
         host: prod.example.com
@@ -1039,7 +1092,7 @@ sql_servers:
     engine: sqlite
     schema: /tmp/x.db
   - group_name: development
-    sql_servers:
+    servers:
       - name: dev-db
         engine: postgres
         host: localhost
@@ -1070,7 +1123,7 @@ sql_servers:
         // 迂回できてしまうため、デシリアライズしない (無視される)
         let config = config_from_yaml(
             r#"
-sql_servers:
+servers:
   - name: sneaky
     engine: sqlite
     schema: /tmp/x.db
@@ -1085,9 +1138,9 @@ sql_servers:
     async fn test_group_requires_non_empty_group_name() {
         let config = config_from_yaml(
             r#"
-sql_servers:
+servers:
   - group_name: ""
-    sql_servers:
+    servers:
       - name: a
         engine: sqlite
         schema: /tmp/a.db
@@ -1101,11 +1154,11 @@ sql_servers:
     async fn test_group_rejects_nested_group() {
         let config = config_from_yaml(
             r#"
-sql_servers:
+servers:
   - group_name: outer
-    sql_servers:
+    servers:
       - group_name: inner
-        sql_servers:
+        servers:
           - name: a
             engine: sqlite
             schema: /tmp/a.db
@@ -1120,9 +1173,9 @@ sql_servers:
         // グループエントリの typo (servers: 等) をサイレントに無視しない
         let config = config_from_yaml(
             r#"
-sql_servers:
+servers:
   - group_name: g
-    sql_servers: []
+    servers: []
     description: typo-extra-key
 "#,
         );
@@ -1132,16 +1185,16 @@ sql_servers:
 
     #[tokio::test]
     async fn test_group_with_template() {
-        // グループ内のサーバーでも sql_server_templates を継承できる
+        // グループ内のサーバーでも server_templates を継承できる
         let config = config_from_yaml(
             r#"
-sql_servers:
+servers:
   - group_name: shared
-    sql_servers:
+    servers:
       - name: db-a
         template: base
         schema: a_db
-sql_server_templates:
+server_templates:
   - name: base
     engine: mysql
     host: db.example.com
@@ -1162,7 +1215,7 @@ sql_server_templates:
         // readonly は省略可能 (デフォルト false)。true 指定は ConnectionInfo に伝わる
         let config = config_from_yaml(
             r#"
-sql_servers:
+servers:
   - name: writable-db
     engine: sqlite
     schema: /tmp/x.db
@@ -1185,7 +1238,7 @@ sql_servers:
         // フロントへ渡す。パスワードや鍵は含めない。
         let config = config_from_yaml(
             r#"
-sql_servers:
+servers:
   - name: tunneled-db
     engine: postgres
     host: 10.0.0.5
@@ -1222,7 +1275,7 @@ sql_servers:
     async fn test_inline_with_template() {
         let config = config_from_yaml(
             r#"
-sql_servers:
+servers:
   - template: shared-host
     name: app-db
     schema: app_db
@@ -1230,7 +1283,7 @@ sql_servers:
     name: log-db
     schema: log_db
     port: 3307
-sql_server_templates:
+server_templates:
   - name: shared-host
     engine: mysql
     host: db.example.com
@@ -1267,7 +1320,7 @@ sql_server_templates:
     async fn test_load_merged_runs_command_and_merges_result() {
         std::env::set_var(
             "QUERYFOLIO_CONFIG_YAML",
-            "sql_servers: []\ndefault_limit: 500\n\
+            "servers: []\ndefault_limit: 500\n\
              config_override_command: /bin/echo default_limit:\\ 7\n",
         );
         let config = AppConfig::load_merged().await.unwrap();
@@ -1283,7 +1336,7 @@ sql_server_templates:
     async fn test_override_command_is_executed_and_merged() {
         // /bin/echo で上書き YAML を出力させ、load_merged と同じ経路を通す
         let yaml = run_source_command(
-            "/bin/echo -n sql_servers:\\n  - name: fetched\\n    engine: sqlite\\n    schema: /tmp/x.db\\n",
+            "/bin/echo -n servers:\\n  - name: fetched\\n    engine: sqlite\\n    schema: /tmp/x.db\\n",
         )
         .await
         .unwrap();
@@ -1291,11 +1344,11 @@ sql_server_templates:
     }
 
     #[test]
-    fn test_override_replaces_sql_servers_wholesale() {
-        // sql_servers はリストなので要素マージではなく丸ごと置き換わる
+    fn test_override_replaces_servers_wholesale() {
+        // servers はリストなので要素マージではなく丸ごと置き換わる
         let config = merged_from(
             r#"
-sql_servers:
+servers:
   - name: local-a
     engine: sqlite
     schema: /tmp/a.db
@@ -1304,7 +1357,7 @@ sql_servers:
     schema: /tmp/b.db
 "#,
             r#"
-sql_servers:
+servers:
   - name: fetched-only
     engine: sqlite
     schema: /tmp/c.db
@@ -1317,9 +1370,9 @@ sql_servers:
 
     #[test]
     fn test_override_can_set_any_top_level_key() {
-        // sql_servers 以外のキーも上書きできる (旧方式との最大の違い)
+        // servers 以外のキーも上書きできる (旧方式との最大の違い)
         let config = merged_from(
-            "sql_servers: []\ndefault_limit: 500\nsqlfiles_dir: ~/local\n",
+            "servers: []\ndefault_limit: 500\nsqlfiles_dir: ~/local\n",
             "default_limit: 42\n",
         );
         assert_eq!(config.default_limit(), 42);
@@ -1335,7 +1388,7 @@ sql_servers:
     fn test_override_merges_mappings_recursively() {
         // マッピング同士は再帰的に混ざる (ローカルの model は残り api_key だけ上書き)
         let config = merged_from(
-            "sql_servers: []\nai:\n  provider: openai\n  model: local-model\n  api_key: sk-local\n",
+            "servers: []\nai:\n  provider: openai\n  model: local-model\n  api_key: sk-local\n",
             "ai:\n  api_key: sk-fetched\n",
         );
         let ai = config.ai().unwrap();
@@ -1348,7 +1401,7 @@ sql_servers:
     fn test_override_ai_wins_over_local_ai() {
         // API キーを 1Password 側に置く運用: 取得 YAML の ai が優先される
         let config = merged_from(
-            "sql_servers: []\nai:\n  api_key: sk-local\n",
+            "servers: []\nai:\n  api_key: sk-local\n",
             "ai:\n  api_key: sk-fetched\n",
         );
         let ai = config.ai().unwrap();
@@ -1357,7 +1410,7 @@ sql_servers:
 
     #[test]
     fn test_local_ai_survives_without_override_ai() {
-        let config = merged_from("sql_servers: []\nai:\n  api_key: sk-local\n", "default_limit: 10\n");
+        let config = merged_from("servers: []\nai:\n  api_key: sk-local\n", "default_limit: 10\n");
         let ai = config.ai().unwrap();
         assert_eq!(ai.get("api_key").and_then(serde_yaml::Value::as_str), Some("sk-local"));
     }
@@ -1366,8 +1419,8 @@ sql_servers:
     fn test_override_key_is_dropped_after_merge() {
         // 取得 YAML 側が config_override_command を持っていても再帰取得はしない
         let config = merged_from(
-            "sql_servers: []\nconfig_override_command: local-cmd\n",
-            "config_override_command: fetched-cmd\nsql_servers: []\n",
+            "servers: []\nconfig_override_command: local-cmd\n",
+            "config_override_command: fetched-cmd\nservers: []\n",
         );
         assert!(config.override_command().unwrap().is_none());
         // 適用済みコマンドは info の表示用に残る
@@ -1376,14 +1429,14 @@ sql_servers:
 
     #[test]
     fn test_no_override_command_reports_inline() {
-        let config = config_from_yaml("sql_servers: []\n");
+        let config = config_from_yaml("servers: []\n");
         assert!(config.override_command().unwrap().is_none());
         assert_eq!(config.info().unwrap().source, "inline");
     }
 
     #[test]
     fn test_override_command_is_read_from_config() {
-        let config = config_from_yaml("sql_servers: []\nconfig_override_command: op read x\n");
+        let config = config_from_yaml("servers: []\nconfig_override_command: op read x\n");
         assert_eq!(config.override_command().unwrap().as_deref(), Some("op read x"));
         assert!(config.info().unwrap().source.contains("op read x"));
     }
@@ -1392,7 +1445,7 @@ sql_servers:
     fn test_blank_override_command_is_error() {
         // 空文字を黙って「未設定」に倒すと、オーバーライドが効かないまま
         // ローカル設定で動いていることに気付けない
-        let config = config_from_yaml("sql_servers: []\nconfig_override_command: \"   \"\n");
+        let config = config_from_yaml("servers: []\nconfig_override_command: \"   \"\n");
         let err = config.override_command().unwrap_err().to_string();
         assert!(err.contains("is empty"));
     }
@@ -1401,8 +1454,8 @@ sql_servers:
     fn test_non_string_override_command_is_error() {
         // 旧方式のマッピング形式を書いてしまった場合も含め、型誤りは黙認しない
         for yaml in [
-            "sql_servers: []\nconfig_override_command: 123\n",
-            "sql_servers: []\nconfig_override_command:\n  command: op read x\n",
+            "servers: []\nconfig_override_command: 123\n",
+            "servers: []\nconfig_override_command:\n  command: op read x\n",
         ] {
             let config = config_from_yaml(yaml);
             let err = config.override_command().unwrap_err().to_string();
@@ -1411,38 +1464,106 @@ sql_servers:
     }
 
     #[test]
-    fn test_old_sql_servers_source_declaration_explains_migration() {
+    fn test_old_servers_source_declaration_explains_migration() {
         // 旧方式の設定のまま上げたユーザーに移行先を伝える
-        let config = config_from_yaml("sql_servers:\n  file: ~/secrets/servers.yaml\n");
+        let config = config_from_yaml("servers:\n  file: ~/secrets/servers.yaml\n");
         let err = config.resolve_servers().unwrap_err().to_string();
         assert!(err.contains("config_override_command"), "unexpected error: {err}");
     }
 
     #[test]
-    fn test_sql_servers_mapping_is_rejected() {
-        // 旧方式 (sql_servers: {command: ...}) はサポートしない
-        let config = config_from_yaml("sql_servers:\n  command: op read x\n");
+    fn test_servers_mapping_is_rejected() {
+        // 旧方式のソース宣言をキーだけ改名して書いてもサポートしない
+        let config = config_from_yaml("servers:\n  command: op read x\n");
         let err = config.resolve_servers().unwrap_err().to_string();
         assert!(err.contains("must be a list"));
     }
 
     #[test]
+    fn test_renamed_keys_are_rejected_with_guidance() {
+        // sql_servers / sql_server_templates は servers / server_templates へ改名済み。
+        // 黙って無視すると接続 0 件で原因が分からないためエラーにする
+        let err = parse_mapping("sql_servers: []\n", "test").unwrap_err().to_string();
+        assert!(err.contains("renamed to 'servers'"), "unexpected error: {err}");
+
+        let err = parse_mapping("servers: []\nsql_server_templates: []\n", "test")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("renamed to 'server_templates'"),
+            "unexpected error: {err}"
+        );
+        // テンプレートはグループエントリに書けないので、その注記は付けない
+        assert!(!err.contains("group entries"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_old_source_declaration_under_old_key_explains_migration() {
+        // 旧キー + 旧方式のソース宣言。改名だけ案内すると「リストに直したのに
+        // 動かない」で二度詰まるため、移行先も同時に伝える
+        let err = parse_mapping("sql_servers:\n  file: ~/secrets/servers.yaml\n", "test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("renamed to 'servers'"), "unexpected error: {err}");
+        assert!(
+            err.contains(CONFIG_OVERRIDE_COMMAND_KEY),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_renamed_key_in_group_entry_is_rejected() {
+        let config = config_from_yaml(
+            "\
+servers:
+  - group_name: Production
+    sql_servers:
+      - name: a
+        engine: sqlite
+        schema: /tmp/a.db
+",
+        );
+        let err = config.resolve_servers().unwrap_err().to_string();
+        assert!(err.contains("renamed to 'servers'"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_renamed_key_inside_a_group_is_rejected() {
+        // グループの中のサーバーに残った旧キー。ServerConfig は unknown field を
+        // 黙って捨てるため、拒否しないと無関係なエラーになる
+        let config = config_from_yaml(
+            "\
+servers:
+  - group_name: Production
+    servers:
+      - group_name: Nested
+        sql_servers:
+          - name: a
+            engine: sqlite
+            schema: /tmp/a.db
+",
+        );
+        let err = config.resolve_servers().unwrap_err().to_string();
+        assert!(err.contains("renamed to 'servers'"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn test_default_limit() {
-        let config = config_from_yaml("sql_servers: []\n");
+        let config = config_from_yaml("servers: []\n");
         assert_eq!(config.default_limit(), 500);
-        let config = config_from_yaml("sql_servers: []\ndefault_limit: 100\n");
+        let config = config_from_yaml("servers: []\ndefault_limit: 100\n");
         assert_eq!(config.default_limit(), 100);
-        let config = config_from_yaml("sql_servers: []\ndefault_limit: 0\n");
+        let config = config_from_yaml("servers: []\ndefault_limit: 0\n");
         assert_eq!(config.default_limit(), 0);
     }
 
     #[test]
     fn test_sqlfiles_dir_default_and_custom() {
-        let config = config_from_yaml("sql_servers: []\n");
+        let config = config_from_yaml("servers: []\n");
         let default_dir = config.resolve_sqlfiles_dir().unwrap();
         assert!(default_dir.ends_with(".config/queryfolio/sqlfiles"));
 
-        let config = config_from_yaml("sql_servers: []\nsqlfiles_dir: ~/my-queries\n");
+        let config = config_from_yaml("servers: []\nsqlfiles_dir: ~/my-queries\n");
         let custom = config.resolve_sqlfiles_dir().unwrap();
         assert_eq!(custom, dirs::home_dir().unwrap().join("my-queries"));
     }
@@ -1494,7 +1615,7 @@ sql_servers:
 
         // 他ユーザーから読める 644 で手動作成された既存ファイルを模す
         let path = dir.join("config.yml");
-        std::fs::write(&path, "sql_servers: []\n").unwrap();
+        std::fs::write(&path, "servers: []\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         // 既存なので None を返しつつ、権限は 600 へ是正される
@@ -1502,7 +1623,7 @@ sql_servers:
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         // 中身は書き換えない
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "sql_servers: []\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "servers: []\n");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1545,9 +1666,9 @@ sql_servers:
 
         // ファイルが無い状態でもテンプレートが作られて読める
         let initial = read_config_file_in(&dir).unwrap();
-        assert!(initial.contains("sql_servers"));
+        assert!(initial.contains("servers"));
 
-        let edited = "sql_servers:\n  - name: edited\n    engine: sqlite\n    schema: /tmp/a.db\n";
+        let edited = "servers:\n  - name: edited\n    engine: sqlite\n    schema: /tmp/a.db\n";
         let saved_path = write_config_file_in(&dir, edited).unwrap();
         assert_eq!(saved_path, dir.join("config.yml").display().to_string());
         assert_eq!(read_config_file_in(&dir).unwrap(), edited);
@@ -1566,11 +1687,11 @@ sql_servers:
         ));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let valid = "sql_servers: []\n";
+        let valid = "servers: []\n";
         write_config_file_in(&dir, valid).unwrap();
 
         // マッピングとしてパースできない内容
-        assert!(write_config_file_in(&dir, "sql_servers: [\n").is_err());
+        assert!(write_config_file_in(&dir, "servers: [\n").is_err());
         // YAML ではあるがマッピングではない
         assert!(write_config_file_in(&dir, "- just\n- a list\n").is_err());
         // 既存の内容は壊れていない
@@ -1592,14 +1713,14 @@ sql_servers:
         let _ = std::fs::remove_dir_all(&dir);
 
         // 新規作成は 600
-        write_config_file_in(&dir, "sql_servers: []\n").unwrap();
+        write_config_file_in(&dir, "servers: []\n").unwrap();
         let path = dir.join("config.yml");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
 
         // 既存が緩い権限 (640) でも、保存時に 600 へ絞る
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-        write_config_file_in(&dir, "sql_servers: []\n# edited\n").unwrap();
+        write_config_file_in(&dir, "servers: []\n# edited\n").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
 
@@ -1615,9 +1736,9 @@ sql_servers:
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config.yaml"), "sql_servers: []\n").unwrap();
+        std::fs::write(dir.join("config.yaml"), "servers: []\n").unwrap();
 
-        let edited = "sql_servers: []\n# edited\n";
+        let edited = "servers: []\n# edited\n";
         let saved_path = write_config_file_in(&dir, edited).unwrap();
         assert_eq!(saved_path, dir.join("config.yaml").display().to_string());
         assert!(!dir.join("config.yml").exists());
