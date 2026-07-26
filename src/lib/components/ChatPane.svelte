@@ -249,6 +249,17 @@
           class="inline-block size-3 animate-spin rounded-full border-2 border-zinc-500 border-t-transparent"
         ></span>
         Thinking...
+        <!-- エージェントが重いクエリを回している時に止める手段。
+             会話は残し、中断されたことはメッセージとして表示される -->
+        <button
+          type="button"
+          class="rounded border border-zinc-600 px-1.5 py-0.5 text-[10px] text-zinc-300 hover:bg-zinc-800"
+          data-annotate="button-chat-stop"
+          title="Stop the assistant (cancels the query it is running)"
+          onclick={() => appStore.stopChat()}
+        >
+          <i class="bi bi-stop-fill" aria-hidden="true"></i> Stop
+        </button>
       </div>
     {/if}
   </div>

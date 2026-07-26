@@ -306,6 +306,11 @@ export interface ChatReply {
 export const aiChat = (connection: string, history: ChatTurn[]) =>
   invoke<ChatReply>("ai_chat", { connection, history });
 
+/// AI チャットのエージェントの実行を中断する (実行中のクエリを止め、
+/// 次のツール往復も行わせない)。実行中のクエリがあれば true。
+export const cancelAiChat = (connection: string) =>
+  invoke<boolean>("cancel_ai_chat", { connection });
+
 /// `queryfolio://open/<path>` deep link / CLI で指定された「開く対象」
 /// (バックエンドの router::OpenTarget に対応)。
 export interface OpenTarget {

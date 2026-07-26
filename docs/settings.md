@@ -473,6 +473,11 @@ at 50 rows, and per reply the assistant may go at most 6 rounds and run at most
 > need a hard guarantee, point the connection at **read-only credentials** —
 > that is the only thing this client cannot talk its way around.
 
+While the assistant is working, a **Stop** button cancels the query it is
+running and ends the round trip. Switching connections or schemas, clearing the
+conversation, and reloading the config cancel it too, so a discarded reply does
+not leave a query running.
+
 Every query it ran is listed above the answer,
 so you can check what it looked at. The conversation is cleared when you switch
 connections (the schema in the prompt changes) and is not persisted to disk.

@@ -63,6 +63,42 @@ struct AppState {
     launch_route: std::sync::Mutex<Option<router::Route>>,
     /// 実行中に届いた開く対象の受け渡し (listener 準備前の取りこぼし対策)。
     live: std::sync::Mutex<LiveDelivery>,
+    /// AI チャットの中断要求 (接続名単位)。
+    chat_cancels: ChatCancels,
+}
+
+/// AI チャット (エージェント) の中断要求を接続ごとに数えるカウンタ。
+/// クエリのキャンセル (CancelRegistry) は「実行中の 1 本」を止めるだけで、
+/// モデルの応答待ちや次のツール往復は止められない。ai_chat は開始時の
+/// カウンタを控え、各ステップの前に増えていれば往復ごと中断する。
+#[derive(Default)]
+struct ChatCancels {
+    inner: tokio::sync::Mutex<std::collections::HashMap<String, u64>>,
+}
+
+impl ChatCancels {
+    /// 中断を要求する (実行中でなくても記録だけ残す。次の往復が
+    /// 開始時のカウンタと比較して中断する)。
+    async fn request(&self, connection: &str) {
+        let mut map = self.inner.lock().await;
+        *map.entry(connection.to_string()).or_insert(0) += 1;
+    }
+
+    /// 現在のカウンタ値。
+    async fn epoch(&self, connection: &str) -> u64 {
+        self.inner
+            .lock()
+            .await
+            .get(connection)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// AI チャットのツール実行を登録するキャンセルレジストリのキー。
+/// ユーザーのクエリ (接続名がキー) と衝突させない。
+fn chat_cancel_key(connection: &str) -> String {
+    format!("{connection}\u{1}ai-chat")
 }
 
 impl AppState {
@@ -521,6 +557,19 @@ async fn cancel_query(
     connection: String,
 ) -> Result<bool, AppError> {
     state.query_cancels.cancel(&connection).await
+}
+
+/// AI チャットのエージェントが実行中のクエリにキャンセルを要求する。
+/// 実行中のクエリが無ければ false を返す (この時点でモデルの応答待ちなら
+/// クエリは走っていないが、ai_chat 側が中断フラグを見て次のツール実行を
+/// 行わないため、往復そのものも間もなく終わる)。
+#[tauri::command]
+async fn cancel_ai_chat(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+) -> Result<bool, AppError> {
+    state.chat_cancels.request(&connection).await;
+    state.query_cancels.cancel(&chat_cancel_key(&connection)).await
 }
 
 /// 接続のクエリ実行履歴を新しい順に返す。
@@ -1078,7 +1127,13 @@ async fn ai_chat(
     };
     // ユーザーのクエリのキャンセル (接続名がキー) と衝突しないよう、
     // エージェントの実行には別のキーを使う
-    let cancel_key = format!("{connection}\u{1}ai-chat");
+    let cancel_key = chat_cancel_key(&connection);
+    // 中断要求はカウンタで見る。実行中のクエリを止めるだけでは、モデルの
+    // 応答待ちや次のツール往復は止まらないため
+    let cancel_epoch = state.chat_cancels.epoch(&connection).await;
+    let cancelled = || async {
+        state.chat_cancels.epoch(&connection).await != cancel_epoch
+    };
 
     let engine = db::parse_engine(&server.engine)?;
     let mut tool_calls: Vec<ai::ChatToolCall> = Vec::new();
@@ -1089,6 +1144,11 @@ async fn ai_chat(
         // 累計上限に達したら、ツールを渡さず最後の回答を書かせる
         // (上限超過をエラーにせず、そこまでに読めた内容で答えさせる)
         let allow_tools = executed_calls < ai::CHAT_MAX_TOOL_CALLS;
+        // 会話が破棄された (接続 / スキーマ切替・Clear・Stop) なら、
+        // 次のモデル呼び出しもツール実行も行わずに打ち切る
+        if cancelled().await {
+            return Err(AppError::Cancelled);
+        }
         let message = ai::chat_step(&ai_config, &messages, allow_tools).await?;
         let requested = ai::parse_tool_calls(&message);
         if requested.is_empty() {
@@ -1122,6 +1182,9 @@ async fn ai_chat(
                 }));
                 continue;
             }
+            if cancelled().await {
+                return Err(AppError::Cancelled);
+            }
             executed_calls += 1;
             let (ok, argument, result_text) = if name == "run_sql" {
                 match ai::parse_run_sql_argument(&arguments) {
@@ -1149,6 +1212,9 @@ async fn ai_chat(
                         .await;
                         match outcome {
                             Ok(result) => (true, sql, format_chat_tool_result(&result)),
+                            // キャンセル要求で止まったクエリは、モデルに
+                            // 「失敗したので別の手を試す」と解釈させず往復ごと終える
+                            Err(AppError::Cancelled) => return Err(AppError::Cancelled),
                             Err(e) => (false, sql, format!("Error: {e}")),
                         }
                     }
@@ -1177,6 +1243,9 @@ async fn ai_chat(
     }
     // 往復の上限に達した場合も、ツールを渡さない最後の 1 回で回答を書かせる
     // (ここまでのツール結果は履歴に載っているので、調べた内容を無駄にしない)
+    if cancelled().await {
+        return Err(AppError::Cancelled);
+    }
     let message = ai::chat_step(&ai_config, &messages, false).await?;
     let content = ai::message_content(&message);
     if content.is_empty() {
@@ -1656,6 +1725,7 @@ pub fn run() {
             ai_explain_sql,
             ai_fix_sql,
             ai_chat,
+            cancel_ai_chat,
             get_config_info,
             ensure_config_file,
             read_config_file,

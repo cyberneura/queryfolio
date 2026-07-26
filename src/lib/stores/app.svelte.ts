@@ -1663,13 +1663,29 @@ const sendChatMessage = async (text: string) => {
   }
 };
 
+/// 応答待ちのエージェントを止める (Stop ボタン)。会話は残すので、
+/// 中断されたことは失敗メッセージとして会話に出る。
+const stopChat = () => {
+  for (const connection of chatRunningConnections.keys()) {
+    void api.cancelAiChat(connection).catch(() => {});
+  }
+};
+
 /// AI チャットの会話を捨てる
 /// (Clear ボタン / 接続切替 / スキーマ切替 / 設定リロード)。
 /// 世代を進めて、応答待ちの往復が破棄後の会話へ書き込むのを防ぐ。
 /// 待機表示 (chatSending) も世代で判定するため、破棄と同時に消える。
+///
+/// 応答を捨てるだけではバックエンドのエージェントは走り続け、重いクエリや
+/// 次のツール往復 (切替後のスキーマを読む) がそのまま実行されてしまうため、
+/// 実行中の接続には中断も要求する。
 const clearChat = () => {
   chatGeneration++;
   chatMessages = [];
+  for (const connection of chatRunningConnections.keys()) {
+    // 中断要求の失敗で会話の破棄を止めない (実行はいずれ終わる)
+    void api.cancelAiChat(connection).catch(() => {});
+  }
 };
 
 /// タブに記録された SQL を同じ接続で再実行する
@@ -2163,6 +2179,7 @@ export default {
   closeAiExplanation,
   sendChatMessage,
   clearChat,
+  stopChat,
   cancelQuery,
   rerunTab,
   submitCellEdits,
