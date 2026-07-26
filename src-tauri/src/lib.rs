@@ -1155,20 +1155,37 @@ async fn ai_chat(
     history: Vec<ai::ChatTurn>,
     request_id: String,
 ) -> Result<ai::ChatReply, AppError> {
-    let result = run_ai_chat(&state, &connection, &history, &request_id).await;
+    // 実行したツール呼び出しは失敗時にも返す (途中まで実行したクエリを
+    // 隠さない。特に中断・タイムアウトはツール実行の後に起きやすい)
+    let mut tool_calls: Vec<ai::ChatToolCall> = Vec::new();
+    let result =
+        run_ai_chat(&state, &connection, &history, &request_id, &mut tool_calls).await;
     // 中断記録は往復の終了時に掃除する (残っても上限で捨てられるが、
     // 同じ ID が再利用されることはないので溜めておく意味が無い)
     state.chat_cancels.finish(&request_id).await;
-    result
+    Ok(match result {
+        Ok(content) => ai::ChatReply {
+            content,
+            tool_calls,
+            error: None,
+        },
+        Err(e) => ai::ChatReply {
+            content: String::new(),
+            tool_calls,
+            error: Some(e.to_string()),
+        },
+    })
 }
 
-/// ai_chat の本体 (中断記録の掃除を呼び出し側に任せるための分離)。
+/// ai_chat の本体。アシスタントの最終メッセージを返し、実行したツール
+/// 呼び出しは (失敗時も呼び出し側が拾えるよう) 引数の Vec へ積む。
 async fn run_ai_chat(
     state: &AppState,
     connection: &str,
     history: &[ai::ChatTurn],
     request_id: &str,
-) -> Result<ai::ChatReply, AppError> {
+    tool_calls: &mut Vec<ai::ChatToolCall>,
+) -> Result<String, AppError> {
     let connection = connection.to_string();
     let mut messages = ai::chat_history_messages(history);
     if messages.is_empty() {
@@ -1217,7 +1234,6 @@ async fn run_ai_chat(
     let cancel_key = chat_cancel_key(&connection, &request_id);
 
     let engine = db::parse_engine(&server.engine)?;
-    let mut tool_calls: Vec<ai::ChatToolCall> = Vec::new();
     // ツール実行の累計。1 応答が複数の tool_calls を並べられるため、
     // 往復回数 (ラウンド) とは別に累計でも上限を課す
     let mut executed_calls = 0usize;
@@ -1245,10 +1261,7 @@ async fn run_ai_chat(
                     "The AI returned an empty message".into(),
                 ));
             }
-            return Ok(ai::ChatReply {
-                content,
-                tool_calls,
-            });
+            return Ok(content);
         }
         // ツール呼び出しを含むアシスタントメッセージはそのまま履歴へ積む
         // (tool メッセージは直前の tool_calls と対応していなければならない)
@@ -1359,10 +1372,7 @@ async fn run_ai_chat(
             ai::CHAT_MAX_TOOL_ROUNDS
         )));
     }
-    Ok(ai::ChatReply {
-        content,
-        tool_calls,
-    })
+    Ok(content)
 }
 
 /// 設定の解決結果を返す (情報表示用。機密を含まない)。

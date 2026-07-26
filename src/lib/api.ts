@@ -295,9 +295,12 @@ export interface ChatToolCall {
 }
 
 /// AI チャット 1 往復の応答 (バックエンドの ai::ChatReply に対応)。
+/// 失敗した往復も reject ではなくこの形で返る (途中まで実行したクエリを
+/// 隠さないため)。error が非 null なら失敗で、content は空。
 export interface ChatReply {
   content: string;
   tool_calls: ChatToolCall[];
+  error: string | null;
 }
 
 /// AI チャット (エージェント) の 1 往復を実行する。会話履歴は毎回そのまま

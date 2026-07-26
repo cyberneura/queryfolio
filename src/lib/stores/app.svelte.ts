@@ -1658,13 +1658,16 @@ const sendChatMessage = async (text: string) => {
     if (selectedConnection !== connection || chatGeneration !== generation) {
       return;
     }
+    // 失敗した往復も (reject ではなく) error 付きで返る。実行した
+    // クエリは成功時と同じく表示する
     chatMessages = [
       ...chatMessages,
       {
         id: nextChatMessageId++,
         role: "assistant",
-        content: reply.content,
+        content: reply.error ?? reply.content,
         toolCalls: reply.tool_calls,
+        failed: reply.error !== null,
       },
     ];
   } catch (e) {

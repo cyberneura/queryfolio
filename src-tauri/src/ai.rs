@@ -399,12 +399,16 @@ pub struct ChatToolCall {
 }
 
 /// チャット 1 往復の応答。
+/// 失敗した往復も (エラーとして reject せず) この形で返す: 途中まで実行した
+/// クエリを隠さないため。実行したクエリは成功時と同じく tool_calls に載る。
 #[derive(Debug, Serialize)]
 pub struct ChatReply {
-    /// アシスタントの最終メッセージ (Markdown)
+    /// アシスタントの最終メッセージ (Markdown)。失敗時は空
     pub content: String,
     /// 応答を組み立てる過程で実行したツール呼び出し
     pub tool_calls: Vec<ChatToolCall>,
+    /// 失敗した場合のエラーメッセージ (成功時は None)
+    pub error: Option<String>,
 }
 
 /// LLM に渡すツール定義 (OpenAI function calling 形式)。
