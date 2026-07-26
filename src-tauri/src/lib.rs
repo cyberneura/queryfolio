@@ -1175,10 +1175,20 @@ async fn ai_chat(
             }));
         }
     }
-    Err(AppError::Ai(format!(
-        "The AI kept calling tools without answering (stopped after {} rounds)",
-        ai::CHAT_MAX_TOOL_ROUNDS
-    )))
+    // 往復の上限に達した場合も、ツールを渡さない最後の 1 回で回答を書かせる
+    // (ここまでのツール結果は履歴に載っているので、調べた内容を無駄にしない)
+    let message = ai::chat_step(&ai_config, &messages, false).await?;
+    let content = ai::message_content(&message);
+    if content.is_empty() {
+        return Err(AppError::Ai(format!(
+            "The AI kept calling tools without answering (stopped after {} rounds)",
+            ai::CHAT_MAX_TOOL_ROUNDS
+        )));
+    }
+    Ok(ai::ChatReply {
+        content,
+        tool_calls,
+    })
 }
 
 /// 設定の解決結果を返す (情報表示用。機密を含まない)。
