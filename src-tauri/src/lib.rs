@@ -1341,6 +1341,17 @@ async fn run_ai_chat(
                                         ),
                                     ) => {
                                         if cancelled().await {
+                                            // future を drop するだけでは
+                                            // spawn_blocking で走るエンジン
+                                            // (DuckDB) は止まらない。この時点
+                                            // では登録が済んでいるはずなので、
+                                            // エンジン別のキャンセル
+                                            // (DuckDB の InterruptHandle 等) を
+                                            // 改めて要求してから待つのをやめる
+                                            let _ = state
+                                                .query_cancels
+                                                .cancel(&cancel_key)
+                                                .await;
                                             break Err(AppError::Cancelled);
                                         }
                                     }
@@ -1363,7 +1374,10 @@ async fn run_ai_chat(
                                     name: name.clone(),
                                     argument: sql,
                                     ok: false,
-                                    summary: "Cancelled".to_string(),
+                                    // 実行に入ったことは分かるが、コネクション
+                                    // 取得の途中で止まった可能性もあるため
+                                    // 「実行した」と断定はしない
+                                    summary: "Cancelled (may not have run)".to_string(),
                                 });
                             }
                             return Err(AppError::Cancelled);
