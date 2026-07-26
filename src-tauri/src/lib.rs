@@ -1101,8 +1101,23 @@ async fn ai_chat(
     if messages.is_empty() {
         return Err(AppError::Ai("The chat history is empty".into()));
     }
+    // 中断要求はカウンタで見る (実行中のクエリを止めるだけでは、モデルの
+    // 応答待ちや次のツール往復は止まらない)。基準値は**コマンド入口で**
+    // 控える: resolve_ai_context は接続とスキーマ取得で待つため、その間に
+    // 来た中断要求を後から控えると基準値に取り込んでしまい、以降の判定が
+    // すべて「中断されていない」になる
+    let cancel_epoch = state.chat_cancels.epoch(&connection).await;
+    let cancelled = || async {
+        state.chat_cancels.epoch(&connection).await != cancel_epoch
+    };
+
     let (ai_config, server, active_schema, schema_map) =
         state.resolve_ai_context(&connection).await?;
+    // コンテキスト解決の間に中断されていたら、ここで打ち切る
+    // (この時点の schema_map / プロンプトは既に古い可能性がある)
+    if cancelled().await {
+        return Err(AppError::Cancelled);
+    }
     // AI 非対応のエンジン (redis / elasticsearch / dynamodb) はフロントでも
     // 入力を塞いでいるが、コマンド側でも拒否する (プロンプトが SQL 前提のため)
     if !engines::capabilities_for_name(&server.engine).supports_ai {
@@ -1128,12 +1143,6 @@ async fn ai_chat(
     // ユーザーのクエリのキャンセル (接続名がキー) と衝突しないよう、
     // エージェントの実行には別のキーを使う
     let cancel_key = chat_cancel_key(&connection);
-    // 中断要求はカウンタで見る。実行中のクエリを止めるだけでは、モデルの
-    // 応答待ちや次のツール往復は止まらないため
-    let cancel_epoch = state.chat_cancels.epoch(&connection).await;
-    let cancelled = || async {
-        state.chat_cancels.epoch(&connection).await != cancel_epoch
-    };
 
     let engine = db::parse_engine(&server.engine)?;
     let mut tool_calls: Vec<ai::ChatToolCall> = Vec::new();
@@ -1150,6 +1159,12 @@ async fn ai_chat(
             return Err(AppError::Cancelled);
         }
         let message = ai::chat_step(&ai_config, &messages, allow_tools).await?;
+        // モデルの応答を待つ間に中断された場合、その応答は採用しない
+        // (ツール無しの応答で終わる往復が最も多いため、ここを見落とすと
+        //  Stop を押しても普通の回答が返ってくる)
+        if cancelled().await {
+            return Err(AppError::Cancelled);
+        }
         let requested = ai::parse_tool_calls(&message);
         if requested.is_empty() {
             let content = ai::message_content(&message);
@@ -1247,6 +1262,9 @@ async fn ai_chat(
         return Err(AppError::Cancelled);
     }
     let message = ai::chat_step(&ai_config, &messages, false).await?;
+    if cancelled().await {
+        return Err(AppError::Cancelled);
+    }
     let content = ai::message_content(&message);
     if content.is_empty() {
         return Err(AppError::Ai(format!(
