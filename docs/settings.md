@@ -461,7 +461,8 @@ Those queries go through a **read-only guard** that ignores the Writable switch.
 The agent path is stricter than read-only mode itself: only `SELECT` / `WITH` /
 `SHOW` / `DESCRIBE` / `DESC` / `EXPLAIN` / `VALUES` / `TABLE` statements are
 accepted (`CALL` is refused because a stored procedure can write, and `PRAGMA`
-because it can change database settings), multiple statements in one call are
+because it can change database settings), `EXPLAIN ANALYZE` is refused (it
+executes the statement it explains), multiple statements in one call are
 refused, and `allow_dangerous_statements` is never applied. Results are capped
 at 50 rows, and per reply the assistant may go at most 6 rounds and run at most
 12 queries in total.

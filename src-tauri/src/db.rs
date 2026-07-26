@@ -1435,6 +1435,21 @@ pub(crate) fn agent_rejection_reason(sql: &str, engine: Engine) -> Option<String
     if cleaned.trim_end().trim_end_matches(';').contains(';') {
         return Some("The assistant may only run one statement at a time; rejected.".to_string());
     }
+    // EXPLAIN ANALYZE は対象文を実際に実行する。is_readonly_allowed は中身の
+    // DML / INTO しか見ないため、`EXPLAIN (ANALYZE) CREATE TABLE x AS SELECT ...`
+    // のような DDL がすり抜ける。エージェントに実行を伴う EXPLAIN は不要なので
+    // (計画を見るだけなら ANALYZE 無しで足りる) まとめて拒否する。
+    let has_word = |target: &str| {
+        cleaned
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|word| word == target)
+    };
+    if keyword == "explain" && has_word("analyze") {
+        return Some(
+            "The assistant may not run EXPLAIN ANALYZE (it executes the statement); rejected."
+                .to_string(),
+        );
+    }
     if !is_readonly_allowed(sql, engine) {
         return Some("The statement is not read-only; rejected.".to_string());
     }
@@ -1724,6 +1739,21 @@ mod tests {
         assert!(f("DROP TABLE t").is_some());
         // 複文は 1 文目が読み取りでも拒否する
         assert!(f("SELECT 1; DELETE FROM t").is_some());
+        // EXPLAIN ANALYZE は対象文を実行するため拒否する。特に
+        // EXPLAIN (ANALYZE) CREATE TABLE ... AS SELECT は DML 語も INTO も
+        // 含まないため is_readonly_allowed を素通りする
+        assert!(is_readonly_allowed(
+            "EXPLAIN (ANALYZE) CREATE TABLE agent_tmp AS SELECT 1",
+            Engine::Postgres
+        ));
+        assert!(agent_rejection_reason(
+            "EXPLAIN (ANALYZE) CREATE TABLE agent_tmp AS SELECT 1",
+            Engine::Postgres
+        )
+        .is_some());
+        assert!(agent_rejection_reason("EXPLAIN ANALYZE SELECT 1", Engine::Postgres).is_some());
+        // ANALYZE 無しの EXPLAIN は実行を伴わないので許可する
+        assert!(agent_rejection_reason("EXPLAIN SELECT 1", Engine::Postgres).is_none());
         // リテラル内のセミコロンは複文ではない
         assert!(f("SELECT 'a; b' FROM t").is_none());
     }
