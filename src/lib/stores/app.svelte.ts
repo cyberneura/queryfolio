@@ -219,10 +219,11 @@ const reloadConnections = async (): Promise<boolean> => {
   if (!(await saveAllDirtyTabs())) {
     return false;
   }
-  // 応答待ちのチャットは resetConnections の**前に**中断する。後回しにすると、
-  // リロード前の接続設定を握ったままのエージェントが破棄済みのプールを
-  // 開き直し、古い認証情報 / スキーマでツール実行を続けうる
-  clearChat();
+  // 応答待ちのチャットは resetConnections の**前に**中断し、要求が届くまで
+  // 待つ。後回し / 投げっぱなしだと、リロード前の接続設定を握ったままの
+  // エージェントが破棄済みのプールを開き直し、古い認証情報 / スキーマで
+  // ツール実行を続けうる
+  await clearChatAndWait();
   try {
     await api.resetConnections();
   } catch (e) {
@@ -615,6 +616,11 @@ const changeActiveSchema = async (schema: string): Promise<boolean> => {
   }
   // 未保存タブは best-effort で保存 (失敗してもスキーマ切替は止めない)
   await flushPendingSave();
+  // AI チャットの会話は切替の**前に**破棄し、中断が届くまで待つ。
+  // system prompt に載るスキーマが変わるため会話は引き継げず、切替が
+  // 先行すると応答待ちの往復が古いプロンプトのまま新しいスキーマの
+  // プールでクエリを実行してしまう
+  await clearChatAndWait();
   try {
     await api.setActiveSchema(connection, schema);
     // 切替中に別接続へ移っていたら、そのスキーマ表示を新接続に適用しない
@@ -623,10 +629,6 @@ const changeActiveSchema = async (schema: string): Promise<boolean> => {
     }
     activeSchema = schema;
     errorMessage = null;
-    // AI チャットの会話も破棄する。system prompt に載るスキーマが変わるため、
-    // 応答待ちの往復は古いスキーマのプロンプトのまま新しいスキーマの
-    // プールでクエリを実行してしまう
-    clearChat();
     // 切替先スキーマの補完候補をバックグラウンドで取得する (待たない)
     void loadSchemaMap();
     return true;
@@ -1323,7 +1325,10 @@ const applySwitchedSchema = (connection: string, schema: string) => {
     return;
   }
   activeSchema = schema;
-  // changeActiveSchema と同じ理由で AI チャットの会話は破棄する
+  // changeActiveSchema と同じ理由で AI チャットの会話は破棄する。
+  // ただし `\c` はクエリの実行そのものが切替なので、切替の前に中断する
+  // ことはできない (実行後に結果として知る)。中断要求が届くまでの短い間、
+  // 応答待ちのエージェントが切替後のスキーマを読みうる
   clearChat();
   // 補完候補は切替先のものを取り直す (待たない)
   void loadSchemaMap();
@@ -1664,12 +1669,20 @@ const sendChatMessage = async (text: string) => {
   }
 };
 
+/// 走っているエージェントに中断を要求し、要求がバックエンドに届くまで待つ。
+/// 中断要求の失敗で呼び出し側の処理を止めない (実行はいずれ終わる)。
+const requestChatCancel = async () => {
+  await Promise.all(
+    [...chatRunningConnections.keys()].map((connection) =>
+      api.cancelAiChat(connection).catch(() => {}),
+    ),
+  );
+};
+
 /// 応答待ちのエージェントを止める (Stop ボタン)。会話は残すので、
 /// 中断されたことは失敗メッセージとして会話に出る。
 const stopChat = () => {
-  for (const connection of chatRunningConnections.keys()) {
-    void api.cancelAiChat(connection).catch(() => {});
-  }
+  void requestChatCancel();
 };
 
 /// AI チャットの会話を捨てる
@@ -1683,10 +1696,17 @@ const stopChat = () => {
 const clearChat = () => {
   chatGeneration++;
   chatMessages = [];
-  for (const connection of chatRunningConnections.keys()) {
-    // 中断要求の失敗で会話の破棄を止めない (実行はいずれ終わる)
-    void api.cancelAiChat(connection).catch(() => {});
-  }
+  void requestChatCancel();
+};
+
+/// 会話を破棄し、中断要求がバックエンドに届くまで待つ。
+/// バックエンドの状態を書き換える操作 (スキーマ切替・設定リロード) の
+/// **前**に使う: 投げっぱなしだと、中断カウンタが進む前に切替が先行し、
+/// 古いエージェントが新しいスキーマ / プールでツール実行を続けうる。
+const clearChatAndWait = async () => {
+  chatGeneration++;
+  chatMessages = [];
+  await requestChatCancel();
 };
 
 /// タブに記録された SQL を同じ接続で再実行する
