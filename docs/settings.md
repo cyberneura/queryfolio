@@ -457,14 +457,22 @@ questions about your data, so the rows it reads are sent back to the model as
 tool results. Everything else it receives is the same: schema, dialect, active
 schema name, and your messages — never connection details.
 
-Those queries are **always read-only**, regardless of the Writable switch. The
-agent path is stricter than read-only mode itself: only `SELECT` / `WITH` /
+Those queries go through a **read-only guard** that ignores the Writable switch.
+The agent path is stricter than read-only mode itself: only `SELECT` / `WITH` /
 `SHOW` / `DESCRIBE` / `DESC` / `EXPLAIN` / `VALUES` / `TABLE` statements are
 accepted (`CALL` is refused because a stored procedure can write, and `PRAGMA`
 because it can change database settings), multiple statements in one call are
 refused, and `allow_dangerous_statements` is never applied. Results are capped
 at 50 rows, and per reply the assistant may go at most 6 rounds and run at most
-12 queries in total. Every query it ran is listed above the answer,
+12 queries in total.
+
+> **The guard is statement-level, not database-enforced.** It shares the known
+> limit of read-only mode: a `SELECT` that calls a side-effecting function
+> (`nextval()`, a user-defined function that writes) is not detected. If you
+> need a hard guarantee, point the connection at **read-only credentials** —
+> that is the only thing this client cannot talk its way around.
+
+Every query it ran is listed above the answer,
 so you can check what it looked at. The conversation is cleared when you switch
 connections (the schema in the prompt changes) and is not persisted to disk.
 
