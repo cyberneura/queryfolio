@@ -449,6 +449,21 @@ message can itself embed data values (for example, a unique-constraint violation
 often includes the conflicting key value), so it is not strictly free of row data.
 Generated SQL is inserted into the editor, never auto-executed.
 
+### AI chat pane
+
+The toolbar's **Chat** button opens a chat pane on the right. Unlike the helpers
+above, the assistant there can **run SQL itself** (a `run_sql` tool) to answer
+questions about your data, so the rows it reads are sent back to the model as
+tool results. Everything else it receives is the same: schema, dialect, active
+schema name, and your messages — never connection details.
+
+Those queries are **always read-only**, regardless of the Writable switch: the
+same guard that backs read-only mode rejects writes, `allow_dangerous_statements`
+is never applied, results are capped at 50 rows, and the assistant may call the
+tool at most 6 times per reply. Every query it ran is listed above the answer,
+so you can check what it looked at. The conversation is cleared when you switch
+connections (the schema in the prompt changes) and is not persisted to disk.
+
 ## Auto `LIMIT` (`default_limit`)
 
 `default_limit` appends `LIMIT n` to `SELECT` statements that do not already have

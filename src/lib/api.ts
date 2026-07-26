@@ -276,6 +276,36 @@ export const aiExplainPlan = (
 export const aiExplainSql = (connection: string, sql: string) =>
   invoke<string>("ai_explain_sql", { connection, sql });
 
+/// AI チャットの 1 ターン (バックエンドの ai::ChatTurn に対応)。
+/// role は "user" / "assistant" のみ (system はバックエンドが組み立てる)。
+export interface ChatTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
+/// AI エージェントが実行したツール呼び出しの記録
+/// (バックエンドの ai::ChatToolCall に対応)。
+export interface ChatToolCall {
+  name: string;
+  /// 実行した SQL (引数のパースに失敗した場合は生の引数)
+  argument: string;
+  ok: boolean;
+  /// 結果の要約 (行数 / エラーメッセージの 1 行目)
+  summary: string;
+}
+
+/// AI チャット 1 往復の応答 (バックエンドの ai::ChatReply に対応)。
+export interface ChatReply {
+  content: string;
+  tool_calls: ChatToolCall[];
+}
+
+/// AI チャット (エージェント) の 1 往復を実行する。会話履歴は毎回そのまま
+/// 送り、system prompt の組み立てとツール実行ループはバックエンドが行う。
+/// エージェントが実行できるのは読み取り専用の SQL のみ。
+export const aiChat = (connection: string, history: ChatTurn[]) =>
+  invoke<ChatReply>("ai_chat", { connection, history });
+
 /// `queryfolio://open/<path>` deep link / CLI で指定された「開く対象」
 /// (バックエンドの router::OpenTarget に対応)。
 export interface OpenTarget {

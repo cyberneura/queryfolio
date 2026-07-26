@@ -1007,6 +1007,152 @@ async fn ai_explain_sql(
     Ok(response.trim().to_string())
 }
 
+/// エージェントの run_sql の結果を LLM 向けのテキストに整形する。
+/// 行数を明示し、列名 + 各行を 1 行の JSON にして渡す (トークン効率と
+/// パースのしやすさの両立)。
+fn format_chat_tool_result(result: &QueryResult) -> String {
+    let mut text = format!(
+        "{} row(s){}",
+        result.row_count,
+        if result.truncated {
+            " (truncated)"
+        } else {
+            ""
+        }
+    );
+    if let Some(affected) = result.affected_rows {
+        text.push_str(&format!(", {affected} affected"));
+    }
+    text.push_str(&format!("\ncolumns: {}\n", result.columns.join(", ")));
+    for row in &result.rows {
+        let line = serde_json::to_string(row).unwrap_or_else(|_| "[unserializable row]".into());
+        text.push_str(&line);
+        text.push('\n');
+    }
+    ai::truncate_tool_result(&text)
+}
+
+/// AI チャット (エージェント) の 1 往復を実行する。
+/// フロントは会話履歴を毎回そのまま渡し、バックエンドが system prompt の
+/// 組み立てとツール実行ループを担う。
+///
+/// ツールは読み取り専用の `run_sql` のみで、実行は**常に読み取り専用**
+/// (ツールバーの Writable スイッチが ON でも書き込みは許可しない)。
+/// エージェントが自分の判断で書き込む事故を構造的に防ぐため。
+/// LLM に送るのはスキーマ情報・方言・アクティブスキーマ名・会話履歴と、
+/// エージェント自身が実行した読み取りクエリの結果のみ。接続情報
+/// (ホスト・認証情報) は送らない。
+#[tauri::command]
+async fn ai_chat(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    history: Vec<ai::ChatTurn>,
+) -> Result<ai::ChatReply, AppError> {
+    let mut messages = ai::chat_history_messages(&history);
+    if messages.is_empty() {
+        return Err(AppError::Ai("The chat history is empty".into()));
+    }
+    let (ai_config, server, active_schema, schema_map) =
+        state.resolve_ai_context(&connection).await?;
+    // AI 非対応のエンジン (redis / elasticsearch / dynamodb) はフロントでも
+    // 入力を塞いでいるが、コマンド側でも拒否する (プロンプトが SQL 前提のため)
+    if !engines::capabilities_for_name(&server.engine).supports_ai {
+        return Err(AppError::Ai(format!(
+            "The AI features are not available for the '{}' engine",
+            server.engine
+        )));
+    }
+    let system_prompt =
+        ai::build_chat_system_prompt(&server.engine, active_schema.as_deref(), &schema_map);
+    messages.insert(
+        0,
+        serde_json::json!({ "role": "system", "content": system_prompt }),
+    );
+
+    // config が readonly ならその案内を出したいので Config を使い、
+    // それ以外でも Switch (= 読み取り専用) に固定する。
+    let readonly_guard = if server.readonly {
+        db::ReadonlyGuard::Config
+    } else {
+        db::ReadonlyGuard::Switch
+    };
+    // ユーザーのクエリのキャンセル (接続名がキー) と衝突しないよう、
+    // エージェントの実行には別のキーを使う
+    let cancel_key = format!("{connection}\u{1}ai-chat");
+
+    let mut tool_calls: Vec<ai::ChatToolCall> = Vec::new();
+    for _ in 0..ai::CHAT_MAX_TOOL_ROUNDS {
+        let message = ai::chat_step(&ai_config, &messages).await?;
+        let requested = ai::parse_tool_calls(&message);
+        if requested.is_empty() {
+            let content = ai::message_content(&message);
+            if content.is_empty() {
+                return Err(AppError::Ai(
+                    "The AI returned an empty message".into(),
+                ));
+            }
+            return Ok(ai::ChatReply {
+                content,
+                tool_calls,
+            });
+        }
+        // ツール呼び出しを含むアシスタントメッセージはそのまま履歴へ積む
+        // (tool メッセージは直前の tool_calls と対応していなければならない)
+        messages.push(message);
+        for (id, name, arguments) in requested {
+            let (ok, argument, result_text) = if name == "run_sql" {
+                match ai::parse_run_sql_argument(&arguments) {
+                    Ok(sql) => {
+                        let outcome = async {
+                            let pool = state.db.get_pool(&server).await?;
+                            db::run_query_cancellable(
+                                &pool,
+                                &state.query_cancels,
+                                &cancel_key,
+                                &sql,
+                                ai::CHAT_TOOL_MAX_ROWS,
+                                None,
+                                readonly_guard,
+                                // エージェントには危険な文も許可しない
+                                false,
+                            )
+                            .await
+                        }
+                        .await;
+                        match outcome {
+                            Ok(result) => (true, sql, format_chat_tool_result(&result)),
+                            Err(e) => (false, sql, format!("Error: {e}")),
+                        }
+                    }
+                    Err(e) => (false, arguments.clone(), format!("Error: {e}")),
+                }
+            } else {
+                (
+                    false,
+                    arguments.clone(),
+                    format!("Error: unknown tool '{name}'"),
+                )
+            };
+            tool_calls.push(ai::ChatToolCall {
+                name: name.clone(),
+                argument,
+                ok,
+                // 要約は 1 行に収める (フロントのツールチップ表示用)
+                summary: result_text.lines().next().unwrap_or("").to_string(),
+            });
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": id,
+                "content": result_text,
+            }));
+        }
+    }
+    Err(AppError::Ai(format!(
+        "The AI kept calling tools without answering (stopped after {} rounds)",
+        ai::CHAT_MAX_TOOL_ROUNDS
+    )))
+}
+
 /// 設定の解決結果を返す (情報表示用。機密を含まない)。
 /// マージ済み設定 (キャッシュ) から作るので、config_override_command で
 /// 上書きされた sqlfiles_dir 等も実際に使われている値が表示される。
@@ -1471,6 +1617,7 @@ pub fn run() {
             ai_explain_plan,
             ai_explain_sql,
             ai_fix_sql,
+            ai_chat,
             get_config_info,
             ensure_config_file,
             read_config_file,

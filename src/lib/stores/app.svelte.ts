@@ -1,7 +1,13 @@
 import { toast } from "svelte-sonner";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import * as api from "$lib/api";
-import type { AiInfo, ConnectionInfo, QueryResult } from "$lib/api";
+import type {
+  AiInfo,
+  ChatToolCall,
+  ChatTurn,
+  ConnectionInfo,
+  QueryResult,
+} from "$lib/api";
 import { merge3 } from "$lib/mergeText";
 
 const AUTO_SAVE_DELAY_MS = 1000;
@@ -32,6 +38,18 @@ export interface ResultTab {
   /// AI が返した修正案の SQL (無ければ null)。自動実行はせず、
   /// ユーザーの Apply でエディタに挿入する
   fixSuggestion: string | null;
+}
+
+/// AI チャットペインに表示する 1 メッセージ。
+/// LLM へ送るのは role / content だけで、それ以外は表示用の付随情報。
+export interface ChatMessage {
+  id: number;
+  role: "user" | "assistant";
+  content: string;
+  /// この応答を作る過程でエージェントが実行した読み取りクエリ (assistant のみ)
+  toolCalls?: ChatToolCall[];
+  /// 応答の取得に失敗した (エラー文言を content に入れて赤く表示する)
+  failed?: boolean;
 }
 
 /// タブの SQL が EXPLAIN 由来かを判定する (Analyze with AI ボタンの表示用)。
@@ -89,6 +107,11 @@ let aiAnalysis = $state<string | null>(null);
 let aiExplaining = $state(false);
 /// AI による選択 SQL 解説の Markdown (モーダル表示中のみ非 null)
 let aiExplanation = $state<string | null>(null);
+/// AI チャット (右ペイン) の表示中メッセージ。
+/// 接続ごとにスキーマが変わるため、接続を切り替えたら破棄する。
+let chatMessages = $state<ChatMessage[]>([]);
+/// AI チャットの応答待ち (入力欄の無効化・二重送信防止)
+let chatSending = $state(false);
 /// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得・取得失敗は null)
 let schemaMap = $state<Record<string, string[]> | null>(null);
 /// 危険な文 (allow_dangerous_statements 有効な接続) の実行前確認ダイアログ。
@@ -227,6 +250,7 @@ const reloadConnections = async (): Promise<boolean> => {
   aiError = null;
   aiAnalysis = null;
   aiExplanation = null;
+  chatMessages = [];
   // 実行中の取得が後から古いマップを書き込まないよう世代を進めて破棄する
   schemaMapGeneration++;
   schemaMap = null;
@@ -353,6 +377,9 @@ const applyConnectionContext = async (name: string): Promise<boolean> => {
   // 同一接続の再選択 (同接続のエディタタブ切替など) では維持する。
   if (selectedConnection !== name) {
     writable = false;
+    // AI チャットの会話も破棄する。system prompt に載るスキーマが接続ごとに
+    // 違うため、別接続の会話を引き継ぐと噛み合わない回答になる
+    chatMessages = [];
   }
   selectedConnection = name;
   errorMessage = filesError;
@@ -1505,6 +1532,74 @@ const closeAiExplanation = () => {
   aiExplanation = null;
 };
 
+/// チャットメッセージの ID 採番 (表示用の key。バックエンドへは送らない)
+let nextChatMessageId = 1;
+
+/// AI チャット (右ペイン) にユーザーの発言を積み、応答を 1 往復もらう。
+/// 会話履歴は毎回まるごとバックエンドへ送る (会話状態はフロントが持つ)。
+const sendChatMessage = async (text: string) => {
+  const message = text.trim();
+  if (!message) {
+    return;
+  }
+  if (!selectedConnection) {
+    toast.warning("Select a connection first");
+    return;
+  }
+  // 二重送信防止 (送信ボタンも disabled にしているが防御的にガードする)
+  if (chatSending) {
+    return;
+  }
+  const connection = selectedConnection;
+  chatMessages = [
+    ...chatMessages,
+    { id: nextChatMessageId++, role: "user", content: message },
+  ];
+  // 失敗した応答は履歴に残すが LLM へは送らない (エラー文言を会話の一部と
+  // 誤解させないため)
+  const history: ChatTurn[] = chatMessages
+    .filter((m) => !m.failed)
+    .map((m) => ({ role: m.role, content: m.content }));
+  chatSending = true;
+  try {
+    const reply = await api.aiChat(connection, history);
+    // 応答待ちの間に接続が切り替わった場合、この会話はもう破棄されている
+    // (別スキーマの回答を新しい会話に混ぜない)
+    if (selectedConnection !== connection) {
+      return;
+    }
+    chatMessages = [
+      ...chatMessages,
+      {
+        id: nextChatMessageId++,
+        role: "assistant",
+        content: reply.content,
+        toolCalls: reply.tool_calls,
+      },
+    ];
+  } catch (e) {
+    if (selectedConnection !== connection) {
+      return;
+    }
+    chatMessages = [
+      ...chatMessages,
+      {
+        id: nextChatMessageId++,
+        role: "assistant",
+        content: toErrorMessage(e),
+        failed: true,
+      },
+    ];
+  } finally {
+    chatSending = false;
+  }
+};
+
+/// AI チャットの会話を捨てる (Clear ボタン / 接続切替)。
+const clearChat = () => {
+  chatMessages = [];
+};
+
 /// タブに記録された SQL を同じ接続で再実行する
 const rerunTab = async (id: number) => {
   const tab = resultTabs.find((t) => t.id === id);
@@ -1943,6 +2038,14 @@ export default {
   get aiExplanation() {
     return aiExplanation;
   },
+  /// AI チャット (右ペイン) の表示中メッセージ
+  get chatMessages() {
+    return chatMessages;
+  },
+  /// AI チャットの応答待ち
+  get chatSending() {
+    return chatSending;
+  },
   /// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得なら null)
   get schemaMap() {
     return schemaMap;
@@ -1986,6 +2089,8 @@ export default {
   closeAiAnalysis,
   explainSql,
   closeAiExplanation,
+  sendChatMessage,
+  clearChat,
   cancelQuery,
   rerunTab,
   submitCellEdits,

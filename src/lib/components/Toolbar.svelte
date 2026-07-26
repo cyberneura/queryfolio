@@ -5,9 +5,18 @@
     onRunCurrent: () => void;
     onOpenSearch: () => void;
     onOpenSettings: () => void;
+    /// AI チャットペイン (右) の表示状態と切り替え
+    chatOpen: boolean;
+    onToggleChat: () => void;
   }
 
-  let { onRunCurrent, onOpenSearch, onOpenSettings }: Props = $props();
+  let {
+    onRunCurrent,
+    onOpenSearch,
+    onOpenSettings,
+    chatOpen,
+    onToggleChat,
+  }: Props = $props();
 
   // 実行中は Run ボタンを Cancel ボタンに切り替え、
   // 実行中のタブ (接続単位で 1 つ) のクエリをキャンセルする
@@ -97,6 +106,19 @@
         <i class="bi bi-play-fill" aria-hidden="true"></i> Run
       </button>
     {/if}
+    <!-- AI チャットペイン (右) の開閉 -->
+    <button
+      class="flex items-center gap-1 rounded border px-2 py-1 text-xs transition-colors {chatOpen
+        ? 'border-blue-500 bg-blue-600/20 text-blue-300 hover:bg-blue-600/30'
+        : 'border-zinc-600 text-zinc-400 hover:bg-zinc-800'}"
+      title="Toggle the AI chat pane"
+      aria-label="Toggle the AI chat pane"
+      aria-pressed={chatOpen}
+      data-annotate="toggle-chat-pane"
+      onclick={onToggleChat}
+    >
+      <i class="bi bi-chat-dots" aria-hidden="true"></i> Chat
+    </button>
     <button
       class="rounded border border-zinc-600 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
       title="Settings"
