@@ -125,11 +125,13 @@ let chatRunningConnections = $state<Map<string, Set<string>>>(new Map());
 /// チャットの往復に付ける ID の採番 (プロセス内で一意なら十分)。
 let nextChatRequestSeq = 1;
 
-/// 会話の破棄 → 中断の到達待ち → バックエンドの切替、の遷移中。
+/// 進行中の「会話の破棄 → 中断の到達待ち → バックエンドの切替」の本数。
 /// この間は新しい送信を受け付けない: 中断要求は「その時点の実行中 ID」を
 /// 対象にするため、待っている隙に送られた往復は中断されないまま、
 /// 切替後のプールを古いプロンプトで使ってしまう。
-let chatTransitioning = $state(false);
+/// 真偽値だと、遷移が重なった時 (スキーマを続けて切り替えた等) に先に
+/// 終わった方が後続の分まで解除してしまうためカウンタで持つ。
+let chatTransitions = $state(0);
 /// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得・取得失敗は null)
 let schemaMap = $state<Record<string, string[]> | null>(null);
 /// 危険な文 (allow_dangerous_statements 有効な接続) の実行前確認ダイアログ。
@@ -1628,7 +1630,7 @@ const sendChatMessage = async (text: string) => {
     return;
   }
   // 接続 / スキーマ切替・設定リロードの遷移中は受け付けない
-  if (chatTransitioning) {
+  if (chatTransitions > 0) {
     return;
   }
   const connection = selectedConnection;
@@ -1732,13 +1734,13 @@ const clearChatAndWait = async () => {
   // 中断の到達を待つ間に新しい往復を始めさせない (始まってしまうと、
   // その往復は中断対象に入らないまま切替後のプールを使う)。
   // 呼び出し側は切替の完了後に endChatTransition() を呼ぶ
-  chatTransitioning = true;
+  chatTransitions++;
   await requestChatCancel();
 };
 
-/// clearChatAndWait で始めた遷移の終了 (成否によらず必ず呼ぶ)。
+/// clearChatAndWait で始めた遷移の終了 (成否によらず必ず 1 回だけ呼ぶ)。
 const endChatTransition = () => {
-  chatTransitioning = false;
+  chatTransitions = Math.max(0, chatTransitions - 1);
 };
 
 /// タブに記録された SQL を同じ接続で再実行する
@@ -2187,7 +2189,7 @@ export default {
   /// 切替の遷移中も入力を塞ぐため true にする
   get chatSending() {
     return (
-      chatTransitioning ||
+      chatTransitions > 0 ||
       (chatSendingGen !== null && chatSendingGen === chatGeneration)
     );
   },

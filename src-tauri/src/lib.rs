@@ -600,18 +600,33 @@ async fn cancel_ai_chat(
     connection: String,
     request_ids: Vec<String>,
 ) -> Result<bool, AppError> {
-    let mut cancelled_query = false;
+    // 先に**全ての ID を記録する**。クエリのキャンセルは DB へ問い合わせる
+    // ため失敗しうるが、そこで打ち切ると残りの往復が中断されないまま
+    // 切替後のバックエンドで動き続けてしまう
     for request_id in &request_ids {
         state.chat_cancels.request(request_id).await;
-        if state
+    }
+    let mut cancelled_query = false;
+    let mut first_error: Option<AppError> = None;
+    for request_id in &request_ids {
+        match state
             .query_cancels
             .cancel(&chat_cancel_key(&connection, request_id))
-            .await?
+            .await
         {
-            cancelled_query = true;
+            Ok(true) => cancelled_query = true,
+            Ok(false) => {}
+            // 1 本の失敗で残りのキャンセルを止めない (記録は済んでいるので
+            // 往復自体は次の判定で止まる)。エラーは最初の 1 件だけ返す
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
         }
     }
-    Ok(cancelled_query)
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(cancelled_query),
+    }
 }
 
 /// 接続のクエリ実行履歴を新しい順に返す。
