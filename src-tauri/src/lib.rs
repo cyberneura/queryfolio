@@ -1317,19 +1317,23 @@ async fn run_ai_chat(
                             .await
                         }
                         .await;
-                        // 登録の隙間 (登録前に届いた中断) をすり抜けて実行
-                        // まで至った場合でも、読んだ行はモデルへ送らない。
-                        // 中断の狙いは「破棄した / 切り替えた後のデータを
-                        // AI プロバイダへ送らないこと」なので、結果を捨てて
-                        // 往復ごと終える
-                        if cancelled().await {
+                        // 中断で終える場合も、DB へ投げた SQL は記録に残す
+                        // (結果はモデルにもユーザーにも見せないが、「何を
+                        //  実行したか」を隠さない)。中断の狙いは「破棄した /
+                        // 切り替えた後のデータを AI プロバイダへ送らないこと」
+                        // なので、結果だけを捨てて往復ごと終える
+                        let cancelled_now = cancelled().await;
+                        if cancelled_now || matches!(outcome, Err(AppError::Cancelled)) {
+                            tool_calls.push(ai::ChatToolCall {
+                                name: name.clone(),
+                                argument: sql,
+                                ok: false,
+                                summary: "Cancelled".to_string(),
+                            });
                             return Err(AppError::Cancelled);
                         }
                         match outcome {
                             Ok(result) => (true, sql, format_chat_tool_result(&result)),
-                            // キャンセル要求で止まったクエリは、モデルに
-                            // 「失敗したので別の手を試す」と解釈させず往復ごと終える
-                            Err(AppError::Cancelled) => return Err(AppError::Cancelled),
                             Err(e) => (false, sql, format!("Error: {e}")),
                         }
                     }
