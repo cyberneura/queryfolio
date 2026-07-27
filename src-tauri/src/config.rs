@@ -35,7 +35,7 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 /// そのままで有効な設定 (接続 0 件) としてパースできる内容にする。
 const CONFIG_TEMPLATE: &str = r#"# QueryFolio config file
 # See config.example.yaml in the repository for the full format.
-# https://github.com/ytyng/queryfolio
+# https://github.com/cyberneura/queryfolio
 
 # Connection definitions.
 #

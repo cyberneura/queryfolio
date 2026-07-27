@@ -149,4 +149,4 @@ fi
 echo "Watching run ${RUN_ID} ..."
 gh run watch "${RUN_ID}" --exit-status
 
-echo "Done: https://github.com/ytyng/queryfolio/releases/tag/v${VERSION}"
+echo "Done: https://github.com/cyberneura/queryfolio/releases/tag/v${VERSION}"

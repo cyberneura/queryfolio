@@ -112,7 +112,7 @@ See `AGENTS.md` for architecture details.
 
 ## Download
 
-Grab the latest installer from the [Releases page](https://github.com/ytyng/queryfolio/releases/latest):
+Grab the latest installer from the [Releases page](https://github.com/cyberneura/queryfolio/releases/latest):
 
 - **macOS**: `QueryFolio_<version>_universal.dmg` (Apple Silicon + Intel). Signed with a
   Developer ID certificate and notarized by Apple, so it opens without a Gatekeeper warning.

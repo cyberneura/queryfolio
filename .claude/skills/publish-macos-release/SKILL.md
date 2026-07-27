@@ -13,7 +13,8 @@ GitHub Release としてサイト (ダウンロードページ) で公開する�
 
 ## 前提
 
-- `gh` が `ytyng` アカウントで認証済みで、リポジトリは `ytyng/queryfolio`。
+- `gh` が `ytyng` アカウントで認証済みで、リポジトリは `cyberneura/queryfolio`
+  (`ytyng` は cyberneura org の admin なので、この 1 アカウントで release まで通る)。
 - 署名・公証用の GitHub Secrets が 6 つとも設定済み (下記「初回セットアップ」)。
   **1 つでも未設定なら macOS ジョブは "Check macOS signing secrets" ステップで失敗する**
   (ad-hoc 署名や公証なしの dmg が黙って公開されるのを防ぐための preflight。フォールバックは無い)。
@@ -71,7 +72,7 @@ Gatekeeper 警告は出ない。ここが `Developer ID` 止まり (Notarized �
 gh release view "v${VERSION}" --json assets --jq '.assets[].name'
 ```
 
-- `https://github.com/ytyng/queryfolio/releases/latest` が新バージョンを指していること。
+- `https://github.com/cyberneura/queryfolio/releases/latest` が新バージョンを指していること。
 - dmg / exe の公開 URL が匿名 (未ログイン) で落とせること。
 - README の Download セクションは `releases/latest` を指す固定リンクなので、通常は更新不要。
 - 告知が必要なら ytyng-blog (`ytyng-blog-cli` スキル) に BlogPost / Achievement を作る。
