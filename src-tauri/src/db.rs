@@ -3074,8 +3074,22 @@ mod tests {
     ///   - MySQL の DDL (`CREATE TABLE`): 暗黙コミットでトランザクションを
     ///     抜けるため拒否されない (DDL を止めているのは文レベルのホワイトリスト)
     /// プローブ用のオブジェクトを作るため、接続ユーザに CREATE 権限が要る。
+    /// 名前は実行ごとにユニークにする: 固定名を `DROP ... IF EXISTS` すると、
+    /// 接続先に同名のオブジェクトがあった場合にユーザのデータを消しかねず、
+    /// 同時実行のテスト同士も潰し合う。テストが途中で panic した時だけ
+    /// プローブ用オブジェクトが残るが、消してしまうよりは害が小さい。
     #[tokio::test]
     async fn test_agent_guard_enforces_readonly_transaction() {
+        // 実行ごとにユニークなプローブ名 (pid + 起動からの経過ナノ秒)
+        let probe = format!(
+            "queryfolio_ro_probe_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+
         if let Ok(url) = std::env::var("QUERYFOLIO_TEST_PG_URL") {
             let raw = PgPoolOptions::new()
                 .max_connections(1)
@@ -3086,11 +3100,7 @@ mod tests {
             // 通常のシーケンスをプローブに使う。**一時オブジェクトは
             // 読み取り専用トランザクションの対象外**で nextval が通って
             // しまうため、TEMP は使えない (実測)
-            sqlx::query("DROP SEQUENCE IF EXISTS queryfolio_ro_probe")
-                .execute(&mut *conn)
-                .await
-                .unwrap();
-            sqlx::query("CREATE SEQUENCE queryfolio_ro_probe")
+            sqlx::query(&format!("CREATE SEQUENCE {probe}"))
                 .execute(&mut *conn)
                 .await
                 .unwrap();
@@ -3101,7 +3111,7 @@ mod tests {
             sqlx::query("SELECT 1").execute(&mut *tx).await.unwrap();
             // 副作用のある SELECT は DB が拒否する (文レベルのガードは
             // 先頭キーワードしか見ないため通してしまう類の文)
-            let err = sqlx::query("SELECT nextval('queryfolio_ro_probe')")
+            let err = sqlx::query(&format!("SELECT nextval('{probe}')"))
                 .execute(&mut *tx)
                 .await
                 .unwrap_err()
@@ -3109,11 +3119,11 @@ mod tests {
             assert!(err.contains("read-only"), "postgres: {err}");
             tx.rollback().await.unwrap();
             // ROLLBACK 後は同じコネクションで書き込める
-            sqlx::query("SELECT nextval('queryfolio_ro_probe')")
+            sqlx::query(&format!("SELECT nextval('{probe}')"))
                 .execute(&mut *conn)
                 .await
                 .unwrap();
-            sqlx::query("DROP SEQUENCE queryfolio_ro_probe")
+            sqlx::query(&format!("DROP SEQUENCE {probe}"))
                 .execute(&mut *conn)
                 .await
                 .unwrap();
@@ -3148,11 +3158,7 @@ mod tests {
             // 通常表をプローブに使う。一時表への書き込みは読み取り専用
             // トランザクションの対象外 (Postgres と同じ)、DDL は暗黙コミットで
             // トランザクションを抜けてしまう — どちらもプローブにならない (実測)
-            sqlx::query("DROP TABLE IF EXISTS queryfolio_ro_probe")
-                .execute(&mut *conn)
-                .await
-                .unwrap();
-            sqlx::query("CREATE TABLE queryfolio_ro_probe (a INT)")
+            sqlx::query(&format!("CREATE TABLE {probe} (a INT)"))
                 .execute(&mut *conn)
                 .await
                 .unwrap();
@@ -3160,7 +3166,7 @@ mod tests {
             let begin = readonly_begin_sql(Engine::MySql).unwrap();
             let mut tx = conn.begin_with(begin).await.unwrap();
             sqlx::query("SELECT 1").execute(&mut *tx).await.unwrap();
-            let err = sqlx::query("INSERT INTO queryfolio_ro_probe VALUES (1)")
+            let err = sqlx::query(&format!("INSERT INTO {probe} VALUES (1)"))
                 .execute(&mut *tx)
                 .await
                 .unwrap_err()
@@ -3171,11 +3177,11 @@ mod tests {
             );
             tx.rollback().await.unwrap();
             // ROLLBACK 後は同じコネクションで書き込める
-            sqlx::query("INSERT INTO queryfolio_ro_probe VALUES (1)")
+            sqlx::query(&format!("INSERT INTO {probe} VALUES (1)"))
                 .execute(&mut *conn)
                 .await
                 .unwrap();
-            sqlx::query("DROP TABLE queryfolio_ro_probe")
+            sqlx::query(&format!("DROP TABLE {probe}"))
                 .execute(&mut *conn)
                 .await
                 .unwrap();
