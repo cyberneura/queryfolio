@@ -3066,8 +3066,35 @@ mod tests {
     /// 検証内容は「readonly_begin_sql で開いたトランザクションの中では
     /// 書き込みが DB に拒否される」「読み取りは通り、ROLLBACK 後も同じ
     /// コネクションで書き込める」の 2 点。
+    /// プローブは**通常 (非 TEMP) オブジェクトへの書き込み**を使う:
+    /// Postgres は `SELECT nextval(...)` (この課題の元になったケースそのもの)、
+    /// MySQL は通常表への INSERT。プローブに使えないもの (いずれも実測):
+    ///   - 一時オブジェクト: 両エンジンとも読み取り専用トランザクションの
+    ///     対象外で、書き込みが通ってしまう
+    ///   - MySQL の DDL (`CREATE TABLE`): 暗黙コミットでトランザクションを
+    ///     抜けるため拒否されない (DDL を止めているのは文レベルのホワイトリスト)
+    /// プローブ用のオブジェクトを作って書き込んで消すため、接続ユーザには
+    /// **CREATE / INSERT / DROP** の権限が要る (MySQL はこれらが独立した権限。
+    /// 足りないとテストは権限エラーで落ちる — 読み取り専用の検証が素通りして
+    /// 緑になることはないが、後始末に失敗して通常表が残ることはある)。
+    /// Postgres 側はシーケンスを作る CREATE 権限があれば所有者として
+    /// nextval / DROP まで通る。
+    /// 名前は実行ごとにユニークにする: 固定名を `DROP ... IF EXISTS` すると、
+    /// 接続先に同名のオブジェクトがあった場合にユーザのデータを消しかねず、
+    /// 同時実行のテスト同士も潰し合う。テストが途中で panic した時だけ
+    /// プローブ用オブジェクトが残るが、消してしまうよりは害が小さい。
     #[tokio::test]
     async fn test_agent_guard_enforces_readonly_transaction() {
+        // 実行ごとにユニークなプローブ名 (pid + 起動からの経過ナノ秒)
+        let probe = format!(
+            "queryfolio_ro_probe_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+
         if let Ok(url) = std::env::var("QUERYFOLIO_TEST_PG_URL") {
             let raw = PgPoolOptions::new()
                 .max_connections(1)
@@ -3075,12 +3102,21 @@ mod tests {
                 .await
                 .unwrap();
             let mut conn = raw.acquire().await.unwrap();
+            // 通常のシーケンスをプローブに使う。**一時オブジェクトは
+            // 読み取り専用トランザクションの対象外**で nextval が通って
+            // しまうため、TEMP は使えない (実測)
+            sqlx::query(&format!("CREATE SEQUENCE {probe}"))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+
             let begin = readonly_begin_sql(Engine::Postgres).unwrap();
             let mut tx = conn.begin_with(begin).await.unwrap();
             // 読み取りは通る
             sqlx::query("SELECT 1").execute(&mut *tx).await.unwrap();
-            // 書き込みは DB が拒否する (文レベルのガードは通していない)
-            let err = sqlx::query("CREATE TEMP TABLE queryfolio_ro_probe (a int)")
+            // 副作用のある SELECT は DB が拒否する (文レベルのガードは
+            // 先頭キーワードしか見ないため通してしまう類の文)
+            let err = sqlx::query(&format!("SELECT nextval('{probe}')"))
                 .execute(&mut *tx)
                 .await
                 .unwrap_err()
@@ -3088,10 +3124,16 @@ mod tests {
             assert!(err.contains("read-only"), "postgres: {err}");
             tx.rollback().await.unwrap();
             // ROLLBACK 後は同じコネクションで書き込める
-            sqlx::query("CREATE TEMP TABLE queryfolio_ro_probe (a int)")
+            sqlx::query(&format!("SELECT nextval('{probe}')"))
                 .execute(&mut *conn)
                 .await
                 .unwrap();
+            sqlx::query(&format!("DROP SEQUENCE {probe}"))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            // プールは 1 接続なので、経路全体の確認へ進む前に返す
+            drop(conn);
 
             // エージェント経路の読み取りが通ること (経路全体の確認)
             let pool = DbPool::Postgres(raw);
@@ -3118,10 +3160,18 @@ mod tests {
                 .await
                 .unwrap();
             let mut conn = raw.acquire().await.unwrap();
+            // 通常表をプローブに使う。一時表への書き込みは読み取り専用
+            // トランザクションの対象外 (Postgres と同じ)、DDL は暗黙コミットで
+            // トランザクションを抜けてしまう — どちらもプローブにならない (実測)
+            sqlx::query(&format!("CREATE TABLE {probe} (a INT)"))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+
             let begin = readonly_begin_sql(Engine::MySql).unwrap();
             let mut tx = conn.begin_with(begin).await.unwrap();
             sqlx::query("SELECT 1").execute(&mut *tx).await.unwrap();
-            let err = sqlx::query("CREATE TABLE queryfolio_ro_probe (a int)")
+            let err = sqlx::query(&format!("INSERT INTO {probe} VALUES (1)"))
                 .execute(&mut *tx)
                 .await
                 .unwrap_err()
@@ -3131,6 +3181,17 @@ mod tests {
                 "mysql: {err}"
             );
             tx.rollback().await.unwrap();
+            // ROLLBACK 後は同じコネクションで書き込める
+            sqlx::query(&format!("INSERT INTO {probe} VALUES (1)"))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            sqlx::query(&format!("DROP TABLE {probe}"))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            // プールは 1 接続なので、経路全体の確認へ進む前に返す
+            drop(conn);
 
             let pool = DbPool::MySql(raw);
             let registry = CancelRegistry::default();
