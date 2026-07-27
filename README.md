@@ -2,6 +2,11 @@
 
 SQL client desktop app. A lightweight, multi-purpose SQL GUI client.
 
+One app for several database engines: **MySQL / PostgreSQL / SQLite / DuckDB** on the SQL side,
+plus **Redis / Elasticsearch / DynamoDB**. The editor language and the unit of execution switch
+per engine, and each engine declares what it supports, so features it lacks are hidden from the
+UI rather than left as dead buttons.
+
 https://github.com/user-attachments/assets/90439816-49c8-4ebd-a068-b102cfe9c7aa
 
 ![QueryFolio screenshot](docs/screenshot.png)
