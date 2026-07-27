@@ -482,14 +482,23 @@ rather than slipping through the parser:
 If the read-only transaction cannot be started, the query fails instead of
 running unprotected.
 
-> **What this still does not cover.** Enforcement stops writes to the database
-> you are connected to. It does not stop a function that writes somewhere else
-> (`dblink` / `postgres_fdw` to another server, writing a file), and on MySQL a
-> read-only transaction still allows writes to temporary tables. It also does
-> not limit what the assistant can *read* — every row it reads is sent to the
-> AI provider. If you need a hard guarantee, point the connection at
-> **read-only credentials**; that is the only thing this client cannot talk its
-> way around.
+> **What this still does not cover** (all of it measured against PostgreSQL 17
+> and MySQL 8.4, not inferred):
+>
+> - **Temporary objects are exempt on both engines.** A read-only transaction
+>   only protects non-temporary tables and sequences, so a write to a temp table
+>   the session already holds still succeeds.
+> - **On MySQL, DDL escapes the transaction.** `CREATE TABLE` performs an
+>   implicit commit before it runs, so the read-only transaction does not refuse
+>   it — what stops DDL there is the statement whitelist above, not the
+>   database. (PostgreSQL refuses DDL properly.)
+> - **Writes to other systems.** A function reaching out through `dblink` /
+>   `postgres_fdw`, or writing a file, is outside what this can see.
+> - **Reading is not limited at all.** Every row the assistant reads is sent to
+>   the AI provider.
+>
+> If you need a hard guarantee, point the connection at **read-only
+> credentials**; that is the only thing this client cannot talk its way around.
 
 While the assistant is working, a **Stop** button cancels the query it is
 running and ends the round trip. Switching connections or schemas, clearing the
