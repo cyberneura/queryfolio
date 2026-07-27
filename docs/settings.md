@@ -467,11 +467,29 @@ refused, and `allow_dangerous_statements` is never applied. Results are capped
 at 50 rows, and per reply the assistant may go at most 6 rounds and run at most
 12 queries in total.
 
-> **The guard is statement-level, not database-enforced.** It shares the known
-> limit of read-only mode: a `SELECT` that calls a side-effecting function
-> (`nextval()`, a user-defined function that writes) is not detected. If you
-> need a hard guarantee, point the connection at **read-only credentials** —
-> that is the only thing this client cannot talk its way around.
+On top of that statement check, the agent's queries are **enforced read-only by
+the database itself**, so a `SELECT` that calls a side-effecting function
+(`nextval()`, a user-defined function that writes) is refused by the server
+rather than slipping through the parser:
+
+| Engine | Enforcement |
+|---|---|
+| PostgreSQL | run inside `BEGIN READ ONLY`, always rolled back |
+| MySQL | run inside `START TRANSACTION READ ONLY`, always rolled back |
+| SQLite | `PRAGMA query_only = 1` on the connection |
+| DuckDB | run inside `BEGIN TRANSACTION READ ONLY`, always rolled back |
+
+If the read-only transaction cannot be started, the query fails instead of
+running unprotected.
+
+> **What this still does not cover.** Enforcement stops writes to the database
+> you are connected to. It does not stop a function that writes somewhere else
+> (`dblink` / `postgres_fdw` to another server, writing a file), and on MySQL a
+> read-only transaction still allows writes to temporary tables. It also does
+> not limit what the assistant can *read* — every row it reads is sent to the
+> AI provider. If you need a hard guarantee, point the connection at
+> **read-only credentials**; that is the only thing this client cannot talk its
+> way around.
 
 While the assistant is working, a **Stop** button cancels the query it is
 running and ends the round trip. Switching connections or schemas, clearing the

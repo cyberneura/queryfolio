@@ -1227,13 +1227,10 @@ async fn run_ai_chat(
         serde_json::json!({ "role": "system", "content": system_prompt }),
     );
 
-    // config が readonly ならその案内を出したいので Config を使い、
-    // それ以外でも Switch (= 読み取り専用) に固定する。
-    let readonly_guard = if server.readonly {
-        db::ReadonlyGuard::Config
-    } else {
-        db::ReadonlyGuard::Switch
-    };
+    // エージェントの実行は Writable スイッチや config に関わらず Agent 固定。
+    // 文レベルのガードに加えて DB レベルの読み取り専用 (読み取り専用
+    // トランザクション / PRAGMA query_only) も強制される。
+    let readonly_guard = db::ReadonlyGuard::Agent;
     // ユーザーのクエリのキャンセル (接続名がキー) と衝突せず、同じ接続の
     // 別の往復とも衝突しないキーを使う
     let cancel_key = chat_cancel_key(&connection, &request_id);

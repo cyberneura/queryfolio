@@ -140,6 +140,16 @@ pub async fn run_query_cancellable(
         return Err(AppError::Config("The SQL statement is empty".into()));
     }
 
+    // エージェント経路は狭いホワイトリスト (db.rs の run_query_on と同じ理由。
+    // 呼び出し側でなく ReadonlyGuard::Agent 自体がポリシーを持つ)
+    if readonly == ReadonlyGuard::Agent {
+        if let Some(reason) =
+            crate::db::agent_rejection_reason(sql, Engine::DuckDb)
+        {
+            return Err(AppError::Readonly(reason));
+        }
+    }
+
     // メタコマンド変換後の SQL にもガードを適用する (すり抜け防止。
     // 変換結果は読み取り系のみなので常に通るが、順序として明示する)
     if readonly != ReadonlyGuard::Off
@@ -193,8 +203,10 @@ pub async fn run_query_cancellable(
     // spawn_blocking は future の drop では止まらないが、キャンセル時は
     // CancelRegistry が interrupt を発行して実行中の文をエラーで終わらせる
     // ため、この await が無期限に残ることはない
+    // エージェント経路は読み取り専用トランザクションで包む (DB レベルの強制)
+    let readonly_tx = readonly == ReadonlyGuard::Agent;
     let result = tokio::task::spawn_blocking(move || {
-        execute_blocking(&conn, &sql_owned, max_rows, fetch, &cancelled)
+        execute_blocking(&conn, &sql_owned, max_rows, fetch, readonly_tx, &cancelled)
     })
     .await
     .map_err(|e| AppError::DuckDb(format!("DuckDB task failed: {e}")))?;
@@ -228,11 +240,17 @@ fn is_duckdb_readonly_statement(sql: &str) -> bool {
 /// blocking スレッドで 1 文を実行する。
 /// fetch = 行を返す文 (SELECT 系 / RETURNING 付き)。それ以外は execute で
 /// 影響行数のみ取得する。
+/// readonly_tx = 読み取り専用トランザクションで包む (エージェント経路)。
+/// DuckDB の `BEGIN TRANSACTION READ ONLY` は `SELECT nextval(...)` を含む
+/// 全ての書き込みを拒否する。接続を Mutex で押さえたまま同期実行するため、
+/// ROLLBACK まで必ずこの関数の中で完了する (キャンセルで中断された場合も、
+/// 中断されるのは実行中の文で、この関数自体は最後まで走る)。
 fn execute_blocking(
     conn: &Mutex<Connection>,
     sql: &str,
     max_rows: usize,
     fetch: bool,
+    readonly_tx: bool,
     cancelled: &AtomicBool,
 ) -> Result<QueryResult, AppError> {
     let conn = conn.lock().map_err(|_| {
@@ -244,6 +262,25 @@ fn execute_blocking(
         return Err(AppError::Cancelled);
     }
 
+    if readonly_tx {
+        conn.execute_batch("BEGIN TRANSACTION READ ONLY")?;
+        let result = execute_statement_blocking(&conn, sql, max_rows, fetch);
+        // 読み取りしかしていないので COMMIT は不要。中断でトランザクションが
+        // aborted になっていても ROLLBACK は受け付けられる
+        // (失敗しても元のエラー・結果を優先して返す)
+        let _ = conn.execute_batch("ROLLBACK");
+        return result;
+    }
+    execute_statement_blocking(&conn, sql, max_rows, fetch)
+}
+
+/// execute_blocking の本体 (トランザクションの内外で共有する)。
+fn execute_statement_blocking(
+    conn: &Connection,
+    sql: &str,
+    max_rows: usize,
+    fetch: bool,
+) -> Result<QueryResult, AppError> {
     if !fetch {
         let affected = conn.execute(sql, [])? as u64;
         return Ok(QueryResult {
@@ -714,6 +751,57 @@ mod tests {
             allow_dangerous,
         )
         .await
+    }
+
+    /// エージェント経路 (ReadonlyGuard::Agent) は読み取り専用トランザクション
+    /// で実行する。文レベルのガードを素通りする副作用付き SELECT
+    /// (`SELECT nextval(...)`) を DB 自身に拒否させることが目的。
+    #[tokio::test]
+    async fn test_agent_guard_blocks_side_effecting_select() {
+        let (_dir, handle) = test_handle().await;
+        run(&handle, "CREATE SEQUENCE s", 10, None, ReadonlyGuard::Off, false)
+            .await
+            .unwrap();
+
+        // 文レベルのガードは SELECT を通す (先頭キーワードしか見ない)
+        assert!(crate::db::agent_rejection_reason(
+            "SELECT nextval('s')",
+            Engine::DuckDb
+        )
+        .is_none());
+
+        // DB レベルの読み取り専用が書き込みを拒否する
+        let err = run(
+            &handle,
+            "SELECT nextval('s')",
+            10,
+            None,
+            ReadonlyGuard::Agent,
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("read-only"), "unexpected error: {err}");
+
+        // 通常の読み取りは通り、ロールバック後も接続は健全なまま
+        let result = run(&handle, "SELECT 1", 10, None, ReadonlyGuard::Agent, false)
+            .await
+            .unwrap();
+        assert_eq!(result.row_count, 1);
+        // Writable な経路は従来どおり実行できる (トランザクションが
+        // 開いたまま残っていないことの確認も兼ねる)
+        let result = run(
+            &handle,
+            "SELECT nextval('s')",
+            10,
+            None,
+            ReadonlyGuard::Off,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.row_count, 1);
     }
 
     #[tokio::test]

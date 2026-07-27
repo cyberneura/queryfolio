@@ -9,7 +9,7 @@ use serde::Serialize;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlRow};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
-use sqlx::{Column, Executor, Row, TypeInfo};
+use sqlx::{Column, Connection as _, Executor, Row, TypeInfo};
 
 use crate::config::ServerConfig;
 use crate::error::AppError;
@@ -741,6 +741,10 @@ pub(crate) fn readonly_block_error(readonly: ReadonlyGuard) -> AppError {
             "Read-only mode is on. Turn on the Writable switch in the \
              toolbar to run write statements. Statement was not executed."
         }
+        ReadonlyGuard::Agent => {
+            "The AI assistant can only run read-only statements. \
+             Statement was not executed."
+        }
         // Off はブロックしないためこのエラーは作られない
         ReadonlyGuard::Off => unreachable!(),
     };
@@ -813,6 +817,13 @@ pub async fn run_statements(
         }
     }
 
+    // エージェント経路が立てた PRAGMA query_only が残っているコネクションを
+    // 引いた場合に備えて解除する (run_query_on と同じ理由。設定は
+    // 「使う側が毎回明示する」方式で確定させる)
+    if let DbConnection::Sqlite(c) = &mut conn {
+        set_sqlite_query_only(c, false).await?;
+    }
+
     // 1 トランザクションで全文を適用する。DDL は含めない (UPDATE のみ) ため、
     // 暗黙コミットは起きない。COMMIT/ROLLBACK まで必ず到達させてから
     // コネクションをプールへ返す。
@@ -839,7 +850,8 @@ pub async fn run_statements(
 
 /// 読み取り専用ガードの由来。ブロック時のメッセージを由来に応じて
 /// 出し分けるために使う (config の readonly か、ツールバーの Writable スイッチか)。
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Agent だけは由来であると同時に強度も表す (DB レベルの強制を伴う)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReadonlyGuard {
     /// 書き込み許可 (readonly ガードなし)
     Off,
@@ -847,6 +859,41 @@ pub enum ReadonlyGuard {
     Config,
     /// ツールバーの Writable スイッチ OFF による読み取り専用
     Switch,
+    /// AI チャットのエージェントによる実行。文レベルの判定に加えて
+    /// DB レベルでも読み取り専用を強制する (run_query_readonly)。
+    /// 文レベルの判定だけでは `SELECT nextval(...)` のような副作用のある
+    /// 関数呼び出しを防げないため。
+    Agent,
+}
+
+/// DB レベルの読み取り専用セッションを開始する SQL (エンジン別)。
+/// トランザクションを読み取り専用で開始し、実行後は必ず ROLLBACK する。
+/// SQLite にはトランザクション属性が無いため PRAGMA query_only を使う
+/// (set_sqlite_query_only)。
+fn readonly_begin_sql(engine: Engine) -> Option<&'static str> {
+    match engine {
+        Engine::Postgres => Some("BEGIN READ ONLY"),
+        Engine::MySql => Some("START TRANSACTION READ ONLY"),
+        _ => None,
+    }
+}
+
+/// SQLite の DB レベル読み取り専用を設定する。
+/// 解除 (0 に戻す) ではなく「実行のたびに 0/1 を明示する」方式にしている:
+/// クエリの future が途中で drop される (チャットの中断) と後始末は走らず、
+/// query_only = 1 が残ったコネクションがプールへ返り得るため、
+/// 後片付けに頼らず毎回の実行で状態を確定させる。
+async fn set_sqlite_query_only(
+    conn: &mut sqlx::SqliteConnection,
+    enabled: bool,
+) -> Result<(), AppError> {
+    let sql = if enabled {
+        "PRAGMA query_only = 1"
+    } else {
+        "PRAGMA query_only = 0"
+    };
+    conn.execute(sql).await?;
+    Ok(())
 }
 
 /// run_query の本体。確保済みのコネクション上で実行する。
@@ -880,6 +927,15 @@ async fn run_query_on(
     // readonly 接続では読み取り系の文のみ許可する。
     // メタコマンドは読み取り系のカタログ照会にしか変換されないため、
     // 変換後の SQL はこの判定を常に通る。
+    // エージェント経路は通常の readonly ガードより狭いホワイトリストを課す
+    // (複文 / CALL / PRAGMA / EXPLAIN ANALYZE を落とす)。lib.rs でもプール取得
+    // 前に同じ判定をしているが、ここでも課すことで ReadonlyGuard::Agent 単体で
+    // エージェントの実行ポリシーが成立する (呼び出し側の実装に依存しない)
+    if readonly == ReadonlyGuard::Agent {
+        if let Some(reason) = agent_rejection_reason(sql, engine) {
+            return Err(AppError::Readonly(reason));
+        }
+    }
     if readonly != ReadonlyGuard::Off && !is_readonly_allowed(sql, engine) {
         return Err(readonly_block_error(readonly));
     }
@@ -914,11 +970,99 @@ async fn run_query_on(
     };
     let started = Instant::now();
 
+    // SQLite の DB レベル読み取り専用は PRAGMA query_only (セッション設定)
+    // なので、エージェント経路でなくても毎回明示して状態を確定させる
+    // (中断で解除処理が走らないまま プールへ返ったコネクションの後始末)
+    if let DbConnection::Sqlite(c) = &mut *conn {
+        set_sqlite_query_only(c, readonly == ReadonlyGuard::Agent).await?;
+    }
+
+    // エージェント経路は読み取り専用トランザクションの中で実行する。
+    // 文レベルのガード (is_readonly_allowed / agent_rejection_reason) は
+    // `SELECT nextval(...)` のような副作用のある関数呼び出しを見抜けないため、
+    // 最終的な拒否は DB 自身にさせる。
+    if readonly == ReadonlyGuard::Agent {
+        return run_query_readonly(conn, sql, max_rows, applied_limit, started).await;
+    }
+
+    let exec = match &mut *conn {
+        DbConnection::MySql(c) => DbExec::MySql(c),
+        DbConnection::Postgres(c) => DbExec::Postgres(c),
+        DbConnection::Sqlite(c) => DbExec::Sqlite(c),
+    };
+    run_query_with(exec, sql, max_rows, applied_limit, started).await
+}
+
+/// 実行に使うコネクション参照。プールのコネクションと、読み取り専用
+/// トランザクション (エージェント経路) で実行部を共有するために挟む。
+enum DbExec<'a> {
+    MySql(&'a mut sqlx::MySqlConnection),
+    Postgres(&'a mut sqlx::PgConnection),
+    Sqlite(&'a mut sqlx::SqliteConnection),
+}
+
+/// DB レベルの読み取り専用でクエリを実行する (エージェント経路)。
+/// Postgres / MySQL は読み取り専用トランザクションで包み、結果に関わらず
+/// ROLLBACK する (読み取りしかしないので COMMIT する必要が無い)。
+/// SQLite は PRAGMA query_only を呼び出し側で設定済み。
+async fn run_query_readonly(
+    conn: &mut DbConnection,
+    sql: &str,
+    max_rows: usize,
+    applied_limit: Option<u64>,
+    started: Instant,
+) -> Result<QueryResult, AppError> {
+    // トランザクションで包めないエンジン (SQLite) は PRAGMA 済みなのでそのまま
+    let begin = match readonly_begin_sql(conn.engine()) {
+        Some(begin) => begin,
+        None => {
+            let exec = match conn {
+                DbConnection::Sqlite(c) => DbExec::Sqlite(c),
+                // readonly_begin_sql が None を返すのは SQLite だけ
+                _ => unreachable!("engine without a read-only transaction"),
+            };
+            return run_query_with(exec, sql, max_rows, applied_limit, started).await;
+        }
+    };
+
+    // sqlx の Transaction は drop 時にも ROLLBACK を積む (中断でこの関数の
+    // future が drop されても、コネクションがトランザクションを開いたまま
+    // プールへ返ることはない)
+    match conn {
+        DbConnection::Postgres(c) => {
+            let mut tx = c.begin_with(begin).await?;
+            let result =
+                run_query_with(DbExec::Postgres(&mut tx), sql, max_rows, applied_limit, started)
+                    .await;
+            // ROLLBACK 自体の失敗は握り潰す (結果を返すのが優先。失敗した
+            // コネクションは ping に失敗してプールから破棄される)
+            let _ = tx.rollback().await;
+            result
+        }
+        DbConnection::MySql(c) => {
+            let mut tx = c.begin_with(begin).await?;
+            let result =
+                run_query_with(DbExec::MySql(&mut tx), sql, max_rows, applied_limit, started).await;
+            let _ = tx.rollback().await;
+            result
+        }
+        DbConnection::Sqlite(_) => unreachable!("sqlite has no read-only transaction"),
+    }
+}
+
+/// 確保済みの実行先 (コネクション or トランザクション) で 1 文を実行する。
+async fn run_query_with(
+    mut exec: DbExec<'_>,
+    sql: &str,
+    max_rows: usize,
+    applied_limit: Option<u64>,
+    started: Instant,
+) -> Result<QueryResult, AppError> {
     if !is_fetch_statement(sql) && !contains_returning(sql) {
-        let affected = match &mut *conn {
-            DbConnection::MySql(c) => (&mut **c).execute(sql).await?.rows_affected(),
-            DbConnection::Postgres(c) => (&mut **c).execute(sql).await?.rows_affected(),
-            DbConnection::Sqlite(c) => (&mut **c).execute(sql).await?.rows_affected(),
+        let affected = match &mut exec {
+            DbExec::MySql(c) => (&mut **c).execute(sql).await?.rows_affected(),
+            DbExec::Postgres(c) => (&mut **c).execute(sql).await?.rows_affected(),
+            DbExec::Sqlite(c) => (&mut **c).execute(sql).await?.rows_affected(),
         };
         return Ok(QueryResult {
             columns: vec![],
@@ -959,25 +1103,25 @@ async fn run_query_on(
         }};
     }
 
-    let (mut columns, rows, truncated) = match &mut *conn {
-        DbConnection::MySql(c) => fetch_rows!(&mut **c, mysql_value_to_json),
-        DbConnection::Postgres(c) => fetch_rows!(&mut **c, pg_value_to_json),
-        DbConnection::Sqlite(c) => fetch_rows!(&mut **c, sqlite_value_to_json),
+    let (mut columns, rows, truncated) = match &mut exec {
+        DbExec::MySql(c) => fetch_rows!(&mut **c, mysql_value_to_json),
+        DbExec::Postgres(c) => fetch_rows!(&mut **c, pg_value_to_json),
+        DbExec::Sqlite(c) => fetch_rows!(&mut **c, sqlite_value_to_json),
     };
 
     // 0 行の結果でも列ヘッダを表示できるよう、describe で列情報を補完する。
     // SHOW 等 prepare できない文では失敗することがあるため、エラーは無視する。
     if columns.is_empty() {
-        let described: Result<Vec<String>, sqlx::Error> = match &mut *conn {
-            DbConnection::MySql(c) => (&mut **c)
+        let described: Result<Vec<String>, sqlx::Error> = match &mut exec {
+            DbExec::MySql(c) => (&mut **c)
                 .describe(sql)
                 .await
                 .map(|d| d.columns().iter().map(|c| c.name().to_string()).collect()),
-            DbConnection::Postgres(c) => (&mut **c)
+            DbExec::Postgres(c) => (&mut **c)
                 .describe(sql)
                 .await
                 .map(|d| d.columns().iter().map(|c| c.name().to_string()).collect()),
-            DbConnection::Sqlite(c) => (&mut **c)
+            DbExec::Sqlite(c) => (&mut **c)
                 .describe(sql)
                 .await
                 .map(|d| d.columns().iter().map(|c| c.name().to_string()).collect()),
@@ -2807,5 +2951,229 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// エージェント経路 (ReadonlyGuard::Agent) は文レベルのガードに加えて
+    /// DB レベルでも読み取り専用を強制する。SQLite は PRAGMA query_only。
+    #[tokio::test]
+    async fn test_agent_guard_enforces_sqlite_query_only() {
+        let pool = make_test_pool().await;
+        let registry = CancelRegistry::default();
+        let DbPool::Sqlite(raw) = &pool else {
+            unreachable!()
+        };
+        run_query(&pool, "CREATE TABLE t (id INTEGER)", 10, None, false, false)
+            .await
+            .unwrap();
+
+        // エージェント経路の読み取りは通る
+        run_query_cancellable(
+            &pool,
+            &registry,
+            "c",
+            "SELECT 1",
+            10,
+            None,
+            ReadonlyGuard::Agent,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // 文レベルのガードを通さない生の書き込みも、DB 自身が拒否する
+        // (query_only が実際にコネクションへ効いていることの確認)
+        let err = sqlx::query("INSERT INTO t VALUES (1)")
+            .execute(raw)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.to_lowercase().contains("readonly")
+                || err.to_lowercase().contains("read-only"),
+            "unexpected error: {err}"
+        );
+
+        // 通常経路の実行は query_only を解除するので、その後の書き込みは通る
+        // (中断で解除処理が走らなかった場合の回復)
+        run_query_cancellable(
+            &pool,
+            &registry,
+            "c",
+            "INSERT INTO t VALUES (2)",
+            10,
+            None,
+            ReadonlyGuard::Off,
+            false,
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO t VALUES (3)")
+            .execute(raw)
+            .await
+            .unwrap();
+    }
+
+    /// セル編集 (run_statements) も query_only の残りを解除してから書き込む。
+    #[tokio::test]
+    async fn test_run_statements_clears_agent_query_only() {
+        let pool = make_test_pool().await;
+        let registry = CancelRegistry::default();
+        run_query(
+            &pool,
+            "CREATE TABLE t (id INTEGER, name TEXT)",
+            10,
+            None,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        run_query(&pool, "INSERT INTO t VALUES (1, 'a')", 10, None, false, false)
+            .await
+            .unwrap();
+
+        // エージェント経路の実行で query_only = 1 を残す
+        run_query_cancellable(
+            &pool,
+            &registry,
+            "c",
+            "SELECT 1",
+            10,
+            None,
+            ReadonlyGuard::Agent,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let affected = run_statements(
+            &pool,
+            &["UPDATE t SET name = 'b' WHERE id = 1".to_string()],
+            ReadonlyGuard::Off,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(affected, 1);
+    }
+
+    /// 実サーバー (Postgres / MySQL) での DB レベル読み取り専用の検証。
+    /// この 2 エンジンは組み込みで起動できないため、サーバーを用意できる
+    /// 環境でのみ走る (URL が無ければスキップ):
+    ///   QUERYFOLIO_TEST_PG_URL=postgres://user:pass@localhost/db \
+    ///   QUERYFOLIO_TEST_MYSQL_URL=mysql://user:pass@localhost/db \
+    ///     cargo test test_agent_guard_enforces_readonly_transaction
+    /// 検証内容は「readonly_begin_sql で開いたトランザクションの中では
+    /// 書き込みが DB に拒否される」「読み取りは通り、ROLLBACK 後も同じ
+    /// コネクションで書き込める」の 2 点。
+    #[tokio::test]
+    async fn test_agent_guard_enforces_readonly_transaction() {
+        if let Ok(url) = std::env::var("QUERYFOLIO_TEST_PG_URL") {
+            let raw = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .unwrap();
+            let mut conn = raw.acquire().await.unwrap();
+            let begin = readonly_begin_sql(Engine::Postgres).unwrap();
+            let mut tx = conn.begin_with(begin).await.unwrap();
+            // 読み取りは通る
+            sqlx::query("SELECT 1").execute(&mut *tx).await.unwrap();
+            // 書き込みは DB が拒否する (文レベルのガードは通していない)
+            let err = sqlx::query("CREATE TEMP TABLE queryfolio_ro_probe (a int)")
+                .execute(&mut *tx)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("read-only"), "postgres: {err}");
+            tx.rollback().await.unwrap();
+            // ROLLBACK 後は同じコネクションで書き込める
+            sqlx::query("CREATE TEMP TABLE queryfolio_ro_probe (a int)")
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+
+            // エージェント経路の読み取りが通ること (経路全体の確認)
+            let pool = DbPool::Postgres(raw);
+            let registry = CancelRegistry::default();
+            let result = run_query_cancellable(
+                &pool,
+                &registry,
+                "pg",
+                "SELECT 1 AS n",
+                10,
+                None,
+                ReadonlyGuard::Agent,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.row_count, 1);
+        }
+
+        if let Ok(url) = std::env::var("QUERYFOLIO_TEST_MYSQL_URL") {
+            let raw = MySqlPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .unwrap();
+            let mut conn = raw.acquire().await.unwrap();
+            let begin = readonly_begin_sql(Engine::MySql).unwrap();
+            let mut tx = conn.begin_with(begin).await.unwrap();
+            sqlx::query("SELECT 1").execute(&mut *tx).await.unwrap();
+            let err = sqlx::query("CREATE TABLE queryfolio_ro_probe (a int)")
+                .execute(&mut *tx)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.to_uppercase().contains("READ ONLY"),
+                "mysql: {err}"
+            );
+            tx.rollback().await.unwrap();
+
+            let pool = DbPool::MySql(raw);
+            let registry = CancelRegistry::default();
+            let result = run_query_cancellable(
+                &pool,
+                &registry,
+                "mysql",
+                "SELECT 1 AS n",
+                10,
+                None,
+                ReadonlyGuard::Agent,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.row_count, 1);
+        }
+    }
+
+    /// エージェント経路でも文レベルのガードは効き続ける
+    /// (メッセージはエージェント向けの文言になる)。
+    #[tokio::test]
+    async fn test_agent_guard_blocks_write_statements() {
+        let pool = make_test_pool().await;
+        let registry = CancelRegistry::default();
+        run_query(&pool, "CREATE TABLE t (id INTEGER)", 10, None, false, false)
+            .await
+            .unwrap();
+
+        let err = run_query_cancellable(
+            &pool,
+            &registry,
+            "c",
+            "INSERT INTO t VALUES (1)",
+            10,
+            None,
+            ReadonlyGuard::Agent,
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        // エージェント用のホワイトリスト (agent_rejection_reason) が先に弾く
+        assert!(err.contains("assistant"), "unexpected error: {err}");
     }
 }
