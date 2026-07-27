@@ -114,7 +114,7 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
 
 ## 開発上の注意
 
-- **アプリ名の表記はユーザーに見える箇所では「QueryFolio」に統一する** (ウインドウタイトル / ツールバー / productName / 生成される設定ファイルのコメント / README 見出し等)。リポジトリ名・bundle identifier (com.ytyng.queryfolio)・crate 名は小文字の queryfolio のまま。
+- **アプリ名の表記はユーザーに見える箇所では「QueryFolio」に統一する** (ウインドウタイトル / ツールバー / productName / 生成される設定ファイルのコメント / README 見出し等)。リポジトリ名・bundle identifier (com.cyberneura.queryfolio)・crate 名は小文字の queryfolio のまま。
 
 - **アプリ内メッセージ (UI ラベル・トースト・placeholder・エラーメッセージ・自動生成される設定ファイルのコメント) はすべて英語で書く**。Rust の AppError 等、フロントに表示される文字列も対象。コードコメントは日本語でよい。
 - ユーザーアクションを受ける要素には `data-annotate="<識別子>"` を付ける (E2E テスト用)。
