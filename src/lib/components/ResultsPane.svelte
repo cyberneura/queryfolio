@@ -450,8 +450,10 @@
   };
 
   // 結果テーブル全体を選択中フォーマットで文字列化する (Copy / Export 共通)。
-  const serializeResult = (format: CopyFormat): string | null => {
-    const result = activeTab?.result;
+  const serializeResult = (
+    format: CopyFormat,
+    result: api.QueryResult | null | undefined,
+  ): string | null => {
     if (!result) {
       return null;
     }
@@ -462,9 +464,45 @@
         : toJson(result);
   };
 
+  // Copy / Export で出力する結果を用意する。
+  //
+  // 結果テーブルの表示は設定の default_limit で絞られているが、Copy / Export では
+  // その制限を無視して全件を出す。取り直しが要らない (default_limit が付いて
+  // いなかった) 場合は表示中の結果をそのまま使う。
+  // 取り直し中は Copy / Export を二重に走らせない。
+  let preparingOutput = $state(false);
+  const resultForOutput = async (): Promise<api.QueryResult | null> => {
+    const tab = activeTab;
+    if (!tab?.result) {
+      return null;
+    }
+    let full: api.QueryResult | null = null;
+    preparingOutput = true;
+    try {
+      full = await appStore.fetchResultWithoutDefaultLimit(tab);
+    } catch (e) {
+      // 取り直しに失敗したら黙って表示中の結果を出さない
+      // (件数が違うものを気付かず出力するほうが危険)
+      toast.error(`Failed to fetch the full result: ${e}`);
+      return null;
+    } finally {
+      preparingOutput = false;
+    }
+    const result = full ?? tab.result;
+    if (result.truncated) {
+      toast.warning(
+        `The output was truncated at ${result.row_count.toLocaleString()} rows.`,
+      );
+    }
+    return result;
+  };
+
   // Copy ボタン: 結果テーブル全体を選択中フォーマットでクリップボードへ。
   const copyResult = async () => {
-    const text = serializeResult(copyFormat);
+    if (preparingOutput) {
+      return;
+    }
+    const text = serializeResult(copyFormat, await resultForOutput());
     if (text === null) {
       return;
     }
@@ -481,7 +519,7 @@
   // ネイティブ保存ダイアログで選ばせたパスへ Rust 側で書き込む。
   // encoding は分割ボタンの選択 (既定は UTF-8)。
   const exportResult = async (encoding: api.ExportEncoding = "utf-8") => {
-    if (!activeTab?.result) {
+    if (!activeTab?.result || preparingOutput) {
       return;
     }
     const ext = copyFormat;
@@ -499,8 +537,8 @@
       // ユーザーがダイアログをキャンセルした
       return;
     }
-    // シリアライズはパス確定後に行う (キャンセル時の無駄な処理を避ける)
-    const text = serializeResult(copyFormat);
+    // 取り直しとシリアライズはパス確定後に行う (キャンセル時の無駄な処理を避ける)
+    const text = serializeResult(copyFormat, await resultForOutput());
     if (text === null) {
       return;
     }
