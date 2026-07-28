@@ -362,7 +362,14 @@ export const writeConfigFile = (content: string) =>
 export const readOverrideConfigYaml = () =>
   invoke<string>("read_override_config_yaml");
 
+/// エクスポート時の文字コード。既定は UTF-8。
+/// Excel など UTF-8 を前提としないツール向けに CP932 / EUC-JP を選べる。
+export type ExportEncoding = "utf-8" | "cp932" | "euc-jp";
+
 /// 結果テーブルの Export で、ネイティブ保存ダイアログで選んだパスへ
 /// テキスト (CSV/TSV/JSON) を書き出す。パスはユーザーが明示的に選択したもの。
-export const writeExportFile = (path: string, contents: string) =>
-  invoke<void>("write_export_file", { path, contents });
+export const writeExportFile = (
+  path: string,
+  contents: string,
+  encoding: ExportEncoding = "utf-8",
+) => invoke<void>("write_export_file", { path, contents, encoding });

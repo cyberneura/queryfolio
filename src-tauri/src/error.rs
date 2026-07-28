@@ -29,6 +29,10 @@ pub enum AppError {
     #[error("AI error: {0}")]
     Ai(String),
 
+    /// 結果のエクスポートに失敗した (未対応の文字コード、変換できない文字)
+    #[error("{0}")]
+    Export(String),
+
     /// EXPLAIN の対象にできない文 (SELECT / WITH 以外) が指定された
     #[error("{0}")]
     Explain(String),

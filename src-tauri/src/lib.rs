@@ -1475,9 +1475,45 @@ async fn read_override_config_yaml() -> Result<String, AppError> {
 /// `write_config_file` で設定書き込みが既に可能なため、フロントが侵害された
 /// 場合の被害範囲は元々広い。ここで新たにファイル書き込みが増えることの
 /// 追加リスクは限定的と判断している。
+/// エクスポート時の文字コード。
+///
+/// 既定は UTF-8。Excel など UTF-8 を前提としないツール向けに CP932 / EUC-JP を選べる。
+/// 文字コード名はフロントから文字列で渡ってくる。
+fn encode_export_contents(contents: &str, encoding: &str) -> Result<Vec<u8>, AppError> {
+    let encoder = match encoding {
+        // 空文字・未指定は既定の UTF-8 として扱う
+        "" | "utf-8" | "utf8" => return Ok(contents.as_bytes().to_vec()),
+        // encoding_rs の SHIFT_JIS は Encoding Standard の定義により Windows-31J (CP932)
+        "cp932" | "shift_jis" | "sjis" => encoding_rs::SHIFT_JIS,
+        "euc-jp" | "eucjp" => encoding_rs::EUC_JP,
+        other => {
+            return Err(AppError::Export(format!(
+                "Unsupported export encoding: {other}"
+            )));
+        }
+    };
+
+    let (encoded, _, had_unmappable) = encoder.encode(contents);
+    if had_unmappable {
+        // 変換できない文字は encoding_rs が数値文字参照 (&#12345;) に置き換える。
+        // 黙って壊れた出力を書くとデータの取り違えにつながるため、失敗として返す。
+        return Err(AppError::Export(format!(
+            "The result contains characters that cannot be represented in {encoding}. \
+             Export as UTF-8 instead, or remove those characters."
+        )));
+    }
+    Ok(encoded.into_owned())
+}
+
 #[tauri::command]
-async fn write_export_file(path: String, contents: String) -> Result<(), AppError> {
-    std::fs::write(&path, contents)?;
+async fn write_export_file(
+    path: String,
+    contents: String,
+    encoding: Option<String>,
+) -> Result<(), AppError> {
+    let encoding = encoding.unwrap_or_default();
+    let bytes = encode_export_contents(&contents, &encoding)?;
+    std::fs::write(&path, bytes)?;
     Ok(())
 }
 
@@ -1902,4 +1938,46 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod export_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn utf8_is_the_default() {
+        assert_eq!(
+            encode_export_contents("あa", "").unwrap(),
+            "あa".as_bytes()
+        );
+        assert_eq!(
+            encode_export_contents("あa", "utf-8").unwrap(),
+            "あa".as_bytes()
+        );
+    }
+
+    #[test]
+    fn encodes_cp932_and_euc_jp() {
+        // 「あ」は CP932 で 0x82 0xA0、EUC-JP で 0xA4 0xA2
+        assert_eq!(
+            encode_export_contents("あa", "cp932").unwrap(),
+            vec![0x82, 0xA0, 0x61]
+        );
+        assert_eq!(
+            encode_export_contents("あa", "euc-jp").unwrap(),
+            vec![0xA4, 0xA2, 0x61]
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_encoding() {
+        assert!(encode_export_contents("a", "utf-16").is_err());
+    }
+
+    #[test]
+    fn rejects_unmappable_characters() {
+        // 変換できない文字は数値文字参照に化けるため、黙って書かずエラーにする
+        assert!(encode_export_contents("a🍣b", "cp932").is_err());
+        assert!(encode_export_contents("🍣", "euc-jp").is_err());
+    }
 }
