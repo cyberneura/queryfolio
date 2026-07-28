@@ -1436,23 +1436,32 @@ const EXPORT_MAX_ROWS = 1_000_000;
 
 /// Copy / Export 用に、アクティブタブの SQL を default_limit 抜きで実行し直す。
 ///
-/// 再実行するのは `applied_limit` が付いていた結果だけ。default_limit が
-/// 付与されるのは「LIMIT を持たない SELECT / WITH」に限られる
-/// (バックエンドの should_auto_limit が insert / update / delete / returning /
-/// into 等を含む文を除外する) ため、書き込みを伴う文を再実行してしまう心配は無い。
-/// 付いていなければ無視すべき default_limit がそもそも無いので、
-/// 表示中の結果をそのまま使う (null を返す)。
+/// 取り直すのは、表示中の結果が絞られている場合だけ:
+/// - `applied_limit` が付いている (LIMIT 無しの SELECT に default_limit を付与した)
+/// - `truncated` が立っている (SQL 自身の LIMIT が大きく、表示用の行数上限で切った)
+///
+/// **書き込みを伴う文は再実行しない。** 判定はバックエンドの
+/// `can_rerun_for_output` (AI エージェント経路と同じ厳しい読み取り専用判定) に任せる。
+/// `truncated` は INSERT ... RETURNING のような書き込み文でも立ちうるため、
+/// applied_limit の有無だけでは安全性を担保できない。
+///
+/// 取り直しが不要・できない場合は null を返し、呼び出し側が表示中の結果を使う
+/// (その場合の打ち切りは呼び出し側がトーストで警告する)。
 const fetchResultWithoutDefaultLimit = async (
   tab: ResultTab,
 ): Promise<QueryResult | null> => {
-  if (tab.result?.applied_limit == null) {
+  const result = tab.result;
+  if (!result || (result.applied_limit == null && !result.truncated)) {
+    return null;
+  }
+  if (!(await api.canRerunForOutput(tab.connection, tab.sql))) {
     return null;
   }
   return await api.runQuery(
     tab.connection,
     tab.sql,
     EXPORT_MAX_ROWS,
-    // 元の実行と同じ権限で実行する (SELECT なので書き込みは起きない)
+    // 元の実行と同じ権限で実行する (読み取り専用と判定済みなので書き込みは起きない)
     effectiveWritable(tab.connection),
     false,
   );

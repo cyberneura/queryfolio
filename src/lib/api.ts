@@ -149,6 +149,11 @@ export const CANCELLED_ERROR_MESSAGE = "Query cancelled";
 export const checkDangerousStatement = (connection: string, sql: string) =>
   invoke<string | null>("check_dangerous_statement", { connection, sql });
 
+/// Copy / Export で全件を取り直すために、その SQL をもう一度実行してよいかを返す。
+/// 書き込みを伴う文を二度実行しないよう、読み取り専用と判定できたものだけ true。
+export const canRerunForOutput = (connection: string, sql: string) =>
+  invoke<boolean>("can_rerun_for_output", { connection, sql });
+
 /// クエリ実行履歴を新しい順に返す。search は SQL の部分一致 (大小無視)。
 export const listQueryHistory = (
   connection: string,
