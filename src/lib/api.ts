@@ -118,12 +118,22 @@ export const resetConnections = () => invoke<void>("reset_connections");
 
 /// writable は Writable スイッチの状態 (未指定・false は読み取り専用の安全側)。
 /// config の readonly: true 接続では、writable に関わらず書き込みは拒否される。
+/// applyDefaultLimit を false にすると、設定の default_limit を自動付与しない
+/// (Copy / Export で全件を出すため)。省略時は従来どおり付与する。
 export const runQuery = (
   connection: string,
   sql: string,
   maxRows?: number,
   writable?: boolean,
-) => invoke<QueryResult>("run_query", { connection, sql, maxRows, writable });
+  applyDefaultLimit?: boolean,
+) =>
+  invoke<QueryResult>("run_query", {
+    connection,
+    sql,
+    maxRows,
+    writable,
+    applyDefaultLimit,
+  });
 
 /// 接続で実行中のクエリにキャンセルを要求する。実行中でなければ false。
 /// キャンセルされた run_query は CANCELLED_ERROR_MESSAGE のエラーで返る。

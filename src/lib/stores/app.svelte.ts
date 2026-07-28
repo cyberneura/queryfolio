@@ -1429,6 +1429,35 @@ const confirmIfDangerous = async (
   return await requestDangerousConfirm(reason);
 };
 
+/// Copy / Export で全件を取り直す時の行数上限。
+/// 設定の default_limit は無視するが、無制限に読むとメモリを使い切るため
+/// クライアント側の安全網は残す。打ち切った場合は truncated が立つ。
+const EXPORT_MAX_ROWS = 1_000_000;
+
+/// Copy / Export 用に、アクティブタブの SQL を default_limit 抜きで実行し直す。
+///
+/// 再実行するのは `applied_limit` が付いていた結果だけ。default_limit が
+/// 付与されるのは「LIMIT を持たない SELECT / WITH」に限られる
+/// (バックエンドの should_auto_limit が insert / update / delete / returning /
+/// into 等を含む文を除外する) ため、書き込みを伴う文を再実行してしまう心配は無い。
+/// 付いていなければ無視すべき default_limit がそもそも無いので、
+/// 表示中の結果をそのまま使う (null を返す)。
+const fetchResultWithoutDefaultLimit = async (
+  tab: ResultTab,
+): Promise<QueryResult | null> => {
+  if (tab.result?.applied_limit == null) {
+    return null;
+  }
+  return await api.runQuery(
+    tab.connection,
+    tab.sql,
+    EXPORT_MAX_ROWS,
+    // 元の実行と同じ権限で実行する (SELECT なので書き込みは起きない)
+    effectiveWritable(tab.connection),
+    false,
+  );
+};
+
 const runQuery = async (sql: string) => {
   // 実行先の接続を await 前に固定する。以降の await (保存・危険文の確認モーダル) の
   // 間に接続が切り替わっても、確認した接続と実行する接続が食い違わないようにする
@@ -2234,6 +2263,7 @@ export default {
   dismissFixSuggestion,
   isConnectionRunning,
   runQuery,
+  fetchResultWithoutDefaultLimit,
   explainQuery,
   analyzeExplainTab,
   closeAiAnalysis,

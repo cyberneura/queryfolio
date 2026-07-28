@@ -418,6 +418,9 @@ async fn run_query(
     // ツールバーの Writable スイッチの状態。省略・false は読み取り専用
     // (安全側の既定)。config の readonly: true はこれより優先される。
     writable: Option<bool>,
+    // 設定の default_limit を自動付与するか。省略時は付与する (従来どおり)。
+    // Copy / Export は結果テーブルの表示用ではなく全件を出したいので false で呼ぶ。
+    apply_default_limit: Option<bool>,
 ) -> Result<QueryResult, AppError> {
     let server = state.find_server(&connection).await?;
     // config の readonly が最優先のハードロック。次にスイッチ。
@@ -433,9 +436,13 @@ async fn run_query(
         Some(schema) => Some(schema),
         None => server.schema.clone(),
     };
-    let auto_limit = match state.resolve_default_limit().await? {
-        0 => None,
-        limit => Some(limit),
+    let auto_limit = if apply_default_limit.unwrap_or(true) {
+        match state.resolve_default_limit().await? {
+            0 => None,
+            limit => Some(limit),
+        }
+    } else {
+        None
     };
     let started = std::time::Instant::now();
 
