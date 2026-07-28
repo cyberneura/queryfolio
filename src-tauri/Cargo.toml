@@ -78,6 +78,9 @@ aws-smithy-http-client = { version = "=1.2.0", default-features = false, feature
 # (異なる Team ID の dylib はロード不可)。副次的に Homebrew 未導入環境でも動く。
 ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 base64 = "0.22"
+# エクスポート時の文字コード変換 (CP932 / EUC-JP)。Excel 等の
+# UTF-8 を前提としないツール向け
+encoding_rs = "0.8"
 futures = "0.3"
 tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-window-state = "2.4.1"

@@ -54,6 +54,14 @@
   let copiedWhole = $state(false);
   let exported = $state(false);
 
+  // Export の文字コード選択メニュー (分割ボタンの ▼)。
+  // 本体のボタンは UTF-8 なので、ここには UTF-8 以外だけを並べる。
+  const EXPORT_ENCODINGS: { value: api.ExportEncoding; label: string }[] = [
+    { value: "cp932", label: "CP932" },
+    { value: "euc-jp", label: "EUC-JP" },
+  ];
+  let exportMenuOpen = $state(false);
+
   const activeTab = $derived(appStore.activeResultTab);
 
   /// 結果セットを持たない文 (INSERT / UPDATE / DELETE / DDL 等) の実行結果を、
@@ -471,7 +479,8 @@
 
   // Export ボタン: 結果テーブル全体を選択中フォーマットでファイルへ保存する。
   // ネイティブ保存ダイアログで選ばせたパスへ Rust 側で書き込む。
-  const exportResult = async () => {
+  // encoding は分割ボタンの選択 (既定は UTF-8)。
+  const exportResult = async (encoding: api.ExportEncoding = "utf-8") => {
     if (!activeTab?.result) {
       return;
     }
@@ -496,7 +505,7 @@
       return;
     }
     try {
-      await api.writeExportFile(path, text);
+      await api.writeExportFile(path, text, encoding);
       exported = true;
       setTimeout(() => {
         exported = false;
@@ -1072,14 +1081,54 @@
           >
             {copiedWhole ? "Copied!" : "Copy"}
           </button>
-          <button
-            class="rounded border border-zinc-700 px-1.5 py-0.5 hover:bg-zinc-700 hover:text-zinc-200"
-            title="Export the whole result to a file in the selected format"
-            data-annotate="button-export-result"
-            onclick={exportResult}
-          >
-            {exported ? "Exported!" : "Export"}
-          </button>
+          <!-- Export は分割ボタン。本体は UTF-8、▼ で文字コードを選ぶ -->
+          <span class="relative inline-flex">
+            <button
+              class="rounded-l border border-zinc-700 px-1.5 py-0.5 hover:bg-zinc-700 hover:text-zinc-200"
+              title="Export the whole result to a file in the selected format (UTF-8)"
+              data-annotate="button-export-result"
+              onclick={() => void exportResult("utf-8")}
+            >
+              {exported ? "Exported!" : "Export"}
+            </button>
+            <button
+              class="-ml-px rounded-r border border-zinc-700 px-1 py-0.5 hover:bg-zinc-700 hover:text-zinc-200"
+              title="Export with a different character encoding"
+              aria-label="Export encoding options"
+              aria-haspopup="menu"
+              data-annotate="button-export-encoding-menu"
+              onclick={() => (exportMenuOpen = !exportMenuOpen)}
+            >
+              <i class="bi bi-caret-down-fill text-[0.6rem]"></i>
+            </button>
+            {#if exportMenuOpen}
+              <!-- 外側クリックで閉じるための背面レイヤー -->
+              <button
+                class="fixed inset-0 z-20 cursor-default"
+                aria-label="Close menu"
+                data-annotate="export-menu-backdrop"
+                onclick={() => (exportMenuOpen = false)}
+              ></button>
+              <div
+                class="absolute right-0 top-full z-30 mt-0.5 min-w-44 rounded border border-zinc-700 bg-zinc-800 py-1 shadow-lg"
+                role="menu"
+              >
+                {#each EXPORT_ENCODINGS as option (option.value)}
+                  <button
+                    class="block w-full px-3 py-1 text-left hover:bg-zinc-700 hover:text-zinc-200"
+                    role="menuitem"
+                    data-annotate="menu-export-as-{option.value}"
+                    onclick={() => {
+                      exportMenuOpen = false;
+                      void exportResult(option.value);
+                    }}
+                  >
+                    Export as {option.label}
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </span>
         {/if}
       </span>
     </div>
