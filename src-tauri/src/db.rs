@@ -1562,6 +1562,16 @@ const AGENT_ALLOWED_KEYWORDS: &[&str] = &[
     "table",
 ];
 
+/// その SQL を「もう一度実行しても副作用が無い」と判断してよいかを返す。
+///
+/// Copy / Export は結果テーブルの打ち切りを避けるために同じ SQL を実行し直すが、
+/// 書き込みを伴う文を二度実行すると事故になる。判定は AI エージェント経路と
+/// 同じ厳しさ (狭いホワイトリスト + 複文禁止 + EXPLAIN ANALYZE 禁止 +
+/// readonly ガード) を使う。
+pub fn is_safe_to_rerun(sql: &str, engine: Engine) -> bool {
+    agent_rejection_reason(sql, engine).is_none()
+}
+
 /// AI エージェントが実行しようとした SQL を拒否すべきなら理由を返す。
 /// 通常の readonly ガードに加えて、上記の狭いホワイトリストと
 /// 複文 (`;` 区切り) の禁止を課す。
@@ -2286,6 +2296,22 @@ mod tests {
             body("SELECT $$--not a comment$$ AS s", Engine::Postgres),
             "SELECT $$--not a comment$$ AS s"
         );
+    }
+
+    #[test]
+    fn test_is_safe_to_rerun() {
+        let f = |s: &str| is_safe_to_rerun(s, Engine::Sqlite);
+        // Copy / Export の取り直しで再実行してよい文
+        assert!(f("SELECT * FROM t LIMIT 10000"));
+        assert!(f("WITH x AS (SELECT 1) SELECT * FROM x"));
+        // 書き込みを伴う文は再実行しない (二重実行の事故になる)
+        assert!(!f("INSERT INTO t VALUES (1) RETURNING id"));
+        assert!(!f("UPDATE t SET a = 1 WHERE id = 1 RETURNING id"));
+        assert!(!f("DELETE FROM t WHERE id = 1"));
+        assert!(!f("WITH x AS (DELETE FROM t RETURNING id) SELECT * FROM x"));
+        // 対象文を実際に実行する EXPLAIN ANALYZE と複文も拒否する
+        assert!(!f("EXPLAIN ANALYZE SELECT * FROM t"));
+        assert!(!f("SELECT 1; SELECT 2"));
     }
 
     #[test]

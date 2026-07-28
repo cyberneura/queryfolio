@@ -436,13 +436,37 @@ async fn run_query(
         Some(schema) => Some(schema),
         None => server.schema.clone(),
     };
-    let auto_limit = if apply_default_limit.unwrap_or(true) {
-        match state.resolve_default_limit().await? {
-            0 => None,
-            limit => Some(limit),
-        }
+    // 結果テーブルの表示用 (apply_default_limit) と、Copy / Export 用の
+    // 全件取得 (apply_default_limit = false) で行数の扱いを分ける。
+    let apply_default_limit = apply_default_limit.unwrap_or(true);
+    let default_limit = if apply_default_limit {
+        state.resolve_default_limit().await?
     } else {
-        None
+        0
+    };
+    let auto_limit = match default_limit {
+        0 => None,
+        limit => Some(limit),
+    };
+    // 表示用の実行では、SQL 自身が LIMIT を持っていて auto_limit を付けられない
+    // 場合 (LIMIT 10000 等) でも、結果テーブルには default_limit 行までしか出さない
+    // (打ち切りは truncated で UI に出る)。
+    //
+    // auto_limit が付く文 (LIMIT 無しの SELECT) はここで絞らない。絞ると
+    // 「LIMIT 500 で 500 行返ってきた」時に必ず truncated が立ち、
+    // 通常のクエリすべてに打ち切り表示が出てしまうため。
+    let max_rows = max_rows.unwrap_or(DEFAULT_MAX_ROWS);
+    // auto_limit で SQL 側が絞られる文はクライアント側の上限を触らない。
+    // engine 名が不正な場合はここでエラーにせず false に倒す (実行時に
+    // 下の async ブロックが同じエラーを返し、失敗として履歴に残るため)。
+    let sql_gets_auto_limit = auto_limit.is_some()
+        && db::parse_engine(&server.engine)
+            .map(|engine| db::should_auto_limit(&sql, engine))
+            .unwrap_or(false);
+    let max_rows = if default_limit > 0 && !sql_gets_auto_limit {
+        max_rows.min(default_limit as usize)
+    } else {
+        max_rows
     };
     let started = std::time::Instant::now();
 
@@ -462,7 +486,7 @@ async fn run_query(
             &state.query_cancels,
             &connection,
             &sql,
-            max_rows.unwrap_or(DEFAULT_MAX_ROWS),
+            max_rows,
             auto_limit,
             readonly_guard,
             server.allow_dangerous_statements,
@@ -1056,6 +1080,23 @@ async fn check_dangerous_statement(
 ) -> Result<Option<String>, AppError> {
     let server = state.find_server(&connection).await?;
     db::dangerous_statement_reason(&server.engine, &sql)
+}
+
+/// Copy / Export で全件を取り直すために、その SQL をもう一度実行してよいかを返す。
+///
+/// 結果テーブルは default_limit で打ち切られるため、全件を出すには同じ SQL を
+/// 実行し直す必要がある。ただし書き込みを伴う文を二度実行してしまうと事故になる
+/// ので、AI エージェント経路と同じ厳しい読み取り専用判定 (複文・EXPLAIN ANALYZE・
+/// CALL / PRAGMA も拒否) を通ったものだけ許可する。
+#[tauri::command]
+async fn can_rerun_for_output(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    sql: String,
+) -> Result<bool, AppError> {
+    let server = state.find_server(&connection).await?;
+    let engine = db::parse_engine(&server.engine)?;
+    Ok(db::is_safe_to_rerun(&sql, engine))
 }
 
 /// EXPLAIN の実行計画を AI に解説させ、ボトルネックの特定・インデックス
@@ -1930,6 +1971,7 @@ pub fn run() {
             ai_generate_sql,
             build_explain_sql,
             check_dangerous_statement,
+            can_rerun_for_output,
             ai_explain_plan,
             ai_explain_sql,
             ai_fix_sql,
