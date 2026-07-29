@@ -261,6 +261,72 @@ fn build_chat_completion_body(
     body
 }
 
+/// リクエストボディから reasoning_effort を取り除く。
+/// 実際に取り除いた (= 送っていた) 場合だけ true を返す。
+fn remove_reasoning_effort(body: &mut serde_json::Value) -> bool {
+    body.as_object_mut()
+        .and_then(|object| object.remove("reasoning_effort"))
+        .is_some()
+}
+
+/// API がエラー応答を返した時の情報 (リトライ可否の判定に使う)。
+struct ApiErrorResponse {
+    status: u16,
+    body: String,
+}
+
+impl From<ApiErrorResponse> for AppError {
+    fn from(error: ApiErrorResponse) -> Self {
+        AppError::Ai(format!(
+            "The AI API returned an error (HTTP {}): {}",
+            error.status,
+            truncate_for_error(&error.body)
+        ))
+    }
+}
+
+/// エラー応答が「reasoning_effort を受け付けない」ことによる拒否かを判定する。
+///
+/// どの値なら通るかはモデルごとに違い、こちらから網羅的に把握できない
+/// (gpt-5.x 系は tools と併用するなら "none" が必須、gpt-4o 系はそもそも
+/// このパラメータを受け付けない)。モデル名の一覧を持ち回るのは
+/// 新モデルが出るたび破綻するので、拒否されたら外して 1 度だけやり直す。
+fn rejects_reasoning_effort(error: &ApiErrorResponse) -> bool {
+    error.status == 400 && error.body.contains("reasoning_effort")
+}
+
+/// Chat Completions API を 1 回だけ呼び、レスポンス JSON を返す。
+async fn post_chat_completion(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+) -> Result<Result<serde_json::Value, ApiErrorResponse>, AppError> {
+    let response = client
+        .post(url)
+        .bearer_auth(api_key)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| AppError::Ai(format!("The AI API request failed: {e}")))?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| AppError::Ai(format!("Failed to read the AI API response: {e}")))?;
+    if !status.is_success() {
+        return Ok(Err(ApiErrorResponse {
+            status: status.as_u16(),
+            body: text,
+        }));
+    }
+
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| AppError::Ai(format!("Failed to parse the AI API response: {e}")))?;
+    Ok(Ok(json))
+}
+
 /// OpenAI Chat Completions API を呼び、`choices[0].message` を返す。
 /// tools を渡すとツール呼び出し (function calling) を許可する。
 /// メッセージ列を組み立てるのは呼び出し側の責務 (フロントから任意
@@ -275,31 +341,18 @@ async fn request_chat_completion(
         .build()
         .map_err(|e| AppError::Ai(format!("Failed to build the HTTP client: {e}")))?;
     let url = format!("{}/chat/completions", config.base_url());
-    let body = build_chat_completion_body(config, messages, tools);
+    let mut body = build_chat_completion_body(config, messages, tools);
 
-    let response = client
-        .post(&url)
-        .bearer_auth(&config.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AppError::Ai(format!("The AI API request failed: {e}")))?;
-
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|e| AppError::Ai(format!("Failed to read the AI API response: {e}")))?;
-    if !status.is_success() {
-        return Err(AppError::Ai(format!(
-            "The AI API returned an error (HTTP {}): {}",
-            status.as_u16(),
-            truncate_for_error(&text)
-        )));
+    let mut result = post_chat_completion(&client, &url, &config.api_key, &body).await?;
+    // reasoning_effort が原因で断られたら、そのパラメータを外して 1 度だけ再送する。
+    // 送っていなかった場合は再送しても同じなので何もしない (無限リトライにもならない)。
+    if let Err(error) = &result {
+        if rejects_reasoning_effort(error) && remove_reasoning_effort(&mut body) {
+            result = post_chat_completion(&client, &url, &config.api_key, &body).await?;
+        }
     }
+    let json = result.map_err(AppError::from)?;
 
-    let json: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| AppError::Ai(format!("Failed to parse the AI API response: {e}")))?;
     json.get("choices")
         .and_then(|choices| choices.get(0))
         .and_then(|choice| choice.get("message"))
@@ -734,6 +787,68 @@ mod tests {
         let tools = chat_tools_spec();
         let body = build_chat_completion_body(&config, &messages(), Some(&tools));
         assert_eq!(body["reasoning_effort"], serde_json::json!("none"));
+    }
+
+    #[test]
+    fn test_rejects_reasoning_effort_detects_parameter_rejection() {
+        // gpt-5.x 系で tools と併用した時のエラー (今回の不具合の発端)
+        let unsupported_combination = ApiErrorResponse {
+            status: 400,
+            body: "{\"error\":{\"message\":\"Function tools with reasoning_effort are not \
+                   supported for gpt-5.6-luna in /v1/chat/completions.\",\
+                   \"param\":\"reasoning_effort\"}}"
+                .into(),
+        };
+        assert!(rejects_reasoning_effort(&unsupported_combination));
+
+        // このパラメータ自体を受け付けないモデル / OpenAI 互換 API
+        let unknown_parameter = ApiErrorResponse {
+            status: 400,
+            body: "{\"error\":{\"message\":\"Unrecognized request argument supplied: \
+                   reasoning_effort\"}}"
+                .into(),
+        };
+        assert!(rejects_reasoning_effort(&unknown_parameter));
+    }
+
+    #[test]
+    fn test_rejects_reasoning_effort_ignores_unrelated_errors() {
+        // 無関係な 400 で再送しない
+        let other_400 = ApiErrorResponse {
+            status: 400,
+            body: "{\"error\":{\"message\":\"Invalid value for 'model'\"}}".into(),
+        };
+        assert!(!rejects_reasoning_effort(&other_400));
+
+        // 認証エラーやサーバーエラーは再送しても同じ
+        let unauthorized = ApiErrorResponse {
+            status: 401,
+            body: "{\"error\":{\"message\":\"Incorrect API key\"}}".into(),
+        };
+        assert!(!rejects_reasoning_effort(&unauthorized));
+        let server_error = ApiErrorResponse {
+            status: 500,
+            body: "reasoning_effort".into(),
+        };
+        assert!(!rejects_reasoning_effort(&server_error));
+    }
+
+    #[test]
+    fn test_remove_reasoning_effort() {
+        let config = AiConfig::from_value(&yaml("api_key: sk-test")).unwrap();
+        let tools = chat_tools_spec();
+        let mut body = build_chat_completion_body(&config, &messages(), Some(&tools));
+        assert!(body.get("reasoning_effort").is_some());
+
+        // 送っていた場合は取り除いて true
+        assert!(remove_reasoning_effort(&mut body));
+        assert!(body.get("reasoning_effort").is_none());
+        // 他のフィールドは残す
+        assert_eq!(body["tools"], tools);
+        assert_eq!(body["model"], serde_json::json!(DEFAULT_OPENAI_MODEL));
+
+        // 送っていなかった場合は false (再送しても同じなので何もしない)
+        assert!(!remove_reasoning_effort(&mut body));
     }
 
     fn turn(role: &str, content: &str) -> ChatTurn {
