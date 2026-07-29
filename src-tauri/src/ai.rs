@@ -14,6 +14,20 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 /// AI API リクエストのタイムアウト (秒)。
 const AI_REQUEST_TIMEOUT_SECS: u64 = 60;
 
+/// 接続先が OpenAI 公式の時に、tools (function calling) 付きのリクエストへ
+/// 付ける reasoning_effort のデフォルト。
+///
+/// gpt-5.6-luna / gpt-5.6-terra のような推論モデルは、/v1/chat/completions で
+/// tools を使う場合 reasoning_effort が "none" でないと 400 を返す:
+///
+/// > Function tools with reasoning_effort are not supported for gpt-5.6-luna in
+/// > /v1/chat/completions. To use function tools, use /v1/responses or set
+/// > reasoning_effort to 'none'.
+///
+/// tools を渡すのは AI チャットだけなので、SQL 生成や EXPLAIN 解説の推論には
+/// 影響しない (そちらのリクエストには reasoning_effort を付けない)。
+const DEFAULT_TOOL_REASONING_EFFORT: &str = "none";
+
 /// エラーメッセージに含める API レスポンス本文の最大長。
 const ERROR_BODY_MAX_CHARS: usize = 500;
 
@@ -33,6 +47,11 @@ pub struct AiConfig {
     /// OpenAI 互換 API 用のベース URL (省略時 DEFAULT_OPENAI_BASE_URL)
     #[serde(default)]
     pub base_url: Option<String>,
+    /// tools (function calling) 付きリクエストで送る reasoning_effort。
+    /// 空文字を指定するとこのパラメータを送らない。
+    /// 省略時の挙動は tool_reasoning_effort() を参照。
+    #[serde(default)]
+    pub tool_reasoning_effort: Option<String>,
 }
 
 fn default_provider() -> String {
@@ -61,6 +80,23 @@ impl AiConfig {
     /// 使用するモデル名 (省略時はデフォルトモデル)。
     pub fn model(&self) -> &str {
         self.model.as_deref().unwrap_or(DEFAULT_OPENAI_MODEL)
+    }
+
+    /// tools 付きリクエストで送る reasoning_effort (送らない場合は None)。
+    ///
+    /// 明示指定があればそれに従う (空文字なら送らない)。
+    /// 省略時は、接続先が OpenAI 公式の場合だけ DEFAULT_TOOL_REASONING_EFFORT を送る。
+    /// base_url で OpenAI 互換 API を指している場合に既定で送ってしまうと、
+    /// reasoning_effort を受け付けない相手では今まで動いていた AI チャットが
+    /// エラーになるため、そちらは明示指定した時だけ送る。
+    fn tool_reasoning_effort(&self) -> Option<&str> {
+        let effort = match self.tool_reasoning_effort.as_deref() {
+            Some(effort) => effort,
+            None if self.base_url() == DEFAULT_OPENAI_BASE_URL => DEFAULT_TOOL_REASONING_EFFORT,
+            None => return None,
+        };
+        let effort = effort.trim();
+        (!effort.is_empty()).then_some(effort)
     }
 
     /// API のベース URL (省略時は OpenAI 公式。末尾スラッシュは除去)。
@@ -202,32 +238,74 @@ fn truncate_for_error(text: &str) -> String {
     format!("{truncated}...")
 }
 
-/// OpenAI Chat Completions API を呼び、`choices[0].message` を返す。
-/// tools を渡すとツール呼び出し (function calling) を許可する。
-/// メッセージ列を組み立てるのは呼び出し側の責務 (フロントから任意
-/// プロンプトを送れる汎用コマンドは作らない)。
-async fn request_chat_completion(
+/// Chat Completions API のリクエストボディを組み立てる。
+/// 通信を伴わない純粋な組み立てなので、単体テストで内容を固定する。
+fn build_chat_completion_body(
     config: &AiConfig,
     messages: &[serde_json::Value],
     tools: Option<&serde_json::Value>,
-) -> Result<serde_json::Value, AppError> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(AI_REQUEST_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| AppError::Ai(format!("Failed to build the HTTP client: {e}")))?;
-    let url = format!("{}/chat/completions", config.base_url());
+) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": config.model(),
         "messages": messages,
     });
-    if let Some(tools) = tools {
-        body["tools"] = tools.clone();
+    let Some(tools) = tools else {
+        return body;
+    };
+    body["tools"] = tools.clone();
+    // 推論モデルは tools と併用する時 reasoning_effort が "none" である必要がある
+    // (DEFAULT_TOOL_REASONING_EFFORT のコメント参照)。
+    if let Some(effort) = config.tool_reasoning_effort() {
+        body["reasoning_effort"] = serde_json::json!(effort);
     }
+    body
+}
 
+/// リクエストボディから reasoning_effort を取り除く。
+/// 実際に取り除いた (= 送っていた) 場合だけ true を返す。
+fn remove_reasoning_effort(body: &mut serde_json::Value) -> bool {
+    body.as_object_mut()
+        .and_then(|object| object.remove("reasoning_effort"))
+        .is_some()
+}
+
+/// API がエラー応答を返した時の情報 (リトライ可否の判定に使う)。
+struct ApiErrorResponse {
+    status: u16,
+    body: String,
+}
+
+impl From<ApiErrorResponse> for AppError {
+    fn from(error: ApiErrorResponse) -> Self {
+        AppError::Ai(format!(
+            "The AI API returned an error (HTTP {}): {}",
+            error.status,
+            truncate_for_error(&error.body)
+        ))
+    }
+}
+
+/// エラー応答が「reasoning_effort を受け付けない」ことによる拒否かを判定する。
+///
+/// どの値なら通るかはモデルごとに違い、こちらから網羅的に把握できない
+/// (gpt-5.x 系は tools と併用するなら "none" が必須、gpt-4o 系はそもそも
+/// このパラメータを受け付けない)。モデル名の一覧を持ち回るのは
+/// 新モデルが出るたび破綻するので、拒否されたら外して 1 度だけやり直す。
+fn rejects_reasoning_effort(error: &ApiErrorResponse) -> bool {
+    error.status == 400 && error.body.contains("reasoning_effort")
+}
+
+/// Chat Completions API を 1 回だけ呼び、レスポンス JSON を返す。
+async fn post_chat_completion(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+) -> Result<Result<serde_json::Value, ApiErrorResponse>, AppError> {
     let response = client
-        .post(&url)
-        .bearer_auth(&config.api_key)
-        .json(&body)
+        .post(url)
+        .bearer_auth(api_key)
+        .json(body)
         .send()
         .await
         .map_err(|e| AppError::Ai(format!("The AI API request failed: {e}")))?;
@@ -238,15 +316,63 @@ async fn request_chat_completion(
         .await
         .map_err(|e| AppError::Ai(format!("Failed to read the AI API response: {e}")))?;
     if !status.is_success() {
-        return Err(AppError::Ai(format!(
-            "The AI API returned an error (HTTP {}): {}",
-            status.as_u16(),
-            truncate_for_error(&text)
-        )));
+        return Ok(Err(ApiErrorResponse {
+            status: status.as_u16(),
+            body: text,
+        }));
     }
 
     let json: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| AppError::Ai(format!("Failed to parse the AI API response: {e}")))?;
+    Ok(Ok(json))
+}
+
+/// 中断判定を持たない呼び出し用の既定値 (常に「中断されていない」)。
+/// SQL 生成 / EXPLAIN 解説はリクエスト単位の中断を持たないためこれを渡す。
+async fn never_cancelled() -> bool {
+    false
+}
+
+/// OpenAI Chat Completions API を呼び、`choices[0].message` を返す。
+/// tools を渡すとツール呼び出し (function calling) を許可する。
+/// メッセージ列を組み立てるのは呼び出し側の責務 (フロントから任意
+/// プロンプトを送れる汎用コマンドは作らない)。
+///
+/// `is_cancelled` は再送の直前に会話が破棄されていないか確かめるための
+/// 判定 (中断を持たない経路は `never_cancelled` を渡す)。
+async fn request_chat_completion<F, Fut>(
+    config: &AiConfig,
+    messages: &[serde_json::Value],
+    tools: Option<&serde_json::Value>,
+    is_cancelled: F,
+) -> Result<serde_json::Value, AppError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(AI_REQUEST_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| AppError::Ai(format!("Failed to build the HTTP client: {e}")))?;
+    let url = format!("{}/chat/completions", config.base_url());
+    let mut body = build_chat_completion_body(config, messages, tools);
+
+    let mut result = post_chat_completion(&client, &url, &config.api_key, &body).await?;
+    // reasoning_effort が原因で断られたら、そのパラメータを外して 1 度だけ再送する。
+    // 送っていなかった場合は再送しても同じなので何もしない (無限リトライにもならない)。
+    if let Err(error) = &result {
+        if rejects_reasoning_effort(error) && remove_reasoning_effort(&mut body) {
+            // 1 回目の応答を待つ間に会話が破棄されていたら再送しない。呼び出し側
+            // (run_ai_chat) の中断判定は chat_step の前後にしか無いため、ここで
+            // 見ないと Stop / Clear / スキーマ切替の後に 2 通目を投げてしまう。
+            if is_cancelled().await {
+                return Err(AppError::Cancelled);
+            }
+            result = post_chat_completion(&client, &url, &config.api_key, &body).await?;
+        }
+    }
+    let json = result.map_err(AppError::from)?;
+
     json.get("choices")
         .and_then(|choices| choices.get(0))
         .and_then(|choice| choice.get("message"))
@@ -265,7 +391,7 @@ pub async fn chat_complete(
         serde_json::json!({ "role": "system", "content": system }),
         serde_json::json!({ "role": "user", "content": user }),
     ];
-    let message = request_chat_completion(config, &messages, None).await?;
+    let message = request_chat_completion(config, &messages, None, never_cancelled).await?;
     let content = message
         .get("content")
         .and_then(|content| content.as_str())
@@ -531,13 +657,22 @@ pub fn truncate_tool_result(text: &str) -> String {
 /// チャットの 1 ステップを実行し、アシスタントメッセージを返す。
 /// allow_tools = false ではツールを渡さず、本文だけの応答を強制する
 /// (ツール実行の上限に達した後、最後の回答を書かせるために使う)。
-pub async fn chat_step(
+///
+/// `is_cancelled` はこの往復が破棄済みかを返す判定。`reasoning_effort` を
+/// 拒否された時の再送の直前に見て、破棄済みなら `AppError::Cancelled` で
+/// 打ち切る (中断はリクエスト単位なので呼び出し側から渡してもらう)。
+pub async fn chat_step<F, Fut>(
     config: &AiConfig,
     messages: &[serde_json::Value],
     allow_tools: bool,
-) -> Result<serde_json::Value, AppError> {
+    is_cancelled: F,
+) -> Result<serde_json::Value, AppError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
     let tools = allow_tools.then(chat_tools_spec);
-    request_chat_completion(config, messages, tools.as_ref()).await
+    request_chat_completion(config, messages, tools.as_ref(), is_cancelled).await
 }
 
 /// アシスタントメッセージの本文 (content) を取り出す (無ければ空文字)。
@@ -599,6 +734,181 @@ mod tests {
         assert!(AiConfig::from_value(&yaml("provider: openai")).is_err());
         let err = AiConfig::from_value(&yaml("provider: openai\napi_key: \"  \"")).unwrap_err();
         assert!(err.to_string().contains("empty api_key"));
+    }
+
+    fn messages() -> Vec<serde_json::Value> {
+        vec![serde_json::json!({ "role": "user", "content": "hello" })]
+    }
+
+    #[test]
+    fn test_chat_completion_body_without_tools_has_no_reasoning_effort() {
+        // tools を使わないリクエスト (SQL 生成・EXPLAIN 解説) は
+        // 推論の効き方を変えないため reasoning_effort を付けない
+        let config = AiConfig::from_value(&yaml("api_key: sk-test")).unwrap();
+        let body = build_chat_completion_body(&config, &messages(), None);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_chat_completion_body_with_tools_sends_reasoning_effort_none() {
+        // 推論モデルは tools と併用する時 reasoning_effort: "none" が必要
+        let config = AiConfig::from_value(&yaml("api_key: sk-test")).unwrap();
+        let tools = chat_tools_spec();
+        let body = build_chat_completion_body(&config, &messages(), Some(&tools));
+        assert_eq!(body["tools"], tools);
+        assert_eq!(body["reasoning_effort"], serde_json::json!("none"));
+    }
+
+    #[test]
+    fn test_chat_completion_body_respects_configured_reasoning_effort() {
+        let config =
+            AiConfig::from_value(&yaml("api_key: sk-test\ntool_reasoning_effort: low")).unwrap();
+        let tools = chat_tools_spec();
+        let body = build_chat_completion_body(&config, &messages(), Some(&tools));
+        assert_eq!(body["reasoning_effort"], serde_json::json!("low"));
+    }
+
+    #[test]
+    fn test_chat_completion_body_omits_reasoning_effort_when_blank() {
+        // reasoning_effort を受け付けない相手向けの逃げ道
+        let config =
+            AiConfig::from_value(&yaml("api_key: sk-test\ntool_reasoning_effort: \"\"")).unwrap();
+        let tools = chat_tools_spec();
+        let body = build_chat_completion_body(&config, &messages(), Some(&tools));
+        assert_eq!(body["tools"], tools);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_chat_completion_body_omits_reasoning_effort_for_custom_base_url() {
+        // OpenAI 互換 API を指している既存設定に、勝手に reasoning_effort を
+        // 送り始めない (受け付けない相手だと今まで動いていたチャットが壊れるため)
+        let config =
+            AiConfig::from_value(&yaml("api_key: sk-test\nbase_url: https://example.com/v1"))
+                .unwrap();
+        let tools = chat_tools_spec();
+        let body = build_chat_completion_body(&config, &messages(), Some(&tools));
+        assert_eq!(body["tools"], tools);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_chat_completion_body_sends_configured_effort_for_custom_base_url() {
+        // 互換 API でも、明示指定があればその値を送る
+        let config = AiConfig::from_value(&yaml(
+            "api_key: sk-test\nbase_url: https://example.com/v1\ntool_reasoning_effort: none",
+        ))
+        .unwrap();
+        let tools = chat_tools_spec();
+        let body = build_chat_completion_body(&config, &messages(), Some(&tools));
+        assert_eq!(body["reasoning_effort"], serde_json::json!("none"));
+    }
+
+    #[test]
+    fn test_chat_completion_body_sends_default_effort_for_explicit_official_base_url() {
+        // base_url に公式 URL を明示的に書いた場合も省略時と同じ扱いになる
+        // (末尾スラッシュは base_url() が落とす)
+        let config = AiConfig::from_value(&yaml(
+            "api_key: sk-test\nbase_url: https://api.openai.com/v1/",
+        ))
+        .unwrap();
+        let tools = chat_tools_spec();
+        let body = build_chat_completion_body(&config, &messages(), Some(&tools));
+        assert_eq!(body["reasoning_effort"], serde_json::json!("none"));
+    }
+
+    #[test]
+    fn test_rejects_reasoning_effort_detects_parameter_rejection() {
+        // gpt-5.x 系で tools と併用した時のエラー (今回の不具合の発端)
+        let unsupported_combination = ApiErrorResponse {
+            status: 400,
+            body: "{\"error\":{\"message\":\"Function tools with reasoning_effort are not \
+                   supported for gpt-5.6-luna in /v1/chat/completions.\",\
+                   \"param\":\"reasoning_effort\"}}"
+                .into(),
+        };
+        assert!(rejects_reasoning_effort(&unsupported_combination));
+
+        // このパラメータ自体を受け付けないモデル / OpenAI 互換 API
+        let unknown_parameter = ApiErrorResponse {
+            status: 400,
+            body: "{\"error\":{\"message\":\"Unrecognized request argument supplied: \
+                   reasoning_effort\"}}"
+                .into(),
+        };
+        assert!(rejects_reasoning_effort(&unknown_parameter));
+    }
+
+    #[test]
+    fn test_rejects_reasoning_effort_ignores_unrelated_errors() {
+        // 無関係な 400 で再送しない
+        let other_400 = ApiErrorResponse {
+            status: 400,
+            body: "{\"error\":{\"message\":\"Invalid value for 'model'\"}}".into(),
+        };
+        assert!(!rejects_reasoning_effort(&other_400));
+
+        // 認証エラーやサーバーエラーは再送しても同じ
+        let unauthorized = ApiErrorResponse {
+            status: 401,
+            body: "{\"error\":{\"message\":\"Incorrect API key\"}}".into(),
+        };
+        assert!(!rejects_reasoning_effort(&unauthorized));
+        let server_error = ApiErrorResponse {
+            status: 500,
+            body: "reasoning_effort".into(),
+        };
+        assert!(!rejects_reasoning_effort(&server_error));
+    }
+
+    #[test]
+    fn test_remove_reasoning_effort() {
+        let config = AiConfig::from_value(&yaml("api_key: sk-test")).unwrap();
+        let tools = chat_tools_spec();
+        let mut body = build_chat_completion_body(&config, &messages(), Some(&tools));
+        assert!(body.get("reasoning_effort").is_some());
+
+        // 送っていた場合は取り除いて true
+        assert!(remove_reasoning_effort(&mut body));
+        assert!(body.get("reasoning_effort").is_none());
+        // 他のフィールドは残す
+        assert_eq!(body["tools"], tools);
+        assert_eq!(body["model"], serde_json::json!(DEFAULT_OPENAI_MODEL));
+
+        // 送っていなかった場合は false (再送しても同じなので何もしない)
+        assert!(!remove_reasoning_effort(&mut body));
+    }
+
+    /// lib.rs (run_ai_chat) が持っている中断判定と同じ形のクロージャ。
+    /// 参照を捕まえた async ブロックを返すところまで揃える。
+    struct ChatCancels;
+
+    impl ChatCancels {
+        async fn is_cancelled(&self, _request_id: &str) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn test_chat_step_accepts_run_ai_chat_style_cancel_check() {
+        // GTK / webkit が無い環境では lib.rs をコンパイルできないため、
+        // 呼び出し側と同じ形のクロージャをここで型付けして固定する
+        // (chat_step のシグネチャを変えた時に lib.rs だけ壊れるのを防ぐ)。
+        // tauri コマンドの future は Send でなければならないので、それも見る。
+        fn assert_send<T: Send>(_value: T) {}
+
+        let cancels = ChatCancels;
+        let request_id = "req-1";
+        let cancelled = || async { cancels.is_cancelled(request_id).await };
+
+        let config = AiConfig::from_value(&yaml("api_key: sk-test")).unwrap();
+        let messages = messages();
+        // future を作るだけで poll しない (実 API は叩かない)。
+        // 同じクロージャを 2 度渡せること (借用で渡す形) もここで確かめる。
+        assert_send(chat_step(&config, &messages, true, &cancelled));
+        assert_send(chat_step(&config, &messages, false, &cancelled));
+        assert_send(chat_complete(&config, "system", "user"));
     }
 
     fn turn(role: &str, content: &str) -> ChatTurn {

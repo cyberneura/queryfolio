@@ -1296,7 +1296,7 @@ async fn run_ai_chat(
         if cancelled().await {
             return Err(AppError::Cancelled);
         }
-        let message = ai::chat_step(&ai_config, &messages, allow_tools).await?;
+        let message = ai::chat_step(&ai_config, &messages, allow_tools, &cancelled).await?;
         // モデルの応答を待つ間に中断された場合、その応答は採用しない
         // (ツール無しの応答で終わる往復が最も多いため、ここを見落とすと
         //  Stop を押しても普通の回答が返ってくる)
@@ -1460,7 +1460,7 @@ async fn run_ai_chat(
     if cancelled().await {
         return Err(AppError::Cancelled);
     }
-    let message = ai::chat_step(&ai_config, &messages, false).await?;
+    let message = ai::chat_step(&ai_config, &messages, false, &cancelled).await?;
     if cancelled().await {
         return Err(AppError::Cancelled);
     }
