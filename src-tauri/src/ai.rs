@@ -327,15 +327,29 @@ async fn post_chat_completion(
     Ok(Ok(json))
 }
 
+/// 中断判定を持たない呼び出し用の既定値 (常に「中断されていない」)。
+/// SQL 生成 / EXPLAIN 解説はリクエスト単位の中断を持たないためこれを渡す。
+async fn never_cancelled() -> bool {
+    false
+}
+
 /// OpenAI Chat Completions API を呼び、`choices[0].message` を返す。
 /// tools を渡すとツール呼び出し (function calling) を許可する。
 /// メッセージ列を組み立てるのは呼び出し側の責務 (フロントから任意
 /// プロンプトを送れる汎用コマンドは作らない)。
-async fn request_chat_completion(
+///
+/// `is_cancelled` は再送の直前に会話が破棄されていないか確かめるための
+/// 判定 (中断を持たない経路は `never_cancelled` を渡す)。
+async fn request_chat_completion<F, Fut>(
     config: &AiConfig,
     messages: &[serde_json::Value],
     tools: Option<&serde_json::Value>,
-) -> Result<serde_json::Value, AppError> {
+    is_cancelled: F,
+) -> Result<serde_json::Value, AppError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(AI_REQUEST_TIMEOUT_SECS))
         .build()
@@ -348,6 +362,12 @@ async fn request_chat_completion(
     // 送っていなかった場合は再送しても同じなので何もしない (無限リトライにもならない)。
     if let Err(error) = &result {
         if rejects_reasoning_effort(error) && remove_reasoning_effort(&mut body) {
+            // 1 回目の応答を待つ間に会話が破棄されていたら再送しない。呼び出し側
+            // (run_ai_chat) の中断判定は chat_step の前後にしか無いため、ここで
+            // 見ないと Stop / Clear / スキーマ切替の後に 2 通目を投げてしまう。
+            if is_cancelled().await {
+                return Err(AppError::Cancelled);
+            }
             result = post_chat_completion(&client, &url, &config.api_key, &body).await?;
         }
     }
@@ -371,7 +391,7 @@ pub async fn chat_complete(
         serde_json::json!({ "role": "system", "content": system }),
         serde_json::json!({ "role": "user", "content": user }),
     ];
-    let message = request_chat_completion(config, &messages, None).await?;
+    let message = request_chat_completion(config, &messages, None, never_cancelled).await?;
     let content = message
         .get("content")
         .and_then(|content| content.as_str())
@@ -637,13 +657,22 @@ pub fn truncate_tool_result(text: &str) -> String {
 /// チャットの 1 ステップを実行し、アシスタントメッセージを返す。
 /// allow_tools = false ではツールを渡さず、本文だけの応答を強制する
 /// (ツール実行の上限に達した後、最後の回答を書かせるために使う)。
-pub async fn chat_step(
+///
+/// `is_cancelled` はこの往復が破棄済みかを返す判定。`reasoning_effort` を
+/// 拒否された時の再送の直前に見て、破棄済みなら `AppError::Cancelled` で
+/// 打ち切る (中断はリクエスト単位なので呼び出し側から渡してもらう)。
+pub async fn chat_step<F, Fut>(
     config: &AiConfig,
     messages: &[serde_json::Value],
     allow_tools: bool,
-) -> Result<serde_json::Value, AppError> {
+    is_cancelled: F,
+) -> Result<serde_json::Value, AppError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
     let tools = allow_tools.then(chat_tools_spec);
-    request_chat_completion(config, messages, tools.as_ref()).await
+    request_chat_completion(config, messages, tools.as_ref(), is_cancelled).await
 }
 
 /// アシスタントメッセージの本文 (content) を取り出す (無ければ空文字)。
@@ -849,6 +878,37 @@ mod tests {
 
         // 送っていなかった場合は false (再送しても同じなので何もしない)
         assert!(!remove_reasoning_effort(&mut body));
+    }
+
+    /// lib.rs (run_ai_chat) が持っている中断判定と同じ形のクロージャ。
+    /// 参照を捕まえた async ブロックを返すところまで揃える。
+    struct ChatCancels;
+
+    impl ChatCancels {
+        async fn is_cancelled(&self, _request_id: &str) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn test_chat_step_accepts_run_ai_chat_style_cancel_check() {
+        // GTK / webkit が無い環境では lib.rs をコンパイルできないため、
+        // 呼び出し側と同じ形のクロージャをここで型付けして固定する
+        // (chat_step のシグネチャを変えた時に lib.rs だけ壊れるのを防ぐ)。
+        // tauri コマンドの future は Send でなければならないので、それも見る。
+        fn assert_send<T: Send>(_value: T) {}
+
+        let cancels = ChatCancels;
+        let request_id = "req-1";
+        let cancelled = || async { cancels.is_cancelled(request_id).await };
+
+        let config = AiConfig::from_value(&yaml("api_key: sk-test")).unwrap();
+        let messages = messages();
+        // future を作るだけで poll しない (実 API は叩かない)。
+        // 同じクロージャを 2 度渡せること (借用で渡す形) もここで確かめる。
+        assert_send(chat_step(&config, &messages, true, &cancelled));
+        assert_send(chat_step(&config, &messages, false, &cancelled));
+        assert_send(chat_complete(&config, "system", "user"));
     }
 
     fn turn(role: &str, content: &str) -> ChatTurn {
