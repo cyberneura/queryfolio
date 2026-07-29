@@ -14,6 +14,20 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 /// AI API リクエストのタイムアウト (秒)。
 const AI_REQUEST_TIMEOUT_SECS: u64 = 60;
 
+/// 接続先が OpenAI 公式の時に、tools (function calling) 付きのリクエストへ
+/// 付ける reasoning_effort のデフォルト。
+///
+/// gpt-5.6-luna / gpt-5.6-terra のような推論モデルは、/v1/chat/completions で
+/// tools を使う場合 reasoning_effort が "none" でないと 400 を返す:
+///
+/// > Function tools with reasoning_effort are not supported for gpt-5.6-luna in
+/// > /v1/chat/completions. To use function tools, use /v1/responses or set
+/// > reasoning_effort to 'none'.
+///
+/// tools を渡すのは AI チャットだけなので、SQL 生成や EXPLAIN 解説の推論には
+/// 影響しない (そちらのリクエストには reasoning_effort を付けない)。
+const DEFAULT_TOOL_REASONING_EFFORT: &str = "none";
+
 /// エラーメッセージに含める API レスポンス本文の最大長。
 const ERROR_BODY_MAX_CHARS: usize = 500;
 
@@ -33,6 +47,11 @@ pub struct AiConfig {
     /// OpenAI 互換 API 用のベース URL (省略時 DEFAULT_OPENAI_BASE_URL)
     #[serde(default)]
     pub base_url: Option<String>,
+    /// tools (function calling) 付きリクエストで送る reasoning_effort。
+    /// 空文字を指定するとこのパラメータを送らない。
+    /// 省略時の挙動は tool_reasoning_effort() を参照。
+    #[serde(default)]
+    pub tool_reasoning_effort: Option<String>,
 }
 
 fn default_provider() -> String {
@@ -61,6 +80,23 @@ impl AiConfig {
     /// 使用するモデル名 (省略時はデフォルトモデル)。
     pub fn model(&self) -> &str {
         self.model.as_deref().unwrap_or(DEFAULT_OPENAI_MODEL)
+    }
+
+    /// tools 付きリクエストで送る reasoning_effort (送らない場合は None)。
+    ///
+    /// 明示指定があればそれに従う (空文字なら送らない)。
+    /// 省略時は、接続先が OpenAI 公式の場合だけ DEFAULT_TOOL_REASONING_EFFORT を送る。
+    /// base_url で OpenAI 互換 API を指している場合に既定で送ってしまうと、
+    /// reasoning_effort を受け付けない相手では今まで動いていた AI チャットが
+    /// エラーになるため、そちらは明示指定した時だけ送る。
+    fn tool_reasoning_effort(&self) -> Option<&str> {
+        let effort = match self.tool_reasoning_effort.as_deref() {
+            Some(effort) => effort,
+            None if self.base_url() == DEFAULT_OPENAI_BASE_URL => DEFAULT_TOOL_REASONING_EFFORT,
+            None => return None,
+        };
+        let effort = effort.trim();
+        (!effort.is_empty()).then_some(effort)
     }
 
     /// API のベース URL (省略時は OpenAI 公式。末尾スラッシュは除去)。
@@ -202,6 +238,29 @@ fn truncate_for_error(text: &str) -> String {
     format!("{truncated}...")
 }
 
+/// Chat Completions API のリクエストボディを組み立てる。
+/// 通信を伴わない純粋な組み立てなので、単体テストで内容を固定する。
+fn build_chat_completion_body(
+    config: &AiConfig,
+    messages: &[serde_json::Value],
+    tools: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": config.model(),
+        "messages": messages,
+    });
+    let Some(tools) = tools else {
+        return body;
+    };
+    body["tools"] = tools.clone();
+    // 推論モデルは tools と併用する時 reasoning_effort が "none" である必要がある
+    // (DEFAULT_TOOL_REASONING_EFFORT のコメント参照)。
+    if let Some(effort) = config.tool_reasoning_effort() {
+        body["reasoning_effort"] = serde_json::json!(effort);
+    }
+    body
+}
+
 /// OpenAI Chat Completions API を呼び、`choices[0].message` を返す。
 /// tools を渡すとツール呼び出し (function calling) を許可する。
 /// メッセージ列を組み立てるのは呼び出し側の責務 (フロントから任意
@@ -216,13 +275,7 @@ async fn request_chat_completion(
         .build()
         .map_err(|e| AppError::Ai(format!("Failed to build the HTTP client: {e}")))?;
     let url = format!("{}/chat/completions", config.base_url());
-    let mut body = serde_json::json!({
-        "model": config.model(),
-        "messages": messages,
-    });
-    if let Some(tools) = tools {
-        body["tools"] = tools.clone();
-    }
+    let body = build_chat_completion_body(config, messages, tools);
 
     let response = client
         .post(&url)
@@ -599,6 +652,88 @@ mod tests {
         assert!(AiConfig::from_value(&yaml("provider: openai")).is_err());
         let err = AiConfig::from_value(&yaml("provider: openai\napi_key: \"  \"")).unwrap_err();
         assert!(err.to_string().contains("empty api_key"));
+    }
+
+    fn messages() -> Vec<serde_json::Value> {
+        vec![serde_json::json!({ "role": "user", "content": "hello" })]
+    }
+
+    #[test]
+    fn test_chat_completion_body_without_tools_has_no_reasoning_effort() {
+        // tools を使わないリクエスト (SQL 生成・EXPLAIN 解説) は
+        // 推論の効き方を変えないため reasoning_effort を付けない
+        let config = AiConfig::from_value(&yaml("api_key: sk-test")).unwrap();
+        let body = build_chat_completion_body(&config, &messages(), None);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_chat_completion_body_with_tools_sends_reasoning_effort_none() {
+        // 推論モデルは tools と併用する時 reasoning_effort: "none" が必要
+        let config = AiConfig::from_value(&yaml("api_key: sk-test")).unwrap();
+        let tools = chat_tools_spec();
+        let body = build_chat_completion_body(&config, &messages(), Some(&tools));
+        assert_eq!(body["tools"], tools);
+        assert_eq!(body["reasoning_effort"], serde_json::json!("none"));
+    }
+
+    #[test]
+    fn test_chat_completion_body_respects_configured_reasoning_effort() {
+        let config =
+            AiConfig::from_value(&yaml("api_key: sk-test\ntool_reasoning_effort: low")).unwrap();
+        let tools = chat_tools_spec();
+        let body = build_chat_completion_body(&config, &messages(), Some(&tools));
+        assert_eq!(body["reasoning_effort"], serde_json::json!("low"));
+    }
+
+    #[test]
+    fn test_chat_completion_body_omits_reasoning_effort_when_blank() {
+        // reasoning_effort を受け付けない相手向けの逃げ道
+        let config =
+            AiConfig::from_value(&yaml("api_key: sk-test\ntool_reasoning_effort: \"\"")).unwrap();
+        let tools = chat_tools_spec();
+        let body = build_chat_completion_body(&config, &messages(), Some(&tools));
+        assert_eq!(body["tools"], tools);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_chat_completion_body_omits_reasoning_effort_for_custom_base_url() {
+        // OpenAI 互換 API を指している既存設定に、勝手に reasoning_effort を
+        // 送り始めない (受け付けない相手だと今まで動いていたチャットが壊れるため)
+        let config =
+            AiConfig::from_value(&yaml("api_key: sk-test\nbase_url: https://example.com/v1"))
+                .unwrap();
+        let tools = chat_tools_spec();
+        let body = build_chat_completion_body(&config, &messages(), Some(&tools));
+        assert_eq!(body["tools"], tools);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_chat_completion_body_sends_configured_effort_for_custom_base_url() {
+        // 互換 API でも、明示指定があればその値を送る
+        let config = AiConfig::from_value(&yaml(
+            "api_key: sk-test\nbase_url: https://example.com/v1\ntool_reasoning_effort: none",
+        ))
+        .unwrap();
+        let tools = chat_tools_spec();
+        let body = build_chat_completion_body(&config, &messages(), Some(&tools));
+        assert_eq!(body["reasoning_effort"], serde_json::json!("none"));
+    }
+
+    #[test]
+    fn test_chat_completion_body_sends_default_effort_for_explicit_official_base_url() {
+        // base_url に公式 URL を明示的に書いた場合も省略時と同じ扱いになる
+        // (末尾スラッシュは base_url() が落とす)
+        let config = AiConfig::from_value(&yaml(
+            "api_key: sk-test\nbase_url: https://api.openai.com/v1/",
+        ))
+        .unwrap();
+        let tools = chat_tools_spec();
+        let body = build_chat_completion_body(&config, &messages(), Some(&tools));
+        assert_eq!(body["reasoning_effort"], serde_json::json!("none"));
     }
 
     fn turn(role: &str, content: &str) -> ChatTurn {
