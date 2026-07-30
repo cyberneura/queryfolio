@@ -11,6 +11,7 @@
     highlightActiveLineGutter,
   } from "@codemirror/view";
   import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
+  import { search, searchKeymap } from "@codemirror/search";
   import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
   import { tags as t } from "@lezer/highlight";
   import { yaml } from "@codemirror/lang-yaml";
@@ -58,6 +59,26 @@
     ".cm-cursor, .cm-dropCursor": { borderLeftColor: "#f3f5f9" },
     ".cm-scroller": {
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, monospace",
+    },
+    // 検索パネル (Cmd+F) をモーダルの配色に合わせる。
+    // 既定のままだと明るいフォームパーツが暗いエディタの上に乗って浮く。
+    ".cm-panels": { backgroundColor: "#18181b", color: "#e4e4e7" },
+    ".cm-panels.cm-panels-top": { borderBottom: "1px solid #3f3f46" },
+    ".cm-panel.cm-search": { fontSize: "12px", padding: "4px 6px" },
+    ".cm-panel.cm-search input[type=text]": {
+      backgroundColor: "#27272a",
+      color: "#f3f5f9",
+      border: "1px solid #52525b",
+      borderRadius: "3px",
+      padding: "2px 4px",
+    },
+    ".cm-panel.cm-search button": {
+      backgroundColor: "#27272a",
+      backgroundImage: "none",
+      color: "#e4e4e7",
+      border: "1px solid #52525b",
+      borderRadius: "3px",
+      padding: "2px 6px",
     },
   });
 
@@ -118,6 +139,21 @@
           highlightActiveLineGutter(),
           drawSelection(),
           history(),
+          // 検索パネルはエディタの上端に出す (下端だとフッターのボタン列と隣接して紛らわしい)
+          search({ top: true }),
+          keymap.of(searchKeymap),
+          // Escape の扱い。searchKeymap より後 = 検索パネルを開いている間は
+          // 「パネルを閉じる」が勝つ。defaultKeymap より前 = テキスト選択中でも
+          // simplifySelection ではなくモーダルを閉じる (検索を足す前と同じ挙動)
+          keymap.of([
+            {
+              key: "Escape",
+              run: () => {
+                handleEscape();
+                return true;
+              },
+            },
+          ]),
           keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
           yaml(),
           yamlLinter,
@@ -205,15 +241,27 @@
     onClose();
   };
 
+  /// Escape の共通処理。エディタにフォーカスがある時は CodeMirror のキーマップから、
+  /// それ以外 (ボタンや読み込みエラー表示) は window のハンドラから呼ばれる。
+  const handleEscape = () => {
+    // 破棄確認を出している間の Escape は「編集に戻る」(誤って捨てない)
+    if (confirmDiscard) {
+      confirmDiscard = false;
+      return;
+    }
+    requestClose();
+  };
+
   const onWindowKeydown = (e: KeyboardEvent) => {
+    // エディタ側 (CodeMirror のキーマップ) が処理済みのキーには手を出さない。
+    // 検索パネルを開いている間の Escape はパネルを閉じるだけにしたいので、
+    // これが無いとモーダルごと閉じてしまう。
+    if (e.defaultPrevented) {
+      return;
+    }
     if (e.key === "Escape") {
       e.preventDefault();
-      // 破棄確認を出している間の Escape は「編集に戻る」(誤って捨てない)
-      if (confirmDiscard) {
-        confirmDiscard = false;
-        return;
-      }
-      requestClose();
+      handleEscape();
       return;
     }
     // Cmd+S / Ctrl+S で保存
