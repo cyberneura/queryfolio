@@ -45,7 +45,7 @@ save. (On Windows, the platform's default file permissions apply.)
 
 You can edit the file with any text editor, or from inside the app:
 
-- Menu bar **QueryFolio → Edit config.yml** opens a built-in editor (with YAML
+- Menu bar **Config → Edit config.yml** opens a built-in editor (with YAML
   syntax highlighting and lint errors shown inline).
 - Saving from the in-app editor validates that the content still parses as a YAML
   mapping, writes it atomically, and reloads all connections.
@@ -412,7 +412,7 @@ Notes:
   plus Touch ID), and cleared on reload.
 - If the key exists but is not a non-empty string, that is an error (QueryFolio
   will not silently fall back to the local-only config).
-- Menu bar **QueryFolio → View override config yaml (Copy only)** appears when
+- Menu bar **Config → View override config yaml (Copy only)** appears when
   this key is set. It runs the command every time and shows the fetched YAML for
   inspection/copying. You can edit the text in the modal (handy for reformatting
   before copying it into 1Password), but those edits stay in memory only — there
