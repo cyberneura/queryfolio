@@ -47,6 +47,8 @@ You can edit the file with any text editor, or from inside the app:
 
 - Menu bar **Config → Edit config.yml** opens a built-in editor (with YAML
   syntax highlighting and lint errors shown inline).
+- Inside that editor, **Cmd/Ctrl+F** opens a find bar (Cmd/Ctrl+G or F3 jumps to
+  the next match, Escape closes the find bar).
 - Saving from the in-app editor validates that the content still parses as a YAML
   mapping, writes it atomically, and reloads all connections.
 
