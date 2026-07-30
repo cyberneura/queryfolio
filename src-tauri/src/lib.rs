@@ -1688,19 +1688,6 @@ fn dispatch_route(app: &tauri::AppHandle, route: router::Route, cwd: Option<Path
     });
 }
 
-/// アプリのメニューバーを組み立てる。
-///
-/// macOS のアプリメニュー (QueryFolio) は NSApplication がメインメニュー設置時の
-/// 内容で確定させるため、後から項目を insert しても反映されない。そのため
-/// tauri のデフォルトメニューを流用せず、アプリメニューを含めて丸ごと自前で組み、
-/// Builder::menu で最初の設置時から渡す。設定変更時はこの関数で組み直す。
-///
-/// 「View override config yaml (Copy only)」は config_override_command が
-/// 設定されている時だけ出す。
-///
-/// 構成は tauri の `Menu::default` を踏襲する (アプリメニュー / View は macOS のみ、
-/// File の quit は macOS 以外のみ)。アプリメニューを持たないプラットフォームでは
-/// 設定編集の項目を Config サブメニューの先頭に置く。
 /// About ダイアログに出すメタ情報 (tauri の Menu::default と同じ内容)。
 fn about_metadata(app: &tauri::AppHandle) -> tauri::menu::AboutMetadata<'_> {
     let package_info = app.package_info();
@@ -1714,6 +1701,20 @@ fn about_metadata(app: &tauri::AppHandle) -> tauri::menu::AboutMetadata<'_> {
     }
 }
 
+/// アプリのメニューバーを組み立てる。
+///
+/// macOS のアプリメニュー (QueryFolio) は NSApplication がメインメニュー設置時の
+/// 内容で確定させるため、後から項目を insert しても反映されない。そのため
+/// tauri のデフォルトメニューを流用せず、アプリメニューを含めて丸ごと自前で組み、
+/// Builder::menu で最初の設置時から渡す。設定変更時はこの関数で組み直す。
+///
+/// 「View override config yaml (Copy only)」は config_override_command が
+/// 設定されている時だけ出す。
+///
+/// 構成は tauri の `Menu::default` を踏襲する (アプリメニュー / View は macOS のみ、
+/// File の quit は macOS 以外のみ)。設定関連の項目は
+/// プラットフォームに関わらず Config サブメニューにまとめる
+/// (アプリメニューと Config に散らばっていると探しにくいため)。
 fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 
@@ -1731,18 +1732,12 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
         use tauri::menu::PredefinedMenuItem;
 
         let package_info = app.package_info();
-        let mut builder = SubmenuBuilder::new(app, package_info.name.clone())
+        SubmenuBuilder::new(app, package_info.name.clone())
             .item(&PredefinedMenuItem::about(
                 app,
                 None,
                 Some(about_metadata(app)),
             )?)
-            .separator()
-            .item(&edit_config_item);
-        if show_source_item {
-            builder = builder.item(&edit_source_item);
-        }
-        builder
             .separator()
             .services()
             .separator()
@@ -1796,18 +1791,15 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
     let reveal_item =
         MenuItemBuilder::with_id("reveal_config_folder", "Reveal config folder").build(app)?;
     let config_menu = {
-        #[allow(unused_mut)]
-        let mut builder = SubmenuBuilder::new(app, "Config");
-        // アプリメニューが無いプラットフォームでは設定編集もここに置く
-        #[cfg(not(target_os = "macos"))]
-        {
-            builder = builder.item(&edit_config_item);
-            if show_source_item {
-                builder = builder.item(&edit_source_item);
-            }
-            builder = builder.separator();
+        let mut builder = SubmenuBuilder::new(app, "Config").item(&edit_config_item);
+        if show_source_item {
+            builder = builder.item(&edit_source_item);
         }
-        builder.item(&reload_item).item(&reveal_item).build()?
+        builder
+            .separator()
+            .item(&reload_item)
+            .item(&reveal_item)
+            .build()?
     };
 
     #[allow(unused_mut)]
