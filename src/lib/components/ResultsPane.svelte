@@ -121,6 +121,175 @@
   // キーボード操作 (Cmd+C / Cmd+A) を結果グリッドに限定するためのフォーカス先
   let gridEl = $state<HTMLDivElement | null>(null);
 
+  // ---- 結果テーブルの行仮想化 ----
+  // 全行 × 全列を DOM に置くと、レイアウトのコストがセル数に比例して増え、
+  // 同じドキュメントにいる SQL エディタの入力までカクつく (実測: 500 行 ×
+  // 60 列 = 31,000 セルで 1 打鍵あたり 17ms、2,000 セルで 1ms、0 セルで 0ms)。
+  // さらに全セルが cellBgClass / isSelectedCell 経由で selection を購読するため、
+  // ドラッグ選択のたびに全セルのエフェクトが再評価される。表示範囲 +
+  // オーバースキャンぶんだけ描画してセル数を数千に抑える。
+  const ROW_OVERSCAN = 10;
+  const DEFAULT_ROW_HEIGHT = 21;
+  /// 列幅の上限 (文字数)。従来の max-w-96 (384px) 相当
+  const MAX_COL_CHARS = 48;
+  /// オブジェクト値の列幅見積り (文字数)。幅を決めるためだけに全行を
+  /// JSON.stringify すると仮想化の意味が無くなるので実測しない
+  const OBJECT_WIDTH_CHARS = 24;
+  /// セル 1 個ぶんの文字以外の幅: padding (px-2 = 8px * 2) + 境界線 1px + 余裕 3px
+  const CELL_CHROME_PX = 20;
+
+  let rowHeight = $state(DEFAULT_ROW_HEIGHT);
+  let gridScrollTop = $state(0);
+  let gridViewportHeight = $state(0);
+
+  /// 等幅フォントでの表示幅を「半角何文字ぶんか」で返す。CSS の ch は半角 (0 の
+  /// 送り幅) なので、`String.length` をそのまま ch に使うと日本語などの全角文字が
+  /// 半分の幅になり、table-layout: fixed では伸びずに切り詰められてしまう。
+  /// East Asian Wide / Fullwidth の範囲を 2 と数える近似で足りる
+  /// 範囲は必ず \u エスケープで書くこと。文字リテラルで書くと、見た目が同じでも
+  /// 意図しないコードポイントになる (CJK 互換漢字 U+F900 のつもりで書いた文字が
+  /// U+8C48 になり、範囲がサロゲート領域を飲み込んで追加面の文字が全て幅2に
+  /// なっていた)。u フラグ + for...of のコードポイント単位反復で、絵文字や
+  /// CJK 拡張B以降も明示的に扱う
+  const WIDE_CHAR =
+    /[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE10-\uFE19\uFE30-\uFE6F\uFF00-\uFF60\uFFE0-\uFFE6\u{1F300}-\u{1FAFF}\u{20000}-\u{3FFFD}]/u;
+  /// limit に達したら打ち切る。呼び出し側は結果を MAX_COL_CHARS で頭打ちにするので
+  /// 値は完全に等価だが、打ち切らないとコストがセル数でなく**総文字数**に比例し、
+  /// 長い TEXT 列で秒単位のフリーズになる (実測: 500 行 × 3 列 × 100KB で 1,971ms →
+  /// 打ち切りありで 1ms)。db.rs は sqlx 経路でセルの文字数を切り詰めないため、
+  /// 100KB の TEXT や長い JSON 文字列はそのままここへ届く
+  const displayWidth = (s: string, limit = Infinity): number => {
+    let w = 0;
+    for (const ch of s) {
+      w += WIDE_CHAR.test(ch) ? 2 : 1;
+      if (w >= limit) {
+        return limit;
+      }
+    }
+    return w;
+  };
+
+  // 描画する行の範囲と、スクロール量を保つための上下スペーサーの高さ。
+  // sticky ヘッダの高さは「コンテンツ上端からの距離」と「ヘッダに隠れる量」で
+  // 相殺されるため、start の算出には入らない
+  const rowWindow = $derived.by(() => {
+    const total = activeTab?.result?.rows.length ?? 0;
+    const h = rowHeight > 0 ? rowHeight : DEFAULT_ROW_HEIGHT;
+    if (total === 0) {
+      return { start: 0, end: 0, padTop: 0, padBottom: 0 };
+    }
+    const visible = Math.ceil((gridViewportHeight || 600) / h);
+    // start は必ず最終行までに収める。行数の少ない結果へ差し替わった直後は
+    // gridScrollTop が新しい総高さより大きいままになりうるので、クランプしないと
+    // start > end で 0 行描画 (列ヘッダと巨大な空白だけ) になる
+    const start = Math.min(
+      Math.max(0, total - 1),
+      Math.max(0, Math.floor(gridScrollTop / h) - ROW_OVERSCAN),
+    );
+    const end = Math.min(total, start + visible + ROW_OVERSCAN * 2);
+    return {
+      start,
+      end,
+      padTop: start * h,
+      padBottom: (total - end) * h,
+    };
+  });
+
+  // 列幅。仮想化すると「描画中のセル」だけで auto レイアウトの列幅が決まり、
+  // スクロールのたびに幅が動いてしまうため、table-layout: fixed + 実データから
+  // 求めた固定幅にする。等幅フォントなので ch 単位で文字数から直接引ける
+  // (DOM 実測が要らない)。padding (px-2 = 8px * 2) + 境界線 1px = 17px に、
+  // サブピクセルの丸めで 1 文字の値まで `y…` と切れないよう 3px の余裕を足す。
+  //
+  // table-layout: fixed は **table の width が auto でないときだけ有効**なので、
+  // `min-width: 100%` では自動レイアウトのままになる (col の幅は単なるヒント扱いに
+  // なり、描画中の行で幅が動く)。かといって `width: 100%` にすると、ペインが狭い時に
+  // 指定幅を下回るまで列が圧縮されてしまう。そこで「100% と列幅の合計の大きい方」を
+  // 明示的な width として与え、狭い時は横スクロール・広い時は余白列が余りを吸う形にする。
+  const columnWidths = $derived.by<{
+    rowNum: string;
+    cols: string[];
+    table: string;
+  } | null>(
+    () => {
+      const result = activeTab?.result;
+      if (!result || result.columns.length === 0) {
+        return null;
+      }
+      const lens = result.columns.map((c) => displayWidth(c, MAX_COL_CHARS));
+      for (const row of result.rows) {
+        for (let j = 0; j < lens.length; j++) {
+          const v = row[j];
+          const len =
+            v === null || v === undefined
+              ? 4 // "NULL"
+              : typeof v === "object"
+                ? OBJECT_WIDTH_CHARS
+                : displayWidth(String(v), MAX_COL_CHARS);
+          if (len > lens[j]) {
+            lens[j] = len;
+          }
+        }
+      }
+      const capped = lens.map((n) => Math.min(n, MAX_COL_CHARS));
+      const rowNumChars = String(result.rows.length).length;
+      const width = (chars: number) => `calc(${chars}ch + ${CELL_CHROME_PX}px)`;
+      // 全列の合計 (行番号列を含む)。余白列は 0 として数える
+      const totalChars = capped.reduce((a, b) => a + b, rowNumChars);
+      const totalPad = (capped.length + 1) * CELL_CHROME_PX;
+      return {
+        rowNum: width(rowNumChars),
+        cols: capped.map(width),
+        table: `max(100%, calc(${totalChars}ch + ${totalPad}px))`,
+      };
+    },
+  );
+
+  // スクロール量とビューポート高さを追う。行高はテーマ変更等でずれうるので
+  // 実際に描画された行から測り直す
+  const syncGridMetrics = () => {
+    const el = gridEl;
+    if (!el) {
+      return;
+    }
+    gridScrollTop = el.scrollTop;
+    gridViewportHeight = el.clientHeight;
+    // offsetHeight は整数へ丸められるため、端数のある行高だとスペーサーと
+    // 実際の行位置が少しずつずれる。getBoundingClientRect は端数を保つ
+    const row = el.querySelector<HTMLElement>("tbody tr[data-row-index]");
+    const h = row?.getBoundingClientRect().height ?? 0;
+    if (h > 0 && h !== rowHeight) {
+      rowHeight = h;
+    }
+  };
+
+  // 行がアンマウントされるとフォーカスが body へ移り、選択が残っているのに Cmd+C /
+  // Cmd+A が効かなくなる (handleWindowKeydown が gridEl.contains(activeElement) で
+  // 判定するため)。**scroll ハンドラの中では戻せない**: その時点ではまだ行が DOM に
+  // 居てフォーカスは body ではなく、Svelte が行を捨てるのはその後だから。しかも
+  // PageDown のような単発スクロールでは次の scroll イベントが来ない。
+  // DOM 更新後に走る $effect で、描画ウインドウの変化を見てから戻す。
+  // グリッド外へ意図的に移した場合 (エディタ・チャット入力・モーダル) は
+  // activeElement が body にならないので、フォーカスを奪わない
+  $effect(() => {
+    void rowWindow;
+    if (selection && gridEl && document.activeElement === document.body) {
+      gridEl.focus({ preventScroll: true });
+    }
+  });
+
+  $effect(() => {
+    const el = gridEl;
+    if (!el) {
+      return;
+    }
+    syncGridMetrics();
+    const observer = new ResizeObserver(syncGridMetrics);
+    observer.observe(el);
+    return () => observer.disconnect();
+  });
+
+
   // Cmd+C コピーにヘッダ行を含めるか。localStorage に保存する
   const COPY_HEADERS_KEY = "queryfolio.results.copyWithHeaders";
   let copyWithHeaders = $state(loadCopyWithHeaders());
@@ -147,6 +316,22 @@
     void appStore.activeTabId;
     selectedCell = null;
     selection = null;
+  });
+
+  // 別の結果を表示する時は先頭へ戻す (前の結果のスクロール量のまま行ウインドウを
+  // 計算すると、行数の違う結果で範囲外を描画してしまう)。**タブ切替だけでなく
+  // 同一タブでの再実行も対象にする**: prepareTargetTab はピン留めの無いタブを
+  // 使い回すため、SQL を書き換えて実行し直しても activeTabId は変わらない
+  $effect(() => {
+    void appStore.activeTabId;
+    void activeTab?.executedAt;
+    if (gridEl) {
+      gridEl.scrollTop = 0;
+      // 横位置も戻す。戻さないと、横に広い結果を右へスクロールした状態で別の結果へ
+      // 切り替えた時に、# 列と左端の列が画面外のまま途中の列から表示される
+      gridEl.scrollLeft = 0;
+    }
+    gridScrollTop = 0;
   });
 
   // 選択範囲を結果サイズにクランプして正規化する (min/max を確定)。
@@ -788,23 +973,28 @@
     editingValue = existing ? existing.input : editText(original);
   };
 
+  // 編集中の値を保留編集へ確定する。**対象タブは activeTab ではなく
+  // editingCell.tabId から引く**: 確定の契機には「編集中のまま別の結果タブへ
+  // 切り替えた」場合が含まれ、その時点で activeTab は既に切替先になっているため、
+  // activeTab を見ると確定できずに入力が黙って消える
   const commitCellEdit = () => {
     const ec = editingCell;
+    const tab = ec ? appStore.resultTabs.find((t) => t.id === ec.tabId) : null;
     // 読み取り専用ビューは閉じるだけで保留編集には登録しない
-    if (
-      !ec ||
-      ec.readonly ||
-      !activeTab ||
-      ec.tabId !== activeTab.id ||
-      !activeTab.result
-    ) {
+    if (!ec || ec.readonly || !tab || !tab.result) {
       editingCell = null;
       return;
     }
-    const col = activeTab.result.columns[ec.colIndex];
-    const original = activeTab.result.rows[ec.rowIndex][ec.colIndex];
+    const col = tab.result.columns[ec.colIndex];
+    const row = tab.result.rows[ec.rowIndex];
+    // 結果が差し替わって行が消えている場合は確定しない (範囲外アクセスを避ける)
+    if (!row || col === undefined) {
+      editingCell = null;
+      return;
+    }
+    const original = row[ec.colIndex];
     const key = `${ec.rowIndex}:${col}`;
-    const map = new Map(pendingEdits.get(activeTab.id) ?? []);
+    const map = new Map(pendingEdits.get(tab.id) ?? []);
     // 元の表示と同じに戻したら保留を解除する
     if (editingValue === editText(original)) {
       map.delete(key);
@@ -816,8 +1006,8 @@
         input: editingValue,
       });
     }
-    if (map.size > 0) pendingEdits.set(activeTab.id, map);
-    else pendingEdits.delete(activeTab.id);
+    if (map.size > 0) pendingEdits.set(tab.id, map);
+    else pendingEdits.delete(tab.id);
     pendingEdits = new Map(pendingEdits);
     editingCell = null;
   };
@@ -825,6 +1015,26 @@
   const cancelCellEdit = () => {
     editingCell = null;
   };
+
+  // 編集中の行が仮想化の描画範囲から外れたら、その場で確定する。
+  // 確定は input の blur 頼みだが、**フォーカス中の要素が DOM から取り除かれた時に
+  // blur は発火しない**ため、スクロールで行を範囲外へ出したまま別セルを編集すると
+  // editingValue が上書きされ、入力が黙って失われる
+  $effect(() => {
+    const ec = editingCell;
+    if (!ec) {
+      return;
+    }
+    // 別タブへ切り替わった場合も input は DOM から消えるので同様に確定する
+    // (commitCellEdit は editingCell.tabId のタブへ積むので切替後でも正しい)
+    if (
+      ec.tabId !== activeTab?.id ||
+      ec.rowIndex < rowWindow.start ||
+      ec.rowIndex >= rowWindow.end
+    ) {
+      commitCellEdit();
+    }
+  });
 
   const onEditKeydown = (e: KeyboardEvent) => {
     if (e.key === "Enter") {
@@ -1226,6 +1436,7 @@
       class="min-h-0 flex-1 overflow-auto focus:outline-none"
       tabindex="-1"
       bind:this={gridEl}
+      onscroll={syncGridMetrics}
     >
       {#if appStore.errorMessage}
         <pre
@@ -1312,7 +1523,23 @@
         </p>
       {:else if activeTab?.result && activeTab.result.columns.length > 0}
         {@const result = activeTab.result}
-        <table class="min-w-full border-collapse font-mono text-xs select-none">
+        <table
+          class="table-fixed border-separate font-mono text-xs select-none"
+          style="border-spacing:0; width:{columnWidths?.table ?? '100%'}"
+        >
+          <!-- 仮想化で描画中の行が変わっても列幅が動かないよう固定幅にする -->
+          {#if columnWidths}
+            <colgroup>
+              <col style="width:{columnWidths.rowNum}" />
+              {#each columnWidths.cols as width, colIndex (colIndex)}
+                <col style="width:{width}" />
+              {/each}
+              <!-- 幅指定の無い余白列。table-layout: fixed では余ったスペースが
+                   幅未指定の列へ回るので、テーブルが親幅より狭い時に各列が
+                   引き伸ばされるのを防ぐ (# 列が極端に広がるのを避ける) -->
+              <col />
+            </colgroup>
+          {/if}
           <!-- WKWebView は border-collapse テーブルの thead / tr に付けた
                背景・sticky を描画しないため (下の行が透けて見える)、各 th に
                直接 sticky と不透明背景を付ける。選択時の色味は不透明な th の
@@ -1334,12 +1561,12 @@
                     : 'text-zinc-300'}"
                 >
                   <button
-                    class="block w-full cursor-pointer px-2 py-1 text-left {isColHeaderSelected(
+                    class="block w-full cursor-pointer truncate px-2 py-1 text-left {isColHeaderSelected(
                       colIndex,
                     )
                       ? 'bg-sky-800/50'
                       : ''}"
-                    title="Click to select this column (drag to select more)"
+                    title="{column} — Click to select this column (drag to select more)"
                     data-annotate="button-result-col-header-{colIndex}"
                     onpointerdown={(e) => beginSelect("col", 0, colIndex, e)}
                     onpointerenter={(e) => extendSelect("col", 0, colIndex, e)}
@@ -1348,11 +1575,25 @@
                   </button>
                 </th>
               {/each}
+              <!-- 余白列 (colgroup の最後の col に対応) -->
+              <th
+                class="sticky top-0 z-10 border-b border-zinc-700 bg-zinc-800 p-0"
+              ></th>
             </tr>
           </thead>
           <tbody>
-            {#each result.rows as row, rowIndex (rowIndex)}
-              <tr class="hover:bg-zinc-800/60">
+            <!-- 上下のスペーサーで未描画ぶんの高さを確保し、スクロール量を保つ -->
+            {#if rowWindow.padTop > 0}
+              <tr aria-hidden="true">
+                <td
+                  colspan={result.columns.length + 2}
+                  style="height:{rowWindow.padTop}px"
+                ></td>
+              </tr>
+            {/if}
+            {#each result.rows.slice(rowWindow.start, rowWindow.end) as row, windowIndex (rowWindow.start + windowIndex)}
+              {@const rowIndex = rowWindow.start + windowIndex}
+              <tr class="hover:bg-zinc-800/60" data-row-index={rowIndex}>
                 <!-- 行番号クリックでその行を選択。ドラッグで複数行に拡張 -->
                 <td
                   class="border-b border-r border-zinc-800 p-0 text-right {isRowHeaderSelected(
@@ -1378,7 +1619,7 @@
                        ダブルクリックで編集 (編集不可セルは読み取り専用ビュー)。
                        truncate のためボタン/入力をセル全面に敷く -->
                   <td
-                    class="relative max-w-96 border-b border-r border-zinc-800 p-0 {pending !==
+                    class="relative border-b border-r border-zinc-800 p-0 {pending !==
                     null
                       ? 'bg-amber-900/40'
                       : cellBgClass(rowIndex, colIndex)}"
@@ -1457,8 +1698,17 @@
                     {/if}
                   </td>
                 {/each}
+                <td class="border-b border-zinc-800"></td>
               </tr>
             {/each}
+            {#if rowWindow.padBottom > 0}
+              <tr aria-hidden="true">
+                <td
+                  colspan={result.columns.length + 2}
+                  style="height:{rowWindow.padBottom}px"
+                ></td>
+              </tr>
+            {/if}
           </tbody>
         </table>
       {:else if activeTab?.result}
