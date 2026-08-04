@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -56,12 +57,78 @@ fn file_path(
     Ok(connection_dir(sqlfiles_dir, connection)?.join(file_name))
 }
 
-/// ディレクトリ直下の、拡張子が ext のファイル名を昇順で返す。存在しなければ空。
+/// 数字の並びを数値として扱う比較 (自然順)。
+///
+/// 素の辞書順だと桁数の違う連番が作成順とズレる: 同一分に複数作った時の連番は
+/// ゼロ埋めされないため (FilesPane の defaultFileName)、"-9" と "-10" では
+/// '1' < '9' により降順で "-9" が先に来る = 古い方が上に並んでしまう。
+/// 数字の並びをまとめて数値として比較することでこれを避ける。
+///
+/// 値が同じ数字列 ("02" と "2") は、比較を決定的にするため桁数の少ない方を先にする。
+fn natural_cmp(a: &str, b: &str) -> Ordering {
+    /// 先頭から続く ASCII 数字を消費して返す。
+    fn take_digits(it: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+        let mut out = String::new();
+        while let Some(c) = it.peek() {
+            if !c.is_ascii_digit() {
+                break;
+            }
+            out.push(*c);
+            it.next();
+        }
+        out
+    }
+
+    let mut ai = a.chars().peekable();
+    let mut bi = b.chars().peekable();
+    loop {
+        match (ai.peek().copied(), bi.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            // 前方一致する短い方を小さいとみなす (辞書順と同じ)
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                if x.is_ascii_digit() && y.is_ascii_digit() {
+                    let da = take_digits(&mut ai);
+                    let db = take_digits(&mut bi);
+                    // 先頭ゼロを除けば「桁数 → 辞書順」で数値の大小になる
+                    // (u64 へのパースだと極端に長い数字列で溢れる)
+                    let ta = da.trim_start_matches('0');
+                    let tb = db.trim_start_matches('0');
+                    let ord = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                    let ord = da.len().cmp(&db.len());
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                } else {
+                    let ord = x.cmp(&y);
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                    ai.next();
+                    bi.next();
+                }
+            }
+        }
+    }
+}
+
+/// ディレクトリ直下の、拡張子が ext のファイル名を**降順**で返す。存在しなければ空。
 /// (list_query_files と search_query_files で列挙条件を共有し、
 ///  隠しファイル/拡張子判定/ソートが片方だけズレるのを防ぐ)
+///
 /// dot 始まりの隠しファイルは除外する。validate_component が dot 始まりの名前を
 /// 拒否する (= CRUD で開けない) のと一貫させ、手動配置された隠しファイルの中身が
 /// 検索プレビューから漏れないようにする。
+///
+/// 降順にしているのは「新しいファイルを一覧の上に出す」ため。既定のファイル名は
+/// `YYYYMMDD-HHMM` 形式で、名前順がそのまま時系列になるよう作られている
+/// (FilesPane の defaultFileName)。したがって名前の降順 = 新しい順になる。
+/// 更新日時ではなく名前を基準にするのは、保存のたびに並びが入れ替わって
+/// 作業中に一覧が跳ねるのを避けるため。
 fn list_query_file_names(dir: &Path, ext: &str) -> Result<Vec<String>, AppError> {
     if !dir.exists() {
         return Ok(vec![]);
@@ -74,11 +141,28 @@ fn list_query_file_names(dir: &Path, ext: &str) -> Result<Vec<String>, AppError>
         .filter(|name| !name.starts_with('.'))
         .filter(|name| name.to_ascii_lowercase().ends_with(&suffix))
         .collect();
-    names.sort();
+    // 降順 (新しいものが先頭)。比較は**拡張子を除いた部分**を自然順で行う。
+    //
+    // 拡張子を付けたまま比べると、同じ分に作られた連番ファイル
+    // ("20260804-1200.sql" と "20260804-1200-2.sql") の順序が逆になる:
+    // '.' (0x2E) > '-' (0x2D) なので、降順では古い無印の方が先に来てしまう。
+    // 拡張子を落とせば "20260804-1200-2" > "20260804-1200" (前方一致する
+    // 短い方が小さい) となり、作成順どおり新しいものが先頭に来る。
+    //
+    // 全要素が suffix で終わることは上の filter が保証しており、suffix は
+    // ASCII なので、末尾 suffix.len() バイトを落とす位置は必ず文字境界になる。
+    let ext_len = suffix.len();
+    names.sort_unstable_by(|a, b| {
+        let a_stem = &a[..a.len() - ext_len];
+        let b_stem = &b[..b.len() - ext_len];
+        // stem が同じになるのは拡張子の大文字小文字だけが違う場合。
+        // 並びを決定的にするため、その時は名前全体で決める。
+        natural_cmp(b_stem, a_stem).then_with(|| b.cmp(a))
+    });
     Ok(names)
 }
 
-/// 接続のクエリファイル一覧を返す (名前昇順)。
+/// 接続のクエリファイル一覧を返す (名前降順 = 新しいものが先頭)。
 pub fn list_query_files(
     sqlfiles_dir: &Path,
     connection: &str,
@@ -101,7 +185,7 @@ pub struct FileSearchHit {
 /// プレビュー行の最大文字数 (これを超えたら末尾を省略記号にする)。
 const PREVIEW_MAX_CHARS: usize = 120;
 
-/// 検索結果の最大件数。名前昇順で先頭からこの数で打ち切る
+/// 検索結果の最大件数。名前降順 (新しい順) で先頭からこの数で打ち切る
 /// (モーダルの一覧を短く保ち、多数ファイル環境での読み取りコストも抑える)。
 const MAX_SEARCH_HITS: usize = 50;
 
@@ -117,7 +201,7 @@ fn truncate_preview(line: &str) -> String {
 
 /// 接続のクエリファイルをファイル名・中身で検索する。
 /// 大文字小文字を区別しない部分一致。中身は最初に一致した行をプレビューとして返す。
-/// 名前昇順で、名前一致または中身一致したファイルのみ返す。
+/// 名前降順 (新しい順) で、名前一致または中身一致したファイルのみ返す。
 /// (rg/grep のような外部プロセスは使わない。クエリファイルは少数のため
 ///  純 Rust で読み取る方が堅牢で、外部依存・インジェクション面も持たない)
 pub fn search_query_files(
@@ -151,7 +235,7 @@ pub fn search_query_files(
                 name_match,
                 content_preview,
             });
-            // 名前昇順で先頭から上限まで。以降のファイルは読まずに打ち切る
+            // 名前降順 (新しい順) で先頭から上限まで。以降のファイルは読まずに打ち切る
             if hits.len() >= MAX_SEARCH_HITS {
                 break;
             }
@@ -392,6 +476,58 @@ mod tests {
         assert_eq!(
             list_query_files(&dir, connection, "sql").unwrap(),
             vec!["other.sql"]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_natural_cmp() {
+        // 数字列は数値として比較する (桁数が違っても作成順どおり)
+        assert_eq!(natural_cmp("a-9", "a-10"), Ordering::Less);
+        assert_eq!(natural_cmp("a-10", "a-9"), Ordering::Greater);
+        assert_eq!(natural_cmp("a-100", "a-99"), Ordering::Greater);
+        // 先頭ゼロがあっても値で比較する。値が同じなら桁数の少ない方を先に
+        assert_eq!(natural_cmp("a-02", "a-9"), Ordering::Less);
+        assert_eq!(natural_cmp("a-2", "a-02"), Ordering::Less);
+        // 数字以外は通常の文字比較。前方一致する短い方が小さい
+        assert_eq!(natural_cmp("20260102-1200", "20260102-1200-2"), Ordering::Less);
+        assert_eq!(natural_cmp("report", "report"), Ordering::Equal);
+        assert_eq!(natural_cmp("apple", "banana"), Ordering::Less);
+        // 日付部分も数値として比較される (桁数が同じなので辞書順と一致する)
+        assert_eq!(natural_cmp("20260102-1200", "20260315-1830"), Ordering::Less);
+    }
+
+    #[test]
+    fn test_list_query_files_sorts_newest_first() {
+        let dir = test_dir().join("order");
+        let connection = "order-conn";
+
+        // 既定のファイル名は YYYYMMDD-HHMM なので、名前の降順 = 新しい順になる。
+        // 作成順と無関係に並ぶことを見るため、わざと時系列とズラして作る。
+        // 末尾の -2 / -10 は同一分内に複数作った時の連番 (FilesPane)。
+        // 拡張子を含めて比較すると無印 (最も古い) が連番より前に来てしまい、
+        // 辞書順で比較すると -2 が -10 より前に来てしまう。その両方の退行を見る。
+        create_query_file(&dir, connection, "20260101-0900", "sql").unwrap();
+        create_query_file(&dir, connection, "20260315-1830", "sql").unwrap();
+        create_query_file(&dir, connection, "20260102-1200", "sql").unwrap();
+        create_query_file(&dir, connection, "20260102-1200-2", "sql").unwrap();
+        create_query_file(&dir, connection, "20260102-1200-10", "sql").unwrap();
+
+        let expected = vec![
+            "20260315-1830.sql",
+            "20260102-1200-10.sql",
+            "20260102-1200-2.sql",
+            "20260102-1200.sql",
+            "20260101-0900.sql",
+        ];
+        assert_eq!(list_query_files(&dir, connection, "sql").unwrap(), expected);
+
+        // 検索結果も同じ並び (列挙を list_query_file_names で共有しているため)
+        let hits = search_query_files(&dir, connection, "2026", "sql").unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.file_name.as_str()).collect::<Vec<_>>(),
+            expected
         );
 
         let _ = fs::remove_dir_all(&dir);

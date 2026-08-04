@@ -24,23 +24,38 @@
   const fileSuffix = $derived(`.${appStore.selectedFileExtension}`);
 
   // デフォルトのファイル名: YYYYMMDD-HHMM (拡張子はバックエンドが付与)。
-  // 日付が先頭にあると名前順ソートが時系列になり探しやすい。
+  // 日付が先頭にあると名前順ソートが時系列になり探しやすい。一覧は名前の降順
+  // (query_files.rs の list_query_file_names) なので、新しいファイルほど上に出る。
   // 同一分内の連続作成で衝突しないよう、既存ファイルと重複する場合は
-  // -2, -3 ... を付けて一意化する。
+  // -2, -3 ... を付けて一意化する。ゼロ埋めはしないが、一覧側が数字を数値として
+  // 比較するため -9 と -10 の並びも作成順どおりになる。
+  //
+  // 番号は**空きを埋めず常に既存の最大値 + 1** を採る。一覧は降順なので、
+  // 削除された若い番号 (や無印) を再利用すると、新しく作ったファイルが同じ分の
+  // 古いファイルより下に出てしまう。
   const defaultFileName = () => {
     const now = new Date();
     const pad = (n: number) => String(n).padStart(2, "0");
     const date = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
     const time = `${pad(now.getHours())}${pad(now.getMinutes())}`;
     const base = `${date}-${time}`;
-    if (!appStore.files.includes(`${base}${fileSuffix}`)) {
-      return base;
+    // 0 = 同じ分のファイルがまだ無い / 1 = 無印だけある / n = -n まである
+    let maxSeq = appStore.files.includes(`${base}${fileSuffix}`) ? 1 : 0;
+    for (const fileName of appStore.files) {
+      if (!fileName.startsWith(`${base}-`) || !fileName.endsWith(fileSuffix)) {
+        continue;
+      }
+      const seq = fileName.slice(
+        base.length + 1,
+        fileName.length - fileSuffix.length,
+      );
+      // 連番以外のもの ("20260804-1200-draft") は無視する
+      if (!/^\d+$/.test(seq)) {
+        continue;
+      }
+      maxSeq = Math.max(maxSeq, Number(seq));
     }
-    let n = 2;
-    while (appStore.files.includes(`${base}-${n}${fileSuffix}`)) {
-      n++;
-    }
-    return `${base}-${n}`;
+    return maxSeq === 0 ? base : `${base}-${maxSeq + 1}`;
   };
 
   const submitNewFile = async () => {
