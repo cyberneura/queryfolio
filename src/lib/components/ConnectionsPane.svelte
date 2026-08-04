@@ -255,7 +255,7 @@
               {#if isPlaintextRisk(connection)}
                 <span
                   class="rounded bg-orange-500/15 px-1 text-[10px] text-orange-400"
-                  title="The connection may fall back to plaintext and the server certificate is not verified (ssl_mode: {connection.sql_ssl_mode}). Set tls: true or ssl_mode: require / verify-full in config."
+                  title="The connection may fall back to plaintext and the server certificate is not verified (ssl_mode: {connection.sql_ssl_mode}). Set tls: true (= ssl_mode: verify-full) in config to require TLS and verify the certificate. ssl_mode: require only prevents the plaintext fallback — it still accepts any certificate."
                   data-annotate="badge-plaintext-{connection.name}">no tls</span
                 >
               {/if}

@@ -315,8 +315,10 @@ a private CA (for example the RDS bundle); it must be a readable file. On MySQL,
 The default stays `prefer` for backward compatibility (raising it outright would
 break connections that rely on self-signed certificates), so **connections that
 can end up unencrypted are flagged with a `no tls` badge** in the connections
-list. Set `tls: true` (or an explicit `ssl_mode`) on anything that crosses an
-untrusted network.
+list (that is, `disable` / `prefer` without an SSH tunnel). Set `tls: true` on
+anything that crosses an untrusted network — `require` clears the badge because
+it stops the plaintext fallback, but it still accepts any certificate, so it
+does not protect against a man in the middle.
 
 **Over an SSH tunnel**, the app connects to `127.0.0.1`, so `verify-full` fails
 the host name check against the server certificate. The tunnel already encrypts
