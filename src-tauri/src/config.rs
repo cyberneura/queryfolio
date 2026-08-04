@@ -260,10 +260,25 @@ pub struct ServerConfig {
     #[serde(default)]
     pub ssh_tunnel: Option<SshTunnelConfig>,
     /// queryfolio 独自拡張: true の場合、HTTP 系エンジン (elasticsearch) の
-    /// 接続に https を使う。省略時 false。SQL 系エンジンでは無視される。
+    /// 接続に https を使う。省略時 false。
     /// dynamodb ではエンドポイント上書き (host 指定) 時のスキームに使う。
+    /// SQL 系エンジン (mysql / postgres) では「TLS を必須にし証明書も検証する」
+    /// 指定として扱う (ssl_mode 省略時の既定が verify-full になる)。
     #[serde(default)]
     pub tls: bool,
+    /// queryfolio 独自拡張: SQL 系エンジン (mysql / postgres) の TLS モード。
+    /// disable / prefer / require / verify-ca / verify-full。
+    /// 省略時は tls: true なら verify-full、そうでなければ prefer
+    /// (sqlx の既定。TLS を試み、張れなければ平文に降格し証明書も検証しない)。
+    /// SSH トンネル経由の接続では接続先が 127.0.0.1 になるため、
+    /// verify-full は証明書のホスト名検証で失敗する (トンネル自体が暗号化
+    /// されているので require までに留めるか省略する)。
+    #[serde(default)]
+    pub ssl_mode: Option<String>,
+    /// queryfolio 独自拡張: 証明書の検証に使うルート CA 証明書 (PEM) のパス。
+    /// ~ 展開あり。verify-ca / verify-full で自己署名 CA を使う場合に指定する。
+    #[serde(default)]
+    pub ssl_root_cert: Option<String>,
     /// queryfolio 独自拡張 (dynamodb 用): aws-config に渡す AWS プロファイル名
     /// (~/.aws/config / credentials)。省略時は既定の credentials chain
     /// (環境変数 → default プロファイル → IMDS)。他のエンジンでは無視される。
@@ -322,7 +337,109 @@ fn sanitize_folder_component(raw: &str) -> String {
     s
 }
 
+/// SQL 系エンジン (mysql / postgres) の TLS モード。
+/// 名前と意味は libpq / MySQL クライアントの ssl-mode に合わせている。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlSslMode {
+    /// TLS を使わない
+    Disable,
+    /// TLS を試み、張れなければ平文に降格する。証明書は検証しない
+    /// (sqlx の既定)
+    Prefer,
+    /// TLS を必須にする。証明書は検証しない
+    /// (経路の盗聴は防げるが、中間者は防げない)。
+    /// libpq は ssl_root_cert があれば verify-ca 相当になるが、**sqlx 0.8 は
+    /// Require を必ず accept_invalid_certs で扱う** (sqlx-postgres の
+    /// connection/tls.rs) ため、ルート CA を渡しても検証されない。
+    /// 検証したい場合は verify-ca / verify-full を明示する必要がある
+    Require,
+    /// TLS を必須にし、サーバー証明書が信頼された CA のものか検証する
+    VerifyCa,
+    /// VerifyCa に加えて、接続先ホスト名が証明書と一致するか検証する
+    VerifyFull,
+}
+
+impl SqlSslMode {
+    /// 平文へ降格しうるモードか (UI / ログでの注意喚起用)
+    pub fn allows_plaintext(self) -> bool {
+        matches!(self, SqlSslMode::Disable | SqlSslMode::Prefer)
+    }
+
+    /// 設定に書く文字列表現 (ConnectionInfo でフロントへ渡す値でもある)
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SqlSslMode::Disable => "disable",
+            SqlSslMode::Prefer => "prefer",
+            SqlSslMode::Require => "require",
+            SqlSslMode::VerifyCa => "verify-ca",
+            SqlSslMode::VerifyFull => "verify-full",
+        }
+    }
+}
+
 impl ServerConfig {
+    /// SQL 系エンジンの実効 TLS モードを返す。
+    ///
+    /// 優先順位は ssl_mode (明示) → tls: true なら verify-full → prefer。
+    /// 既定を prefer のままにしているのは後方互換のため (いきなり verify-full に
+    /// すると、社内の自己署名証明書などで動いていた接続が壊れる)。
+    /// prefer は「TLS が張れなければ平文に降格し、張れても証明書を検証しない」
+    /// ため、直接接続では tls: true か ssl_mode の指定を推奨する。
+    pub fn sql_ssl_mode(&self) -> Result<SqlSslMode, AppError> {
+        let Some(raw) = self.ssl_mode.as_deref() else {
+            return Ok(if self.tls {
+                SqlSslMode::VerifyFull
+            } else {
+                SqlSslMode::Prefer
+            });
+        };
+
+        // 空文字を「未設定」に倒すと、書いたつもりの設定が黙って無視される
+        let normalized = raw.trim().to_ascii_lowercase().replace('_', "-");
+        match normalized.as_str() {
+            "disable" => Ok(SqlSslMode::Disable),
+            "prefer" => Ok(SqlSslMode::Prefer),
+            "require" => Ok(SqlSslMode::Require),
+            "verify-ca" => Ok(SqlSslMode::VerifyCa),
+            "verify-full" => Ok(SqlSslMode::VerifyFull),
+            other => Err(AppError::Config(format!(
+                "Server '{}': unsupported ssl_mode '{}'. \
+                 Use one of: disable / prefer / require / verify-ca / verify-full",
+                self.name, other
+            ))),
+        }
+    }
+
+    /// ssl_root_cert の設定値を返す (未設定なら None)。
+    ///
+    /// 検証を行わないモード (disable / prefer / require) と併記されている場合は
+    /// エラーにする。sqlx は検証しないモードでルート CA を**黙って無視する**ため、
+    /// 「CA を指定したのだから検証されている」という誤解を放置すると、中間者を
+    /// 受け入れたまま安全だと思い込むことになる。
+    pub fn sql_ssl_root_cert(&self) -> Result<Option<&str>, AppError> {
+        let Some(raw) = self.ssl_root_cert.as_deref().map(str::trim) else {
+            return Ok(None);
+        };
+        if raw.is_empty() {
+            return Err(AppError::Config(format!(
+                "Server '{}': ssl_root_cert is empty",
+                self.name
+            )));
+        }
+
+        let mode = self.sql_ssl_mode()?;
+        if !matches!(mode, SqlSslMode::VerifyCa | SqlSslMode::VerifyFull) {
+            return Err(AppError::Config(format!(
+                "Server '{}': ssl_root_cert is ignored with ssl_mode: {} \
+                 (the certificate is not verified). Use ssl_mode: verify-ca or \
+                 verify-full to verify it, or remove ssl_root_cert.",
+                self.name,
+                mode.as_str()
+            )));
+        }
+        Ok(Some(raw))
+    }
+
     /// クエリファイルの保存フォルダ名を返す。
     /// folder_name が設定されていればそれを使い、無ければ
     /// <host>_<engine>_<schema>_<user> を組み立てる (name は使わない)。
@@ -421,6 +538,10 @@ pub struct ConnectionInfo {
     pub allow_dangerous_statements: bool,
     /// 接続一覧での表示グループ名 (グループ未所属なら null)
     pub group_name: Option<String>,
+    /// SQL 系エンジン (mysql / postgres) の実効 TLS モード。
+    /// 他のエンジン、および ssl_mode の値が不正な場合は null。
+    /// フロントは「暗号化されない可能性がある直接接続」の表示に使う。
+    pub sql_ssl_mode: Option<String>,
     /// エンジンの能力宣言 (エディタ言語・ファイル拡張子・UI の出し分け)。
     /// フロントはエンジン名ではなくこれで UI を出し分ける。
     pub capabilities: crate::engines::EngineCapabilities,
@@ -441,6 +562,17 @@ impl From<&ServerConfig> for ConnectionInfo {
             readonly: server.readonly,
             allow_dangerous_statements: server.allow_dangerous_statements,
             group_name: server.group_name.clone(),
+            // TLS モードを持つのは sqlx で結線する mysql / postgres だけ。
+            // エンジン名の別名 (mariadb / postgresql) も拾うため parse_engine を通す。
+            // エンジン名や ssl_mode の値が不正な設定は接続時にエラーになるので、
+            // ここでは表示を諦めて null にする
+            sql_ssl_mode: match crate::db::parse_engine(&server.engine) {
+                Ok(crate::db::Engine::MySql) | Ok(crate::db::Engine::Postgres) => server
+                    .sql_ssl_mode()
+                    .ok()
+                    .map(|mode| mode.as_str().to_string()),
+                _ => None,
+            },
             capabilities: crate::engines::capabilities_for_name(&server.engine),
         }
     }
@@ -1793,6 +1925,8 @@ servers:
             password: Some("secret".into()),
             ssh_tunnel: None,
             tls: false,
+            ssl_mode: None,
+            ssl_root_cert: None,
             aws_profile: None,
             readonly: false,
             allow_dangerous_statements: false,
@@ -1822,11 +1956,105 @@ servers:
             password: None,
             ssh_tunnel: None,
             tls: false,
+            ssl_mode: None,
+            ssl_root_cert: None,
             aws_profile: None,
             readonly: false,
             allow_dangerous_statements: false,
             group_name: None,
         }
+    }
+
+    /// TLS の実効モードは「明示 ssl_mode → tls: true なら verify-full → prefer」。
+    /// 既定が prefer (平文へ降格しうる) であることは後方互換の意図的な選択なので、
+    /// 変更に気付けるようテストで固定しておく。
+    #[test]
+    fn test_sql_ssl_mode() {
+        let mut s = server_with(None, Some("h"), "postgres", Some("db"), Some("u"));
+
+        // 何も指定しなければ sqlx 既定と同じ prefer
+        assert_eq!(s.sql_ssl_mode().unwrap(), SqlSslMode::Prefer);
+        assert!(s.sql_ssl_mode().unwrap().allows_plaintext());
+
+        // tls: true は verify-full 相当
+        s.tls = true;
+        assert_eq!(s.sql_ssl_mode().unwrap(), SqlSslMode::VerifyFull);
+        assert!(!s.sql_ssl_mode().unwrap().allows_plaintext());
+
+        // ssl_mode は tls より優先する
+        s.ssl_mode = Some("require".into());
+        assert_eq!(s.sql_ssl_mode().unwrap(), SqlSslMode::Require);
+
+        // 大文字・アンダースコア・前後の空白を許容する
+        s.ssl_mode = Some("  VERIFY_CA ".into());
+        assert_eq!(s.sql_ssl_mode().unwrap(), SqlSslMode::VerifyCa);
+
+        s.ssl_mode = Some("disable".into());
+        assert_eq!(s.sql_ssl_mode().unwrap(), SqlSslMode::Disable);
+        assert!(s.sql_ssl_mode().unwrap().allows_plaintext());
+
+        // 未知の値は黙って既定に倒さずエラーにする
+        s.ssl_mode = Some("verify".into());
+        assert!(s.sql_ssl_mode().is_err());
+        s.ssl_mode = Some("".into());
+        assert!(s.sql_ssl_mode().is_err());
+    }
+
+    /// ssl_root_cert は検証を行うモードでしか意味を持たない。
+    /// sqlx は検証しないモードでルート CA を黙って無視するため、
+    /// 併記された設定は「検証されている」という誤解を生む。エラーで気付かせる。
+    #[test]
+    fn test_sql_ssl_root_cert_requires_verifying_mode() {
+        let mut s = server_with(None, Some("h"), "postgres", Some("db"), Some("u"));
+        s.ssl_root_cert = Some("~/certs/ca.pem".into());
+
+        // 検証しないモードとの併記はエラー
+        assert!(s.sql_ssl_root_cert().is_err()); // 既定 = prefer
+        s.ssl_mode = Some("require".into());
+        assert!(s.sql_ssl_root_cert().is_err());
+        s.ssl_mode = Some("disable".into());
+        assert!(s.sql_ssl_root_cert().is_err());
+
+        // 検証するモードなら通る
+        s.ssl_mode = Some("verify-ca".into());
+        assert_eq!(s.sql_ssl_root_cert().unwrap(), Some("~/certs/ca.pem"));
+        s.ssl_mode = None;
+        s.tls = true; // = verify-full
+        assert_eq!(s.sql_ssl_root_cert().unwrap(), Some("~/certs/ca.pem"));
+
+        // 空文字はエラー、未設定は None
+        s.ssl_root_cert = Some("  ".into());
+        assert!(s.sql_ssl_root_cert().is_err());
+        s.ssl_root_cert = None;
+        assert_eq!(s.sql_ssl_root_cert().unwrap(), None);
+    }
+
+    /// ConnectionInfo の sql_ssl_mode は SQL 系エンジンだけに載る
+    /// (フロントの "no tls" 表示はこの値で判断する)。
+    #[test]
+    fn test_connection_info_sql_ssl_mode() {
+        let s = server_with(None, Some("h"), "postgres", Some("db"), Some("u"));
+        assert_eq!(
+            ConnectionInfo::from(&s).sql_ssl_mode.as_deref(),
+            Some("prefer")
+        );
+
+        // エンジン名の別名も拾う
+        let mut s = server_with(None, Some("h"), "mariadb", Some("db"), Some("u"));
+        s.tls = true;
+        assert_eq!(
+            ConnectionInfo::from(&s).sql_ssl_mode.as_deref(),
+            Some("verify-full")
+        );
+
+        // TLS モードを持たないエンジンは null
+        let s = server_with(None, None, "sqlite", Some("/tmp/x.sqlite3"), None);
+        assert!(ConnectionInfo::from(&s).sql_ssl_mode.is_none());
+
+        // 不正な ssl_mode は表示を諦めて null (接続時にエラーになる)
+        let mut s = server_with(None, Some("h"), "postgres", Some("db"), Some("u"));
+        s.ssl_mode = Some("bogus".into());
+        assert!(ConnectionInfo::from(&s).sql_ssl_mode.is_none());
     }
 
     #[test]
@@ -1875,6 +2103,8 @@ servers:
             allow_dangerous_statements: false,
             group_name: None,
             tls: false,
+            ssl_mode: None,
+            ssl_root_cert: None,
             aws_profile: None,
         };
         // アクセスキー ID はフォルダ名に出さず、短いハッシュで区別する

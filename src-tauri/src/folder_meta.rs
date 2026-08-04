@@ -126,6 +126,8 @@ mod tests {
             password: Some("s3cret".to_string()),
             ssh_tunnel: None,
             tls: false,
+            ssl_mode: None,
+            ssl_root_cert: None,
             aws_profile: None,
             readonly: true,
             allow_dangerous_statements: false,
