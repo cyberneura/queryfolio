@@ -957,9 +957,13 @@ const moveFileToConnection = async (
     errorMessage = moveError;
     return false;
   }
-  // タブを閉じる過程で接続が切り替わっていなければ一覧を更新する
-  if (selectedConnection === fromConnection) {
-    files = await api.listQueryFiles(fromConnection);
+  // 今表示している一覧が移動元・移動先のどちらであっても最新化する
+  // (移動元からは消え、移動先には現れる)。タブを閉じた時に隣のタブが
+  // アクティブになって選択接続が移動先へ変わっていることがあるため、
+  // 移動元だけを見ると移動したファイルが一覧に出てこない。
+  const shown = selectedConnection;
+  if (shown === fromConnection || shown === toConnection) {
+    files = await api.listQueryFiles(shown);
   }
   errorMessage = null;
   return true;
