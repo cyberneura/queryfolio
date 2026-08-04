@@ -1220,6 +1220,16 @@ pub(crate) fn leading_keyword(sql: &str) -> String {
             rest = after.split_once('\n').map(|(_, r)| r).unwrap_or("");
             continue;
         }
+        // MySQL の実行コメント (`/*! ... */` / `/*!50110 ... */`) はサーバーが
+        // SQL として実行するので、コメントとして読み飛ばさずマーカーだけ外す
+        // (`/*! DROP TABLE t */` の先頭キーワードは drop)。
+        // engine を受け取らない関数なので方言で分けていないが、`/*!` を使わない
+        // 他方言で誤ってこの形を書いても、先頭キーワードが解釈できずガードが
+        // 厳しくなる (拒否側に倒れる) だけで穴にはならない。
+        if let Some(after) = rest.strip_prefix("/*!") {
+            rest = after.trim_start_matches(|c: char| c.is_ascii_digit());
+            continue;
+        }
         if let Some(after) = rest.strip_prefix("/*") {
             rest = after.split_once("*/").map(|(_, r)| r).unwrap_or("");
             continue;
@@ -1280,6 +1290,8 @@ fn is_dash_comment_start(chars: &[char], i: usize, mysql: bool) -> bool {
 
 pub(crate) fn scan_sql(sql: &str, engine: Engine) -> SqlScan {
     let hash_comments = matches!(engine, Engine::MySql);
+    // MySQL の実行コメント (`/*! ... */`) はサーバーが SQL として解釈・実行する
+    let executable_comments = matches!(engine, Engine::MySql);
     // DuckDB はドル引用に対応しており方言は Postgres 相当
     let dollar_quotes = matches!(engine, Engine::Postgres | Engine::DuckDb);
     let chars: Vec<char> = sql.chars().collect();
@@ -1356,6 +1368,24 @@ pub(crate) fn scan_sql(sql: &str, engine: Engine) -> SqlScan {
             }
             cleaned.push(' ');
         } else if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            // MySQL の実行コメント (`/*! ... */` / `/*!50110 ... */`) は
+            // サーバーがコメントではなく SQL として解釈・実行する。
+            // ここで他のコメントと同じく空白化すると、
+            // `UPDATE t SET x=1 WHERE id=1; /*! DROP TABLE t */` の DROP が
+            // cleaned から消え、複文判定も危険文ガードも見落とす。
+            // 開始マーカー (`/*!` とバージョン番号) だけを読み飛ばし、
+            // 中身は通常の SQL として走査させる (閉じの `*/` は記号として
+            // cleaned に残るが、単語境界の判定には影響しない)。
+            if executable_comments && chars.get(i + 2) == Some(&'!') {
+                advance!();
+                advance!();
+                advance!();
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    advance!();
+                }
+                cleaned.push(' ');
+                continue;
+            }
             advance!();
             advance!();
             while i < chars.len() {
@@ -2070,6 +2100,44 @@ mod tests {
         assert!(!contains_multiple_statements(
             "SELECT 1--1; DROP TABLE t;",
             Engine::Sqlite
+        ));
+    }
+
+    /// MySQL の実行コメント (`/*! ... */`) はサーバーが SQL として実行するので、
+    /// コメントとして落とすとガードから隠れてしまう。
+    #[test]
+    fn test_mysql_executable_comments_are_code() {
+        // 複文の 2 文目を実行コメントに隠せない
+        assert!(contains_multiple_statements(
+            "UPDATE t SET x=1 WHERE id=1; /*! DROP TABLE t */",
+            Engine::MySql
+        ));
+        // 先頭キーワードも中身から取る (バージョン指定付きも同じ)
+        assert_eq!(leading_keyword("/*! DROP TABLE t */"), "drop");
+        assert_eq!(leading_keyword("/*!50110 DROP TABLE t */"), "drop");
+        assert!(dangerous_reason("/*! DROP TABLE t */", Engine::MySql).is_some());
+        assert!(dangerous_reason("/*!50110 TRUNCATE TABLE t */", Engine::MySql).is_some());
+        assert!(!is_readonly_allowed("/*! DELETE FROM t */", Engine::MySql));
+        assert!(!is_readonly_allowed(
+            "WITH x AS (SELECT 1) /*! DELETE FROM t */",
+            Engine::MySql
+        ));
+        // 通常のブロックコメントは従来どおりコメントとして落ちる
+        assert_eq!(leading_keyword("/* c */ SELECT 1"), "select");
+        assert!(!contains_multiple_statements(
+            "SELECT 1 /* ; DROP TABLE t */",
+            Engine::MySql
+        ));
+        assert!(dangerous_reason("SELECT 1 /* DROP TABLE t */", Engine::MySql).is_none());
+        // scan_sql 側は MySQL のみ対象なので、他方言では従来どおりコメント
+        assert!(!contains_multiple_statements(
+            "UPDATE t SET x=1 WHERE id=1; /*! DROP TABLE t */",
+            Engine::Postgres
+        ));
+        // 実行コメント内の LIMIT も見えるので auto LIMIT は付けない
+        assert!(!should_auto_limit(
+            "SELECT * FROM t /*! LIMIT 5 */",
+            Engine::MySql
         ));
     }
 
