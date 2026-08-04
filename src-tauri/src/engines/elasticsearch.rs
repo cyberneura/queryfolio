@@ -1082,6 +1082,8 @@ mod tests {
             allow_dangerous_statements: false,
             group_name: None,
             tls: true,
+            ssl_mode: None,
+            ssl_root_cert: None,
             aws_profile: None,
         };
         // トンネル無しなら URL ホストは差し替えない

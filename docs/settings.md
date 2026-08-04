@@ -14,6 +14,7 @@ in the repository root.
   - [Common keys](#common-keys)
   - [Engines](#engines)
   - [Safety guards (`readonly`, `allow_dangerous_statements`)](#safety-guards)
+  - [TLS for SQL engines (`tls`, `ssl_mode`, `ssl_root_cert`)](#tls-for-sql-engines)
   - [SSH tunnels (`ssh_tunnel`)](#ssh-tunnels-ssh_tunnel)
 - [Connection groups](#connection-groups)
 - [Connection templates](#connection-templates)
@@ -89,7 +90,9 @@ servers:
 | `schema` | depends | The database / schema to connect to. For SQLite / DuckDB, this is the **path to the database file** (queryfolio extension; `~` is expanded; if `schema` is omitted, `host` is used as the file path instead). For DynamoDB, this is the **AWS region** (required, e.g. `ap-northeast-1`). |
 | `user` | no | Database user. For DynamoDB, a static **access key ID** (paired with `password` as the secret access key). |
 | `password` | no | Database password. |
-| `tls` | no | Use `https` for HTTP-based engines (Elasticsearch, and the DynamoDB endpoint override; queryfolio extension). Default `false`. Ignored by SQL engines. |
+| `tls` | no | For HTTP-based engines (Elasticsearch, and the DynamoDB endpoint override) use `https`. For SQL engines (MySQL / PostgreSQL) it makes the default `ssl_mode` `verify-full` — TLS is required and the certificate is verified. Default `false` (queryfolio extension). See [TLS for SQL engines](#tls-for-sql-engines). |
+| `ssl_mode` | no | MySQL / PostgreSQL only (queryfolio extension): `disable` / `prefer` / `require` / `verify-ca` / `verify-full`. Takes precedence over `tls`. See [TLS for SQL engines](#tls-for-sql-engines). |
+| `ssl_root_cert` | no | MySQL / PostgreSQL only (queryfolio extension): path to a root CA certificate (PEM) used for verification (`~` is expanded). |
 | `aws_profile` | no | DynamoDB only (queryfolio extension): the AWS profile name (`~/.aws/config` / `credentials`) used for credentials. Ignored when `user` / `password` are set. SSO-based profiles (`sso_session` etc.) are not supported yet — use static keys or the default credential chain. |
 | `readonly` | no | See [Safety guards](#safety-guards). Default `false`. |
 | `allow_dangerous_statements` | no | See [Safety guards](#safety-guards). Default `false`. |
@@ -263,6 +266,61 @@ side-effect-free statements run until you turn it on).
     password: dev_password
     allow_dangerous_statements: true
   ```
+
+### TLS for SQL engines
+
+MySQL / PostgreSQL connections are made with sqlx, whose default SSL mode is
+`prefer` / `Preferred`. **That default tries TLS, silently falls back to
+plaintext when the handshake does not succeed, and does not verify the server
+certificate.** An attacker on the path can therefore force the session down to
+plaintext (exposing credentials, queries, and results) or present any
+certificate and read or modify the traffic.
+
+Two keys control this (queryfolio extensions):
+
+- **`tls: true`** — the effective mode becomes `verify-full`: TLS is required,
+  the certificate must chain to a trusted CA, and the host name must match.
+- **`ssl_mode`** — set the mode explicitly. Takes precedence over `tls`.
+
+| `ssl_mode` | TLS required | Certificate verified | Host name checked |
+|-----------|--------------|----------------------|-------------------|
+| `disable` | no (never) | – | – |
+| `prefer` (default) | no (falls back) | no | no |
+| `require` | yes | no\* | no |
+| `verify-ca` | yes | yes | no |
+| `verify-full` | yes | yes | yes |
+
+\* **PostgreSQL only**: with `require`, if `ssl_root_cert` is also set, the
+driver verifies the certificate as if `verify-ca` had been requested (this
+matches libpq). On MySQL, `require` never verifies. If you set `ssl_root_cert`,
+prefer being explicit with `verify-ca` / `verify-full` so both engines behave
+the same.
+
+Use `ssl_root_cert` to point at a root CA certificate (PEM) when the server uses
+a private CA (for example the RDS bundle); it must be a readable file. On MySQL,
+`verify-full` maps to the driver's `VerifyIdentity`.
+
+```yaml
+- name: prod-postgres
+  engine: postgres
+  host: db.example.com
+  schema: production_db
+  user: readonly_user
+  password: your_password
+  tls: true                       # = ssl_mode: verify-full
+  # ssl_mode: verify-full
+  # ssl_root_cert: ~/.config/queryfolio/certs/rds-ca.pem
+```
+
+The default stays `prefer` for backward compatibility (raising it outright would
+break connections that rely on self-signed certificates), so **connections that
+can end up unencrypted are flagged with a `no tls` badge** in the connections
+list. Set `tls: true` (or an explicit `ssl_mode`) on anything that crosses an
+untrusted network.
+
+**Over an SSH tunnel**, the app connects to `127.0.0.1`, so `verify-full` fails
+the host name check against the server certificate. The tunnel already encrypts
+the path, so leave these keys unset (or use `require`) for tunneled connections.
 
 ### SSH tunnels (`ssh_tunnel`)
 

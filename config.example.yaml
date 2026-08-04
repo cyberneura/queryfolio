@@ -28,6 +28,36 @@ servers:
     user: mysql_user
     password: your_mysql_password
 
+  # --- SQL エンジン (mysql / postgres) の TLS ---
+  #
+  # 重要: ssl_mode も tls も指定しない直接接続は sqlx の既定 (prefer) で動く。
+  # prefer は「TLS を試み、張れなければ平文へ降格する。張れてもサーバー証明書を
+  # 検証しない」ため、経路上の攻撃者に盗聴・改竄されうる。
+  # インターネット越しに直接つなぐ接続 (RDS 等) では必ず tls: true か
+  # ssl_mode を指定すること。接続一覧では平文になりうる接続に "no tls" の
+  # バッジが付く。
+  #
+  # tls: true         → ssl_mode 省略時の既定が verify-full になる
+  # ssl_mode:         → disable / prefer / require / verify-ca / verify-full
+  #                      (tls より優先。MySQL の verify-full は VerifyIdentity)
+  # ssl_root_cert:    → 自己署名 CA を使う場合のルート証明書 (PEM)。~ 展開あり
+  #
+  # SSH トンネル経由の接続は接続先が 127.0.0.1 になるため、verify-full は
+  # 証明書のホスト名検証で失敗する。トンネル自体が暗号化されているので
+  # 指定しない (prefer のまま) か require までに留める。
+  - name: prod-postgres
+    description: "本番 PostgreSQL (TLS 必須 + 証明書検証)"
+    engine: postgres
+    host: db.example.com
+    port: 5432
+    schema: production_db
+    user: readonly_user
+    password: your_password_here
+    readonly: true
+    tls: true
+    # ssl_mode: verify-full
+    # ssl_root_cert: ~/.config/queryfolio/certs/rds-ca.pem
+
   # queryfolio 拡張: sqlite は schema に DB ファイルパスを指定する
   - name: local-sqlite
     description: "ローカルの SQLite ファイル"

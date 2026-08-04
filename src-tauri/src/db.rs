@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -6,12 +7,12 @@ use std::time::Instant;
 use base64::Engine as _;
 use futures::TryStreamExt;
 use serde::Serialize;
-use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlRow};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow};
+use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlRow, MySqlSslMode};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow, PgSslMode};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Column, Connection as _, Executor, Row, TypeInfo};
 
-use crate::config::ServerConfig;
+use crate::config::{ServerConfig, SqlSslMode};
 use crate::error::AppError;
 use crate::config::expand_tilde;
 use crate::tunnel::SshTunnel;
@@ -476,6 +477,31 @@ fn default_port(engine: Engine) -> u16 {
     }
 }
 
+/// ssl_root_cert のパスを展開して返す (未設定なら None)。
+/// 存在しないパスは接続時の分かりにくいエラーになる前にここで弾く。
+fn ssl_root_cert_path(server: &ServerConfig) -> Result<Option<PathBuf>, AppError> {
+    let Some(raw) = server.ssl_root_cert.as_deref().map(str::trim) else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        return Err(AppError::Config(format!(
+            "Server '{}': ssl_root_cert is empty",
+            server.name
+        )));
+    }
+    let path = expand_tilde(raw);
+    // ディレクトリを渡されると sqlx 側で分かりにくい読み込みエラーになるので、
+    // 通常ファイルであることまで確かめる
+    if !path.is_file() {
+        return Err(AppError::Config(format!(
+            "Server '{}': ssl_root_cert is not a file: {}",
+            server.name,
+            path.display()
+        )));
+    }
+    Ok(Some(path))
+}
+
 async fn connect(
     server: &ServerConfig,
     engine: Engine,
@@ -484,7 +510,21 @@ async fn connect(
 ) -> Result<DbPool, AppError> {
     match engine {
         Engine::MySql => {
-            let mut options = MySqlConnectOptions::new().host(host).port(port);
+            let ssl_mode = match server.sql_ssl_mode()? {
+                SqlSslMode::Disable => MySqlSslMode::Disabled,
+                SqlSslMode::Prefer => MySqlSslMode::Preferred,
+                SqlSslMode::Require => MySqlSslMode::Required,
+                SqlSslMode::VerifyCa => MySqlSslMode::VerifyCa,
+                // MySQL の VerifyIdentity が libpq の verify-full 相当
+                SqlSslMode::VerifyFull => MySqlSslMode::VerifyIdentity,
+            };
+            let mut options = MySqlConnectOptions::new()
+                .host(host)
+                .port(port)
+                .ssl_mode(ssl_mode);
+            if let Some(path) = ssl_root_cert_path(server)? {
+                options = options.ssl_ca(path);
+            }
             if let Some(user) = &server.user {
                 options = options.username(user);
             }
@@ -502,7 +542,20 @@ async fn connect(
             Ok(DbPool::MySql(pool))
         }
         Engine::Postgres => {
-            let mut options = PgConnectOptions::new().host(host).port(port);
+            let ssl_mode = match server.sql_ssl_mode()? {
+                SqlSslMode::Disable => PgSslMode::Disable,
+                SqlSslMode::Prefer => PgSslMode::Prefer,
+                SqlSslMode::Require => PgSslMode::Require,
+                SqlSslMode::VerifyCa => PgSslMode::VerifyCa,
+                SqlSslMode::VerifyFull => PgSslMode::VerifyFull,
+            };
+            let mut options = PgConnectOptions::new()
+                .host(host)
+                .port(port)
+                .ssl_mode(ssl_mode);
+            if let Some(path) = ssl_root_cert_path(server)? {
+                options = options.ssl_root_cert(path);
+            }
             if let Some(user) = &server.user {
                 options = options.username(user);
             }

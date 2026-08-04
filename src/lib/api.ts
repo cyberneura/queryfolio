@@ -48,6 +48,10 @@ export interface ConnectionInfo {
   allow_dangerous_statements: boolean;
   /// 接続一覧での表示グループ名 (グループ未所属なら null)
   group_name: string | null;
+  /// SQL 系エンジン (mysql / postgres) の実効 TLS モード。
+  /// disable / prefer は平文へ降格しうる (prefer は sqlx の既定)。
+  /// 他のエンジンでは null
+  sql_ssl_mode: string | null;
   /// エンジンの能力宣言 (UI の出し分けに使う)
   capabilities: EngineCapabilities;
 }
