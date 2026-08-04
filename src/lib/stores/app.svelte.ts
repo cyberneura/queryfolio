@@ -946,6 +946,15 @@ const moveFileToConnection = async (
     await api.moveQueryFile(fromConnection, toConnection, fileName);
   } catch (e) {
     errorMessage = toErrorMessage(e);
+    // 移動が拒否される経路がある (移動先に同名がある / 拡張子が違うエンジン /
+    // 保存フォルダを共有している)。ファイルは移動元に残っているので、閉じた
+    // タブを開き直して編集中の状態へ戻す (内容は閉じる前に保存済み)。
+    // 失敗しても元のエラーを上書きしないよう、errorMessage は最後に入れ直す。
+    const moveError = errorMessage;
+    if (openedTabs.length > 0) {
+      await openFileByTarget(fromConnection, fileName);
+    }
+    errorMessage = moveError;
     return false;
   }
   // タブを閉じる過程で接続が切り替わっていなければ一覧を更新する
