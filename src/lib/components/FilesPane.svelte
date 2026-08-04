@@ -27,7 +27,8 @@
   // 日付が先頭にあると名前順ソートが時系列になり探しやすい。一覧は名前の降順
   // (query_files.rs の list_query_file_names) なので、新しいファイルほど上に出る。
   // 同一分内の連続作成で衝突しないよう、既存ファイルと重複する場合は
-  // -2, -3 ... を付けて一意化する。
+  // -2, -3 ... を付けて一意化する。ゼロ埋めはしないが、一覧側が数字を数値として
+  // 比較するため -9 と -10 の並びも作成順どおりになる。
   const defaultFileName = () => {
     const now = new Date();
     const pad = (n: number) => String(n).padStart(2, "0");
@@ -37,14 +38,11 @@
     if (!appStore.files.includes(`${base}${fileSuffix}`)) {
       return base;
     }
-    // 連番は 2 桁ゼロ埋め (-02, -03 ...)。一覧は名前の降順なので、ゼロ埋めしないと
-    // "-10" が "-9" より前に並び、同一分内で作成順とズレる。
-    const withSeq = (i: number) => `${base}-${String(i).padStart(2, "0")}`;
     let n = 2;
-    while (appStore.files.includes(`${withSeq(n)}${fileSuffix}`)) {
+    while (appStore.files.includes(`${base}-${n}${fileSuffix}`)) {
       n++;
     }
-    return withSeq(n);
+    return `${base}-${n}`;
   };
 
   const submitNewFile = async () => {
