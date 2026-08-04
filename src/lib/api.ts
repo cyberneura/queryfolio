@@ -218,6 +218,16 @@ export const renameQueryFile = (
   newName: string,
 ) => invoke<string>("rename_query_file", { connection, oldName, newName });
 
+/// クエリファイルを別の接続のフォルダへ移動する (FILES から CONNECTIONS への
+/// ドラッグ & ドロップ)。移動後のファイル名を返す。
+/// クエリファイルの拡張子が違うエンジン同士の移動はバックエンドが拒否する。
+export const moveQueryFile = (
+  fromConnection: string,
+  toConnection: string,
+  fileName: string,
+) =>
+  invoke<string>("move_query_file", { fromConnection, toConnection, fileName });
+
 export const listSchemas = (connection: string) =>
   invoke<string[]>("list_schemas", { connection });
 

@@ -905,6 +905,70 @@ const renameFile = async (
   }
 };
 
+// クエリファイルを別の接続のフォルダへ移動する (FILES から CONNECTIONS への
+// ドラッグ & ドロップ)。成功したら true、失敗したら errorMessage を設定して false。
+//
+// 移動元 (fromConnection) は**ドラッグを開始した時点の接続**を呼び出し側から
+// 受け取る。selectedConnection を見に行くと、ドラッグ中に接続が切り替わった時に
+// 別接続の同名ファイルを移動してしまう。
+const moveFileToConnection = async (
+  fileName: string,
+  fromConnection: string,
+  toConnection: string,
+): Promise<boolean> => {
+  if (fromConnection === toConnection) {
+    return false;
+  }
+  // 対象ファイルを開いているタブは、**移動する前に**保存して閉じる。順序が要点:
+  // - 移動してから保存すると、移動元のパスにファイルが作り直されてしまう。
+  // - 保存だけして開いたままにすると、移動の I/O を待つ間に打った文字が
+  //   「移動後のファイルにも UI にも無い」状態で消える。閉じてしまえばその窓が無い。
+  //
+  // removeEditorTab(save=true) は、保存に失敗した場合と保存中にさらに編集された
+  // 場合にタブを閉じずに戻る (自動保存の予約解除も中でやる)。閉じ切れなかったら
+  // 移動そのものを中止する。移動先の接続で開き直すのはユーザーに委ねる —
+  // タブの接続を差し替えると、プール / SSH トンネルの参照 (maybeDisconnectIfIdle)
+  // と噛み合わなくなる。
+  const openedTabs = editorTabs.filter(
+    (t) => t.connection === fromConnection && t.file === fileName,
+  );
+  for (const tab of openedTabs) {
+    await removeEditorTab(tab.id, true);
+  }
+  if (
+    editorTabs.some(
+      (t) => t.connection === fromConnection && t.file === fileName,
+    )
+  ) {
+    return false;
+  }
+  try {
+    await api.moveQueryFile(fromConnection, toConnection, fileName);
+  } catch (e) {
+    errorMessage = toErrorMessage(e);
+    // 移動が拒否される経路がある (移動先に同名がある / 拡張子が違うエンジン /
+    // 保存フォルダを共有している)。ファイルは移動元に残っているので、閉じた
+    // タブを開き直して編集中の状態へ戻す (内容は閉じる前に保存済み)。
+    // 失敗しても元のエラーを上書きしないよう、errorMessage は最後に入れ直す。
+    const moveError = errorMessage;
+    if (openedTabs.length > 0) {
+      await openFileByTarget(fromConnection, fileName);
+    }
+    errorMessage = moveError;
+    return false;
+  }
+  // 今表示している一覧が移動元・移動先のどちらであっても最新化する
+  // (移動元からは消え、移動先には現れる)。タブを閉じた時に隣のタブが
+  // アクティブになって選択接続が移動先へ変わっていることがあるため、
+  // 移動元だけを見ると移動したファイルが一覧に出てこない。
+  const shown = selectedConnection;
+  if (shown === fromConnection || shown === toConnection) {
+    files = await api.listQueryFiles(shown);
+  }
+  errorMessage = null;
+  return true;
+};
+
 // クエリファイルの絶対パスをクリップボードへコピーする。成功したら true。
 // 失敗時は errorMessage を設定して false を返す。
 const copyFilePath = async (fileName: string): Promise<boolean> => {
@@ -2261,6 +2325,7 @@ export default {
   createFile,
   deleteFile,
   renameFile,
+  moveFileToConnection,
   copyFilePath,
   saveCurrentFile,
   discardActiveFileConflict,

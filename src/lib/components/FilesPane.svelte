@@ -1,6 +1,7 @@
 <script lang="ts">
   import { toast } from "svelte-sonner";
   import appStore from "$lib/stores/app.svelte";
+  import { setFileDragPayload } from "$lib/fileDrag";
 
   interface Props {
     /// HISTORY / TABLES タブへの切り替え (タブ状態は +page.svelte が持つ)
@@ -19,6 +20,8 @@
   /// リネーム入力中のファイルと入力値
   let renamingFile = $state<string | null>(null);
   let renameValue = $state("");
+  /// CONNECTIONS ペインへドラッグ中のファイル (ドラッグ元を薄く表示するため)
+  let draggingFile = $state<string | null>(null);
 
   /// エンジン別のクエリファイル拡張子 (ドット付き。例 ".sql" / ".redis")
   const fileSuffix = $derived(`.${appStore.selectedFileExtension}`);
@@ -136,6 +139,24 @@
     renameValue = value.replace(/[/\\]/g, "");
   };
 
+  // CONNECTIONS ペインへドラッグして別サーバーへ移動する。移動そのものは
+  // ドロップ先 (ConnectionsPane) が appStore.moveFileToConnection で行う。
+  const startDrag = (e: DragEvent, fileName: string) => {
+    // リネーム入力中は draggable を外してあるが、念のため二重で防ぐ
+    // (入力欄のテキスト選択をドラッグ扱いにしない)
+    if (!e.dataTransfer || renamingFile === fileName) {
+      return;
+    }
+    const connection = appStore.selectedConnection;
+    if (!connection) {
+      return;
+    }
+    setFileDragPayload(e.dataTransfer, { connection, fileName });
+    draggingFile = fileName;
+    // ドラッグ中はメニューを閉じる (ドロップ後も開いたまま残るのを防ぐ)
+    closeMenu();
+  };
+
   const handleNameClick = (fileName: string) => {
     // 既に開いている (選択中) ファイルの名前を再クリックしたらリネームに入る
     if (appStore.selectedFile === fileName) {
@@ -231,137 +252,150 @@
           Click + to create a query file
         </p>
       {/if}
-      {#each appStore.files as fileName (fileName)}
-        <div
-          class="group relative flex items-center gap-1 pr-1 hover:bg-zinc-800 {appStore.selectedFile ===
-          fileName
-            ? 'bg-zinc-800 border-l-2 border-blue-400'
-            : 'border-l-2 border-transparent'}"
-        >
-          {#if renamingFile === fileName}
-            <form
-              class="flex-1 px-2 py-1"
-              onsubmit={(e) => {
-                e.preventDefault();
-                void submitRename();
-              }}
-            >
-              <!-- svelte-ignore a11y_autofocus -->
-              <input
-                class="w-full rounded border border-zinc-600 bg-zinc-800 px-1.5 py-0.5 text-sm text-zinc-200 outline-none focus:border-blue-400"
-                data-annotate="input-rename-{fileName}"
-                autofocus
-                value={renameValue}
-                oninput={(e) => sanitizeRenameInput(e.currentTarget.value)}
-                onfocus={(e) => e.currentTarget.select()}
-                onblur={cancelRename}
-                onkeydown={(e) => {
-                  if (e.key === "Escape") {
-                    e.preventDefault();
-                    cancelRename();
-                  }
+      <!-- ドラッグ & ドロップのハンドラを持つ行に正しい ARIA ロールを与えるため、
+           一覧部分だけを role="list" で包む (作成フォームや空メッセージは含めない) -->
+      <div role="list">
+        {#each appStore.files as fileName (fileName)}
+          <div
+            role="listitem"
+            class="group relative flex items-center gap-1 pr-1 hover:bg-zinc-800 {appStore.selectedFile ===
+            fileName
+              ? 'bg-zinc-800 border-l-2 border-blue-400'
+              : 'border-l-2 border-transparent'} {draggingFile === fileName
+              ? 'opacity-50'
+              : ''}"
+            data-annotate="file-row-{fileName}"
+            draggable={renamingFile !== fileName}
+            ondragstart={(e) => startDrag(e, fileName)}
+            ondragend={() => {
+              draggingFile = null;
+            }}
+          >
+            {#if renamingFile === fileName}
+              <form
+                class="flex-1 px-2 py-1"
+                onsubmit={(e) => {
+                  e.preventDefault();
+                  void submitRename();
                 }}
-              />
-            </form>
-          {:else}
-            <button
-              class="min-w-0 flex-1 truncate px-3 py-1.5 text-left text-sm text-zinc-200"
-              data-annotate="button-file-{fileName}"
-              onclick={() => handleNameClick(fileName)}
-            >
-              {fileName}
-              {#if appStore.selectedFile === fileName && appStore.dirty}
-                <span class="text-zinc-500" title="Unsaved">*</span>
-              {/if}
-            </button>
-            <button
-              class="shrink-0 rounded px-1 py-0.5 text-zinc-500 hover:bg-zinc-700 hover:text-zinc-200 {openMenuFile ===
-              fileName
-                ? 'block bg-zinc-700 text-zinc-200'
-                : 'hidden group-hover:block'}"
-              title="More actions"
-              aria-label="More actions"
-              aria-haspopup="menu"
-              data-annotate="button-file-menu-{fileName}"
-              onclick={() => {
-                confirmingDelete = null;
-                openMenuFile = openMenuFile === fileName ? null : fileName;
-              }}
-            >
-              <i class="bi bi-three-dots-vertical" aria-hidden="true"></i>
-            </button>
-          {/if}
+              >
+                <!-- svelte-ignore a11y_autofocus -->
+                <input
+                  class="w-full rounded border border-zinc-600 bg-zinc-800 px-1.5 py-0.5 text-sm text-zinc-200 outline-none focus:border-blue-400"
+                  data-annotate="input-rename-{fileName}"
+                  autofocus
+                  value={renameValue}
+                  oninput={(e) => sanitizeRenameInput(e.currentTarget.value)}
+                  onfocus={(e) => e.currentTarget.select()}
+                  onblur={cancelRename}
+                  onkeydown={(e) => {
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      cancelRename();
+                    }
+                  }}
+                />
+              </form>
+            {:else}
+              <button
+                class="min-w-0 flex-1 truncate px-3 py-1.5 text-left text-sm text-zinc-200"
+                data-annotate="button-file-{fileName}"
+                onclick={() => handleNameClick(fileName)}
+              >
+                {fileName}
+                {#if appStore.selectedFile === fileName && appStore.dirty}
+                  <span class="text-zinc-500" title="Unsaved">*</span>
+                {/if}
+              </button>
+              <button
+                class="shrink-0 rounded px-1 py-0.5 text-zinc-500 hover:bg-zinc-700 hover:text-zinc-200 {openMenuFile ===
+                fileName
+                  ? 'block bg-zinc-700 text-zinc-200'
+                  : 'hidden group-hover:block'}"
+                title="More actions"
+                aria-label="More actions"
+                aria-haspopup="menu"
+                data-annotate="button-file-menu-{fileName}"
+                onclick={() => {
+                  confirmingDelete = null;
+                  openMenuFile = openMenuFile === fileName ? null : fileName;
+                }}
+              >
+                <i class="bi bi-three-dots-vertical" aria-hidden="true"></i>
+              </button>
+            {/if}
 
-          {#if openMenuFile === fileName}
-            <!-- メニュー外クリックで閉じる透明バックドロップ -->
-            <button
-              class="fixed inset-0 z-20 cursor-default"
-              tabindex="-1"
-              aria-label="Close menu"
-              data-annotate="menu-backdrop-{fileName}"
-              onclick={closeMenu}
-            ></button>
-            <div
-              class="absolute right-1 top-full z-30 mt-0.5 min-w-32 rounded border border-zinc-700 bg-zinc-800 py-1 shadow-lg"
-              role="menu"
-            >
-              {#if confirmingDelete === fileName}
-                <div class="px-3 py-1 text-xs text-zinc-400">Delete this file?</div>
-                <div class="flex gap-1 px-2 py-1">
+            {#if openMenuFile === fileName}
+              <!-- メニュー外クリックで閉じる透明バックドロップ -->
+              <button
+                class="fixed inset-0 z-20 cursor-default"
+                tabindex="-1"
+                aria-label="Close menu"
+                data-annotate="menu-backdrop-{fileName}"
+                onclick={closeMenu}
+              ></button>
+              <div
+                class="absolute right-1 top-full z-30 mt-0.5 min-w-32 rounded border border-zinc-700 bg-zinc-800 py-1 shadow-lg"
+                role="menu"
+              >
+                {#if confirmingDelete === fileName}
+                  <div class="px-3 py-1 text-xs text-zinc-400">Delete this file?</div>
+                  <div class="flex gap-1 px-2 py-1">
+                    <button
+                      class="flex-1 rounded bg-red-700 px-2 py-1 text-xs text-red-100 hover:bg-red-600"
+                      role="menuitem"
+                      data-annotate="confirm-delete-{fileName}"
+                      onclick={() => void doDelete(fileName)}
+                    >
+                      Delete
+                    </button>
+                    <button
+                      class="flex-1 rounded bg-zinc-700 px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-600"
+                      role="menuitem"
+                      data-annotate="cancel-delete-{fileName}"
+                      onclick={() => {
+                        confirmingDelete = null;
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                {:else}
                   <button
-                    class="flex-1 rounded bg-red-700 px-2 py-1 text-xs text-red-100 hover:bg-red-600"
+                    class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-zinc-200 hover:bg-zinc-700"
                     role="menuitem"
-                    data-annotate="confirm-delete-{fileName}"
-                    onclick={() => void doDelete(fileName)}
+                    data-annotate="menu-rename-{fileName}"
+                    onclick={() => startRename(fileName)}
                   >
-                    Delete
+                    <i class="bi bi-pencil" aria-hidden="true"></i>
+                    Rename
                   </button>
                   <button
-                    class="flex-1 rounded bg-zinc-700 px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-600"
+                    class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-zinc-200 hover:bg-zinc-700"
                     role="menuitem"
-                    data-annotate="cancel-delete-{fileName}"
+                    data-annotate="menu-copy-fullpath-{fileName}"
+                    onclick={() => void doCopyFullPath(fileName)}
+                  >
+                    <i class="bi bi-clipboard" aria-hidden="true"></i>
+                    Copy full path
+                  </button>
+                  <button
+                    class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-red-400 hover:bg-zinc-700"
+                    role="menuitem"
+                    data-annotate="menu-delete-{fileName}"
                     onclick={() => {
-                      confirmingDelete = null;
+                      confirmingDelete = fileName;
                     }}
                   >
-                    Cancel
+                    <i class="bi bi-trash" aria-hidden="true"></i>
+                    Delete
                   </button>
-                </div>
-              {:else}
-                <button
-                  class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-zinc-200 hover:bg-zinc-700"
-                  role="menuitem"
-                  data-annotate="menu-rename-{fileName}"
-                  onclick={() => startRename(fileName)}
-                >
-                  <i class="bi bi-pencil" aria-hidden="true"></i>
-                  Rename
-                </button>
-                <button
-                  class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-zinc-200 hover:bg-zinc-700"
-                  role="menuitem"
-                  data-annotate="menu-copy-fullpath-{fileName}"
-                  onclick={() => void doCopyFullPath(fileName)}
-                >
-                  <i class="bi bi-clipboard" aria-hidden="true"></i>
-                  Copy full path
-                </button>
-                <button
-                  class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-red-400 hover:bg-zinc-700"
-                  role="menuitem"
-                  data-annotate="menu-delete-{fileName}"
-                  onclick={() => {
-                    confirmingDelete = fileName;
-                  }}
-                >
-                  <i class="bi bi-trash" aria-hidden="true"></i>
-                  Delete
-                </button>
-              {/if}
-            </div>
-          {/if}
-        </div>
-      {/each}
+                {/if}
+              </div>
+            {/if}
+          </div>
+        {/each}
+      </div>
     {/if}
   </div>
 </div>
