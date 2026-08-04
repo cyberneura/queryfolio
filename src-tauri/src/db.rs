@@ -1245,6 +1245,18 @@ pub(crate) struct SqlScan {
 ///   ($tag$ ... $tag$) にも対応 (# は Postgres では XOR 演算子なので
 ///   コメント扱いしない)
 /// - コメント: -- と /* */。MySQL は # 行コメントも対象
+///
+/// **バックスラッシュによるエスケープ (`'a\'b'`) は意図的に解釈しない。**
+/// MySQL は既定でこれを解釈するが、NO_BACKSLASH_ESCAPES を有効にした環境では
+/// 解釈しない。どちらか一方に決め打ちすると、
+/// - エスケープを解釈する側に倒す → NO_BACKSLASH_ESCAPES の環境で
+///   `SELECT 'a\'; DROP TABLE t; --'` のセミコロン以降をリテラルとして飲み込み、
+///   複文判定・readonly / 危険文ガードをすり抜けさせてしまう
+/// - 解釈しない側に倒す (現状) → 既定設定の MySQL で `'a\'; b'` のような
+///   リテラルを含む正当なクエリが「複文」と判定されて拒否される
+/// となる。この結果はガードの拒否側 (安全側) なので、後者を選んでいる
+/// (回避したい場合は `''` で引用符をエスケープするか、Writable ON +
+/// allow_dangerous_statements: true にしてガードを外す)。
 /// chars[i] から `--` 行コメントが始まるか。
 ///
 /// MySQL だけは `--` の直後が空白 (制御文字・行末を含む) の時しか行コメントに
@@ -2037,6 +2049,19 @@ mod tests {
             "SELECT 1 # ; DROP TABLE t",
             Engine::MySql
         ));
+        // バックスラッシュのエスケープは解釈しない (scan_sql のコメント参照)。
+        // 既定設定の MySQL では 1 文だが、NO_BACKSLASH_ESCAPES の環境では
+        // 2 文目が実行されるため、拒否側 = 安全側に倒す
+        assert!(contains_multiple_statements(
+            r"SELECT 'a\'; DROP TABLE t; --'",
+            Engine::MySql
+        ));
+        // 二重化によるエスケープは従来どおり 1 つのリテラルとして扱う
+        assert!(!contains_multiple_statements(
+            "SELECT 'a''; still one literal'",
+            Engine::MySql
+        ));
+
         // 他方言は `--` の直後が何であってもコメント
         assert!(!contains_multiple_statements(
             "SELECT 1--1; DROP TABLE t;",
