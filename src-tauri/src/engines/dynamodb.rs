@@ -254,7 +254,14 @@ pub async fn run_query_cancellable(
     }
 
     // readonly / dangerous ガードは SQL 系の共通ロジックを実行前に全文へ適用する。
-    // PartiQL は SELECT / INSERT / UPDATE / DELETE のみなので判定はそのまま使える
+    // PartiQL は SELECT / INSERT / UPDATE / DELETE のみなので判定はそのまま使える。
+    // 複文はガードが 1 文目しか見ないため、ガードが有効なら拒否する
+    // (PartiQL 自体も 1 文しか受け付けないが、判定順を SQL 系と揃えておく)
+    if (readonly != ReadonlyGuard::Off || !allow_dangerous)
+        && crate::db::contains_multiple_statements(sql, Engine::DynamoDb)
+    {
+        return Err(crate::db::multi_statement_block_error());
+    }
     if readonly != ReadonlyGuard::Off && !is_readonly_allowed(sql, Engine::DynamoDb) {
         return Err(readonly_block_error(readonly));
     }

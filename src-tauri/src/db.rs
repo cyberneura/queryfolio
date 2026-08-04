@@ -807,6 +807,14 @@ pub async fn run_statements(
                 "Only UPDATE statements can be applied from the results grid.".into(),
             ));
         }
+        // 複文はガードをすり抜けるため、ガードが有効なら拒否する
+        // (run_query_on と同じ理由。`UPDATE ... WHERE ...; DROP TABLE t;` は
+        // 先頭が update で where もあるため、両方のガードを通過してしまう)
+        if (readonly != ReadonlyGuard::Off || !allow_dangerous)
+            && contains_multiple_statements(sql, engine)
+        {
+            return Err(multi_statement_block_error());
+        }
         if readonly != ReadonlyGuard::Off && !is_readonly_allowed(sql, engine) {
             return Err(readonly_block_error(readonly));
         }
@@ -936,6 +944,20 @@ async fn run_query_on(
             return Err(AppError::Readonly(reason));
         }
     }
+    // 複文 (`;` 区切り) は 1 文目だけを見るガードをすり抜ける。
+    // `SELECT 1; DELETE FROM t;` は先頭が select なので is_readonly_allowed を、
+    // `UPDATE t SET x=1 WHERE id=1; DROP TABLE t;` は where があるので
+    // dangerous_reason を通過してしまう。一方、実行経路のドライバは複文を
+    // そのまま実行する (SQLite は fetch 経路でも、Postgres / MySQL は引数なしの
+    // execute 経路 = 単純問い合わせプロトコルで通る)。
+    // そのためガードが有効な接続では複文自体を拒否する。両方のガードを外して
+    // いる接続では従来どおり複文を許すので、スクリプトの貼り付け実行は壊れない。
+    if (readonly != ReadonlyGuard::Off || !allow_dangerous)
+        && contains_multiple_statements(sql, engine)
+    {
+        return Err(multi_statement_block_error());
+    }
+
     if readonly != ReadonlyGuard::Off && !is_readonly_allowed(sql, engine) {
         return Err(readonly_block_error(readonly));
     }
@@ -1374,6 +1396,13 @@ pub fn build_explain_sql(engine: &str, sql: &str) -> Result<String, AppError> {
             "Explain is available only for SELECT / WITH statements".into(),
         ));
     }
+    // EXPLAIN のプレフィックスが効くのは 1 文目だけで、`SELECT 1; DROP TABLE t;`
+    // の 2 文目以降はそのまま実行される。EXPLAIN に複文を渡す用途も無いため拒否する。
+    if contains_multiple_statements(sql, engine) {
+        return Err(AppError::Explain(
+            "Explain is available only for a single statement".into(),
+        ));
+    }
     // EXPLAIN ANALYZE は対象文を実際に実行するため、先頭が SELECT / WITH
     // でも書き込みを伴い得る文 (SELECT INTO / CTE 付き DML) は対象外にする
     // (is_readonly_allowed と同じ保守的な単語判定を流用する)
@@ -1442,6 +1471,29 @@ pub(crate) fn contains_returning(sql: &str) -> bool {
 /// 弱点: SELECT に副作用のある関数 (nextval 等) や CALL のプロシージャ内の
 /// 書き込み、括弧形の設定 PRAGMA (`PRAGMA journal_mode(WAL)` 等) までは
 /// 防げない。あくまで事故防止のガードである。
+/// `;` 区切りの複文かどうかを判定する。
+///
+/// 文字列リテラル・コメントは scan_sql が除去済みの cleaned を見るため、
+/// `SELECT 'a;b'` のようなリテラル内のセミコロンには反応しない。
+/// 末尾のセミコロン (`SELECT 1;`) は 1 文として扱う。
+pub(crate) fn contains_multiple_statements(sql: &str, engine: Engine) -> bool {
+    let cleaned = scan_sql(sql, engine).cleaned;
+    cleaned.trim_end().trim_end_matches(';').contains(';')
+}
+
+/// ガードが有効な接続で複文が渡された時のエラー。
+/// 解除の手順まで書く (どちらのガードが効いているかは呼び出し側で分かるが、
+/// 複文はその両方をすり抜けるため、判定としては 1 つにまとめている)。
+pub(crate) fn multi_statement_block_error() -> AppError {
+    AppError::Readonly(
+        "Multiple statements are not allowed while the read-only / safety guard is on. \
+         Run one statement at a time, or turn Writable on and set \
+         \"allow_dangerous_statements: true\" for this connection in config. \
+         Statement was not executed."
+            .into(),
+    )
+}
+
 pub(crate) fn is_readonly_allowed(sql: &str, engine: Engine) -> bool {
     if !is_fetch_statement(sql) {
         return false;
@@ -1585,10 +1637,10 @@ pub(crate) fn agent_rejection_reason(sql: &str, engine: Engine) -> Option<String
     }
     // 複文はドライバ次第で通ることがあり、1 文目だけを見るガードを
     // すり抜けうるため、エージェント経路では一律に拒否する
-    let cleaned = scan_sql(sql, engine).cleaned;
-    if cleaned.trim_end().trim_end_matches(';').contains(';') {
+    if contains_multiple_statements(sql, engine) {
         return Some("The assistant may only run one statement at a time; rejected.".to_string());
     }
+    let cleaned = scan_sql(sql, engine).cleaned;
     // EXPLAIN ANALYZE は対象文を実際に実行する。is_readonly_allowed は中身の
     // DML / INTO しか見ないため、`EXPLAIN (ANALYZE) CREATE TABLE x AS SELECT ...`
     // のような DDL がすり抜ける。エージェントに実行を伴う EXPLAIN は不要なので
@@ -1910,6 +1962,62 @@ mod tests {
         assert!(agent_rejection_reason("EXPLAIN SELECT 1", Engine::Postgres).is_none());
         // リテラル内のセミコロンは複文ではない
         assert!(f("SELECT 'a; b' FROM t").is_none());
+    }
+
+    #[test]
+    fn test_contains_multiple_statements() {
+        let f = |s: &str| contains_multiple_statements(s, Engine::Sqlite);
+        // 1 文 (末尾のセミコロン有無は問わない)
+        assert!(!f("SELECT 1"));
+        assert!(!f("SELECT 1;"));
+        assert!(!f("SELECT 1;  "));
+        assert!(!f("SELECT 1;\n"));
+        // 複文
+        assert!(f("SELECT 1; DELETE FROM t"));
+        assert!(f("SELECT 1; DELETE FROM t;"));
+        assert!(f("UPDATE t SET x = 1 WHERE id = 1; DROP TABLE t;"));
+        // リテラル・コメント内のセミコロンには反応しない
+        assert!(!f("SELECT 'a; b' FROM t"));
+        assert!(!f("SELECT 1 -- ; not a statement"));
+        assert!(!f("/* ; */ SELECT 1"));
+        // ドル引用 (Postgres) の中身も cleaned から除去される
+        assert!(!contains_multiple_statements(
+            "SELECT $$a; b$$",
+            Engine::Postgres
+        ));
+    }
+
+    /// 複文でガードをすり抜けられないこと。
+    ///
+    /// is_readonly_allowed / dangerous_reason は先頭キーワードしか見ないため、
+    /// これらの文は単体では「許可」と判定される。ガードが有効な接続では
+    /// run_query_on / run_statements が複文の時点で拒否することで防いでいる。
+    #[test]
+    fn test_multi_statement_bypasses_keyword_guards() {
+        // readonly ガードは 1 文目が SELECT なので通してしまう
+        assert!(is_readonly_allowed(
+            "SELECT 1; DELETE FROM t;",
+            Engine::Sqlite
+        ));
+        assert!(contains_multiple_statements(
+            "SELECT 1; DELETE FROM t;",
+            Engine::Sqlite
+        ));
+
+        // 危険文ガードは 1 文目に WHERE があるので通してしまう
+        assert!(dangerous_reason(
+            "UPDATE t SET x = 1 WHERE id = 1; DROP TABLE t;",
+            Engine::Sqlite
+        )
+        .is_none());
+        assert!(contains_multiple_statements(
+            "UPDATE t SET x = 1 WHERE id = 1; DROP TABLE t;",
+            Engine::Sqlite
+        ));
+
+        // EXPLAIN は 1 文目にしか効かないため、組み立て時点で拒否する
+        assert!(build_explain_sql("sqlite", "SELECT 1; DROP TABLE t;").is_err());
+        assert!(build_explain_sql("sqlite", "SELECT 1;").is_ok());
     }
 
     #[test]
