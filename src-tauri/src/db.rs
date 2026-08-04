@@ -1208,6 +1208,14 @@ pub async fn list_schemas(
 }
 
 /// SQL の先頭キーワード (コメントを除く) を小文字で返す。
+///
+/// 方言を受け取らないため、ここでは `/*! ... */` も通常のブロックコメントとして
+/// 読み飛ばす。MySQL ではこれがサーバーに実行されるが、方言依存の解釈をこの
+/// 共通パーサーに入れると、`/*!` が本当にコメントである他方言で
+/// `/*! SELECT 1 */ DROP TABLE t` の先頭キーワードを select と誤読し、
+/// readonly / 危険文ガードが DROP を見落とす (逆向きの穴になる)。
+/// MySQL の実行コメントは scan_sql が cleaned に残すので、そちらを見る
+/// dangerous_reason 側で拾う。
 pub(crate) fn leading_keyword(sql: &str) -> String {
     let mut rest = sql;
     loop {
@@ -1218,16 +1226,6 @@ pub(crate) fn leading_keyword(sql: &str) -> String {
         }
         if let Some(after) = rest.strip_prefix('#') {
             rest = after.split_once('\n').map(|(_, r)| r).unwrap_or("");
-            continue;
-        }
-        // MySQL の実行コメント (`/*! ... */` / `/*!50110 ... */`) はサーバーが
-        // SQL として実行するので、コメントとして読み飛ばさずマーカーだけ外す
-        // (`/*! DROP TABLE t */` の先頭キーワードは drop)。
-        // engine を受け取らない関数なので方言で分けていないが、`/*!` を使わない
-        // 他方言で誤ってこの形を書いても、先頭キーワードが解釈できずガードが
-        // 厳しくなる (拒否側に倒れる) だけで穴にはならない。
-        if let Some(after) = rest.strip_prefix("/*!") {
-            rest = after.trim_start_matches(|c: char| c.is_ascii_digit());
             continue;
         }
         if let Some(after) = rest.strip_prefix("/*") {
@@ -1613,6 +1611,20 @@ pub(crate) fn dangerous_reason(sql: &str, engine: Engine) -> Option<&'static str
             .any(|word| word == target)
     };
     let kw = leading_keyword(sql);
+    // 先頭がコメントだけで終わる場合 (leading_keyword が空) は、cleaned の先頭語を
+    // 先頭キーワードとして扱う。MySQL の実行コメント (`/*! DROP TABLE t */`) は
+    // scan_sql が中身を cleaned に残すため、これで drop を拾える。
+    // 実行コメントを持たない方言では cleaned にも中身が残らないので、この分岐は
+    // 「コメントだけの入力」で空のままになり、判定は変わらない。
+    let kw = if kw.is_empty() {
+        cleaned
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .find(|word| !word.is_empty())
+            .unwrap_or("")
+            .to_string()
+    } else {
+        kw
+    };
 
     // EXPLAIN ANALYZE / EXPLAIN (ANALYZE) は対象文を実際に実行するため、
     // ラップされた DML も危険判定の対象にする。ANALYZE 無しの EXPLAIN は
@@ -2112,9 +2124,9 @@ mod tests {
             "UPDATE t SET x=1 WHERE id=1; /*! DROP TABLE t */",
             Engine::MySql
         ));
-        // 先頭キーワードも中身から取る (バージョン指定付きも同じ)
-        assert_eq!(leading_keyword("/*! DROP TABLE t */"), "drop");
-        assert_eq!(leading_keyword("/*!50110 DROP TABLE t */"), "drop");
+        // 先頭が実行コメントでも危険文として拾う (leading_keyword は方言を
+        // 受け取らないため空を返すが、dangerous_reason が cleaned から補う)
+        assert_eq!(leading_keyword("/*! DROP TABLE t */"), "");
         assert!(dangerous_reason("/*! DROP TABLE t */", Engine::MySql).is_some());
         assert!(dangerous_reason("/*!50110 TRUNCATE TABLE t */", Engine::MySql).is_some());
         assert!(!is_readonly_allowed("/*! DELETE FROM t */", Engine::MySql));
@@ -2129,11 +2141,24 @@ mod tests {
             Engine::MySql
         ));
         assert!(dangerous_reason("SELECT 1 /* DROP TABLE t */", Engine::MySql).is_none());
-        // scan_sql 側は MySQL のみ対象なので、他方言では従来どおりコメント
+        // scan_sql 側は MySQL のみ対象なので、他方言では従来どおりコメント。
+        // 逆に leading_keyword を方言非依存で実行コメント対応にすると、
+        // 他方言で `/*! SELECT 1 */ DROP TABLE t` の先頭を select と誤読して
+        // DROP を見落とすため、共通パーサーは変更していない
         assert!(!contains_multiple_statements(
             "UPDATE t SET x=1 WHERE id=1; /*! DROP TABLE t */",
             Engine::Postgres
         ));
+        assert_eq!(leading_keyword("/*! SELECT 1 */ DROP TABLE t"), "drop");
+        assert!(dangerous_reason("/*! SELECT 1 */ DROP TABLE t", Engine::Sqlite).is_some());
+        assert!(dangerous_reason("/*! SELECT 1 */ DROP TABLE t", Engine::Postgres).is_some());
+        assert!(!is_readonly_allowed(
+            "/*! SELECT 1 */ DROP TABLE t",
+            Engine::Sqlite
+        ));
+        // コメントだけの入力は従来どおり対象外
+        assert!(dangerous_reason("-- only comment", Engine::MySql).is_none());
+        assert!(dangerous_reason("/* just a comment */", Engine::Postgres).is_none());
         // 実行コメント内の LIMIT も見えるので auto LIMIT は付けない
         assert!(!should_auto_limit(
             "SELECT * FROM t /*! LIMIT 5 */",
