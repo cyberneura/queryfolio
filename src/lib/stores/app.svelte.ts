@@ -919,36 +919,34 @@ const moveFileToConnection = async (
   if (fromConnection === toConnection) {
     return false;
   }
-  // 対象ファイルを開いているタブがあれば、**移動する前に**未保存内容を確定させる。
-  // 移動後に保存すると、移動元のパスにファイルが作り直されてしまう。
-  // 移動後はタブを閉じる (下記) ので、ここで保存しそこねた編集は失われる。
-  // そのためデバウンス待ちの分 (flushPendingSave) だけでなく、対象タブが dirty
-  // なら明示的に保存し、保存できなければ移動そのものを中止する。
+  // 対象ファイルを開いているタブは、**移動する前に**保存して閉じる。順序が要点:
+  // - 移動してから保存すると、移動元のパスにファイルが作り直されてしまう。
+  // - 保存だけして開いたままにすると、移動の I/O を待つ間に打った文字が
+  //   「移動後のファイルにも UI にも無い」状態で消える。閉じてしまえばその窓が無い。
+  //
+  // removeEditorTab(save=true) は、保存に失敗した場合と保存中にさらに編集された
+  // 場合にタブを閉じずに戻る (自動保存の予約解除も中でやる)。閉じ切れなかったら
+  // 移動そのものを中止する。移動先の接続で開き直すのはユーザーに委ねる —
+  // タブの接続を差し替えると、プール / SSH トンネルの参照 (maybeDisconnectIfIdle)
+  // と噛み合わなくなる。
   const openedTabs = editorTabs.filter(
     (t) => t.connection === fromConnection && t.file === fileName,
   );
-  if (openedTabs.length > 0) {
-    if (!(await flushPendingSave())) {
-      return false;
-    }
-    for (const tab of openedTabs) {
-      if (tab.dirty && !(await saveEditorTab(tab))) {
-        return false;
-      }
-    }
+  for (const tab of openedTabs) {
+    await removeEditorTab(tab.id, true);
+  }
+  if (
+    editorTabs.some(
+      (t) => t.connection === fromConnection && t.file === fileName,
+    )
+  ) {
+    return false;
   }
   try {
     await api.moveQueryFile(fromConnection, toConnection, fileName);
   } catch (e) {
     errorMessage = toErrorMessage(e);
     return false;
-  }
-  // 開いていたタブは閉じる (移動でファイルはこの接続のものではなくなった)。
-  // 保存は上で済ませてあるので、ここでは保存しない (save=false)。
-  // 移動先の接続で開き直すのはユーザーに委ねる — タブの接続を差し替えると、
-  // プール / SSH トンネルの参照 (maybeDisconnectIfIdle) と噛み合わなくなる。
-  for (const tab of openedTabs) {
-    await removeEditorTab(tab.id, false);
   }
   // タブを閉じる過程で接続が切り替わっていなければ一覧を更新する
   if (selectedConnection === fromConnection) {

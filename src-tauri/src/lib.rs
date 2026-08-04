@@ -843,6 +843,16 @@ async fn move_query_file(
             "Cannot move a .{from_ext} file to \"{to_connection}\": it uses .{to_ext} files"
         )));
     }
+    // 別の接続でもクエリファイルの保存フォルダは同じことがある
+    // (folder_name の明示指定、または host/engine/schema/user が同じ場合)。
+    // 移動しても同じ場所なので、成功として返さずここで知らせる。成功にすると
+    // フロントがタブを閉じて "Moved" と出すのに、ファイルは移動元の一覧に
+    // 残ったままになる。
+    if from.sqlfiles_folder_name() == to.sqlfiles_folder_name() {
+        return Err(AppError::QueryFile(format!(
+            "\"{to_connection}\" shares the same query file folder as \"{from_connection}\": the file is already there"
+        )));
+    }
     let moved = query_files::move_query_file(
         &state.resolve_sqlfiles_dir().await?,
         &from.sqlfiles_folder_name(),
