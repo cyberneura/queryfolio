@@ -1248,23 +1248,6 @@ pub(crate) struct SqlScan {
     pub(crate) body_end: usize,
 }
 
-/// エンジンごとのコメント・クォート規則で SQL を 1 パス走査する。
-/// - 文字列リテラル: ' " ` (二重化エスケープ対応)。Postgres はドル引用
-///   ($tag$ ... $tag$) にも対応 (# は Postgres では XOR 演算子なので
-///   コメント扱いしない)
-/// - コメント: -- と /* */。MySQL は # 行コメントも対象
-///
-/// **バックスラッシュによるエスケープ (`'a\'b'`) は意図的に解釈しない。**
-/// MySQL は既定でこれを解釈するが、NO_BACKSLASH_ESCAPES を有効にした環境では
-/// 解釈しない。どちらか一方に決め打ちすると、
-/// - エスケープを解釈する側に倒す → NO_BACKSLASH_ESCAPES の環境で
-///   `SELECT 'a\'; DROP TABLE t; --'` のセミコロン以降をリテラルとして飲み込み、
-///   複文判定・readonly / 危険文ガードをすり抜けさせてしまう
-/// - 解釈しない側に倒す (現状) → 既定設定の MySQL で `'a\'; b'` のような
-///   リテラルを含む正当なクエリが「複文」と判定されて拒否される
-/// となる。この結果はガードの拒否側 (安全側) なので、後者を選んでいる
-/// (回避したい場合は `''` で引用符をエスケープするか、Writable ON +
-/// allow_dangerous_statements: true にしてガードを外す)。
 /// chars[i] から `--` 行コメントが始まるか。
 ///
 /// MySQL だけは `--` の直後が空白 (制御文字・行末を含む) の時しか行コメントに
@@ -1286,6 +1269,23 @@ fn is_dash_comment_start(chars: &[char], i: usize, mysql: bool) -> bool {
         .is_none_or(|next| next.is_whitespace() || next.is_control())
 }
 
+/// エンジンごとのコメント・クォート規則で SQL を 1 パス走査する。
+/// - 文字列リテラル: ' " ` (二重化エスケープ対応)。Postgres はドル引用
+///   ($tag$ ... $tag$) にも対応 (# は Postgres では XOR 演算子なので
+///   コメント扱いしない)
+/// - コメント: -- と /* */。MySQL は # 行コメントも対象
+///
+/// **バックスラッシュによるエスケープ (`'a\'b'`) は意図的に解釈しない。**
+/// MySQL は既定でこれを解釈するが、NO_BACKSLASH_ESCAPES を有効にした環境では
+/// 解釈しない。どちらか一方に決め打ちすると、
+/// - エスケープを解釈する側に倒す → NO_BACKSLASH_ESCAPES の環境で
+///   `SELECT 'a\'; DROP TABLE t; --'` のセミコロン以降をリテラルとして飲み込み、
+///   複文判定・readonly / 危険文ガードをすり抜けさせてしまう
+/// - 解釈しない側に倒す (現状) → 既定設定の MySQL で `'a\'; b'` のような
+///   リテラルを含む正当なクエリが「複文」と判定されて拒否される
+/// となる。この結果はガードの拒否側 (安全側) なので、後者を選んでいる
+/// (回避したい場合は `''` で引用符をエスケープするか、Writable ON +
+/// allow_dangerous_statements: true にしてガードを外す)。
 pub(crate) fn scan_sql(sql: &str, engine: Engine) -> SqlScan {
     let hash_comments = matches!(engine, Engine::MySql);
     // MySQL の実行コメント (`/*! ... */`) はサーバーが SQL として解釈・実行する
