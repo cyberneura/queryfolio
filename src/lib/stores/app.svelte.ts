@@ -905,6 +905,59 @@ const renameFile = async (
   }
 };
 
+// クエリファイルを別の接続のフォルダへ移動する (FILES から CONNECTIONS への
+// ドラッグ & ドロップ)。成功したら true、失敗したら errorMessage を設定して false。
+//
+// 移動元 (fromConnection) は**ドラッグを開始した時点の接続**を呼び出し側から
+// 受け取る。selectedConnection を見に行くと、ドラッグ中に接続が切り替わった時に
+// 別接続の同名ファイルを移動してしまう。
+const moveFileToConnection = async (
+  fileName: string,
+  fromConnection: string,
+  toConnection: string,
+): Promise<boolean> => {
+  if (fromConnection === toConnection) {
+    return false;
+  }
+  // 対象ファイルを開いているタブがあれば、**移動する前に**未保存内容を確定させる。
+  // 移動後に保存すると、移動元のパスにファイルが作り直されてしまう。
+  // 移動後はタブを閉じる (下記) ので、ここで保存しそこねた編集は失われる。
+  // そのためデバウンス待ちの分 (flushPendingSave) だけでなく、対象タブが dirty
+  // なら明示的に保存し、保存できなければ移動そのものを中止する。
+  const openedTabs = editorTabs.filter(
+    (t) => t.connection === fromConnection && t.file === fileName,
+  );
+  if (openedTabs.length > 0) {
+    if (!(await flushPendingSave())) {
+      return false;
+    }
+    for (const tab of openedTabs) {
+      if (tab.dirty && !(await saveEditorTab(tab))) {
+        return false;
+      }
+    }
+  }
+  try {
+    await api.moveQueryFile(fromConnection, toConnection, fileName);
+  } catch (e) {
+    errorMessage = toErrorMessage(e);
+    return false;
+  }
+  // 開いていたタブは閉じる (移動でファイルはこの接続のものではなくなった)。
+  // 保存は上で済ませてあるので、ここでは保存しない (save=false)。
+  // 移動先の接続で開き直すのはユーザーに委ねる — タブの接続を差し替えると、
+  // プール / SSH トンネルの参照 (maybeDisconnectIfIdle) と噛み合わなくなる。
+  for (const tab of openedTabs) {
+    await removeEditorTab(tab.id, false);
+  }
+  // タブを閉じる過程で接続が切り替わっていなければ一覧を更新する
+  if (selectedConnection === fromConnection) {
+    files = await api.listQueryFiles(fromConnection);
+  }
+  errorMessage = null;
+  return true;
+};
+
 // クエリファイルの絶対パスをクリップボードへコピーする。成功したら true。
 // 失敗時は errorMessage を設定して false を返す。
 const copyFilePath = async (fileName: string): Promise<boolean> => {
@@ -2261,6 +2314,7 @@ export default {
   createFile,
   deleteFile,
   renameFile,
+  moveFileToConnection,
   copyFilePath,
   saveCurrentFile,
   discardActiveFileConflict,

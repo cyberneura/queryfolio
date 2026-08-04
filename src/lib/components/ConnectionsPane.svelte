@@ -1,6 +1,8 @@
 <script lang="ts">
+  import { toast } from "svelte-sonner";
   import appStore from "$lib/stores/app.svelte";
   import type { ConnectionInfo } from "$lib/api";
+  import { hasFileDragPayload, readFileDragPayload } from "$lib/fileDrag";
 
   const engineLabel = (engine: string): string => {
     switch (engine.toLowerCase()) {
@@ -84,6 +86,60 @@
 
   const TIP_MARGIN = 16;
 
+  /// クエリファイルをドラッグして重ねている接続名 (ドロップ先のハイライト用)
+  let dropTarget = $state<string | null>(null);
+
+  // FILES ペインからドラッグしてきたクエリファイルを受ける。
+  // dragover では dataTransfer の中身を読めないので、種別 (MIME タイプ) だけで
+  // 判定する。移動元と同じ接続には落とさせない (no-op なのでハイライトも出さない)。
+  const canDrop = (e: DragEvent, connection: ConnectionInfo): boolean =>
+    hasFileDragPayload(e.dataTransfer) &&
+    appStore.selectedConnection !== connection.name;
+
+  const handleDragOver = (e: DragEvent, connection: ConnectionInfo) => {
+    if (!canDrop(e, connection)) {
+      return;
+    }
+    // preventDefault しないとドロップが許可されない (HTML の DnD 仕様)
+    e.preventDefault();
+    if (e.dataTransfer) {
+      e.dataTransfer.dropEffect = "move";
+    }
+    dropTarget = connection.name;
+  };
+
+  const handleDragLeave = (connection: ConnectionInfo) => {
+    if (dropTarget === connection.name) {
+      dropTarget = null;
+    }
+  };
+
+  const handleDrop = async (e: DragEvent, connection: ConnectionInfo) => {
+    dropTarget = null;
+    if (!hasFileDragPayload(e.dataTransfer)) {
+      return;
+    }
+    e.preventDefault();
+    const payload = readFileDragPayload(e.dataTransfer);
+    if (!payload || payload.connection === connection.name) {
+      return;
+    }
+    // 移動元はドラッグ開始時の接続 (payload) を使う。ドロップまでの間に
+    // 選択接続が変わっていても、掴んだファイルを取り違えない。
+    const moved = await appStore.moveFileToConnection(
+      payload.fileName,
+      payload.connection,
+      connection.name,
+    );
+    if (moved) {
+      toast.success(`Moved "${payload.fileName}" to ${connection.name}`);
+    } else {
+      toast.error(`Failed to move "${payload.fileName}"`, {
+        description: appStore.errorMessage ?? undefined,
+      });
+    }
+  };
+
   const showTip = (c: ConnectionInfo, e: MouseEvent) => {
     hovered = c;
     setAnchor(e);
@@ -159,12 +215,17 @@
             class="flex w-full flex-col gap-0.5 px-3 py-2 text-left hover:bg-zinc-800 {appStore.selectedConnection ===
             connection.name
               ? 'bg-zinc-800 border-l-2 border-blue-400'
-              : 'border-l-2 border-transparent'}"
+              : 'border-l-2 border-transparent'} {dropTarget === connection.name
+              ? 'bg-blue-500/20 outline outline-1 outline-blue-400'
+              : ''}"
             data-annotate="button-connection-{connection.name}"
             onclick={() => appStore.selectConnection(connection.name)}
             onmouseenter={(e) => showTip(connection, e)}
             onmousemove={(e) => hovered && setAnchor(e)}
             onmouseleave={hideTip}
+            ondragover={(e) => handleDragOver(e, connection)}
+            ondragleave={() => handleDragLeave(connection)}
+            ondrop={(e) => void handleDrop(e, connection)}
           >
             <span class="truncate text-sm text-zinc-200">{connection.name}</span>
             <span class="flex items-center gap-1 text-xs text-zinc-500">

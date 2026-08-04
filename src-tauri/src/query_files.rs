@@ -413,6 +413,84 @@ pub fn rename_query_file(
     Ok(new_normalized)
 }
 
+/// クエリファイルを別の接続のフォルダへ移動し、正規化されたファイル名を返す。
+/// 移動元と移動先が同じフォルダを指す場合は no-op で名前を返す
+/// (別々の接続でも folder_name が同じなら同じフォルダになりうる)。
+///
+/// 拡張子はエンジンごとに違うので、呼び出し側 (lib.rs) が移動元と移動先で
+/// 同じであることを確認してから呼ぶ。ここでは 1 つの ext として扱う。
+pub fn move_query_file(
+    sqlfiles_dir: &Path,
+    from_connection: &str,
+    to_connection: &str,
+    file_name: &str,
+    ext: &str,
+) -> Result<String, AppError> {
+    let normalized = normalize_file_name(file_name, ext)?;
+    let from_dir = connection_dir(sqlfiles_dir, from_connection)?;
+    let to_dir = connection_dir(sqlfiles_dir, to_connection)?;
+
+    // 存在確認は同一フォルダの判定より先に行う。後にすると、存在しない
+    // ファイルの移動が「成功」として返ってしまう。
+    let from_path = from_dir.join(&normalized);
+    if !from_path.exists() {
+        return Err(AppError::QueryFile(format!(
+            "File not found: {}",
+            from_path.display()
+        )));
+    }
+    if from_dir == to_dir {
+        return Ok(normalized);
+    }
+
+    fs::create_dir_all(&to_dir)?;
+
+    // 大文字小文字だけが違う同名ファイルを先に弾く (case-insensitive FS の実挙動
+    // と揃え、rename_query_file の判定とも一致させる)。列挙に失敗したら
+    // 「衝突なし」とはみなさずエラーにする (見落としたまま移動しない)。
+    let lower = normalized.to_ascii_lowercase();
+    for entry in fs::read_dir(&to_dir)? {
+        let Ok(name) = entry?.file_name().into_string() else {
+            continue;
+        };
+        if name.to_ascii_lowercase() == lower {
+            return Err(AppError::QueryFile(format!(
+                "A file with the same name already exists at the destination: {normalized}"
+            )));
+        }
+    }
+
+    // **移動先の名前を atomic に予約してから rename する。**
+    // Unix の rename は移動先が存在しても黙って置き換えるため、上の存在確認と
+    // rename の間に同名ファイルが作られると (並行した移動・外部からの作成)
+    // そのファイルを失う。O_EXCL の作成なら「無ければ作る」が atomic なので、
+    // 予約に成功した = その名前は自分のものだと確定できる。
+    let to_path = to_dir.join(&normalized);
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&to_path)
+    {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(AppError::QueryFile(format!(
+                "A file with the same name already exists at the destination: {normalized}"
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    // 移動元・移動先とも sqlfiles_dir の直下なので同一ファイルシステムになり、
+    // rename が使える (EXDEV でのコピー + 削除のフォールバックは不要)。
+    // ここで置き換えられるのは自分が予約した空ファイルだけ。
+    if let Err(e) = fs::rename(&from_path, &to_path) {
+        // 予約した空ファイルを残さない (残すと次の移動が衝突で失敗し続ける)
+        let _ = fs::remove_file(&to_path);
+        return Err(e.into());
+    }
+    Ok(normalized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,6 +776,62 @@ mod tests {
         let files = list_query_files(&dir, connection, "sql").unwrap();
         assert!(files.iter().any(|f| f.eq_ignore_ascii_case("report.sql")));
         assert!(!files.contains(&"Report.sql".to_string()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_move_query_file() {
+        let dir = test_dir().join("move");
+        let from = "from-conn";
+        let to = "to-conn";
+
+        create_query_file(&dir, from, "report", "sql").unwrap();
+        write_query_file(&dir, from, "report", "SELECT 1;", "sql").unwrap();
+
+        // 移動先フォルダがまだ無くても作られる。内容は保持される
+        assert_eq!(
+            move_query_file(&dir, from, to, "report", "sql").unwrap(),
+            "report.sql"
+        );
+        assert!(list_query_files(&dir, from, "sql").unwrap().is_empty());
+        assert_eq!(list_query_files(&dir, to, "sql").unwrap(), vec!["report.sql"]);
+        assert_eq!(
+            read_query_file(&dir, to, "report", "sql").unwrap(),
+            "SELECT 1;"
+        );
+
+        // 移動元に無いファイルはエラー (同一フォルダ指定でも成功にしない)
+        assert!(move_query_file(&dir, from, to, "report", "sql").is_err());
+        assert!(move_query_file(&dir, from, from, "report", "sql").is_err());
+
+        // 移動先に同名があればエラー (移動元は残る)
+        create_query_file(&dir, from, "report", "sql").unwrap();
+        assert!(move_query_file(&dir, from, to, "report", "sql").is_err());
+        assert_eq!(
+            list_query_files(&dir, from, "sql").unwrap(),
+            vec!["report.sql"]
+        );
+        // 大文字小文字違いも同名扱い (移動元と移動先は別フォルダなので、
+        // case-insensitive な FS でも両方を作れる)
+        create_query_file(&dir, from, "Sales", "sql").unwrap();
+        create_query_file(&dir, to, "sales", "sql").unwrap();
+        assert!(move_query_file(&dir, from, to, "Sales", "sql").is_err());
+
+        // 同じフォルダへの移動は no-op (別接続でも folder_name が同じことがある)
+        assert_eq!(
+            move_query_file(&dir, from, from, "report", "sql").unwrap(),
+            "report.sql"
+        );
+        assert_eq!(
+            read_query_file(&dir, from, "report", "sql").unwrap(),
+            ""
+        );
+
+        // パストラバーサルは拒否
+        assert!(move_query_file(&dir, from, "../evil", "report", "sql").is_err());
+        assert!(move_query_file(&dir, "../evil", to, "report", "sql").is_err());
+        assert!(move_query_file(&dir, from, to, "../evil", "sql").is_err());
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -822,6 +822,40 @@ async fn rename_query_file(
     query_files::rename_query_file(&dir, &folder, &old_name, &new_name, ext)
 }
 
+/// クエリファイルを別の接続のフォルダへ移動する (FILES から CONNECTIONS への
+/// ドラッグ & ドロップ)。正規化された移動後のファイル名を返す。
+#[tauri::command]
+async fn move_query_file(
+    state: tauri::State<'_, AppState>,
+    from_connection: String,
+    to_connection: String,
+    file_name: String,
+) -> Result<String, AppError> {
+    let from = state.find_server(&from_connection).await?;
+    let to = state.find_server(&to_connection).await?;
+    let from_ext = engines::capabilities_for_name(&from.engine).file_extension;
+    let to_ext = engines::capabilities_for_name(&to.engine).file_extension;
+    // クエリファイルの拡張子はエンジンごとに違う (.sql / .redis / .es)。
+    // 拡張子が変わる移動は、移動先の一覧に出てこないファイルを作るだけなので
+    // 受け付けない (勝手に拡張子を付け替えると中身と食い違う)。
+    if from_ext != to_ext {
+        return Err(AppError::QueryFile(format!(
+            "Cannot move a .{from_ext} file to \"{to_connection}\": it uses .{to_ext} files"
+        )));
+    }
+    let moved = query_files::move_query_file(
+        &state.resolve_sqlfiles_dir().await?,
+        &from.sqlfiles_folder_name(),
+        &to.sqlfiles_folder_name(),
+        &file_name,
+        from_ext,
+    )?;
+    // 移動先フォルダが新規作成された場合があるので、接続の説明メタファイルを
+    // 書き出す (ベストエフォート: メタ書き込みの失敗で移動を壊さない)。
+    let _ = state.refresh_folder_meta(&to).await;
+    Ok(moved)
+}
+
 /// 接続先サーバー上の database (スキーマ) 一覧を返す。
 #[tauri::command]
 async fn list_schemas(
@@ -1950,6 +1984,7 @@ pub fn run() {
             create_query_file,
             delete_query_file,
             rename_query_file,
+            move_query_file,
             list_schemas,
             set_active_schema,
             get_active_schema,
