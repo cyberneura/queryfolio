@@ -286,15 +286,17 @@ Two keys control this (queryfolio extensions):
 |-----------|--------------|----------------------|-------------------|
 | `disable` | no (never) | – | – |
 | `prefer` (default) | no (falls back) | no | no |
-| `require` | yes | no\* | no |
+| `require` | yes | no | no |
 | `verify-ca` | yes | yes | no |
 | `verify-full` | yes | yes | yes |
 
-\* **PostgreSQL only**: with `require`, if `ssl_root_cert` is also set, the
-driver verifies the certificate as if `verify-ca` had been requested (this
-matches libpq). On MySQL, `require` never verifies. If you set `ssl_root_cert`,
-prefer being explicit with `verify-ca` / `verify-full` so both engines behave
-the same.
+`require` only prevents the plaintext fallback — **it never verifies the
+certificate**, so it does not stop a man in the middle. (libpq treats
+`require` + a root CA like `verify-ca`, but the driver used here, sqlx 0.8,
+always accepts invalid certificates below `verify-ca`.) Because the root CA
+would be silently ignored, **setting `ssl_root_cert` together with `disable` /
+`prefer` / `require` is a configuration error** — pick `verify-ca` or
+`verify-full` instead.
 
 Use `ssl_root_cert` to point at a root CA certificate (PEM) when the server uses
 a private CA (for example the RDS bundle); it must be a readable file. On MySQL,

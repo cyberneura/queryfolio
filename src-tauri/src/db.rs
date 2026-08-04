@@ -478,17 +478,13 @@ fn default_port(engine: Engine) -> u16 {
 }
 
 /// ssl_root_cert のパスを展開して返す (未設定なら None)。
-/// 存在しないパスは接続時の分かりにくいエラーになる前にここで弾く。
+/// 値の妥当性 (空文字・検証しないモードとの併記) は ServerConfig 側で検証し、
+/// ここではファイルとして開ける形かを見る
+/// (存在しないパスは接続時の分かりにくいエラーになる前に弾く)。
 fn ssl_root_cert_path(server: &ServerConfig) -> Result<Option<PathBuf>, AppError> {
-    let Some(raw) = server.ssl_root_cert.as_deref().map(str::trim) else {
+    let Some(raw) = server.sql_ssl_root_cert()? else {
         return Ok(None);
     };
-    if raw.is_empty() {
-        return Err(AppError::Config(format!(
-            "Server '{}': ssl_root_cert is empty",
-            server.name
-        )));
-    }
     let path = expand_tilde(raw);
     // ディレクトリを渡されると sqlx 側で分かりにくい読み込みエラーになるので、
     // 通常ファイルであることまで確かめる

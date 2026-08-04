@@ -348,8 +348,10 @@ pub enum SqlSslMode {
     Prefer,
     /// TLS を必須にする。証明書は検証しない
     /// (経路の盗聴は防げるが、中間者は防げない)。
-    /// ただし Postgres は libpq に合わせて、ssl_root_cert を指定していれば
-    /// VerifyCa 相当の検証を行う (MySQL は検証しない)
+    /// libpq は ssl_root_cert があれば verify-ca 相当になるが、**sqlx 0.8 は
+    /// Require を必ず accept_invalid_certs で扱う** (sqlx-postgres の
+    /// connection/tls.rs) ため、ルート CA を渡しても検証されない。
+    /// 検証したい場合は verify-ca / verify-full を明示する必要がある
     Require,
     /// TLS を必須にし、サーバー証明書が信頼された CA のものか検証する
     VerifyCa,
@@ -406,6 +408,36 @@ impl ServerConfig {
                 self.name, other
             ))),
         }
+    }
+
+    /// ssl_root_cert の設定値を返す (未設定なら None)。
+    ///
+    /// 検証を行わないモード (disable / prefer / require) と併記されている場合は
+    /// エラーにする。sqlx は検証しないモードでルート CA を**黙って無視する**ため、
+    /// 「CA を指定したのだから検証されている」という誤解を放置すると、中間者を
+    /// 受け入れたまま安全だと思い込むことになる。
+    pub fn sql_ssl_root_cert(&self) -> Result<Option<&str>, AppError> {
+        let Some(raw) = self.ssl_root_cert.as_deref().map(str::trim) else {
+            return Ok(None);
+        };
+        if raw.is_empty() {
+            return Err(AppError::Config(format!(
+                "Server '{}': ssl_root_cert is empty",
+                self.name
+            )));
+        }
+
+        let mode = self.sql_ssl_mode()?;
+        if !matches!(mode, SqlSslMode::VerifyCa | SqlSslMode::VerifyFull) {
+            return Err(AppError::Config(format!(
+                "Server '{}': ssl_root_cert is ignored with ssl_mode: {} \
+                 (the certificate is not verified). Use ssl_mode: verify-ca or \
+                 verify-full to verify it, or remove ssl_root_cert.",
+                self.name,
+                mode.as_str()
+            )));
+        }
+        Ok(Some(raw))
     }
 
     /// クエリファイルの保存フォルダ名を返す。
@@ -1966,6 +1998,35 @@ servers:
         assert!(s.sql_ssl_mode().is_err());
         s.ssl_mode = Some("".into());
         assert!(s.sql_ssl_mode().is_err());
+    }
+
+    /// ssl_root_cert は検証を行うモードでしか意味を持たない。
+    /// sqlx は検証しないモードでルート CA を黙って無視するため、
+    /// 併記された設定は「検証されている」という誤解を生む。エラーで気付かせる。
+    #[test]
+    fn test_sql_ssl_root_cert_requires_verifying_mode() {
+        let mut s = server_with(None, Some("h"), "postgres", Some("db"), Some("u"));
+        s.ssl_root_cert = Some("~/certs/ca.pem".into());
+
+        // 検証しないモードとの併記はエラー
+        assert!(s.sql_ssl_root_cert().is_err()); // 既定 = prefer
+        s.ssl_mode = Some("require".into());
+        assert!(s.sql_ssl_root_cert().is_err());
+        s.ssl_mode = Some("disable".into());
+        assert!(s.sql_ssl_root_cert().is_err());
+
+        // 検証するモードなら通る
+        s.ssl_mode = Some("verify-ca".into());
+        assert_eq!(s.sql_ssl_root_cert().unwrap(), Some("~/certs/ca.pem"));
+        s.ssl_mode = None;
+        s.tls = true; // = verify-full
+        assert_eq!(s.sql_ssl_root_cert().unwrap(), Some("~/certs/ca.pem"));
+
+        // 空文字はエラー、未設定は None
+        s.ssl_root_cert = Some("  ".into());
+        assert!(s.sql_ssl_root_cert().is_err());
+        s.ssl_root_cert = None;
+        assert_eq!(s.sql_ssl_root_cert().unwrap(), None);
     }
 
     /// ConnectionInfo の sql_ssl_mode は SQL 系エンジンだけに載る

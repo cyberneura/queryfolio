@@ -40,7 +40,10 @@ servers:
   # tls: true         → ssl_mode 省略時の既定が verify-full になる
   # ssl_mode:         → disable / prefer / require / verify-ca / verify-full
   #                      (tls より優先。MySQL の verify-full は VerifyIdentity)
-  # ssl_root_cert:    → 自己署名 CA を使う場合のルート証明書 (PEM)。~ 展開あり
+  # ssl_root_cert:    → 自己署名 CA を使う場合のルート証明書 (PEM)。~ 展開あり。
+  #                      検証しないモード (disable / prefer / require) と併記すると
+  #                      黙って無視されるため設定エラーにしている
+  #                      (verify-ca / verify-full を指定すること)
   #
   # SSH トンネル経由の接続は接続先が 127.0.0.1 になるため、verify-full は
   # 証明書のホスト名検証で失敗する。トンネル自体が暗号化されているので
