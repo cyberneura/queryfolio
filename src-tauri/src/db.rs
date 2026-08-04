@@ -1245,6 +1245,27 @@ pub(crate) struct SqlScan {
 ///   ($tag$ ... $tag$) にも対応 (# は Postgres では XOR 演算子なので
 ///   コメント扱いしない)
 /// - コメント: -- と /* */。MySQL は # 行コメントも対象
+/// chars[i] から `--` 行コメントが始まるか。
+///
+/// MySQL だけは `--` の直後が空白 (制御文字・行末を含む) の時しか行コメントに
+/// ならない。`SELECT 1--1` は「1 - (-1)」であってコメントではない。
+/// https://dev.mysql.com/doc/refman/8.4/en/ansi-diff-comments.html
+///
+/// ここを他方言と同じ扱いにすると、`SELECT 1--1; DROP TABLE t;` のセミコロン以降を
+/// 丸ごとコメントとして落としてしまい、複文判定 (contains_multiple_statements) と
+/// readonly / 危険文ガードが、MySQL が実際に実行する 2 文目を見落とす。
+fn is_dash_comment_start(chars: &[char], i: usize, mysql: bool) -> bool {
+    if chars.get(i) != Some(&'-') || chars.get(i + 1) != Some(&'-') {
+        return false;
+    }
+    if !mysql {
+        return true;
+    }
+    chars
+        .get(i + 2)
+        .is_none_or(|next| next.is_whitespace() || next.is_control())
+}
+
 pub(crate) fn scan_sql(sql: &str, engine: Engine) -> SqlScan {
     let hash_comments = matches!(engine, Engine::MySql);
     // DuckDB はドル引用に対応しており方言は Postgres 相当
@@ -1312,7 +1333,7 @@ pub(crate) fn scan_sql(sql: &str, engine: Engine) -> SqlScan {
                 advance!();
                 body_end = byte_pos;
             }
-        } else if c == '-' && i + 1 < chars.len() && chars[i + 1] == '-' {
+        } else if is_dash_comment_start(&chars, i, hash_comments) {
             while i < chars.len() && chars[i] != '\n' {
                 advance!();
             }
@@ -1984,6 +2005,46 @@ mod tests {
         assert!(!contains_multiple_statements(
             "SELECT $$a; b$$",
             Engine::Postgres
+        ));
+    }
+
+    /// MySQL の `--` は直後が空白の時だけ行コメント。
+    /// ここを他方言と同じにすると `SELECT 1--1; DROP TABLE t;` の 2 文目が
+    /// コメント扱いで消え、複文判定もガードもすり抜ける。
+    #[test]
+    fn test_mysql_dash_comment_requires_whitespace() {
+        assert!(contains_multiple_statements(
+            "SELECT 1--1; DROP TABLE t;",
+            Engine::MySql
+        ));
+        // `--;` も直後が空白でないためコメントではない (安全側 = 複文として検出)
+        assert!(contains_multiple_statements(
+            "SELECT 1 --; DROP TABLE t;",
+            Engine::MySql
+        ));
+        // 空白付き / 行末の `--` は従来どおりコメント
+        assert!(!contains_multiple_statements(
+            "SELECT 1 -- ; DROP TABLE t;",
+            Engine::MySql
+        ));
+        assert!(!contains_multiple_statements("SELECT 1 --", Engine::MySql));
+        assert!(is_readonly_allowed(
+            "SELECT * FROM t -- delete\n",
+            Engine::MySql
+        ));
+        // MySQL の # 行コメントは従来どおり
+        assert!(!contains_multiple_statements(
+            "SELECT 1 # ; DROP TABLE t",
+            Engine::MySql
+        ));
+        // 他方言は `--` の直後が何であってもコメント
+        assert!(!contains_multiple_statements(
+            "SELECT 1--1; DROP TABLE t;",
+            Engine::Postgres
+        ));
+        assert!(!contains_multiple_statements(
+            "SELECT 1--1; DROP TABLE t;",
+            Engine::Sqlite
         ));
     }
 
