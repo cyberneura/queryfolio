@@ -150,6 +150,14 @@ pub async fn run_query_cancellable(
         }
     }
 
+    // 複文はガードをすり抜ける (1 文目しか見ないため)。db.rs の run_query_on と
+    // 同じく、ガードが有効な接続では複文自体を拒否する。
+    if (readonly != ReadonlyGuard::Off || !allow_dangerous)
+        && crate::db::contains_multiple_statements(sql, Engine::DuckDb)
+    {
+        return Err(crate::db::multi_statement_block_error());
+    }
+
     // メタコマンド変換後の SQL にもガードを適用する (すり抜け防止。
     // 変換結果は読み取り系のみなので常に通るが、順序として明示する)
     if readonly != ReadonlyGuard::Off
