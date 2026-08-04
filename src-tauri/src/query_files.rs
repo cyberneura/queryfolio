@@ -56,12 +56,19 @@ fn file_path(
     Ok(connection_dir(sqlfiles_dir, connection)?.join(file_name))
 }
 
-/// ディレクトリ直下の、拡張子が ext のファイル名を昇順で返す。存在しなければ空。
+/// ディレクトリ直下の、拡張子が ext のファイル名を**降順**で返す。存在しなければ空。
 /// (list_query_files と search_query_files で列挙条件を共有し、
 ///  隠しファイル/拡張子判定/ソートが片方だけズレるのを防ぐ)
+///
 /// dot 始まりの隠しファイルは除外する。validate_component が dot 始まりの名前を
 /// 拒否する (= CRUD で開けない) のと一貫させ、手動配置された隠しファイルの中身が
 /// 検索プレビューから漏れないようにする。
+///
+/// 降順にしているのは「新しいファイルを一覧の上に出す」ため。既定のファイル名は
+/// `YYYYMMDD-HHMM` 形式で、名前順がそのまま時系列になるよう作られている
+/// (FilesPane の defaultFileName)。したがって名前の降順 = 新しい順になる。
+/// 更新日時ではなく名前を基準にするのは、保存のたびに並びが入れ替わって
+/// 作業中に一覧が跳ねるのを避けるため。
 fn list_query_file_names(dir: &Path, ext: &str) -> Result<Vec<String>, AppError> {
     if !dir.exists() {
         return Ok(vec![]);
@@ -74,11 +81,28 @@ fn list_query_file_names(dir: &Path, ext: &str) -> Result<Vec<String>, AppError>
         .filter(|name| !name.starts_with('.'))
         .filter(|name| name.to_ascii_lowercase().ends_with(&suffix))
         .collect();
-    names.sort();
+    // 降順 (新しいものが先頭)。比較は**拡張子を除いた部分**で行う。
+    //
+    // 拡張子を付けたまま比べると、同じ分に作られた連番ファイル
+    // ("20260804-1200.sql" と "20260804-1200-02.sql") の順序が逆になる:
+    // '.' (0x2E) > '-' (0x2D) なので、降順では古い無印の方が先に来てしまう。
+    // 拡張子を落とせば "20260804-1200-02" > "20260804-1200" (前方一致する
+    // 短い方が小さい) となり、作成順どおり新しいものが先頭に来る。
+    //
+    // 全要素が suffix で終わることは上の filter が保証しており、suffix は
+    // ASCII なので、末尾 suffix.len() バイトを落とす位置は必ず文字境界になる。
+    let ext_len = suffix.len();
+    names.sort_unstable_by(|a, b| {
+        let a_stem = &a[..a.len() - ext_len];
+        let b_stem = &b[..b.len() - ext_len];
+        // stem が同じになるのは拡張子の大文字小文字だけが違う場合。
+        // 並びを決定的にするため、その時は名前全体で決める。
+        b_stem.cmp(a_stem).then_with(|| b.cmp(a))
+    });
     Ok(names)
 }
 
-/// 接続のクエリファイル一覧を返す (名前昇順)。
+/// 接続のクエリファイル一覧を返す (名前降順 = 新しいものが先頭)。
 pub fn list_query_files(
     sqlfiles_dir: &Path,
     connection: &str,
@@ -101,7 +125,7 @@ pub struct FileSearchHit {
 /// プレビュー行の最大文字数 (これを超えたら末尾を省略記号にする)。
 const PREVIEW_MAX_CHARS: usize = 120;
 
-/// 検索結果の最大件数。名前昇順で先頭からこの数で打ち切る
+/// 検索結果の最大件数。名前降順 (新しい順) で先頭からこの数で打ち切る
 /// (モーダルの一覧を短く保ち、多数ファイル環境での読み取りコストも抑える)。
 const MAX_SEARCH_HITS: usize = 50;
 
@@ -117,7 +141,7 @@ fn truncate_preview(line: &str) -> String {
 
 /// 接続のクエリファイルをファイル名・中身で検索する。
 /// 大文字小文字を区別しない部分一致。中身は最初に一致した行をプレビューとして返す。
-/// 名前昇順で、名前一致または中身一致したファイルのみ返す。
+/// 名前降順 (新しい順) で、名前一致または中身一致したファイルのみ返す。
 /// (rg/grep のような外部プロセスは使わない。クエリファイルは少数のため
 ///  純 Rust で読み取る方が堅牢で、外部依存・インジェクション面も持たない)
 pub fn search_query_files(
@@ -151,7 +175,7 @@ pub fn search_query_files(
                 name_match,
                 content_preview,
             });
-            // 名前昇順で先頭から上限まで。以降のファイルは読まずに打ち切る
+            // 名前降順 (新しい順) で先頭から上限まで。以降のファイルは読まずに打ち切る
             if hits.len() >= MAX_SEARCH_HITS {
                 break;
             }
@@ -392,6 +416,40 @@ mod tests {
         assert_eq!(
             list_query_files(&dir, connection, "sql").unwrap(),
             vec!["other.sql"]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_list_query_files_sorts_newest_first() {
+        let dir = test_dir().join("order");
+        let connection = "order-conn";
+
+        // 既定のファイル名は YYYYMMDD-HHMM なので、名前の降順 = 新しい順になる。
+        // 作成順と無関係に並ぶことを見るため、わざと時系列とズラして作る。
+        // 末尾の -02 / -10 は同一分内に複数作った時の連番 (FilesPane)。
+        // 拡張子を含めて比較すると無印が連番より前に来てしまうため、その退行も見る。
+        create_query_file(&dir, connection, "20260101-0900", "sql").unwrap();
+        create_query_file(&dir, connection, "20260315-1830", "sql").unwrap();
+        create_query_file(&dir, connection, "20260102-1200", "sql").unwrap();
+        create_query_file(&dir, connection, "20260102-1200-02", "sql").unwrap();
+        create_query_file(&dir, connection, "20260102-1200-10", "sql").unwrap();
+
+        let expected = vec![
+            "20260315-1830.sql",
+            "20260102-1200-10.sql",
+            "20260102-1200-02.sql",
+            "20260102-1200.sql",
+            "20260101-0900.sql",
+        ];
+        assert_eq!(list_query_files(&dir, connection, "sql").unwrap(), expected);
+
+        // 検索結果も同じ並び (列挙を list_query_file_names で共有しているため)
+        let hits = search_query_files(&dir, connection, "2026", "sql").unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.file_name.as_str()).collect::<Vec<_>>(),
+            expected
         );
 
         let _ = fs::remove_dir_all(&dir);

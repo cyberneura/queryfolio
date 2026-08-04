@@ -24,7 +24,8 @@
   const fileSuffix = $derived(`.${appStore.selectedFileExtension}`);
 
   // デフォルトのファイル名: YYYYMMDD-HHMM (拡張子はバックエンドが付与)。
-  // 日付が先頭にあると名前順ソートが時系列になり探しやすい。
+  // 日付が先頭にあると名前順ソートが時系列になり探しやすい。一覧は名前の降順
+  // (query_files.rs の list_query_file_names) なので、新しいファイルほど上に出る。
   // 同一分内の連続作成で衝突しないよう、既存ファイルと重複する場合は
   // -2, -3 ... を付けて一意化する。
   const defaultFileName = () => {
@@ -36,11 +37,14 @@
     if (!appStore.files.includes(`${base}${fileSuffix}`)) {
       return base;
     }
+    // 連番は 2 桁ゼロ埋め (-02, -03 ...)。一覧は名前の降順なので、ゼロ埋めしないと
+    // "-10" が "-9" より前に並び、同一分内で作成順とズレる。
+    const withSeq = (i: number) => `${base}-${String(i).padStart(2, "0")}`;
     let n = 2;
-    while (appStore.files.includes(`${base}-${n}${fileSuffix}`)) {
+    while (appStore.files.includes(`${withSeq(n)}${fileSuffix}`)) {
       n++;
     }
-    return `${base}-${n}`;
+    return withSeq(n);
   };
 
   const submitNewFile = async () => {
