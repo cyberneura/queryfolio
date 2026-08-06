@@ -471,8 +471,8 @@ async fn run_query(
     let started = std::time::Instant::now();
 
     let result = async {
-        // \c <database> は SQL の実行ではなく接続状態の変更なので、
-        // プールを取得する前にここで処理する。
+        // \c <database> と USE <database> は SQL の実行ではなく接続状態の
+        // 変更なので、プールを取得する前にここで処理する。
         // (メタコマンドの解釈エラーもここで出すことで、失敗として履歴に残る)
         let engine = db::parse_engine(&server.engine)?;
         if let Some(meta_commands::MetaCommand::Connect(schema)) =
@@ -523,7 +523,7 @@ async fn run_query(
     result
 }
 
-/// `\c <database>` の実処理。アクティブスキーマを切り替え、切替後の接続で
+/// `\c <database>` / `USE <database>` の実処理。アクティブスキーマを切り替え、切替後の接続で
 /// 確認用のクエリを実行して結果として返す (空の結果だと成功が分かりにくいため)。
 ///
 /// 切替に失敗した場合 (存在しない database 等) は元のスキーマへ戻す。

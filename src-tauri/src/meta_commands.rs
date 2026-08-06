@@ -11,13 +11,18 @@ pub enum MetaCommand {
     Connect(String),
 }
 
-/// psql 風メタコマンド (\l, \dt など) を解釈する。
+/// psql 風メタコマンド (\l, \dt など) と `USE <database>` を解釈する。
 ///
-/// 大半は読み取り系のカタログ照会 SQL に変換する。`\c <schema>` だけは
-/// SQL ではなくアクティブスキーマの切り替えを表す MetaCommand::Connect を返す。
+/// 大半は読み取り系のカタログ照会 SQL に変換する。`\c <schema>` と
+/// `USE <database>` だけは SQL ではなくアクティブスキーマの切り替えを表す
+/// MetaCommand::Connect を返す。
 /// \i (ファイル実行) のようなその他の状態を持つコマンドは対象外。
-/// 入力がメタコマンドでなければ None、未対応のメタコマンドはエラーを返す。
+/// 入力がメタコマンドでも `USE` でもなければ None、未対応のメタコマンドは
+/// エラーを返す。
 pub fn translate(engine: Engine, input: &str) -> Result<Option<MetaCommand>, AppError> {
+    if let Some(command) = translate_use(engine, input)? {
+        return Ok(Some(command));
+    }
     let trimmed = input.trim();
     if !trimmed.starts_with('\\') {
         return Ok(None);
@@ -56,6 +61,77 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
         Engine::Redis | Engine::Elasticsearch | Engine::DynamoDb => unreachable!(),
     };
     Ok(Some(MetaCommand::Sql(sql)))
+}
+
+/// `USE <database>` を `\c <database>` と同じアクティブスキーマの切り替えとして
+/// 解釈する。対象外の入力には None を返す (通常の SQL として実行される)。
+///
+/// `USE` をそのまま DB へ投げても切り替わらない: MySQL の `USE` はセッション
+/// 単位の変更で、プールの別のコネクションに当たる次のクエリには効かない。
+/// 加えて `USE` は fetch 系の文でないため readonly ガードにも弾かれる。
+/// `\c` と同じ MetaCommand::Connect にすればプールを張り直すのでどちらも解決する
+/// (切り替え自体は書き込みではないので readonly 接続でも許してよい)。
+///
+/// PostgreSQL に `USE` 文は無い (素で実行すれば構文エラー) が、MySQL の癖で
+/// 打たれることが多いため同じく切り替えとして受け付ける。sqlite / duckdb は
+/// `\c` 自体が非対応 (schema が DB ファイルパス) なので対象にしない。
+/// DuckDB の `USE` はネイティブに動くため、そのまま実行させる。
+fn translate_use(engine: Engine, input: &str) -> Result<Option<MetaCommand>, AppError> {
+    if !matches!(engine, Engine::MySql | Engine::Postgres) {
+        return Ok(None);
+    }
+    // 先頭キーワードの判定は leading_keyword と揃える (先頭のコメントは読み飛ばす)
+    let rest = crate::db::strip_leading_comments(input);
+    let keyword_end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    if !rest[..keyword_end].eq_ignore_ascii_case("use") {
+        return Ok(None);
+    }
+    // 末尾のセミコロン・コメント (`USE mydb; -- switch`) を落とした本体だけを見る。
+    // 方言ごとのコメント規則を書き直さないよう scan_sql の body_end を使う。
+    // body_end は input 基準の byte 位置なので、キーワードの終端も input 基準へ直す
+    // (キーワード自身は code なので body_end はその後ろにあるが、万一そうでなければ
+    //  引数無しとして扱われ「切り替えない」側に倒れる)
+    let arg_start = input.len() - rest.len() + keyword_end;
+    let body_end = crate::db::scan_sql(input, engine).body_end;
+    let after = input.get(arg_start..body_end).unwrap_or("");
+    // `USE db; SELECT 1` のような複文は、切り替えだけ行って 2 文目を黙って
+    // 捨てることになるため拒否する (末尾のセミコロンは body_end が落としているので、
+    // ここに残る `;` は 2 文目がある証拠)
+    if after.contains(';') {
+        return Err(AppError::Config(
+            "USE cannot be combined with another statement \
+             (run one statement at a time)"
+                .into(),
+        ));
+    }
+    let mut parts = after.split_whitespace();
+    let Some(name) = parts.next() else {
+        return Err(AppError::Config(
+            "USE requires a database name (usage: USE <database>)".into(),
+        ));
+    };
+    if parts.next().is_some() {
+        return Err(AppError::Config(
+            "USE takes only a database name (usage: USE <database>)".into(),
+        ));
+    }
+    let name = unquote_database_name(engine, name);
+    Ok(Some(MetaCommand::Connect(
+        validate_database_name(name)?.to_string(),
+    )))
+}
+
+/// `USE` の引数に付いた識別子クォートを外す。MySQL は `` ` ``、PostgreSQL は
+/// `"` がクォート文字。`USE \`my-db\`` のように方言として正しい書き方を
+/// そのまま受け付けるため。外した中身は validate_database_name で検証する
+/// (クォート内のエスケープを使う名前は非対応)。
+fn unquote_database_name(engine: Engine, name: &str) -> &str {
+    let quote = if engine == Engine::MySql { '`' } else { '"' };
+    name.strip_prefix(quote)
+        .and_then(|inner| inner.strip_suffix(quote))
+        .unwrap_or(name)
 }
 
 /// `\c <schema>` の引数を検証する。
@@ -458,6 +534,102 @@ mod tests {
         assert!(translate(Engine::Postgres, "\\c a;b").is_err());
         assert!(translate(Engine::Postgres, "\\c my.db").is_err());
         assert!(translate(Engine::MySql, "\\c `db`").is_err());
+    }
+
+    #[test]
+    fn test_use_switches_database() {
+        // USE は \c と同じアクティブスキーマの切り替えとして扱う
+        // (セッション単位の USE ではプールの次のコネクションに効かないため)
+        assert_eq!(
+            translate(Engine::MySql, "USE chatbot_backend;")
+                .unwrap()
+                .unwrap(),
+            MetaCommand::Connect("chatbot_backend".to_string())
+        );
+        // 小文字・大文字混在・前後の空白・改行も同じ
+        assert_eq!(
+            translate(Engine::MySql, "  use  2024_logs  \n")
+                .unwrap()
+                .unwrap(),
+            MetaCommand::Connect("2024_logs".to_string())
+        );
+        // PostgreSQL に USE 文は無いが、MySQL の癖で打たれるので受け付ける
+        assert_eq!(
+            translate(Engine::Postgres, "Use otherdb").unwrap().unwrap(),
+            MetaCommand::Connect("otherdb".to_string())
+        );
+        // 先頭のコメントは leading_keyword と同じく読み飛ばす
+        assert_eq!(
+            translate(Engine::MySql, "-- switch\nUSE mydb")
+                .unwrap()
+                .unwrap(),
+            MetaCommand::Connect("mydb".to_string())
+        );
+        // 末尾のコメントも本体の外なので無視する (scan_sql の body_end)
+        assert_eq!(
+            translate(Engine::MySql, "USE mydb; -- switch to backend")
+                .unwrap()
+                .unwrap(),
+            MetaCommand::Connect("mydb".to_string())
+        );
+        assert_eq!(
+            translate(Engine::Postgres, "USE mydb /* switch */")
+                .unwrap()
+                .unwrap(),
+            MetaCommand::Connect("mydb".to_string())
+        );
+    }
+
+    #[test]
+    fn test_use_accepts_quoted_database_name() {
+        // 方言のクォート付き (MySQL の `db`) はそのまま受け付ける
+        assert_eq!(
+            translate(Engine::MySql, "USE `my-db`").unwrap().unwrap(),
+            MetaCommand::Connect("my-db".to_string())
+        );
+        assert_eq!(
+            translate(Engine::Postgres, "USE \"mydb\"")
+                .unwrap()
+                .unwrap(),
+            MetaCommand::Connect("mydb".to_string())
+        );
+        // 方言違いのクォートは外さないので、識別子として不正になる
+        assert!(translate(Engine::MySql, "USE \"mydb\"").is_err());
+        assert!(translate(Engine::Postgres, "USE `mydb`").is_err());
+    }
+
+    #[test]
+    fn test_use_argument_errors() {
+        let err = translate(Engine::MySql, "USE").unwrap_err();
+        assert!(err.to_string().contains("requires a database name"));
+        assert!(translate(Engine::MySql, "USE ;").is_err());
+        // 複文は切り替えだけ行って 2 文目を捨てることになるので拒否する
+        let err = translate(Engine::MySql, "USE mydb; DELETE FROM t").unwrap_err();
+        assert!(err.to_string().contains("one statement at a time"));
+        assert!(translate(Engine::MySql, "USE mydb;DELETE FROM t").is_err());
+        assert!(translate(Engine::MySql, "USE a;b").is_err());
+        // database 名より後ろに余分な引数があるものも拒否する
+        let err = translate(Engine::MySql, "USE mydb other").unwrap_err();
+        assert!(err.to_string().contains("takes only a database name"));
+        // MySQL の実行コメントはサーバーが実行するのでコメント扱いにしない
+        // (黙って切り替えだけ行い中身を捨ててはいけない)
+        assert!(translate(Engine::MySql, "USE mydb /*! DROP TABLE t */").is_err());
+        // 識別子として不自然な名前は弾く
+        assert!(translate(Engine::MySql, "USE my.db").is_err());
+    }
+
+    #[test]
+    fn test_use_is_not_intercepted_for_other_engines() {
+        // sqlite / duckdb は \c 自体が非対応。duckdb の USE はネイティブに
+        // 動くため、通常の SQL として実行させる (None を返す)
+        assert!(translate(Engine::Sqlite, "USE mydb").unwrap().is_none());
+        assert!(translate(Engine::DuckDb, "USE mydb").unwrap().is_none());
+        assert!(translate(Engine::Redis, "USE mydb").unwrap().is_none());
+        // USE で始まる別の識別子を切り替えと誤読しない
+        assert!(translate(Engine::MySql, "USER_TABLE").unwrap().is_none());
+        assert!(translate(Engine::MySql, "SELECT * FROM t USE INDEX (i)")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

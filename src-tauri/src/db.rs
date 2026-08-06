@@ -964,13 +964,15 @@ async fn run_query_on(
 ) -> Result<QueryResult, AppError> {
     let engine = conn.engine();
     // psql 風メタコマンド (\l, \dt など) はカタログ照会 SQL に変換して実行する。
-    // \c (スキーマ切替) は SQL にならないため、ここへ来る前に lib.rs の
-    // run_query が処理している
+    // \c / USE (スキーマ切替) は SQL にならないため、ここへ来る前に lib.rs の
+    // run_query が処理している。エージェント経路 (ReadonlyGuard::Agent) は
+    // run_query を通らないため、切替をここで拒否することになる (接続状態を
+    // 変える操作はエージェントに許していない)
     let translated = match crate::meta_commands::translate(engine, sql)? {
         Some(crate::meta_commands::MetaCommand::Sql(sql)) => Some(sql),
         Some(crate::meta_commands::MetaCommand::Connect(_)) => {
             return Err(AppError::Config(
-                "\\c must be handled before the query runs".into(),
+                "Switching the active database (\\c / USE) is not available here".into(),
             ));
         }
         None => None,
@@ -1266,6 +1268,20 @@ pub async fn list_schemas(
 /// MySQL の実行コメントは scan_sql が cleaned に残すので、そちらを見る
 /// dangerous_reason 側で拾う。
 pub(crate) fn leading_keyword(sql: &str) -> String {
+    strip_leading_comments(sql)
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// 先頭の空白とコメント (`--` / `#` / `/* */`) を読み飛ばした残りを返す。
+///
+/// 方言の扱い (`/*! ... */` を通常のコメントとして読み飛ばすこと) と、その
+/// 理由は leading_keyword のコメントを参照。先頭キーワードの判定だけでなく、
+/// キーワードより後ろの部分を切り出す用途 (meta_commands の `USE <database>`)
+/// でも使う。
+pub(crate) fn strip_leading_comments(sql: &str) -> &str {
     let mut rest = sql;
     loop {
         rest = rest.trim_start();
@@ -1283,10 +1299,7 @@ pub(crate) fn leading_keyword(sql: &str) -> String {
         }
         break;
     }
-    rest.chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect::<String>()
-        .to_ascii_lowercase()
+    rest
 }
 
 /// SQL の走査結果。cleaned はキーワード判定用 (文字列リテラルとコメントを

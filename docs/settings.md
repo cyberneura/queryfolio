@@ -229,7 +229,9 @@ side-effect-free statements run until you turn it on).
   `PRAGMA` like `PRAGMA journal_mode = WAL`, etc.). The check is keyword-based:
   statements whose leading keyword is `SELECT` / `WITH` / `SHOW` / `DESCRIBE` /
   `DESC` / `EXPLAIN` / `VALUES` / `TABLE` / `CALL` / (non-assignment) `PRAGMA`,
-  plus meta commands, are allowed. This is a guard, not a sandbox — it does **not** stop
+  plus meta commands, are allowed. Switching the active database (`\c <database>`
+  or `USE <database>`) is a connection state change rather than a statement, so
+  it is allowed too. This is a guard, not a sandbox — it does **not** stop
   every side effect: a `CALL` to a stored procedure that writes, a SELECT that
   calls a side-effecting function (e.g. `nextval`), or a parenthesized settings
   `PRAGMA` are not blocked. A `readonly` connection shows a lock in the UI and
