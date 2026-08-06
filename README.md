@@ -29,7 +29,7 @@ https://github.com/user-attachments/assets/90439816-49c8-4ebd-a068-b102cfe9c7aa
 - Query cancellation while running
 - Per-connection query history (searchable, stored locally with restrictive file permissions)
 - psql-style meta commands (`\l` `\dt` `\dv` `\dn` `\du` `\d [table]`) translated to catalog queries, with MySQL / SQLite equivalents where possible
-- `\c <database>` switches the active database of the connection (MySQL / PostgreSQL). The pool is rebuilt, and the database selector, schema browser, and SQL completion follow
+- `\c <database>` (or `USE <database>`) switches the active database of the connection (MySQL / PostgreSQL). The pool is rebuilt, and the database selector, schema browser, and SQL completion follow. Both are connection state changes rather than statements, so they work with the Writable switch off
 - `readonly: true` per connection rejects write statements (INSERT / UPDATE / DELETE / DDL, including CTE-wrapped DML) as a safety guard
 - TLS for MySQL / PostgreSQL: `tls: true` requires an encrypted connection **and verifies the server certificate** (`verify-full`); `ssl_mode` (`disable` / `prefer` / `require` / `verify-ca` / `verify-full`) and `ssl_root_cert` give finer control. **Without either, the driver default (`prefer`) applies: it falls back to plaintext when TLS cannot be negotiated and does not verify the certificate** — connections that can end up unencrypted are flagged with a `no tls` badge in the connections list
 - Auto `LIMIT` for SELECTs without one (`default_limit`, default 500)
