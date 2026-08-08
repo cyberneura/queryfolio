@@ -59,14 +59,6 @@
     return rows;
   };
 
-  /// 通信が平文になりうる直接接続か。
-  /// disable は TLS を使わず、prefer (sqlx の既定) は TLS が張れなければ平文へ
-  /// 降格し、張れてもサーバー証明書を検証しない。SSH トンネル経由なら経路自体が
-  /// 暗号化されているので対象外。
-  const isPlaintextRisk = (c: ConnectionInfo) =>
-    !c.has_ssh_tunnel &&
-    (c.sql_ssl_mode === "disable" || c.sql_ssl_mode === "prefer");
-
   /// 設定順を保ったまま、連続する同一グループ名の接続をセクションにまとめる。
   /// group_name が無い接続はヘッダ無しのセクションになる。
   const sections = $derived.by(() => {
@@ -252,12 +244,11 @@
                   data-annotate="badge-readonly-{connection.name}">read-only</span
                 >
               {/if}
-              {#if isPlaintextRisk(connection)}
-                <span
-                  class="rounded bg-orange-500/15 px-1 text-[10px] text-orange-400"
-                  title="The connection may fall back to plaintext and the server certificate is not verified (ssl_mode: {connection.sql_ssl_mode}). Set tls: true (= ssl_mode: verify-full) in config to require TLS and verify the certificate. ssl_mode: require only prevents the plaintext fallback — it still accepts any certificate."
-                  data-annotate="badge-plaintext-{connection.name}">no tls</span
-                >
+              {#if connection.sql_ssl_mode}
+                <!-- 画面には出さない。詳細ツールチップは mouseenter でしか開かない
+                     ため、バッヂを消すとキーボード / スクリーンリーダーからは TLS の
+                     状態を知る手段が無くなる。警告ではなく値そのものを読ませる。 -->
+                <span class="sr-only">TLS: {connection.sql_ssl_mode}</span>
               {/if}
             </span>
             {#if connection.description}

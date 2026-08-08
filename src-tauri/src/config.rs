@@ -2030,7 +2030,7 @@ servers:
     }
 
     /// ConnectionInfo の sql_ssl_mode は SQL 系エンジンだけに載る
-    /// (フロントの "no tls" 表示はこの値で判断する)。
+    /// (フロントは接続の詳細ツールチップにこの値を出す)。
     #[test]
     fn test_connection_info_sql_ssl_mode() {
         let s = server_with(None, Some("h"), "postgres", Some("db"), Some("u"));
