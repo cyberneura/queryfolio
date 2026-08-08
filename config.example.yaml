@@ -34,8 +34,7 @@ servers:
   # prefer は「TLS を試み、張れなければ平文へ降格する。張れてもサーバー証明書を
   # 検証しない」ため、経路上の攻撃者に盗聴・改竄されうる。
   # インターネット越しに直接つなぐ接続 (RDS 等) では必ず tls: true か
-  # ssl_mode を指定すること。接続一覧では平文になりうる接続に "no tls" の
-  # バッジが付く。
+  # ssl_mode を指定すること。接続をホバーすると詳細に TLS の値が出る。
   #
   # tls: true         → ssl_mode 省略時の既定が verify-full になる
   # ssl_mode:         → disable / prefer / require / verify-ca / verify-full
