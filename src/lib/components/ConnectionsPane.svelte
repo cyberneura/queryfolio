@@ -244,6 +244,12 @@
                   data-annotate="badge-readonly-{connection.name}">read-only</span
                 >
               {/if}
+              {#if connection.sql_ssl_mode}
+                <!-- 画面には出さない。詳細ツールチップは mouseenter でしか開かない
+                     ため、バッヂを消すとキーボード / スクリーンリーダーからは TLS の
+                     状態を知る手段が無くなる。警告ではなく値そのものを読ませる。 -->
+                <span class="sr-only">TLS: {connection.sql_ssl_mode}</span>
+              {/if}
             </span>
             {#if connection.description}
               <span class="truncate text-xs text-zinc-500"
