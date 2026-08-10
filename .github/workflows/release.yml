@@ -191,3 +191,74 @@ jobs:
         run: |
           VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
           gh release edit "v${VERSION}" --draft=false --latest
+
+  # 公開後に Homebrew tap (cyberneura/homebrew-tap) の Cask を新バージョンへ更新する。
+  # taskshoot-cli の cargo-dist と同じ運用 (同じ tap、同じ HOMEBREW_TAP_TOKEN 名の PAT)。
+  # Tauri アプリは cargo-dist に乗れないため、Cask の生成とコミットはここで直接行う。
+  # Cask は version と sha256 を直書きするので、この更新を怠ると `brew install` が
+  # 古いバージョンを配り続ける。secret 欠落時は黙ってスキップせず失敗させる
+  # (Release 自体は publish 済みなので、このジョブの失敗が公開を妨げることはない)。
+  homebrew:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Check Homebrew tap token
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::error::Missing repository secret HOMEBREW_TAP_TOKEN (PAT with contents:write on cyberneura/homebrew-tap; same one taskshoot-cli uses). The cask was NOT updated."
+            exit 1
+          fi
+
+      - name: Download released dmg
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          gh release download "v${VERSION}" --pattern '*_universal.dmg' --output queryfolio.dmg
+          echo "DMG_SHA256=$(sha256sum queryfolio.dmg | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Update Homebrew cask
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          cat > queryfolio.rb <<EOF
+          cask "queryfolio" do
+            version "${VERSION}"
+            sha256 "${DMG_SHA256}"
+
+            url "https://github.com/cyberneura/queryfolio/releases/download/v#{version}/QueryFolio_#{version}_universal.dmg"
+            name "QueryFolio"
+            desc "Multi-purpose SQL GUI client"
+            homepage "https://github.com/cyberneura/queryfolio"
+
+            livecheck do
+              url :url
+              strategy :github_latest
+            end
+
+            app "QueryFolio.app"
+
+            zap trash: [
+              "~/.config/queryfolio",
+              "~/Library/Caches/com.cyberneura.queryfolio",
+              "~/Library/Preferences/com.cyberneura.queryfolio.plist",
+              "~/Library/Saved Application State/com.cyberneura.queryfolio.savedState",
+              "~/Library/WebKit/com.cyberneura.queryfolio",
+            ]
+          end
+          EOF
+          # gh api PUT は既存ファイルの更新に現在の blob sha を要求する (初回作成時は不要)。
+          CURRENT_SHA=$(gh api repos/cyberneura/homebrew-tap/contents/Casks/queryfolio.rb -q .sha 2>/dev/null || true)
+          gh api -X PUT repos/cyberneura/homebrew-tap/contents/Casks/queryfolio.rb \
+            -f message="Update queryfolio cask to v${VERSION}" \
+            -f content="$(base64 -w0 queryfolio.rb)" \
+            ${CURRENT_SHA:+-f sha="$CURRENT_SHA"}
