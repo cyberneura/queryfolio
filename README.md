@@ -116,7 +116,15 @@ pnpm tauri build             # release build (macOS: signed with Developer ID vi
 
 See `AGENTS.md` for architecture details.
 
-## Download
+## Install
+
+### Homebrew (macOS)
+
+```shell
+brew install --cask cyberneura/tap/queryfolio
+```
+
+### Manual download
 
 Grab the latest installer from the [Releases page](https://github.com/cyberneura/queryfolio/releases/latest):
 
@@ -147,6 +155,11 @@ secret fails the macOS job up front, so an unsigned or un-notarized build is nev
 published). See the `publish-macos-release` skill (`.claude/skills/publish-macos-release/`)
 for the full runbook, including how to verify the published dmg and the one-time
 signing-secrets setup.
+
+After the Release is published, the `homebrew` job updates the cask in
+[cyberneura/homebrew-tap](https://github.com/cyberneura/homebrew-tap) (`Casks/queryfolio.rb`)
+to the new version. It authenticates with the `HOMEBREW_TAP_TOKEN` repository secret — a PAT
+with `contents: write` on the tap repository, the same token taskshoot-cli uses.
 
 ## License
 
