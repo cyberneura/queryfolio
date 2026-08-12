@@ -21,6 +21,7 @@
   import DangerousConfirmModal from "$lib/components/DangerousConfirmModal.svelte";
   import SearchModal from "$lib/components/SearchModal.svelte";
   import ChatPane from "$lib/components/ChatPane.svelte";
+  import HelpPane from "$lib/components/HelpPane.svelte";
   import PaneDivider from "$lib/components/PaneDivider.svelte";
 
   let showSettings = $state(false);
@@ -116,6 +117,8 @@
   /// AI チャットペインは本文が長いので、サイドバーより広い範囲を許す
   const CHAT_MIN = 240;
   const CHAT_MAX = 720;
+  const HELP_MIN = 260;
+  const HELP_MAX = 720;
   const EDITOR_FRAC_MIN = 0.15;
   const EDITOR_FRAC_MAX = 0.85;
 
@@ -165,6 +168,10 @@
   );
   /// AI チャットペインを開いているか (表示状態も次回起動へ引き継ぐ)
   let showChat = $state(loadLayoutValue("chatOpen", 0) === 1);
+  let helpWidth = $state(
+    clamp(loadLayoutValue("helpWidth", 380), HELP_MIN, HELP_MAX),
+  );
+  let showHelp = $state(loadLayoutValue("helpOpen", 0) === 1);
 
   // ドラッグ開始時の基準サイズ。PaneDivider は開始位置からの累積 delta を
   // 渡すので、基準 + delta で計算するとクランプ飽和後もポインタと同期する
@@ -172,6 +179,7 @@
   let dragBaseSidebar = 0;
   let dragBaseEditorFrac = 0;
   let dragBaseChat = 0;
+  let dragBaseHelp = 0;
 
   const selectedConnectionInfo = $derived(
     appStore.connections.find((c) => c.name === appStore.selectedConnection) ??
@@ -313,6 +321,11 @@
     }}
     onOpenSettings={() => {
       showSettings = true;
+    }}
+    helpOpen={showHelp}
+    onToggleHelp={() => {
+      showHelp = !showHelp;
+      saveLayoutValue("helpOpen", showHelp ? 1 : 0);
     }}
     chatOpen={showChat}
     onToggleChat={() => {
@@ -507,6 +520,32 @@
             saveLayoutValue("chatOpen", 0);
           }}
           onInsert={(sql) => appStore.insertSqlSnippet(sql)}
+        />
+      </div>
+    {/if}
+
+    <!-- ヘルプペイン。チャットペインのさらに右 (最も右) に並ぶ -->
+    {#if showHelp}
+      <PaneDivider
+        direction="vertical"
+        annotate="pane-divider-help"
+        onDragStart={() => {
+          dragBaseHelp = helpWidth;
+        }}
+        onDrag={(delta) => {
+          // 右端のペインなので、ドラッグ方向と幅の増減は逆になる
+          helpWidth = clamp(dragBaseHelp - delta, HELP_MIN, HELP_MAX);
+        }}
+        onDragEnd={() => saveLayoutValue("helpWidth", helpWidth)}
+      />
+      <div class="shrink-0" style="width: {helpWidth}px">
+        <HelpPane
+          engine={selectedEngine}
+          onClose={() => {
+            showHelp = false;
+            saveLayoutValue("helpOpen", 0);
+          }}
+          onInsert={(text) => appStore.insertSqlSnippet(text)}
         />
       </div>
     {/if}
