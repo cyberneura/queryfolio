@@ -660,26 +660,35 @@ async fn fetch_tables_limited(
     let mut start_name: Option<String> = None;
     let mut has_more = false;
     loop {
-        let out = client
-            .client
-            .list_tables()
-            .set_exclusive_start_table_name(start_name.take())
-            .limit(LIST_TABLES_PAGE)
-            .send()
-            .await
-            .map_err(|e| sdk_error("ListTables failed", e))?;
+        // 1 操作ごとの SDK タイムアウトとは別に、一覧全体にも締切を置く。
+        // ページの完了を待ってから経過時間を見るだけでは、締切の直前に終わった
+        // ページの次の要求がまた丸ごと SDK タイムアウトぶん走れてしまうので、
+        // **残り時間を各要求に被せる**。残りが尽きていれば即座に打ち切られる
+        let remaining = REQUEST_TIMEOUT.saturating_sub(started.elapsed());
+        let page = tokio::time::timeout(
+            remaining,
+            client
+                .client
+                .list_tables()
+                .set_exclusive_start_table_name(start_name.take())
+                .limit(LIST_TABLES_PAGE)
+                .send(),
+        )
+        .await;
+        let out = match page {
+            Ok(result) => result.map_err(|e| sdk_error("ListTables failed", e))?,
+            // 締切で打ち切った。集まったぶんを返し、続きがあることを伝える
+            Err(_) => {
+                has_more = true;
+                break;
+            }
+        };
         names.extend(out.table_names.unwrap_or_default());
         start_name = out.last_evaluated_table_name;
         if start_name.is_none() {
             break;
         }
         if names.len() >= limit {
-            has_more = true;
-            break;
-        }
-        // 1 操作ごとの SDK タイムアウトとは別に、一覧全体にも締切を置く。
-        // ここで抜けた場合は続きが残っているので has_more を立てる
-        if started.elapsed() > REQUEST_TIMEOUT {
             has_more = true;
             break;
         }
