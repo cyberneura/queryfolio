@@ -637,7 +637,15 @@ const selectConnection = async (name: string) => {
 
 /// エディタタブをアクティブにする。タブの接続が現在の接続と違えば、その接続へ
 /// 切り替える (files / スキーマ / 補完もタブの接続のものに揃える)。
-const activateEditorTab = async (id: number) => {
+///
+/// @param viaCycle - Ctrl+Tab の巡回から呼ばれたか。巡回以外の経路 (タブの
+///   クリック等) は、進行中の巡回を打ち切って通常の移動として扱う。Ctrl を
+///   押したままタブをクリックされた時に、そのタブを MRU へ載せないまま古い
+///   巡回位置から進み続けるのを防ぐ。
+const activateEditorTab = async (id: number, viaCycle = false) => {
+  if (!viaCycle) {
+    tabCycle = null;
+  }
   if (id === activeEditorTabId) {
     return;
   }
@@ -702,7 +710,7 @@ const cycleEditorTabStep = async (direction: 1 | -1) => {
     return;
   }
   cycle.index = stepCycleIndex(cycle.index, direction, cycle.order.length);
-  await activateEditorTab(cycle.order[cycle.index]);
+  await activateEditorTab(cycle.order[cycle.index], true);
 };
 
 /// Ctrl を離した (または window がフォーカスを失った) 時に巡回を終える。
