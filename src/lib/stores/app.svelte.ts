@@ -179,6 +179,19 @@ const queueTabCycleStep = (step: () => void | Promise<void>): Promise<void> => {
   return tabCycleChain;
 };
 
+/// 巡回の世代。打ち切るたびに進める。**キューに積んだ時点の世代を控え、実行の
+/// 直前に照合する**: 打ち切りは `tabCycle` を null にするだけなので、それだけだと
+/// 既にキューに並んでいたステップが後から走って巡回を作り直してしまう
+/// (ユーザーが明示的に選んだタブから離れる)。
+let tabCycleGeneration = 0;
+
+/// 進行中の巡回を打ち切る (タブのクリック・ファイルを開く・タブを閉じる等、
+/// 巡回以外の移動が起きた時)。
+const cancelTabCycle = () => {
+  tabCycle = null;
+  tabCycleGeneration++;
+};
+
 /// タブを MRU の先頭へ繰り上げる。巡回中は呼ばない (上記の理由)。
 const touchTabMru = (id: number) => {
   tabMruOrder = touchMru(tabMruOrder, id);
@@ -299,7 +312,7 @@ const reloadConnections = async (): Promise<boolean> => {
   activeEditorTabId = null;
   lastActiveTabByConnection.clear();
   tabMruOrder = [];
-  tabCycle = null;
+  cancelTabCycle();
   // 設定リロードでバックエンドは全プール/トンネルを破棄する (resetConnections)。
   // 確立済みフラグもクリアし、次の契機で張り直せるようにする。
   resourcesLoaded.clear();
@@ -618,7 +631,7 @@ const selectConnection = async (name: string) => {
   // 接続を明示的に選ぶのは巡回とは別の操作。巡回中 (Ctrl を押したまま接続を
   // クリックした等) なら、ここで巡回を打ち切ってから通常の移動として扱う
   // (打ち切らないと、以降のステップが古い順序スナップショットで動く)。
-  tabCycle = null;
+  cancelTabCycle();
   // この接続で最後に開いていたタブを復元する (無ければエディタは空表示)
   activeEditorTabId = pickTabForConnection(name);
   if (activeEditorTabId != null) {
@@ -644,7 +657,7 @@ const selectConnection = async (name: string) => {
 ///   巡回位置から進み続けるのを防ぐ。
 const activateEditorTab = async (id: number, viaCycle = false) => {
   if (!viaCycle) {
-    tabCycle = null;
+    cancelTabCycle();
   }
   if (id === activeEditorTabId) {
     return;
@@ -655,7 +668,7 @@ const activateEditorTab = async (id: number, viaCycle = false) => {
   }
   // タブのアクティブ化もナビゲーション。await を挟む処理が「その後にユーザーが
   // 別タブへ移動した」ことを検知できるよう世代を進める。
-  navigationGeneration++;
+  const navGen = ++navigationGeneration;
   // 未保存タブは best-effort で保存するが、保存失敗でもアクティブ化は止めない。
   // (書込不可などで保存に失敗しても未保存 SQL を閲覧・コピーできるようにする。
   //  タブは残るので内容は失われない)
@@ -673,6 +686,12 @@ const activateEditorTab = async (id: number, viaCycle = false) => {
       maybeDisconnectIfIdle(previous);
     }
   }
+  // await の間にユーザーが別のタブ / ファイルへ移動していたら、ここで
+  // activeEditorTabId を書くとその移動を上書きしてしまう。接続切替を伴う
+  // 巡回ステップは特に長く、その最中のクリックがこれに当たる。
+  if (navGen !== navigationGeneration) {
+    return;
+  }
   activeEditorTabId = id;
   lastActiveTabByConnection.set(tab.connection, id);
   if (!tabCycle) {
@@ -683,8 +702,17 @@ const activateEditorTab = async (id: number, viaCycle = false) => {
 /// Ctrl+Tab / Ctrl+Shift+Tab で、履歴 (MRU) 順に 1 つ進む / 戻る。
 /// Ctrl を押しっぱなしで連打すると、その分だけ奥へ進む。
 /// 連打しても順に処理されるよう、ステップはキューに積む。
-const cycleEditorTab = (direction: 1 | -1): Promise<void> =>
-  queueTabCycleStep(() => cycleEditorTabStep(direction));
+const cycleEditorTab = (direction: 1 | -1): Promise<void> => {
+  // キーを押した時点の世代。実行までの間に打ち切られていたら、このステップは
+  // 無かったことにする。
+  const generation = tabCycleGeneration;
+  return queueTabCycleStep(() => {
+    if (generation !== tabCycleGeneration) {
+      return;
+    }
+    return cycleEditorTabStep(direction);
+  });
+};
 
 const cycleEditorTabStep = async (direction: 1 | -1) => {
   if (editorTabs.length === 0) {
@@ -827,6 +855,10 @@ const selectFile = async (fileName: string) => {
       diskContent: content,
     };
     editorTabs = [...editorTabs, tab];
+    // 新しいタブを開くのは明示的な移動。activateEditorTab を通らない経路なので、
+    // 進行中の巡回はここで打ち切る (打ち切らないと、次の Ctrl+Tab がこのタブを
+    // 含まない古いスナップショットの続きから進む)。
+    cancelTabCycle();
     activeEditorTabId = tab.id;
     lastActiveTabByConnection.set(connection, tab.id);
     touchTabMru(tab.id);
@@ -916,7 +948,7 @@ const removeEditorTab = async (id: number, save: boolean) => {
   // 消えた ID が残る。そのまま進むと存在しないタブを選んで 1 回分が空振りするので、
   // 巡回自体を打ち切る (次の Ctrl+Tab は現在のタブ構成で組み直される)。
   if (tabCycle) {
-    tabCycle = null;
+    cancelTabCycle();
   }
   if (lastActiveTabByConnection.get(tab.connection) === id) {
     lastActiveTabByConnection.delete(tab.connection);
