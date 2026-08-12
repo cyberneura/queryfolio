@@ -8,6 +8,9 @@
     /// AI チャットペイン (右) の表示状態と切り替え
     chatOpen: boolean;
     onToggleChat: () => void;
+    /// ヘルプペイン (最も右) の表示状態と切り替え
+    helpOpen: boolean;
+    onToggleHelp: () => void;
   }
 
   let {
@@ -16,6 +19,8 @@
     onOpenSettings,
     chatOpen,
     onToggleChat,
+    helpOpen,
+    onToggleHelp,
   }: Props = $props();
 
   // 実行中は Run ボタンを Cancel ボタンに切り替え、
@@ -118,6 +123,19 @@
       onclick={onToggleChat}
     >
       <i class="bi bi-chat-dots" aria-hidden="true"></i> Chat
+    </button>
+    <!-- ヘルプペイン (最も右) の開閉 -->
+    <button
+      class="flex items-center gap-1 rounded border px-2 py-1 text-xs transition-colors {helpOpen
+        ? 'border-blue-500 bg-blue-600/20 text-blue-300 hover:bg-blue-600/30'
+        : 'border-zinc-600 text-zinc-400 hover:bg-zinc-800'}"
+      title="Toggle the help pane"
+      aria-label="Toggle the help pane"
+      aria-pressed={helpOpen}
+      data-annotate="toggle-help-pane"
+      onclick={onToggleHelp}
+    >
+      <i class="bi bi-question-lg" aria-hidden="true"></i>
     </button>
     <button
       class="rounded border border-zinc-600 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
