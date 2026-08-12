@@ -138,6 +138,20 @@ impl AppState {
     /// config_override_command は 1Password 等の外部コマンドで数秒かかり
     /// Touch ID を要求することもあるため、クエリ実行のたびに走らせない。
     /// reset_connections でクリアされる。
+    /// 起動前の CLI 書き出し (`apply_cli_write_route`) で既にマージ済み設定を
+    /// 解決している場合、それをキャッシュに載せた状態で作る。
+    ///
+    /// `config_override_command` は 1Password 等の外部プロセスを起こすため、
+    /// 1 回の CLI 起動で 2 度実行させない: 遅い / Touch ID が 2 回出るだけでなく、
+    /// 取得結果が変わると**書き込みと読み出しで別のスナップショット**を使うことになり、
+    /// 書いたファイルを開けなくなる (sqlfiles_dir や接続一覧が食い違う)。
+    fn with_config(config: Option<Arc<AppConfig>>) -> Self {
+        Self {
+            config: tokio::sync::Mutex::new(config),
+            ..Default::default()
+        }
+    }
+
     async fn resolve_config(&self) -> Result<Arc<AppConfig>, AppError> {
         let mut cached = self.config.lock().await;
         if let Some(config) = cached.as_ref() {
@@ -234,7 +248,7 @@ impl AppState {
                 // (「queryfolio のデータ保存パスのみ対象」の要件を実体レベルで担保)。
                 let folder = server.sqlfiles_folder_name();
                 let concrete = sqlfiles_dir.join(&folder).join(&target.file_name);
-                verify_within_dir(&sqlfiles_dir, &concrete)?;
+                query_files::verify_within_dir(&sqlfiles_dir, &concrete)?;
                 Ok(target)
             }
             // 接続名 + ファイル名の指定 (CLI の `write`)。**ここでは書き込まない** —
@@ -268,7 +282,7 @@ impl AppState {
                 }
                 // OpenFile と同じ多重防御 (シンボリックリンクで保存領域外を
                 // 指していないか)。
-                verify_within_dir(&sqlfiles_dir, &concrete)?;
+                query_files::verify_within_dir(&sqlfiles_dir, &concrete)?;
                 Ok(router::OpenTarget {
                     connection: server.name.clone(),
                     file_name,
@@ -1698,25 +1712,6 @@ async fn frontend_ready(
     Ok(LaunchResult { targets, errors })
 }
 
-/// `file` をシンボリックリンク解決込みで canonicalize し、`base` (これも
-/// canonicalize したもの) の配下に留まることを確かめる。保存領域外の実体を指す
-/// リンクを弾く多重防御。開く対象は既存ファイルのはずなので、canonicalize
-/// できない (存在しない等) 場合は拒否する。
-fn verify_within_dir(base: &std::path::Path, file: &std::path::Path) -> Result<(), AppError> {
-    let canonical_base = base.canonicalize().map_err(|e| {
-        AppError::QueryFile(format!("Cannot resolve the query files directory: {e}"))
-    })?;
-    let canonical_file = file
-        .canonicalize()
-        .map_err(|e| AppError::QueryFile(format!("Cannot open the file: {e}")))?;
-    if !canonical_file.starts_with(&canonical_base) {
-        return Err(AppError::QueryFile(
-            "The file resolves outside the query files directory".into(),
-        ));
-    }
-    Ok(())
-}
-
 /// 実行中に受け取ったルート (deep link / CLI サブコマンド) を解決し、フロントへ
 /// イベントで届ける。解決は設定の読み取りを伴い async なので、別タスクで行う。
 /// 成功なら `open-query-file` に OpenTarget を、失敗なら `open-query-file-error` に
@@ -1977,18 +1972,24 @@ fn resolve_write_content(arg_content: Option<String>) -> Result<Option<String>, 
 /// 続行して「開く」だけ行うと、書き込みに失敗しているのに古い内容がそのまま開き、
 /// 依頼したエージェントには成功したように見えてしまう (終了ステータスからも
 /// 失敗を判別できない)。
-fn apply_cli_write_route(route: &router::Route) -> Result<(), AppError> {
+///
+/// 解決したマージ済み設定を返す (書き出しを行わなかった場合は `None`)。
+/// 呼び出し側はこれを `AppState` のキャッシュに載せ、`config_override_command` を
+/// 1 回の起動で 2 度実行しないようにする (`AppState::with_config` 参照)。
+fn apply_cli_write_route(
+    route: &router::Route,
+) -> Result<Option<Arc<AppConfig>>, AppError> {
     let router::Route::WriteFile {
         connection,
         file_name,
         content,
     } = route
     else {
-        return Ok(());
+        return Ok(None);
     };
     let content = resolve_write_content(content.clone())?;
     tauri::async_runtime::block_on(async {
-        let config = AppConfig::load_merged().await?;
+        let config = Arc::new(AppConfig::load_merged().await?);
         let servers = config.resolve_servers()?;
         let server = servers
             .iter()
@@ -2027,7 +2028,7 @@ fn apply_cli_write_route(route: &router::Route) -> Result<(), AppError> {
         // (アプリ内の作成・保存と同じ扱い。ベストエフォート)。
         let dir = query_files::connection_dir(&sqlfiles_dir, &folder)?;
         let _ = folder_meta::write_folder_meta(&dir, server);
-        Ok::<(), AppError>(())
+        Ok::<Option<Arc<AppConfig>>, AppError>(Some(config))
     })
 }
 
@@ -2040,17 +2041,24 @@ pub fn run() {
     // 起動時引数だけを見る: 実行中インスタンスが転送されてくる argv を
     // 処理する経路 (single-instance のコールバック) では、その argv は
     // 別プロセスのものなので書き出しは既に済んでいる。
-    {
+    //
+    // ここで解決したマージ済み設定は AppState のキャッシュに引き継ぐ
+    // (config_override_command を 1 起動で 2 度実行しない)。
+    let preflight_config = {
         let argv: Vec<String> = std::env::args().skip(1).collect();
-        if let Some(route) = router::route_from_cli_args(&argv) {
-            if let Err(e) = apply_cli_write_route(&route) {
-                // 書けていないものを開きに行かない。CLI から呼んだ側が
-                // 終了ステータスで失敗を判別できるようにする。
-                eprintln!("[cli] failed to write the query file: {e}");
-                std::process::exit(1);
-            }
+        match router::route_from_cli_args(&argv) {
+            Some(route) => match apply_cli_write_route(&route) {
+                Ok(config) => config,
+                Err(e) => {
+                    // 書けていないものを開きに行かない。CLI から呼んだ側が
+                    // 終了ステータスで失敗を判別できるようにする。
+                    eprintln!("[cli] failed to write the query file: {e}");
+                    std::process::exit(1);
+                }
+            },
+            None => None,
         }
-    }
+    };
 
     tauri::Builder::default()
         // single-instance は最初に登録する (プラグインは登録順に走る)。
@@ -2105,7 +2113,7 @@ pub fn run() {
             }
             _ => {}
         })
-        .manage(AppState::default())
+        .manage(AppState::with_config(preflight_config))
         .setup(|app| {
             use tauri::Manager;
             use tauri_plugin_deep_link::DeepLinkExt;

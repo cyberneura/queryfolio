@@ -446,6 +446,25 @@ pub fn create_query_file(
     Ok(normalized)
 }
 
+/// `file` をシンボリックリンク解決込みで canonicalize し、`base` (これも
+/// canonicalize したもの) の配下に留まることを確かめる。保存領域外の実体を指す
+/// リンクを弾く多重防御。対象は既存ファイルのはずなので、canonicalize
+/// できない (存在しない等) 場合は拒否する。
+pub fn verify_within_dir(base: &Path, file: &Path) -> Result<(), AppError> {
+    let canonical_base = base.canonicalize().map_err(|e| {
+        AppError::QueryFile(format!("Cannot resolve the query files directory: {e}"))
+    })?;
+    let canonical_file = file
+        .canonicalize()
+        .map_err(|e| AppError::QueryFile(format!("Cannot open the file: {e}")))?;
+    if !canonical_file.starts_with(&canonical_base) {
+        return Err(AppError::QueryFile(
+            "The file resolves outside the query files directory".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// クエリファイルが無ければ空で作る (あれば内容はそのまま)。
 /// 正規化されたファイル名を返す。
 ///
@@ -493,6 +512,12 @@ pub fn ensure_query_file(
                     path.display()
                 )));
             }
+            // `metadata` はリンクを辿るため、**保存領域の外にある通常ファイル**を
+            // 指すシンボリックリンクは上の is_file() を通ってしまう。実行中インスタンス
+            // 側は同じ対象を verify_within_dir で拒否するので、ここで通すと
+            // 「CLI は終了ステータス 0 なのにファイルは開かれない」になる。
+            // 開く側と同じ判定をここでも行い、成功の意味を揃える。
+            verify_within_dir(sqlfiles_dir, &path)?;
             Ok(normalized)
         }
         Err(e) => Err(e.into()),
@@ -731,6 +756,29 @@ mod tests {
             )
             .unwrap();
             assert!(ensure_query_file(&dir, connection, "dangling", "sql").is_err());
+        }
+
+        // 保存領域の外にある**実在する通常ファイル**を指すリンク。
+        // metadata はリンクを辿るので is_file() は通ってしまうが、実行中
+        // インスタンス側は verify_within_dir で拒否する。ここで成功にすると
+        // 「CLI は 0 で終わったのにファイルは開かれない」になる。
+        #[cfg(unix)]
+        {
+            let outside = test_dir().join("ensure-non-file-outside");
+            fs::create_dir_all(&outside).unwrap();
+            let target = outside.join("real.sql");
+            fs::write(&target, "SELECT 1;").unwrap();
+            std::os::unix::fs::symlink(&target, conn_dir.join("escaping.sql")).unwrap();
+            assert!(ensure_query_file(&dir, connection, "escaping", "sql").is_err());
+
+            // 保存領域の**中**を指すリンクは、開く側 (verify_within_dir) が
+            // 受け入れるのでこちらも受け入れる (判定を食い違わせない)。
+            let inside = conn_dir.join("inside.sql");
+            fs::write(&inside, "SELECT 1;").unwrap();
+            std::os::unix::fs::symlink(&inside, conn_dir.join("linked.sql")).unwrap();
+            assert!(ensure_query_file(&dir, connection, "linked", "sql").is_ok());
+
+            let _ = fs::remove_dir_all(&outside);
         }
 
         let _ = fs::remove_dir_all(&dir);
