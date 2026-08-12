@@ -253,6 +253,16 @@ pub async fn run_query_cancellable(
         return Err(AppError::Config("The SQL statement is empty".into()));
     }
 
+    // `tables` はテーブル一覧を返す queryfolio 独自の文 (CYBERNEURA-DEV-406)。
+    // PartiQL に SHOW TABLES に相当する構文が無く、DynamoDB へ投げても構文エラーに
+    // なるため、ここで受けて ListTables に流す。ExecuteStatement を経由しない
+    // 純粋な読み取りなので、readonly / dangerous ガードより前に処理してよい
+    // (ガードに掛けると SQL の先頭キーワード判定で fetch 文と見なされず、
+    // Writable OFF の接続で拒否されてしまう)。
+    if is_tables_statement(sql) {
+        return list_tables_query(client, registry, connection_name, max_rows).await;
+    }
+
     // readonly / dangerous ガードは SQL 系の共通ロジックを実行前に全文へ適用する。
     // PartiQL は SELECT / INSERT / UPDATE / DELETE のみなので判定はそのまま使える。
     // 複文はガードが 1 文目しか見ないため、ガードが有効なら拒否する
@@ -556,9 +566,89 @@ fn validate_table_name(name: &str) -> Result<&str, AppError> {
     Ok(name)
 }
 
+/// エディタの入力が `tables` (queryfolio 独自の文) か。
+///
+/// 末尾のセミコロンと前後の空白だけを許し、`tables where ...` のような続きは
+/// 受け付けない (PartiQL の文と紛れないようにするため)。大小は区別しない。
+fn is_tables_statement(sql: &str) -> bool {
+    let trimmed = sql.trim();
+    let body = trimmed.strip_suffix(';').unwrap_or(trimmed);
+    body.trim_end().eq_ignore_ascii_case("tables")
+}
+
+/// `tables` 文の結果 (name / kind の表)。
+///
+/// キャンセルの扱いは PartiQL 経路と揃える (クライアント側で future を打ち切る)。
+async fn list_tables_query(
+    client: &DynamoClient,
+    registry: &CancelRegistry,
+    connection_name: &str,
+    max_rows: usize,
+) -> Result<QueryResult, AppError> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let guard = registry.register(
+        connection_name,
+        CancelTarget::ClientSide {
+            notify: notify.clone(),
+        },
+        cancelled,
+    );
+    let started = Instant::now();
+    let result = tokio::select! {
+        biased;
+        // 表示は max_rows 件まで。truncated の判定に 1 件だけ多く取る
+        result = fetch_tables_limited(client, max_rows.saturating_add(1)) => result,
+        _ = notify.notified() => Err(AppError::Cancelled),
+    };
+    let was_cancelled = guard.was_cancelled();
+    drop(guard);
+    if was_cancelled && result.is_err() {
+        return Err(AppError::Cancelled);
+    }
+    let tables = result?;
+
+    // 他の結果と同じく max_rows で打ち切り、切ったことを truncated で伝える
+    let truncated = tables.len() > max_rows;
+    let rows: Vec<Vec<serde_json::Value>> = tables
+        .into_iter()
+        .take(max_rows)
+        .map(|t| {
+            vec![
+                serde_json::Value::String(t.name),
+                serde_json::Value::String(t.kind),
+            ]
+        })
+        .collect();
+
+    Ok(QueryResult {
+        columns: vec!["name".to_string(), "kind".to_string()],
+        row_count: rows.len(),
+        rows,
+        affected_rows: None,
+        truncated,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        applied_limit: None,
+        switched_schema: None,
+    })
+}
+
 /// テーブル一覧 (スキーマブラウザの TABLES ペイン用)。
 /// ListTables をページネーションで辿り、MAX_TABLES 件で打ち切る。
 pub async fn fetch_tables(client: &DynamoClient) -> Result<Vec<TableInfo>, AppError> {
+    fetch_tables_limited(client, MAX_TABLES).await
+}
+
+/// テーブル一覧を最大 `limit` 件まで取る。
+///
+/// `limit` を分けているのは、`tables` 文が `max_rows` までしか表示しないのに
+/// MAX_TABLES (5,000) 件ぶんの ListTables を叩くのを避けるため
+/// (CYBERNEURA-DEV-406)。ページ単位でしか止められないので、実際の取得数は
+/// LIST_TABLES_PAGE の切り上げになる。
+async fn fetch_tables_limited(
+    client: &DynamoClient,
+    limit: usize,
+) -> Result<Vec<TableInfo>, AppError> {
     let started = Instant::now();
     let mut names: Vec<String> = Vec::new();
     let mut start_name: Option<String> = None;
@@ -573,7 +663,7 @@ pub async fn fetch_tables(client: &DynamoClient) -> Result<Vec<TableInfo>, AppEr
             .map_err(|e| sdk_error("ListTables failed", e))?;
         names.extend(out.table_names.unwrap_or_default());
         start_name = out.last_evaluated_table_name;
-        if start_name.is_none() || names.len() >= MAX_TABLES {
+        if start_name.is_none() || names.len() >= limit {
             break;
         }
         // 1 操作ごとの SDK タイムアウトとは別に、一覧全体にも締切を置く
@@ -581,7 +671,7 @@ pub async fn fetch_tables(client: &DynamoClient) -> Result<Vec<TableInfo>, AppEr
             break;
         }
     }
-    names.truncate(MAX_TABLES);
+    names.truncate(limit);
     Ok(names
         .into_iter()
         .map(|name| TableInfo {
@@ -698,6 +788,28 @@ async fn describe_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `tables` は Writable OFF でも実行できる queryfolio 独自の文
+    /// (CYBERNEURA-DEV-406)。PartiQL の文と紛れないよう、末尾のセミコロンと
+    /// 前後の空白だけを許す。
+    #[test]
+    fn test_is_tables_statement() {
+        for ok in ["tables", "TABLES", " tables ", "tables;", "  Tables ;  "] {
+            assert!(is_tables_statement(ok), "should accept: {ok:?}");
+        }
+        for ng in [
+            "table",
+            "tables where x = 1",
+            "select * from tables",
+            // 複文で別の文を紛れ込ませられないこと
+            "tables; select 1",
+            // セミコロンは 1 個だけ許す
+            "tables;;",
+            "",
+        ] {
+            assert!(!is_tables_statement(ng), "should reject: {ng:?}");
+        }
+    }
     use crate::db::dangerous_statement_reason;
 
     fn s(v: &str) -> AttributeValue {
