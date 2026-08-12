@@ -299,6 +299,34 @@ fn parse_command_line(line: &str) -> Result<Vec<Vec<u8>>, AppError> {
     Ok(args)
 }
 
+/// 接続先アドレスを組み立てる。`tls` が true なら TLS 付き (`rediss://` 相当)。
+///
+/// `insecure` は常に false。ここを true にすると任意のサイト向けの正当な証明書が
+/// 通ってしまい、中間者攻撃をそのまま受け入れる。`tls: true` と書いた利用者の期待は
+/// 「経路が守られている」ことなので、検証しない TLS を黙って提供しない
+/// (config.rs が verify しない ssl_mode と ssl_root_cert の併記を設定エラーに
+/// しているのと同じ方針)。
+///
+/// `tls_params` を None にしているのでルート CA はシステムの信頼ストアを使う
+/// (redis crate の tls-rustls は rustls-native-certs を引く)。自己署名 CA を
+/// 使いたい場合は SSH トンネルを使うこと。
+///
+/// なお SSH トンネル経由の接続では接続先が 127.0.0.1 になるため、`tls: true` を
+/// 足すと証明書のホスト名検証で失敗する。トンネル自体が暗号化されているので
+/// 併用する必要は無い (SQL 系エンジンの verify-full と同じ制約)。
+fn connection_addr(tls: bool, host: &str, port: u16) -> redis::ConnectionAddr {
+    if tls {
+        redis::ConnectionAddr::TcpTls {
+            host: host.to_string(),
+            port,
+            insecure: false,
+            tls_params: None,
+        }
+    } else {
+        redis::ConnectionAddr::Tcp(host.to_string(), port)
+    }
+}
+
 /// 接続を確立して疎通確認 (PING) まで行う。
 /// schema は database 番号 (省略時 0)。
 pub async fn connect(
@@ -326,7 +354,7 @@ pub async fn connect(
     if let Some(password) = server.password.as_deref().filter(|p| !p.is_empty()) {
         redis_settings = redis_settings.set_password(password);
     }
-    let info = redis::ConnectionAddr::Tcp(host.to_string(), port)
+    let info = connection_addr(server.tls, host, port)
         .into_connection_info()?
         .set_redis_settings(redis_settings);
     let client = redis::Client::open(info)?;
@@ -680,6 +708,37 @@ mod tests {
         assert_eq!(parse_command_line("").unwrap(), Vec::<Vec<u8>>::new());
         // マルチバイト文字は UTF-8 のまま
         assert_eq!(parsed("GET キー"), vec!["GET", "キー"]);
+    }
+
+    /// tls: true が黙って無視され、平文 TCP で接続していた不具合
+    /// (CYBERNEURA-DEV-420) の回帰テスト。
+    #[test]
+    fn test_connection_addr_uses_tls_when_requested() {
+        match connection_addr(true, "redis.example.com", 6380) {
+            redis::ConnectionAddr::TcpTls {
+                host,
+                port,
+                insecure,
+                ..
+            } => {
+                assert_eq!(host, "redis.example.com");
+                assert_eq!(port, 6380);
+                // 検証しない TLS は中間者をそのまま受け入れるので必ず false
+                assert!(!insecure);
+            }
+            other => panic!("tls: true must not fall back to plaintext: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_connection_addr_is_plaintext_by_default() {
+        match connection_addr(false, "localhost", 6379) {
+            redis::ConnectionAddr::Tcp(host, port) => {
+                assert_eq!(host, "localhost");
+                assert_eq!(port, 6379);
+            }
+            other => panic!("tls: false must stay plaintext: {other:?}"),
+        }
     }
 
     #[test]

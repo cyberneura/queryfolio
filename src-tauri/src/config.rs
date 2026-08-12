@@ -264,6 +264,8 @@ pub struct ServerConfig {
     /// dynamodb ではエンドポイント上書き (host 指定) 時のスキームに使う。
     /// SQL 系エンジン (mysql / postgres) では「TLS を必須にし証明書も検証する」
     /// 指定として扱う (ssl_mode 省略時の既定が verify-full になる)。
+    /// redis では TLS 接続 (`rediss://` 相当) にする。証明書は必ず検証する
+    /// (engines/redis.rs の connection_addr)。
     #[serde(default)]
     pub tls: bool,
     /// queryfolio 独自拡張: SQL 系エンジン (mysql / postgres) の TLS モード。
@@ -538,9 +540,12 @@ pub struct ConnectionInfo {
     pub allow_dangerous_statements: bool,
     /// 接続一覧での表示グループ名 (グループ未所属なら null)
     pub group_name: Option<String>,
-    /// SQL 系エンジン (mysql / postgres) の実効 TLS モード。
+    /// 実効 TLS モード (SqlSslMode の文字列表現)。
+    /// mysql / postgres は ssl_mode / tls から解決した値、redis は tls: true なら
+    /// verify-full (証明書もホスト名も検証する)、false なら disable。
     /// 他のエンジン、および ssl_mode の値が不正な場合は null。
     /// フロントは「暗号化されない可能性がある直接接続」の表示に使う。
+    /// (フィールド名の sql_ 接頭辞は SQL 系専用だった頃の名残)
     pub sql_ssl_mode: Option<String>,
     /// エンジンの能力宣言 (エディタ言語・ファイル拡張子・UI の出し分け)。
     /// フロントはエンジン名ではなくこれで UI を出し分ける。
@@ -562,7 +567,6 @@ impl From<&ServerConfig> for ConnectionInfo {
             readonly: server.readonly,
             allow_dangerous_statements: server.allow_dangerous_statements,
             group_name: server.group_name.clone(),
-            // TLS モードを持つのは sqlx で結線する mysql / postgres だけ。
             // エンジン名の別名 (mariadb / postgresql) も拾うため parse_engine を通す。
             // エンジン名や ssl_mode の値が不正な設定は接続時にエラーになるので、
             // ここでは表示を諦めて null にする
@@ -571,6 +575,19 @@ impl From<&ServerConfig> for ConnectionInfo {
                     .sql_ssl_mode()
                     .ok()
                     .map(|mode| mode.as_str().to_string()),
+                // redis は tls の有無がそのまま TLS / 平文になる (中間のモードが
+                // 無い)。平文でも disable として出すのは、TLS を書いたつもりの
+                // 接続が平文で繋がっていることに気付ける手段がこれしか無いため
+                // (CYBERNEURA-DEV-420)
+                Ok(crate::db::Engine::Redis) => Some(
+                    if server.tls {
+                        SqlSslMode::VerifyFull
+                    } else {
+                        SqlSslMode::Disable
+                    }
+                    .as_str()
+                    .to_string(),
+                ),
                 _ => None,
             },
             capabilities: crate::engines::capabilities_for_name(&server.engine),
@@ -2029,7 +2046,7 @@ servers:
         assert_eq!(s.sql_ssl_root_cert().unwrap(), None);
     }
 
-    /// ConnectionInfo の sql_ssl_mode は SQL 系エンジンだけに載る
+    /// ConnectionInfo の sql_ssl_mode は SQL 系エンジンと redis に載る
     /// (フロントは接続の詳細ツールチップにこの値を出す)。
     #[test]
     fn test_connection_info_sql_ssl_mode() {
@@ -2055,6 +2072,22 @@ servers:
         let mut s = server_with(None, Some("h"), "postgres", Some("db"), Some("u"));
         s.ssl_mode = Some("bogus".into());
         assert!(ConnectionInfo::from(&s).sql_ssl_mode.is_none());
+
+        // redis は tls の有無をそのまま出す。平文でも disable として出すことで、
+        // tls を書いたつもりの接続が平文で繋がっていることに気付ける
+        // (CYBERNEURA-DEV-420)
+        let s = server_with(None, Some("h"), "redis", Some("0"), None);
+        assert_eq!(
+            ConnectionInfo::from(&s).sql_ssl_mode.as_deref(),
+            Some("disable")
+        );
+
+        let mut s = server_with(None, Some("h"), "valkey", Some("0"), None);
+        s.tls = true;
+        assert_eq!(
+            ConnectionInfo::from(&s).sql_ssl_mode.as_deref(),
+            Some("verify-full")
+        );
     }
 
     #[test]

@@ -49,7 +49,13 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 thiserror = "2"
 # Redis エンジン用クライアント (tokio ランタイムで任意コマンドを実行する)
-redis = { version = "1.4", default-features = false, features = ["tokio-comp"] }
+# tokio-rustls-comp: tls: true の接続で TcpTls を使うために必要
+# (rustls 系。openssl は増やさない)。無いと ConnectionAddr::TcpTls が
+# 実行時に「TLS feature が無効」で失敗する
+redis = { version = "1.4", default-features = false, features = [
+    "tokio-comp",
+    "tokio-rustls-comp",
+] }
 # DuckDB エンジン用クライアント (sqlx に DuckDB ドライバが無いため独自結線)。
 # bundled で C++ ソースを静的リンクする (Homebrew の libduckdb を動的リンクすると
 # ssh2 と同じく Developer ID 署名アプリの library validation で起動できないため)。

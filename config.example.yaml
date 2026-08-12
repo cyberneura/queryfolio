@@ -78,12 +78,16 @@ servers:
   # エディタは 1 行 = 1 コマンド (GET my-key / MGET a b c ...)。
   # schema は database 番号 (省略時 0)。user / password は ACL / AUTH に使う。
   # SSH トンネルも SQL エンジンと同様に使える。
+  # tls: true (queryfolio 拡張、省略時 false) で TLS 接続 (rediss://) になる。
+  # 証明書は常に検証する (システムの信頼ストア)。SSH トンネル経由では接続先が
+  # 127.0.0.1 になりホスト名検証に失敗するため、併用しないこと。
   - name: local-redis
     description: "ローカルの Redis"
     engine: redis
     host: localhost
     port: 6379
     schema: "0"
+    # tls: true
 
   # queryfolio 拡張: elasticsearch (エイリアス: es / opensearch)。
   # エディタは Kibana Console 風のリクエストブロック
