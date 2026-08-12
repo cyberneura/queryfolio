@@ -138,6 +138,20 @@ impl AppState {
     /// config_override_command は 1Password 等の外部コマンドで数秒かかり
     /// Touch ID を要求することもあるため、クエリ実行のたびに走らせない。
     /// reset_connections でクリアされる。
+    /// 起動前の CLI 書き出し (`apply_cli_write_route`) で既にマージ済み設定を
+    /// 解決している場合、それをキャッシュに載せた状態で作る。
+    ///
+    /// `config_override_command` は 1Password 等の外部プロセスを起こすため、
+    /// 1 回の CLI 起動で 2 度実行させない: 遅い / Touch ID が 2 回出るだけでなく、
+    /// 取得結果が変わると**書き込みと読み出しで別のスナップショット**を使うことになり、
+    /// 書いたファイルを開けなくなる (sqlfiles_dir や接続一覧が食い違う)。
+    fn with_config(config: Option<Arc<AppConfig>>) -> Self {
+        Self {
+            config: tokio::sync::Mutex::new(config),
+            ..Default::default()
+        }
+    }
+
     async fn resolve_config(&self) -> Result<Arc<AppConfig>, AppError> {
         let mut cached = self.config.lock().await;
         if let Some(config) = cached.as_ref() {
@@ -189,11 +203,11 @@ impl AppState {
     ) -> Result<router::OpenTarget, AppError> {
         match route {
             router::Route::OpenFile { path } => {
-                // sqlfiles_dir は「アプリプロセスのカレントディレクトリ」で絶対化する。
-                // 設定が相対 sqlfiles_dir の場合、実際のファイル I/O (query_files) と
-                // verify_within_dir はアプリプロセスの cwd 基準で解決されるため、
-                // パス検証の base もそこに揃える (実行中インスタンスへ渡る起動元 cwd と
-                // 混同しない)。std::path::absolute は FS に触れない字句的絶対化。
+                // resolve_sqlfiles_dir は相対設定を設定ディレクトリ基準で絶対化して
+                // 返すため、ここでの絶対化は本来 no-op。それでも残すのは、パス検証の
+                // base が相対のままだと strip_prefix の比較が実 I/O と食い違うためで、
+                // 「base は必ず絶対」という前提をこの場で担保しておく
+                // (std::path::absolute は FS に触れない字句的絶対化)。
                 let sqlfiles_dir = self.resolve_sqlfiles_dir().await?;
                 let sqlfiles_dir =
                     std::path::absolute(&sqlfiles_dir).unwrap_or(sqlfiles_dir);
@@ -234,8 +248,45 @@ impl AppState {
                 // (「queryfolio のデータ保存パスのみ対象」の要件を実体レベルで担保)。
                 let folder = server.sqlfiles_folder_name();
                 let concrete = sqlfiles_dir.join(&folder).join(&target.file_name);
-                verify_within_dir(&sqlfiles_dir, &concrete)?;
+                query_files::verify_within_dir(&sqlfiles_dir, &concrete)?;
                 Ok(target)
+            }
+            // 接続名 + ファイル名の指定 (CLI の `write`)。**ここでは書き込まない** —
+            // 書き出しは起動側プロセスが Tauri の起動前に済ませている
+            // (router::Route::WriteFile のドキュメント参照)。ここは
+            // 「その接続のそのファイルを開く」の解決だけを行う。
+            router::Route::WriteFile {
+                connection,
+                file_name,
+                ..
+            } => {
+                let server = self.find_server(connection).await?;
+                let ext = engines::capabilities_for_name(&server.engine).file_extension;
+                // 起動側の書き出しと同じ正規化を通す (拡張子の補完・名前の検証)。
+                // 同じ関数を使うことで「検証した名前」と「実際に書いた名前」が
+                // 必ず一致する。
+                let file_name = query_files::normalize_file_name(file_name, ext)?;
+                let sqlfiles_dir = self.resolve_sqlfiles_dir().await?;
+                let sqlfiles_dir =
+                    std::path::absolute(&sqlfiles_dir).unwrap_or(sqlfiles_dir);
+                let concrete = sqlfiles_dir
+                    .join(server.sqlfiles_folder_name())
+                    .join(&file_name);
+                // 書き出しに失敗している (存在しない) 場合は、canonicalize の
+                // 一般的な I/O エラーではなく分かりやすい文言で返す。
+                if !concrete.exists() {
+                    return Err(AppError::QueryFile(format!(
+                        "File not found: {}",
+                        concrete.display()
+                    )));
+                }
+                // OpenFile と同じ多重防御 (シンボリックリンクで保存領域外を
+                // 指していないか)。
+                query_files::verify_within_dir(&sqlfiles_dir, &concrete)?;
+                Ok(router::OpenTarget {
+                    connection: server.name.clone(),
+                    file_name,
+                })
             }
         }
     }
@@ -1661,25 +1712,6 @@ async fn frontend_ready(
     Ok(LaunchResult { targets, errors })
 }
 
-/// `file` をシンボリックリンク解決込みで canonicalize し、`base` (これも
-/// canonicalize したもの) の配下に留まることを確かめる。保存領域外の実体を指す
-/// リンクを弾く多重防御。開く対象は既存ファイルのはずなので、canonicalize
-/// できない (存在しない等) 場合は拒否する。
-fn verify_within_dir(base: &std::path::Path, file: &std::path::Path) -> Result<(), AppError> {
-    let canonical_base = base.canonicalize().map_err(|e| {
-        AppError::QueryFile(format!("Cannot resolve the query files directory: {e}"))
-    })?;
-    let canonical_file = file
-        .canonicalize()
-        .map_err(|e| AppError::QueryFile(format!("Cannot open the file: {e}")))?;
-    if !canonical_file.starts_with(&canonical_base) {
-        return Err(AppError::QueryFile(
-            "The file resolves outside the query files directory".into(),
-        ));
-    }
-    Ok(())
-}
-
 /// 実行中に受け取ったルート (deep link / CLI サブコマンド) を解決し、フロントへ
 /// イベントで届ける。解決は設定の読み取りを伴い async なので、別タスクで行う。
 /// 成功なら `open-query-file` に OpenTarget を、失敗なら `open-query-file-error` に
@@ -1882,9 +1914,151 @@ fn reveal_config_folder() -> Result<(), AppError> {
         .map_err(|e| AppError::Config(format!("Failed to reveal {}: {e}", target.display())))
 }
 
+/// CLI の `write` サブコマンドで標準入力から受け取る内容の上限 (バイト)。
+/// クエリファイルとしては十分に大きく、取り違えたパイプで巨大なファイルを
+/// 丸ごとメモリに載せることは防げる大きさ。超過は切り詰めずエラーにする
+/// (途中まで書くとクエリが壊れたまま保存される)。
+const MAX_STDIN_CONTENT_BYTES: usize = 10 * 1024 * 1024;
+
+/// CLI の `write` サブコマンドの内容を決める。
+///
+/// 引数で渡っていればそれを使い、無ければ標準入力から読む。次の場合は
+/// 「内容の指定なし」= `Ok(None)` として扱う (= 既存ファイルを潰さない):
+///
+/// - 標準入力が端末 (対話シェルで内容を渡していない。読むと入力待ちで固まる)
+/// - 標準入力が空 (GUI 起動 `open -a QueryFolio --args write ...` の stdin は
+///   /dev/null で即 EOF になる。これを「空で書け」と解釈すると、既存のクエリ
+///   ファイルを黙って空にしてしまう)
+///
+/// 読み取りの失敗と上限超過は `Err` にする (内容が分からないまま / 途中までで
+/// 上書きしない。呼び出し側はここで打ち切って非ゼロ終了する)。
+fn resolve_write_content(arg_content: Option<String>) -> Result<Option<String>, AppError> {
+    use std::io::{IsTerminal, Read};
+
+    if let Some(content) = arg_content {
+        return Ok(Some(content));
+    }
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Ok(None);
+    }
+    // 上限 + 1 バイトまで読み、超えたら「上限超過」と判定する
+    // (ちょうど上限で切ると、切り詰めたのか元から上限ぴったりなのか分からない)。
+    let mut buf = String::new();
+    stdin
+        .take(MAX_STDIN_CONTENT_BYTES as u64 + 1)
+        .read_to_string(&mut buf)
+        .map_err(|e| {
+            AppError::QueryFile(format!("Failed to read the content from stdin: {e}"))
+        })?;
+    if buf.len() > MAX_STDIN_CONTENT_BYTES {
+        return Err(AppError::QueryFile(format!(
+            "The content from stdin is larger than the {MAX_STDIN_CONTENT_BYTES} byte limit"
+        )));
+    }
+    Ok(if buf.is_empty() { None } else { Some(buf) })
+}
+
+/// CLI の `write <connection> <file-name> [content]` を処理し、クエリファイルを
+/// 書き出す (内容の指定が無ければ空ファイルを作るだけ。既存は変更しない)。
+///
+/// **Tauri を起動する前に、起動したプロセス自身が行う**。実行中インスタンスが
+/// いる場合、single-instance プラグインが転送するのは argv と cwd だけで
+/// 標準入力は渡らないため、書き出しを実行中インスタンス側に任せると
+/// パイプで渡した内容が失われる。書き出しを起動側で完結させ、実行中インスタンス
+/// (または自分自身) には「開く」だけを任せる。
+///
+/// 失敗した場合は `Err` を返す。呼び出し側 (run) は起動を続けず**非ゼロで終了する**:
+/// 続行して「開く」だけ行うと、書き込みに失敗しているのに古い内容がそのまま開き、
+/// 依頼したエージェントには成功したように見えてしまう (終了ステータスからも
+/// 失敗を判別できない)。
+///
+/// 解決したマージ済み設定を返す (書き出しを行わなかった場合は `None`)。
+/// 呼び出し側はこれを `AppState` のキャッシュに載せ、`config_override_command` を
+/// 1 回の起動で 2 度実行しないようにする (`AppState::with_config` 参照)。
+fn apply_cli_write_route(
+    route: &router::Route,
+) -> Result<Option<Arc<AppConfig>>, AppError> {
+    let router::Route::WriteFile {
+        connection,
+        file_name,
+        content,
+    } = route
+    else {
+        return Ok(None);
+    };
+    let content = resolve_write_content(content.clone())?;
+    tauri::async_runtime::block_on(async {
+        let config = Arc::new(AppConfig::load_merged().await?);
+        let servers = config.resolve_servers()?;
+        let server = servers
+            .iter()
+            .find(|s| &s.name == connection)
+            .ok_or_else(|| {
+                AppError::Config(format!(
+                    "Connection '{connection}' is not defined in the config"
+                ))
+            })?;
+        let sqlfiles_dir = config.resolve_sqlfiles_dir()?;
+        let folder = server.sqlfiles_folder_name();
+        let ext = engines::capabilities_for_name(&server.engine).file_extension;
+        match &content {
+            // 内容が指定された時だけ上書きする。
+            Some(text) => {
+                let name = query_files::normalize_file_name(file_name, ext)?;
+                query_files::write_query_file(
+                    &sqlfiles_dir,
+                    &folder,
+                    &name,
+                    text,
+                    ext,
+                )?;
+            }
+            // 指定が無ければ「無ければ作る」だけ (既存の内容は残す)。
+            None => {
+                query_files::ensure_query_file(
+                    &sqlfiles_dir,
+                    &folder,
+                    file_name,
+                    ext,
+                )?;
+            }
+        }
+        // フォルダを新規作成した時に接続の説明メタファイルを置く
+        // (アプリ内の作成・保存と同じ扱い。ベストエフォート)。
+        let dir = query_files::connection_dir(&sqlfiles_dir, &folder)?;
+        let _ = folder_meta::write_folder_meta(&dir, server);
+        Ok::<Option<Arc<AppConfig>>, AppError>(Some(config))
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     use tauri::Emitter;
+
+    // CLI の `write` は、Tauri (single-instance プラグイン) を起動する前に
+    // このプロセスで書き出す (apply_cli_write_route のドキュメント参照)。
+    // 起動時引数だけを見る: 実行中インスタンスが転送されてくる argv を
+    // 処理する経路 (single-instance のコールバック) では、その argv は
+    // 別プロセスのものなので書き出しは既に済んでいる。
+    //
+    // ここで解決したマージ済み設定は AppState のキャッシュに引き継ぐ
+    // (config_override_command を 1 起動で 2 度実行しない)。
+    let preflight_config = {
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        match router::route_from_cli_args(&argv) {
+            Some(route) => match apply_cli_write_route(&route) {
+                Ok(config) => config,
+                Err(e) => {
+                    // 書けていないものを開きに行かない。CLI から呼んだ側が
+                    // 終了ステータスで失敗を判別できるようにする。
+                    eprintln!("[cli] failed to write the query file: {e}");
+                    std::process::exit(1);
+                }
+            },
+            None => None,
+        }
+    };
 
     tauri::Builder::default()
         // single-instance は最初に登録する (プラグインは登録順に走る)。
@@ -1939,7 +2113,7 @@ pub fn run() {
             }
             _ => {}
         })
-        .manage(AppState::default())
+        .manage(AppState::with_config(preflight_config))
         .setup(|app| {
             use tauri::Manager;
             use tauri_plugin_deep_link::DeepLinkExt;

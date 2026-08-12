@@ -892,6 +892,44 @@ const openFileByTarget = async (connection: string, fileName: string) => {
   if (selectedConnection !== connection) {
     return;
   }
+  // 一覧に無いファイルなら FILES ペインを取り直す。CLI の
+  // `queryfolio write <connection> <file-name>` は実行中インスタンスの外で
+  // ファイルを作るため、その接続が既に選択済み (= selectConnection が no-op)
+  // だと、エディタでは開けるのに一覧には現れないままになる。
+  if (!files.includes(fileName)) {
+    try {
+      const latest = await api.listQueryFiles(connection);
+      if (selectedConnection === connection) {
+        files = latest;
+      }
+    } catch {
+      // 一覧の更新に失敗してもファイルは開ける (表示だけの問題)。
+      // 次にこの接続を選び直した時に取り直される。
+    }
+    // 取得を待つ間に別接続へ移っていたら、その接続の一覧も開く対象も
+    // 触らない (selectFile は「今の選択接続」で開くため、切替先の同名
+    // ファイルを開いてしまう)。
+    if (selectedConnection !== connection) {
+      return;
+    }
+  }
+  // 既に開いているタブなら、アクティブにする前にディスクの内容と突き合わせる。
+  // CLI の `queryfolio write` はこのプロセスの外でファイルを書き換えるため、
+  // 外部変更ポーリング (FILE_WATCH_INTERVAL_MS) を待つと、書き換えたはずの
+  // クエリを開いたのに**古い SQL が最大 2.5 秒表示され、そのまま実行できてしまう**。
+  // 判定は通常のポーリングと同じ経路を使う (手元の未保存編集は衝突として扱い、
+  // 黙って捨てない)。
+  const opened = editorTabs.find(
+    (t) => t.connection === connection && t.file === fileName,
+  );
+  if (opened) {
+    await checkTabForExternalChange(opened.id);
+    // 突き合わせを待つ間に別接続へ移っていたら、開く対象を触らない
+    // (上の一覧取り直しと同じガード)。
+    if (selectedConnection !== connection) {
+      return;
+    }
+  }
   await selectFile(fileName);
 };
 
