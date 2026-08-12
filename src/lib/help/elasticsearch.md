@@ -181,9 +181,13 @@ family of `POST` requests (`_search`, `_count`, `_msearch`, `_explain`,
 `_analyze` …) since those read despite the method. Everything else is refused
 before it is sent.
 
-Deleting an index (`DELETE /orders`), `_delete_by_query` and `_update_by_query`
-additionally need `allow_dangerous_statements` on the connection: each of them
-can rewrite or remove every document the query matches.
+These additionally need `allow_dangerous_statements` on the connection, because
+each of them rewrites or removes every document it matches:
+
+- `DELETE /orders` — deletes the index
+- `DELETE /_data_stream/logs` — deletes the data stream and its backing indices
+- `_delete_by_query`
+- `_update_by_query`
 
 Paths containing `.` or `..` segments are rejected outright, encoded or not.
 Responses are read up to 20 MB and long cells are truncated with a marker.
