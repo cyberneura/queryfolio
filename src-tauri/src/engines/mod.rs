@@ -131,7 +131,11 @@ mod tests {
         let redis = capabilities_for_name("redis");
         assert_eq!(redis.editor_language, "redis");
         assert_eq!(redis.file_extension, "redis");
-        assert!(!redis.supports_schemas);
+        // Redis の「スキーマ」は database 番号。Database 欄で切り替えられる
+        // (CYBERNEURA-DEV-408)
+        assert!(redis.supports_schemas);
+        // エイリアスも同じ capability
+        assert!(capabilities_for_name("valkey").supports_schemas);
         assert!(!redis.supports_tables);
         assert!(!redis.supports_explain);
         assert!(!redis.supports_format);
