@@ -1251,10 +1251,13 @@ pub async fn list_schemas(
                 .unwrap_or("main");
             Ok(vec![path.to_string()])
         }
-        // Redis / Elasticsearch / DynamoDB に database 一覧の概念は無い
+        // Redis の「database」は番号 (CYBERNEURA-DEV-408)。
+        // 数はサーバー設定なのでモジュール側で問い合わせる
+        DbPool::Redis(client) => crate::engines::redis::list_databases(client).await,
+        // Elasticsearch / DynamoDB に database 一覧の概念は無い
         // (capabilities.supports_schemas = false でフロントは呼ばないが、
         // 直接呼ばれても壊れないよう空を返す)
-        DbPool::Redis(_) | DbPool::Elasticsearch(_) | DbPool::DynamoDb(_) => Ok(vec![]),
+        DbPool::Elasticsearch(_) | DbPool::DynamoDb(_) => Ok(vec![]),
     }
 }
 
