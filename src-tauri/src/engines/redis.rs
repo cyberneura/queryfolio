@@ -330,8 +330,12 @@ fn database_names(count: i64) -> Vec<String> {
 /// 既定値へ倒れた場合、実際の database 数が 16 より多い環境では 16 以降を
 /// プルダウンから選べない。ただし**設定 / オーバーライドで現在選ばれている番号は
 /// 一覧に無くても選択肢に残る** (EditorToolbar が activeSchema を option として
-/// 足すため)。逆に 16 未満の環境では存在しない番号が並ぶが、選ぶと接続に失敗して
-/// `rollback_schema_override` が元へ戻すので、壊れた状態にはならない。
+/// 足すため)。逆に 16 未満の環境では存在しない番号が並ぶ。**選んだ時点では成功として
+/// 扱われ、失敗するのは次のクエリ**になる。これは redis に限らず Database 欄の共通の
+/// 挙動で (`set_active_schema` はオーバーライドを保存するだけ。接続して検証するのは
+/// メタコマンドの経路のみ)、失敗時は `rollback_schema_override` が元へ戻すので
+/// 壊れた状態にはならない。選択時に検証しようとすると、接続を遅延確立する設計
+/// (AGENTS.md の「接続 (SSH トンネル) の遅延確立」) とぶつかるため踏み込まない。
 pub async fn list_databases(client: &redis::Client) -> Result<Vec<String>, AppError> {
     let count = match open_connection(client).await {
         Ok(mut conn) => {
