@@ -606,10 +606,12 @@ async fn list_tables_query(
     if was_cancelled && result.is_err() {
         return Err(AppError::Cancelled);
     }
-    let tables = result?;
+    let (tables, has_more) = result?;
 
-    // 他の結果と同じく max_rows で打ち切り、切ったことを truncated で伝える
-    let truncated = tables.len() > max_rows;
+    // 他の結果と同じく max_rows で打ち切り、切ったことを truncated で伝える。
+    // ページネーションの締切で途中終了した場合も has_more で拾う
+    // (部分的な一覧を完全なものとして扱わない)
+    let truncated = has_more || tables.len() > max_rows;
     let rows: Vec<Vec<serde_json::Value>> = tables
         .into_iter()
         .take(max_rows)
@@ -636,7 +638,7 @@ async fn list_tables_query(
 /// テーブル一覧 (スキーマブラウザの TABLES ペイン用)。
 /// ListTables をページネーションで辿り、MAX_TABLES 件で打ち切る。
 pub async fn fetch_tables(client: &DynamoClient) -> Result<Vec<TableInfo>, AppError> {
-    fetch_tables_limited(client, MAX_TABLES).await
+    Ok(fetch_tables_limited(client, MAX_TABLES).await?.0)
 }
 
 /// テーブル一覧を最大 `limit` 件まで取る。
@@ -645,13 +647,18 @@ pub async fn fetch_tables(client: &DynamoClient) -> Result<Vec<TableInfo>, AppEr
 /// MAX_TABLES (5,000) 件ぶんの ListTables を叩くのを避けるため
 /// (CYBERNEURA-DEV-406)。ページ単位でしか止められないので、実際の取得数は
 /// LIST_TABLES_PAGE の切り上げになる。
+/// 返り値の bool は「まだ続きがある」フラグ。`limit` に達した場合と、
+/// ページネーションの締切で打ち切った場合の両方で true になる。呼び出し側が
+/// 結果を truncated として報告できるようにするため
+/// (締切での打ち切りを黙って完全な一覧として扱わない)。
 async fn fetch_tables_limited(
     client: &DynamoClient,
     limit: usize,
-) -> Result<Vec<TableInfo>, AppError> {
+) -> Result<(Vec<TableInfo>, bool), AppError> {
     let started = Instant::now();
     let mut names: Vec<String> = Vec::new();
     let mut start_name: Option<String> = None;
+    let mut has_more = false;
     loop {
         let out = client
             .client
@@ -663,16 +670,25 @@ async fn fetch_tables_limited(
             .map_err(|e| sdk_error("ListTables failed", e))?;
         names.extend(out.table_names.unwrap_or_default());
         start_name = out.last_evaluated_table_name;
-        if start_name.is_none() || names.len() >= limit {
+        if start_name.is_none() {
             break;
         }
-        // 1 操作ごとの SDK タイムアウトとは別に、一覧全体にも締切を置く
+        if names.len() >= limit {
+            has_more = true;
+            break;
+        }
+        // 1 操作ごとの SDK タイムアウトとは別に、一覧全体にも締切を置く。
+        // ここで抜けた場合は続きが残っているので has_more を立てる
         if started.elapsed() > REQUEST_TIMEOUT {
+            has_more = true;
             break;
         }
     }
+    if names.len() > limit {
+        has_more = true;
+    }
     names.truncate(limit);
-    Ok(names
+    let tables: Vec<TableInfo> = names
         .into_iter()
         .map(|name| TableInfo {
             qualified_name: name.clone(),
@@ -680,7 +696,8 @@ async fn fetch_tables_limited(
             schema: None,
             kind: "table".to_string(),
         })
-        .collect())
+        .collect();
+    Ok((tables, has_more))
 }
 
 /// ScalarAttributeType (S / N / B) の表示文字列。
