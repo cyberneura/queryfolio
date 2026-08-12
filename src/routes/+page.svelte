@@ -321,7 +321,13 @@
     }}
   />
 
-  <div class="flex min-h-0 flex-1">
+  <!-- overflow-x-auto: 接続一覧 / サイドバー / チャットは shrink-0 の固定幅なので、
+       ウインドウを狭めると中央のエディタが 0 幅まで潰れた先で右端がはみ出す。
+       ドキュメントをスクロールさせない代わりに、この行の中で横スクロールできるように
+       しておかないと右側のペインへ到達できなくなる (CYBERNEURA-DEV-421)。
+       縦は各ペインが内側にスクロール領域を持つので抑止する (片方だけ指定すると
+       もう片方が auto に計算されるため、明示的に hidden を置く) -->
+  <div class="flex min-h-0 flex-1 overflow-x-auto overflow-y-hidden">
     <div class="shrink-0" style="width: {connectionsWidth}px">
       <ConnectionsPane />
     </div>
