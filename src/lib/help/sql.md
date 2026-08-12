@@ -75,10 +75,25 @@ WITH ranked AS (
 SELECT * FROM ranked WHERE n = 1;
 ```
 
+Counts per day. Truncating a timestamp to its date is dialect-specific, so the
+grouping expression differs. Days with no rows are absent rather than zero;
+filling them in needs a generated series, which each engine spells differently.
+
 ```sql
--- Counts per day. Days with no rows are absent rather than zero; filling them
--- in needs a generated series, which each engine spells differently.
-SELECT substr(created_at, 1, 10) AS day, count(*) AS orders
+-- PostgreSQL
+SELECT date_trunc('day', created_at)::date AS day, count(*) AS orders
+FROM orders
+WHERE created_at >= '2026-08-01'
+GROUP BY day
+ORDER BY day;
+-- MySQL
+SELECT date(created_at) AS day, count(*) AS orders
+FROM orders
+WHERE created_at >= '2026-08-01'
+GROUP BY day
+ORDER BY day;
+-- SQLite (created_at stored as an ISO-8601 string)
+SELECT date(created_at) AS day, count(*) AS orders
 FROM orders
 WHERE created_at >= '2026-08-01'
 GROUP BY day

@@ -15,8 +15,9 @@ import sqlHelp from "./sql.md?raw";
 /**
  * エンジン名 → ヘルプ本文。
  *
- * 接続の `engine` はエイリアスを含むため、正規化した名前で引く
- * (valkey → redis, es / opensearch → elasticsearch)。
+ * 接続の `engine` はエイリアスを含むため、**バックエンドが受け付ける綴りを全て**
+ * 並べる (`db.rs` の `parse_engine`)。片方だけだと `engine: mariadb` の接続が
+ * 「ヘルプ無し」になる。エイリアスを足す時は両方を揃えること。
  */
 const HELP_BY_ENGINE: Record<string, string> = {
   redis: redisHelp,
@@ -26,9 +27,11 @@ const HELP_BY_ENGINE: Record<string, string> = {
   opensearch: elasticsearchHelp,
   dynamodb: dynamodbHelp,
   mysql: sqlHelp,
+  mariadb: sqlHelp,
   postgres: sqlHelp,
   postgresql: sqlHelp,
   sqlite: sqlHelp,
+  sqlite3: sqlHelp,
   duckdb: duckdbHelp,
 };
 
