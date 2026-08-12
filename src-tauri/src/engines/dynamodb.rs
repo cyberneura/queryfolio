@@ -570,7 +570,7 @@ fn validate_table_name(name: &str) -> Result<&str, AppError> {
 ///
 /// 末尾のセミコロンと前後の空白だけを許し、`tables where ...` のような続きは
 /// 受け付けない (PartiQL の文と紛れないようにするため)。大小は区別しない。
-fn is_tables_statement(sql: &str) -> bool {
+pub(crate) fn is_tables_statement(sql: &str) -> bool {
     let trimmed = sql.trim();
     let body = trimmed.strip_suffix(';').unwrap_or(trimmed);
     body.trim_end().eq_ignore_ascii_case("tables")
