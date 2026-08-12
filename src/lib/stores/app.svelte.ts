@@ -679,7 +679,7 @@ const cycleEditorTab = (direction: 1 | -1): Promise<void> =>
   queueTabCycleStep(() => cycleEditorTabStep(direction));
 
 const cycleEditorTabStep = async (direction: 1 | -1) => {
-  if (editorTabs.length < 2) {
+  if (editorTabs.length === 0) {
     return;
   }
   if (!tabCycle) {
@@ -688,10 +688,17 @@ const cycleEditorTabStep = async (direction: 1 | -1) => {
       editorTabs.map((t) => t.id),
     );
     const current = activeEditorTabId == null ? -1 : order.indexOf(activeEditorTabId);
-    tabCycle = { order, index: current < 0 ? 0 : current };
+    // アクティブなタブが無い状態 (タブを持たない接続を選んでいる時など) は、
+    // 「先頭の 1 つ手前」から始めて最初の Ctrl+Tab が履歴の先頭に当たるようにする。
+    // 逆方向なら「末尾の 1 つ次」= 0 から始めて末尾に当たる。0 で始めてしまうと
+    // 直近のタブを飛ばして 2 番目に移ってしまう。
+    tabCycle = {
+      order,
+      index: current >= 0 ? current : direction === 1 ? -1 : 0,
+    };
   }
   const cycle = tabCycle;
-  if (cycle.order.length < 2) {
+  if (cycle.order.length === 0) {
     return;
   }
   cycle.index = stepCycleIndex(cycle.index, direction, cycle.order.length);

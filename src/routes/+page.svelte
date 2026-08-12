@@ -46,10 +46,13 @@
   }
 
   /// モーダルを 1 つでも開いているか (キーボードはモーダルのものとみなす)。
+  /// aiAnalysis (EXPLAIN の AI 解説) はこのファイルではなく ResultsPane が
+  /// 描画するが、画面を覆うのは同じなのでここで見る。
   const isModalOpen = () =>
     showSearch ||
     showSettings ||
     configEditorMode !== null ||
+    appStore.aiAnalysis !== null ||
     appStore.aiExplanation !== null ||
     appStore.dangerousConfirmReason !== null;
 
