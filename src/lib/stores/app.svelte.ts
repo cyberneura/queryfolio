@@ -15,6 +15,7 @@ import {
   stepCycleIndex,
   touchMru,
 } from "$lib/editor/tabCycle";
+import { buildEngineHelpContext } from "$lib/help";
 
 const AUTO_SAVE_DELAY_MS = 1000;
 
@@ -1890,6 +1891,20 @@ const sendChatMessage = async (text: string) => {
   const history: ChatTurn[] = chatMessages
     .filter((m) => !m.failed)
     .map((m) => ({ role: m.role, content: m.content }));
+  // エンジン固有の書き方をモデルに渡す (CYBERNEURA-DEV-407)。ヘルプペインと同じ本文。
+  // 画面には出さず送信ペイロードにだけ載せるので、chatMessages には入れない。
+  // 付けるのは**最後の発言**。バックエンドが履歴を直近 N 件に切り詰めるため、
+  // 先頭に置くと会話が伸びた時点で落ちる。
+  const helpContext = buildEngineHelpContext(
+    connections.find((c) => c.name === connection)?.engine,
+  );
+  if (helpContext && history.length > 0) {
+    const last = history[history.length - 1];
+    history[history.length - 1] = {
+      ...last,
+      content: `${helpContext}\n\n${last.content}`,
+    };
+  }
   chatSendingGen = generation;
   // 中断はこの ID を指定して行う (同じ接続で複数の往復が走りうる)
   const requestId = `chat-${nextChatRequestSeq++}`;
