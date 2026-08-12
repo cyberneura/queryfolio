@@ -38,6 +38,7 @@ https://github.com/user-attachments/assets/90439816-49c8-4ebd-a068-b102cfe9c7aa
 - Resizable panes: drag the dividers between the sidebars, editor, and results; sizes are persisted across restarts
 - Window size / position restored across restarts
 - Open a saved query file by path from a `queryfolio://open/<path>` URL or the `queryfolio open <path>` CLI subcommand (restricted to files under the query files directory; reuses the running window)
+- Write and open a query file from the CLI with `queryfolio write <connection> <file-name> [content]` (content can also be piped in on stdin) — for AI agents that prepare a query for review
 
 ## Setup
 
@@ -105,6 +106,26 @@ queryfolio open /Users/me/.config/queryfolio/sqlfiles/reporting/monthly.sql
 ```
 
 Only files directly under a connection folder inside the query files directory (`sqlfiles_dir`) can be opened. Paths outside that directory, unknown folders, non-`.sql` files, and `..` traversal are rejected. The connection that owns the folder is selected automatically and the file is opened in a new editor tab.
+
+### Writing a query file from the CLI
+
+`write` takes a connection name and a file name instead of a path, so the query files directory and the connection's folder name do not have to be known by the caller. The content can be given as the third argument or piped in on stdin. This is mainly meant for AI agents that prepare a query for a human to review and run.
+
+```shell
+# Content as an argument
+queryfolio write reporting monthly.sql "SELECT * FROM orders LIMIT 10;"
+
+# Content on stdin
+echo "SELECT * FROM orders LIMIT 10;" | queryfolio write reporting monthly.sql
+
+# No content: create the file if it does not exist yet, then open it
+queryfolio write reporting monthly.sql
+```
+
+- The connection name is the `name` of a server in the config; the file gets the connection engine's extension (`.sql` / `.redis` / `.es`) if it is missing, and the connection's folder is created if needed.
+- Content is written only when it is actually given. An **empty** stdin is treated as "no content" so that a GUI launch (`open -a QueryFolio --args write ...`, whose stdin is `/dev/null`) cannot silently blank an existing file. Existing content is otherwise overwritten.
+- The file is written by the process you launch, before the running window is asked to open it — stdin cannot be forwarded to an already-running instance. If writing fails (unknown connection, invalid name, stdin larger than 10 MiB, I/O error), the reason is printed to stderr and the command exits non-zero without opening anything.
+- `write` is **CLI-only**: there is no `queryfolio://write/...` URL. A web page can make the browser open a `queryfolio://` URL, and dropping arbitrary SQL into the query files directory that way would be a trap waiting for the next person who runs it.
 
 ## Development
 

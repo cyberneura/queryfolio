@@ -28,7 +28,7 @@ pub(crate) fn validate_component(name: &str) -> Result<&str, AppError> {
 /// クエリファイル名を正規化する (接続エンジンの拡張子を保証する)。
 /// ext は "sql" / "redis" などドット無しの拡張子 (engines::EngineCapabilities
 /// の file_extension)。
-fn normalize_file_name(name: &str, ext: &str) -> Result<String, AppError> {
+pub(crate) fn normalize_file_name(name: &str, ext: &str) -> Result<String, AppError> {
     let name = validate_component(name)?;
     let suffix = format!(".{}", ext.to_ascii_lowercase());
     if name.to_ascii_lowercase().ends_with(&suffix) {
@@ -353,6 +353,38 @@ pub fn create_query_file(
     Ok(normalized)
 }
 
+/// クエリファイルが無ければ空で作る (あれば内容はそのまま)。
+/// 正規化されたファイル名を返す。
+///
+/// `create_query_file` との違いは**既存を上書きも失敗もしない**こと。
+/// CLI (`queryfolio write <connection> <file-name>`) で内容を省略した時に使う:
+/// 「まだ無ければ作って開く / あればそのまま開く」が期待される挙動で、
+/// 既存の内容を空で潰してはいけない。
+///
+/// 作成は `create_new` (`O_EXCL`) で行い、存在確認と作成の間に他プロセスが
+/// 同名ファイルを作った場合も既存扱いにする (中身を消さない)。
+pub fn ensure_query_file(
+    sqlfiles_dir: &Path,
+    connection: &str,
+    file_name: &str,
+    ext: &str,
+) -> Result<String, AppError> {
+    let normalized = normalize_file_name(file_name, ext)?;
+    let path = file_path(sqlfiles_dir, connection, &normalized, ext)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(_) => Ok(normalized),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(normalized),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub fn delete_query_file(
     sqlfiles_dir: &Path,
     connection: &str,
@@ -532,6 +564,35 @@ mod tests {
             normalize_file_name("keys.sql", "redis").unwrap(),
             "keys.sql.redis"
         );
+    }
+
+    #[test]
+    fn test_ensure_query_file_creates_and_keeps_existing() {
+        let dir = test_dir().join("ensure");
+        let connection = "conn";
+
+        // 無ければ空で作る (拡張子も補う)
+        assert_eq!(
+            ensure_query_file(&dir, connection, "report", "sql").unwrap(),
+            "report.sql"
+        );
+        assert_eq!(read_query_file(&dir, connection, "report", "sql").unwrap(), "");
+
+        // 既存の内容は消さない (create_query_file と違いエラーにもしない)
+        write_query_file(&dir, connection, "report.sql", "SELECT 1;", "sql").unwrap();
+        assert_eq!(
+            ensure_query_file(&dir, connection, "report.sql", "sql").unwrap(),
+            "report.sql"
+        );
+        assert_eq!(
+            read_query_file(&dir, connection, "report", "sql").unwrap(),
+            "SELECT 1;"
+        );
+
+        // 不正な名前は作らずエラー
+        assert!(ensure_query_file(&dir, connection, "../evil", "sql").is_err());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

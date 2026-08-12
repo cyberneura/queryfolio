@@ -5,6 +5,12 @@
 //! ここに variant とパースを足すだけで URI / CLI の両方に対応できる
 //! (「queryfolio:// と同様のルートで機能を追加していけるように」の要)。
 //!
+//! ただし**書き込みを伴うアクション (`write`) は CLI 専用**で、URI からは
+//! 受け付けない (`parse_uri` は UnknownAction にする)。`queryfolio://` URL は
+//! Web ページからでも開かせられるため、URI で書き込みを許すと閲覧中のページが
+//! 任意の SQL をユーザーのクエリファイルとして置けてしまう (ユーザーが後から
+//! それを実行する危険がある)。CLI は起動する本人の操作なのでこの経路は無い。
+//!
 //! パス解決 ([`resolve_open_target`]) はセキュリティ上重要なので Tauri に依存
 //! させず純粋な std だけで書き、単体テストで境界を固める。開けるのは
 //! 「クエリファイル保存ディレクトリ (`sqlfiles_dir`) 直下の接続フォルダにある
@@ -18,12 +24,35 @@ use std::path::{Component, Path, PathBuf};
 /// URI スキーム名 (`queryfolio://...`)。
 pub const URI_SCHEME: &str = "queryfolio";
 
+/// 既存ファイルをパス指定で開く CLI サブコマンド。
+const OPEN_SUBCOMMAND: &str = "open";
+
+/// 接続フォルダにクエリファイルを書き出して開く CLI サブコマンド。
+const WRITE_SUBCOMMAND: &str = "write";
+
 /// URI / CLI から解釈されたアクション (まだ検証していない生の入力を保持する)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
     /// クエリファイルをパス指定で開く。`path` は未検証の生パス
     /// (`resolve_open_target` で保存領域配下かを検証してから使う)。
     OpenFile { path: String },
+    /// 接続 (SQL サーバー設定) の名前とファイル名を指定してクエリファイルを開く。
+    /// `content` があればその内容で書き出してから開く (CLI 専用。下記参照)。
+    ///
+    /// **書き出し自体はこの Route の解決では行わない**。CLI プロセスが
+    /// Tauri を起動する前に書き終えてから、この Route を「開く」指示として
+    /// 実行中インスタンス (または自プロセス) に渡す。標準入力の内容は
+    /// single-instance プラグインが転送する argv には載らないため、
+    /// 書き出しを起動側で完結させないと転送経路で失われる。
+    /// そのため解決側 (lib.rs) は `content` を参照しない。
+    WriteFile {
+        /// 接続名 (`ServerConfig::name`)。未検証。
+        connection: String,
+        /// ファイル名。未検証 (拡張子はエンジンのものが補われる)。
+        file_name: String,
+        /// 書き出す内容 (省略時は既存ファイルをそのまま開く)。
+        content: Option<String>,
+    },
 }
 
 /// 開く対象のクエリファイルを、接続名と (正規化済み) ファイル名で表す。
@@ -94,6 +123,9 @@ impl std::error::Error for RouteError {}
 
 /// `queryfolio://open/<path>` 形式の URI を [`Route`] に解釈する。
 ///
+/// 受け付けるアクションは `open` のみ。`write` は書き込みを伴うため URI からは
+/// 受け付けない (モジュールドキュメント参照)。
+///
 /// アクションは `queryfolio://` の直後、最初の `/` までを取る。残りが開く対象の
 /// パス (パーセントエンコードされていればデコードする)。絶対パスが渡ると
 /// `queryfolio://open//abs/path.sql` のように `/` が重なるが、`open` を取り出した
@@ -120,25 +152,57 @@ pub fn parse_uri(uri: &str) -> Result<Route, RouteError> {
     }
 }
 
-/// CLI 引数列 (プログラム名を除いたもの) から [`Route`] を解釈する。
+/// CLI 引数列から [`Route`] を解釈する。
 ///
-/// `open <path>` サブコマンド形式のみ扱う。`queryfolio://` URL 引数は
-/// deep-link プラグインが処理するためここでは無視する (二重処理防止)。
+/// 扱うのは次の 2 形式:
+///
+/// - `open <path>` — 保存済みのクエリファイルをパス指定で開く
+/// - `write <connection> <file-name> [content]` — 接続のフォルダにクエリファイルを
+///   書き出して開く (`content` 省略時は呼び出し側が標準入力を読む。読めなければ
+///   既存ファイルをそのまま開く)
+///
+/// 引数列にはプログラム名が含まれることがある (single-instance が転送する argv は
+/// argv[0] 込み) ため、先頭固定ではなく**最初に現れたサブコマンド語**を起点にする。
+///
+/// `queryfolio://` URL 引数は deep-link プラグインが処理するため `open` のパスとしては
+/// 受け取らない (二重処理防止)。**引数列全体からの除去はしない** — 除去すると
+/// `write` の内容が URL だった時 (`write prod a.sql 'queryfolio://open/x'`) にその
+/// 内容ごと消えてしまうため。URL 引数はサブコマンド語と一致しないので、起点探索の
+/// 邪魔にもならない。
 pub fn route_from_cli_args<S: AsRef<str>>(args: &[S]) -> Option<Route> {
     let scheme_prefix = format!("{URI_SCHEME}://");
-    let args: Vec<&str> = args
+    let args: Vec<&str> = args.iter().map(|s| s.as_ref()).collect();
+    // open / write のどちらか先に現れた方を採用する (両方を別々に探すと、
+    // 後ろのサブコマンドの引数に紛れた語を拾ってしまう)。
+    let pos = args
         .iter()
-        .map(|s| s.as_ref())
-        .filter(|s| !s.starts_with(&scheme_prefix))
-        .collect();
-    let pos = args.iter().position(|a| *a == "open")?;
-    let path = args.get(pos + 1)?;
-    if path.trim().is_empty() {
-        return None;
+        .position(|a| *a == OPEN_SUBCOMMAND || *a == WRITE_SUBCOMMAND)?;
+    match args[pos] {
+        OPEN_SUBCOMMAND => {
+            let path = args.get(pos + 1)?;
+            if path.trim().is_empty() || path.starts_with(&scheme_prefix) {
+                return None;
+            }
+            Some(Route::OpenFile {
+                path: (*path).to_string(),
+            })
+        }
+        WRITE_SUBCOMMAND => {
+            let connection = args.get(pos + 1)?;
+            let file_name = args.get(pos + 2)?;
+            if connection.trim().is_empty() || file_name.trim().is_empty() {
+                return None;
+            }
+            // 内容は省略可 (省略時は標準入力、それも無ければ書き出さない)。
+            // 空文字を明示的に渡した場合は「空で書く」意図として Some("") を保つ。
+            Some(Route::WriteFile {
+                connection: (*connection).to_string(),
+                file_name: (*file_name).to_string(),
+                content: args.get(pos + 3).map(|c| (*c).to_string()),
+            })
+        }
+        _ => None,
     }
-    Some(Route::OpenFile {
-        path: (*path).to_string(),
-    })
 }
 
 /// 生パスを、保存ディレクトリ配下の接続フォルダにあるクエリファイルとして解決する。
@@ -359,10 +423,98 @@ mod tests {
             route_from_cli_args(&["queryfolio://open//tmp/a.sql"]),
             None
         );
+        // open の後ろに URL が来ても、それをパスとしては受け取らない
+        assert_eq!(
+            route_from_cli_args(&["open", "queryfolio://open//tmp/a.sql"]),
+            None
+        );
         // open の後にパスが無ければ None
         assert_eq!(route_from_cli_args(&["open"]), None);
         // 無関係な引数だけなら None
         assert_eq!(route_from_cli_args(&["--flag", "value"]), None);
+        // argv[0] (プログラムパス) が混ざっていても拾える
+        assert_eq!(
+            route_from_cli_args(&["/Applications/QueryFolio.app/queryfolio", "open", "/tmp/a.sql"]),
+            Some(Route::OpenFile {
+                path: "/tmp/a.sql".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_route_from_cli_args_write() {
+        // 内容つき
+        assert_eq!(
+            route_from_cli_args(&["write", "prod", "report.sql", "select 1"]),
+            Some(Route::WriteFile {
+                connection: "prod".to_string(),
+                file_name: "report.sql".to_string(),
+                content: Some("select 1".to_string()),
+            })
+        );
+        // 内容省略 (標準入力または「開くだけ」)
+        assert_eq!(
+            route_from_cli_args(&["write", "prod", "report"]),
+            Some(Route::WriteFile {
+                connection: "prod".to_string(),
+                file_name: "report".to_string(),
+                content: None,
+            })
+        );
+        // 空文字の内容は「空で書く」意図として保つ (None に潰さない)
+        assert_eq!(
+            route_from_cli_args(&["write", "prod", "report.sql", ""]),
+            Some(Route::WriteFile {
+                connection: "prod".to_string(),
+                file_name: "report.sql".to_string(),
+                content: Some(String::new()),
+            })
+        );
+        // 内容が queryfolio:// URL でもそのまま内容として扱う
+        // (URL 引数の除去で内容を落とさない)
+        assert_eq!(
+            route_from_cli_args(&["write", "prod", "a.sql", "queryfolio://open/x"]),
+            Some(Route::WriteFile {
+                connection: "prod".to_string(),
+                file_name: "a.sql".to_string(),
+                content: Some("queryfolio://open/x".to_string()),
+            })
+        );
+        // 引数が足りない / 空白だけなら None
+        assert_eq!(route_from_cli_args(&["write", "prod"]), None);
+        assert_eq!(route_from_cli_args(&["write"]), None);
+        assert_eq!(route_from_cli_args(&["write", " ", "a.sql"]), None);
+        assert_eq!(route_from_cli_args(&["write", "prod", "  "]), None);
+    }
+
+    #[test]
+    fn test_route_from_cli_args_first_subcommand_wins() {
+        // 先に現れたサブコマンドを採用する。write の内容に "open" という語が
+        // 入っていても open サブコマンドとして誤解釈しない。
+        assert_eq!(
+            route_from_cli_args(&["write", "prod", "a.sql", "open /etc/passwd"]),
+            Some(Route::WriteFile {
+                connection: "prod".to_string(),
+                file_name: "a.sql".to_string(),
+                content: Some("open /etc/passwd".to_string()),
+            })
+        );
+        assert_eq!(
+            route_from_cli_args(&["open", "/tmp/a.sql", "write"]),
+            Some(Route::OpenFile {
+                path: "/tmp/a.sql".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_uri_rejects_write() {
+        // 書き込みアクションは URI からは受け付けない (Web ページから
+        // queryfolio:// を開かせられるため)
+        assert_eq!(
+            parse_uri("queryfolio://write/prod/a.sql"),
+            Err(RouteError::UnknownAction("write".to_string()))
+        );
     }
 
     #[test]
