@@ -303,7 +303,9 @@
 
 <svelte:window onkeydown={handleGlobalKeydown} />
 
-<div class="flex h-screen flex-col bg-zinc-950 text-zinc-200">
+<!-- overflow-hidden: 内側のペインがはみ出しても、アプリの枠から外へ広げない
+     (html/body 側の overflow: hidden と対で効かせる。CYBERNEURA-DEV-421) -->
+<div class="flex h-screen flex-col overflow-hidden bg-zinc-950 text-zinc-200">
   <Toolbar
     onRunCurrent={() => editor?.runCurrentStatement()}
     onOpenSearch={() => {
