@@ -46,12 +46,50 @@
     configEditorMode = mode;
   }
 
-  /// グローバルショートカット。Cmd+K (mac) / Ctrl+K で検索モーダルを開閉する。
+  /// モーダルを 1 つでも開いているか (キーボードはモーダルのものとみなす)。
+  /// aiAnalysis (EXPLAIN の AI 解説) はこのファイルではなく ResultsPane が
+  /// 描画するが、画面を覆うのは同じなのでここで見る。
+  const isModalOpen = () =>
+    showSearch ||
+    showSettings ||
+    configEditorMode !== null ||
+    appStore.aiAnalysis !== null ||
+    appStore.aiExplanation !== null ||
+    appStore.dangerousConfirmReason !== null;
+
+  /// グローバルショートカット。
+  /// - Cmd+K (mac) / Ctrl+K で検索モーダルを開閉する
+  /// - Ctrl+Tab / Ctrl+Shift+Tab でエディタタブを履歴順に切り替える
   function handleGlobalKeydown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
       e.preventDefault();
       showSearch = !showSearch;
+      return;
     }
+    // Ctrl+Tab は Ctrl 単独の時だけ拾う (Cmd+Tab は OS のアプリ切替、
+    // Alt+Tab は Windows のウインドウ切替なので、修飾が増えたら手を出さない)。
+    // preventDefault が要る: 既定はフォーカス移動で、押すたびにフォーカスが
+    // エディタから外れてしまう。
+    // モーダルが開いている間は無視する (見えない裏でタブが移り、閉じたら別の
+    // ファイルになっている、という状態を作らない)。
+    if (e.key === "Tab" && e.ctrlKey && !e.metaKey && !e.altKey && !isModalOpen()) {
+      e.preventDefault();
+      void appStore.cycleEditorTab(e.shiftKey ? -1 : 1);
+    }
+  }
+
+  /// Ctrl を離したら巡回を終える (そこで初めて、選んだタブが履歴の先頭になる)。
+  function handleGlobalKeyup(e: KeyboardEvent) {
+    if (e.key === "Control") {
+      void appStore.endEditorTabCycle();
+    }
+  }
+
+  /// ウインドウがフォーカスを失うと Ctrl の keyup は届かない (Cmd+Tab で
+  /// アプリを切り替えた時など)。巡回状態を持ち越すと、次に Ctrl+Tab を押した時に
+  /// 古い巡回の続きから進んでしまうので、ここでも終わらせる。
+  function handleWindowBlur() {
+    void appStore.endEditorTabCycle();
   }
   let editor: SqlEditor | undefined = $state();
 
@@ -309,7 +347,11 @@
   });
 </script>
 
-<svelte:window onkeydown={handleGlobalKeydown} />
+<svelte:window
+  onkeydown={handleGlobalKeydown}
+  onkeyup={handleGlobalKeyup}
+  onblur={handleWindowBlur}
+/>
 
 <!-- overflow-hidden: 内側のペインがはみ出しても、アプリの枠から外へ広げない
      (html/body 側の overflow: hidden と対で効かせる。CYBERNEURA-DEV-421) -->
