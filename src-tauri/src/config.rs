@@ -63,7 +63,9 @@ servers: []
 #
 # config_override_command: op read "op://development/queryfolio/config-yaml"
 
-# Where query files are stored (default: ~/.config/queryfolio/sqlfiles)
+# Where query files are stored (default: ~/.config/queryfolio/sqlfiles).
+# A relative path is resolved against this config directory, not the current
+# working directory, so the CLI and a running window always agree on it.
 # sqlfiles_dir: ~/queries
 #
 # Query files live under <sqlfiles_dir>/<folder>/<name>.sql. The per-connection
@@ -705,9 +707,24 @@ impl AppConfig {
     }
 
     /// クエリファイルの保存ディレクトリを解決する。
+    ///
+    /// 相対パスが書かれていた場合は**カレントディレクトリではなく設定ディレクトリ
+    /// (`~/.config/queryfolio`) を基準に解決する**。CLI の `write` は起動した
+    /// プロセス自身が書き出す一方、開くのは実行中インスタンス (別プロセス・別 cwd)
+    /// なので、cwd 基準だと 2 つのプロセスが違う場所を指してしまう
+    /// (書いたファイルが開けず、意図しないディレクトリに残る)。GUI を Finder から
+    /// 起動した時の cwd (`/`) も基準として無意味なため、プロセスに依存しない
+    /// 基準へ寄せる。
     pub fn resolve_sqlfiles_dir(&self) -> Result<PathBuf, AppError> {
         match self.doc.get("sqlfiles_dir").and_then(|v| v.as_str()) {
-            Some(dir) if !dir.trim().is_empty() => Ok(expand_tilde(dir)),
+            Some(dir) if !dir.trim().is_empty() => {
+                let path = expand_tilde(dir);
+                if path.is_absolute() {
+                    Ok(path)
+                } else {
+                    Ok(app_config_dir()?.join(path))
+                }
+            }
             _ => Ok(app_config_dir()?.join("sqlfiles")),
         }
     }
@@ -1715,6 +1732,16 @@ servers:
         let config = config_from_yaml("servers: []\nsqlfiles_dir: ~/my-queries\n");
         let custom = config.resolve_sqlfiles_dir().unwrap();
         assert_eq!(custom, dirs::home_dir().unwrap().join("my-queries"));
+
+        // 相対パスは cwd ではなく設定ディレクトリ基準 (プロセスに依存しない)。
+        // CLI (書き出す側) と実行中インスタンス (開く側) は cwd が違うため。
+        let config = config_from_yaml("servers: []\nsqlfiles_dir: my-queries\n");
+        let relative = config.resolve_sqlfiles_dir().unwrap();
+        assert_eq!(relative, app_config_dir().unwrap().join("my-queries"));
+
+        let config = config_from_yaml("servers: []\nsqlfiles_dir: ./a/../b\n");
+        let relative = config.resolve_sqlfiles_dir().unwrap();
+        assert_eq!(relative, app_config_dir().unwrap().join("./a/../b"));
     }
 
     #[test]

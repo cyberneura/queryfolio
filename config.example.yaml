@@ -280,6 +280,10 @@ server_templates:
 # --- クエリファイルの保存先 (任意。デフォルト ~/.config/queryfolio/sqlfiles) ---
 # sqlfiles_dir: ~/queries
 #
+# 相対パスを書いた場合は、カレントディレクトリではなく設定ディレクトリ
+# (~/.config/queryfolio) を基準に解決する。CLI と実行中のウインドウは
+# 別プロセス (別 cwd) なので、cwd 基準だと互いに違う場所を指してしまうため。
+#
 # クエリファイルは <sqlfiles_dir>/<フォルダ名>/<name>.sql に保存される。
 # フォルダ名は接続ごとに次のルールで決まる (接続 name は使わない):
 #   - サーバーに folder_name を指定していればそれを使う

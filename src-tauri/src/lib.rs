@@ -189,11 +189,11 @@ impl AppState {
     ) -> Result<router::OpenTarget, AppError> {
         match route {
             router::Route::OpenFile { path } => {
-                // sqlfiles_dir は「アプリプロセスのカレントディレクトリ」で絶対化する。
-                // 設定が相対 sqlfiles_dir の場合、実際のファイル I/O (query_files) と
-                // verify_within_dir はアプリプロセスの cwd 基準で解決されるため、
-                // パス検証の base もそこに揃える (実行中インスタンスへ渡る起動元 cwd と
-                // 混同しない)。std::path::absolute は FS に触れない字句的絶対化。
+                // resolve_sqlfiles_dir は相対設定を設定ディレクトリ基準で絶対化して
+                // 返すため、ここでの絶対化は本来 no-op。それでも残すのは、パス検証の
+                // base が相対のままだと strip_prefix の比較が実 I/O と食い違うためで、
+                // 「base は必ず絶対」という前提をこの場で担保しておく
+                // (std::path::absolute は FS に触れない字句的絶対化)。
                 let sqlfiles_dir = self.resolve_sqlfiles_dir().await?;
                 let sqlfiles_dir =
                     std::path::absolute(&sqlfiles_dir).unwrap_or(sqlfiles_dir);
