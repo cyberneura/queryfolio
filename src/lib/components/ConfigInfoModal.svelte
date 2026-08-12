@@ -47,8 +47,12 @@
     }
   }}
 >
+  <!-- 他のモーダル (AiAnalysisModal / SearchModal / ConfigEditorModal) と同様に
+       ビューポート内へ収める。loadError に長いメッセージが入ると縦にはみ出すが、
+       fixed かつ中央揃えなので上端が画面外へ出て読めなくなる (ドキュメント自体は
+       スクロールしないため戻せない。CYBERNEURA-DEV-421) -->
   <div
-    class="flex w-[560px] flex-col gap-3 rounded-lg border border-zinc-700 bg-zinc-900 p-4 shadow-xl"
+    class="flex max-h-[85vh] w-[560px] flex-col gap-3 overflow-auto rounded-lg border border-zinc-700 bg-zinc-900 p-4 shadow-xl"
   >
     <h2 class="text-sm font-semibold text-zinc-200">Settings</h2>
 
