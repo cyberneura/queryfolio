@@ -342,8 +342,17 @@ pub async fn list_databases(client: &redis::Client) -> Result<Vec<String>, AppEr
             let mut cmd = redis::cmd("CONFIG");
             cmd.arg("GET").arg("databases");
             // 応答は ["databases", "16"] (RESP2) か {databases: 16} (RESP3)。
-            // どちらも 2 要素の文字列列として読めるので Vec<String> で受ける
-            let reply: Result<Vec<String>, _> = cmd.query_async(&mut conn).await;
+            // どちらも 2 要素の文字列列として読めるので Vec<String> で受ける。
+            //
+            // PING と同じくタイムアウトを掛ける。open_connection が見るのは接続の
+            // 確立までで、TCP は繋がるのに応答しない相手 (止まった SSH トンネル /
+            // half-open なサービス) だとこの await が戻らなくなる。
+            // 落ちたら既定値へ倒す (一覧が出ないより既定値で出したほうが使える)
+            let reply: Result<Vec<String>, _> =
+                match tokio::time::timeout(CONNECT_TIMEOUT, cmd.query_async(&mut conn)).await {
+                    Ok(reply) => reply,
+                    Err(_) => Ok(Vec::new()),
+                };
             reply
                 .ok()
                 .and_then(|values| values.get(1).and_then(|v| v.parse::<i64>().ok()))
