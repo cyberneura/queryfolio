@@ -118,6 +118,12 @@ UNLINK  big:key
 
 ## Server and config
 
+These read nothing but a server's own state, yet `CONFIG`, `CLIENT`, `SLOWLOG`
+and `LATENCY` are not on the read-only list — the guard works per command, not
+per subcommand, and each of these has writing forms (`CONFIG SET`,
+`CLIENT KILL`, `SLOWLOG RESET`, `LATENCY RESET`). **Turn Writable on first**, or
+they are refused before they reach the server.
+
 ```
 CONFIG GET maxmemory
 CONFIG GET maxmemory-policy
@@ -125,6 +131,10 @@ CLIENT LIST
 SLOWLOG GET 10
 LATENCY LATEST
 ```
+
+`INFO`, `DBSIZE`, `OBJECT` and `MEMORY USAGE` need no such thing — they are on
+the list (`MEMORY` is checked per subcommand, so `MEMORY USAGE` passes while
+`MEMORY PURGE` does not).
 
 ## What is blocked, and why
 

@@ -12,12 +12,14 @@ psql-style shortcuts, translated to whichever catalog the engine uses:
 
 ```
 \l          -- databases
-\dn         -- schemas
 \dt         -- tables
 \dv         -- views
-\du         -- roles
 \d users    -- one table's columns, types and indexes
 ```
+
+Two more exist, but not everywhere: `\dn` (schemas) is PostgreSQL only, and
+`\du` (roles) is PostgreSQL and MySQL. Asking an engine for one it does not
+have returns an "unsupported meta command" error listing what it does support.
 
 Switching database is `\c reporting` or `USE reporting` (MySQL and PostgreSQL).
 Both rebuild the connection pool, so they take effect for every following
@@ -90,9 +92,11 @@ EXPLAIN SELECT * FROM orders WHERE user_id = 42;
 ```
 
 The Explain button runs this for you and can hand the plan to the AI for a
-reading. `EXPLAIN ANALYZE` is refused with Writable off — it executes the
-statement it is explaining, which is not what you want against production while
-you are only looking.
+reading.
+
+`EXPLAIN ANALYZE` really runs the statement it is explaining, so with Writable
+off it is allowed for a read (`EXPLAIN ANALYZE SELECT …`) and refused when the
+analysed statement writes. The Explain button always uses plain `EXPLAIN`.
 
 ## Editing results
 
@@ -106,7 +110,7 @@ With **Writable off** (the default) the leading keyword has to be one of
 `SELECT`, `WITH`, `SHOW`, `DESCRIBE`, `EXPLAIN`, `PRAGMA`, `VALUES`, `TABLE`,
 `CALL`. Write-shaped variants are rejected even when they start that way: a
 `WITH` whose body is an `INSERT`/`UPDATE`/`DELETE`, `SELECT … INTO`,
-`EXPLAIN ANALYZE` of a DML statement, and assignment-form `PRAGMA`.
+`EXPLAIN ANALYZE` of a statement that writes, and assignment-form `PRAGMA`.
 
 `readonly: true` on a connection outranks the Writable switch and cannot be
 turned off from the toolbar — the lock icon means the setting, not the switch.

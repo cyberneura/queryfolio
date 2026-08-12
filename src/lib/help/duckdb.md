@@ -88,8 +88,9 @@ With **Writable off** (the default) only read-shaped statements run, and the
 same guards as the other SQL engines apply: no `SELECT … INTO`, no CTE that
 wraps a write, no `EXPLAIN ANALYZE` of a write, no assignment-form `PRAGMA`.
 
-`EXPLAIN` is available; `EXPLAIN ANALYZE` is not, because it executes the
-statement it is explaining.
+`EXPLAIN ANALYZE` really runs the statement it is explaining, so it is allowed
+for a read and refused when the analysed statement writes. The Explain button
+always uses plain `EXPLAIN`.
 
 Without `allow_dangerous_statements`, `UPDATE`/`DELETE` with no `WHERE`, and any
 `DROP` or `TRUNCATE`, are refused.
