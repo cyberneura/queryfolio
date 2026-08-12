@@ -64,12 +64,22 @@
     // 既定のままだと明るいフォームパーツが暗いエディタの上に乗って浮く。
     ".cm-panels": { backgroundColor: "#18181b", color: "#e4e4e7" },
     ".cm-panels.cm-panels-top": { borderBottom: "1px solid #3f3f46" },
-    ".cm-panel.cm-search": { fontSize: "12px", padding: "4px 6px" },
-    ".cm-panel.cm-search input[type=text]": {
+    // フォントサイズは入力欄・ボタン・ラベルに**個別に**指定する。CodeMirror の
+    // 基本テーマが `.cm-textfield` / `.cm-button` に `font-size: 70%`、検索パネルの
+    // `label` に `80%` を当てているため、パネル側の指定だけでは 70% / 80% を掛けた
+    // 大きさになってしまう (12px 指定で実測 8.4px)。モーダル内の他のボタンが
+    // Tailwind の text-xs (12px) なので、パネルの操作系もそこへ揃える。
+    ".cm-panel.cm-search": { fontSize: "13px", padding: "4px 6px" },
+    // 検索・置換の入力欄は `.cm-textfield` で引く。**`input[type=text]` では引けない**:
+    // @codemirror/search はこの 2 つを type 属性なしで生成するため、属性セレクタに
+    // 一致しない (既定の type が text でも属性は無い)。以前この指定だったので、
+    // 下の配色は一度も当たっていなかった。
+    ".cm-panel.cm-search input.cm-textfield": {
       backgroundColor: "#27272a",
       color: "#f3f5f9",
       border: "1px solid #52525b",
       borderRadius: "3px",
+      fontSize: "12px",
       padding: "2px 4px",
     },
     ".cm-panel.cm-search button": {
@@ -78,8 +88,10 @@
       color: "#e4e4e7",
       border: "1px solid #52525b",
       borderRadius: "3px",
+      fontSize: "12px",
       padding: "2px 6px",
     },
+    ".cm-panel.cm-search label": { fontSize: "12px" },
   });
 
   // SqlEditor と同じ、oneDark より明るい配色
