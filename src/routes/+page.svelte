@@ -149,18 +149,16 @@
     ) {
       return;
     }
-    const block = formatRunLogBlock(
-      target.logLabel,
-      executedAt,
-      runLogBody(result),
-    );
+    // ラベルは書き戻す直前に本文から取り直したものを使う (SqlEditor が渡す)
+    const buildBlock = (label: string) =>
+      formatRunLogBlock(label, executedAt, runLogBody(result));
     // `\c` / `USE` は実行そのものが切替なので、その文が切り替えた先は
     // 「変わっていない」とみなす (この結果は切替後のスキーマのもの)
     const expectedSchema = result.switched_schema ?? schema;
     const outcome =
       appStore.activeEditorTabId === tabId &&
       appStore.activeSchema === expectedSchema
-        ? (editor?.writeRunLog(target, block) ?? "stale")
+        ? (editor?.writeRunLog(target, buildBlock) ?? "stale")
         : "stale";
     switch (outcome) {
       case "stale":
@@ -169,6 +167,9 @@
         toast.warning(
           "The editor changed while the query was running — the log was not written.",
         );
+        break;
+      case "unmarked":
+        // 実行中にマーカーを消した = 書き戻しの取り消しなので黙って従う
         break;
       case "broken":
         toast.warning(
