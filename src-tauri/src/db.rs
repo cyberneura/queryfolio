@@ -1761,6 +1761,15 @@ const AGENT_ALLOWED_KEYWORDS: &[&str] = &[
 /// 同じ厳しさ (狭いホワイトリスト + 複文禁止 + EXPLAIN ANALYZE 禁止 +
 /// readonly ガード) を使う。
 pub fn is_safe_to_rerun(sql: &str, engine: Engine) -> bool {
+    // DynamoDB の `tables` は ListTables を叩くだけの読み取り文で、SQL 系の
+    // キーワード判定 (AGENT_ALLOWED_KEYWORDS / is_fetch_statement) には乗らない
+    // (CYBERNEURA-DEV-406)。ここで拾わないと、テーブル数が default_limit を超えた
+    // 時に Copy / Export が打ち切られた表のまま出力される。
+    // この分岐は Copy / Export の再実行判定だけに効く (AI エージェント経路は
+    // agent_rejection_reason を直接使う)
+    if engine == Engine::DynamoDb && crate::engines::dynamodb::is_tables_statement(sql) {
+        return true;
+    }
     agent_rejection_reason(sql, engine).is_none()
 }
 
@@ -2664,6 +2673,15 @@ mod tests {
         // 対象文を実際に実行する EXPLAIN ANALYZE と複文も拒否する
         assert!(!f("EXPLAIN ANALYZE SELECT * FROM t"));
         assert!(!f("SELECT 1; SELECT 2"));
+
+        // DynamoDB の `tables` は ListTables だけの読み取り文なので再実行してよい
+        // (CYBERNEURA-DEV-406)。SQL 系のキーワード判定には乗らないため個別に通す
+        assert!(is_safe_to_rerun("tables", Engine::DynamoDb));
+        assert!(is_safe_to_rerun("tables;", Engine::DynamoDb));
+        // 他のエンジンでは従来どおり拒否する
+        assert!(!is_safe_to_rerun("tables", Engine::Sqlite));
+        // 引数や複文が付いた形は DynamoDB でも拒否する
+        assert!(!is_safe_to_rerun("tables; DELETE FROM t", Engine::DynamoDb));
     }
 
     #[test]

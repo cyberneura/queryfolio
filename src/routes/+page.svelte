@@ -21,6 +21,7 @@
   import DangerousConfirmModal from "$lib/components/DangerousConfirmModal.svelte";
   import SearchModal from "$lib/components/SearchModal.svelte";
   import ChatPane from "$lib/components/ChatPane.svelte";
+  import HelpPane from "$lib/components/HelpPane.svelte";
   import PaneDivider from "$lib/components/PaneDivider.svelte";
 
   let showSettings = $state(false);
@@ -45,12 +46,50 @@
     configEditorMode = mode;
   }
 
-  /// グローバルショートカット。Cmd+K (mac) / Ctrl+K で検索モーダルを開閉する。
+  /// モーダルを 1 つでも開いているか (キーボードはモーダルのものとみなす)。
+  /// aiAnalysis (EXPLAIN の AI 解説) はこのファイルではなく ResultsPane が
+  /// 描画するが、画面を覆うのは同じなのでここで見る。
+  const isModalOpen = () =>
+    showSearch ||
+    showSettings ||
+    configEditorMode !== null ||
+    appStore.aiAnalysis !== null ||
+    appStore.aiExplanation !== null ||
+    appStore.dangerousConfirmReason !== null;
+
+  /// グローバルショートカット。
+  /// - Cmd+K (mac) / Ctrl+K で検索モーダルを開閉する
+  /// - Ctrl+Tab / Ctrl+Shift+Tab でエディタタブを履歴順に切り替える
   function handleGlobalKeydown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
       e.preventDefault();
       showSearch = !showSearch;
+      return;
     }
+    // Ctrl+Tab は Ctrl 単独の時だけ拾う (Cmd+Tab は OS のアプリ切替、
+    // Alt+Tab は Windows のウインドウ切替なので、修飾が増えたら手を出さない)。
+    // preventDefault が要る: 既定はフォーカス移動で、押すたびにフォーカスが
+    // エディタから外れてしまう。
+    // モーダルが開いている間は無視する (見えない裏でタブが移り、閉じたら別の
+    // ファイルになっている、という状態を作らない)。
+    if (e.key === "Tab" && e.ctrlKey && !e.metaKey && !e.altKey && !isModalOpen()) {
+      e.preventDefault();
+      void appStore.cycleEditorTab(e.shiftKey ? -1 : 1);
+    }
+  }
+
+  /// Ctrl を離したら巡回を終える (そこで初めて、選んだタブが履歴の先頭になる)。
+  function handleGlobalKeyup(e: KeyboardEvent) {
+    if (e.key === "Control") {
+      void appStore.endEditorTabCycle();
+    }
+  }
+
+  /// ウインドウがフォーカスを失うと Ctrl の keyup は届かない (Cmd+Tab で
+  /// アプリを切り替えた時など)。巡回状態を持ち越すと、次に Ctrl+Tab を押した時に
+  /// 古い巡回の続きから進んでしまうので、ここでも終わらせる。
+  function handleWindowBlur() {
+    void appStore.endEditorTabCycle();
   }
   let editor: SqlEditor | undefined = $state();
 
@@ -116,6 +155,8 @@
   /// AI チャットペインは本文が長いので、サイドバーより広い範囲を許す
   const CHAT_MIN = 240;
   const CHAT_MAX = 720;
+  const HELP_MIN = 260;
+  const HELP_MAX = 720;
   const EDITOR_FRAC_MIN = 0.15;
   const EDITOR_FRAC_MAX = 0.85;
 
@@ -165,6 +206,10 @@
   );
   /// AI チャットペインを開いているか (表示状態も次回起動へ引き継ぐ)
   let showChat = $state(loadLayoutValue("chatOpen", 0) === 1);
+  let helpWidth = $state(
+    clamp(loadLayoutValue("helpWidth", 380), HELP_MIN, HELP_MAX),
+  );
+  let showHelp = $state(loadLayoutValue("helpOpen", 0) === 1);
 
   // ドラッグ開始時の基準サイズ。PaneDivider は開始位置からの累積 delta を
   // 渡すので、基準 + delta で計算するとクランプ飽和後もポインタと同期する
@@ -172,6 +217,7 @@
   let dragBaseSidebar = 0;
   let dragBaseEditorFrac = 0;
   let dragBaseChat = 0;
+  let dragBaseHelp = 0;
 
   const selectedConnectionInfo = $derived(
     appStore.connections.find((c) => c.name === appStore.selectedConnection) ??
@@ -301,9 +347,15 @@
   });
 </script>
 
-<svelte:window onkeydown={handleGlobalKeydown} />
+<svelte:window
+  onkeydown={handleGlobalKeydown}
+  onkeyup={handleGlobalKeyup}
+  onblur={handleWindowBlur}
+/>
 
-<div class="flex h-screen flex-col bg-zinc-950 text-zinc-200">
+<!-- overflow-hidden: 内側のペインがはみ出しても、アプリの枠から外へ広げない
+     (html/body 側の overflow: hidden と対で効かせる。CYBERNEURA-DEV-421) -->
+<div class="flex h-screen flex-col overflow-hidden bg-zinc-950 text-zinc-200">
   <Toolbar
     onRunCurrent={() => editor?.runCurrentStatement()}
     onOpenSearch={() => {
@@ -312,6 +364,11 @@
     onOpenSettings={() => {
       showSettings = true;
     }}
+    helpOpen={showHelp}
+    onToggleHelp={() => {
+      showHelp = !showHelp;
+      saveLayoutValue("helpOpen", showHelp ? 1 : 0);
+    }}
     chatOpen={showChat}
     onToggleChat={() => {
       showChat = !showChat;
@@ -319,7 +376,13 @@
     }}
   />
 
-  <div class="flex min-h-0 flex-1">
+  <!-- overflow-x-auto: 接続一覧 / サイドバー / チャットは shrink-0 の固定幅なので、
+       ウインドウを狭めると中央のエディタが 0 幅まで潰れた先で右端がはみ出す。
+       ドキュメントをスクロールさせない代わりに、この行の中で横スクロールできるように
+       しておかないと右側のペインへ到達できなくなる (CYBERNEURA-DEV-421)。
+       縦は各ペインが内側にスクロール領域を持つので抑止する (片方だけ指定すると
+       もう片方が auto に計算されるため、明示的に hidden を置く) -->
+  <div class="flex min-h-0 flex-1 overflow-x-auto overflow-y-hidden">
     <div class="shrink-0" style="width: {connectionsWidth}px">
       <ConnectionsPane />
     </div>
@@ -499,6 +562,32 @@
             saveLayoutValue("chatOpen", 0);
           }}
           onInsert={(sql) => appStore.insertSqlSnippet(sql)}
+        />
+      </div>
+    {/if}
+
+    <!-- ヘルプペイン。チャットペインのさらに右 (最も右) に並ぶ -->
+    {#if showHelp}
+      <PaneDivider
+        direction="vertical"
+        annotate="pane-divider-help"
+        onDragStart={() => {
+          dragBaseHelp = helpWidth;
+        }}
+        onDrag={(delta) => {
+          // 右端のペインなので、ドラッグ方向と幅の増減は逆になる
+          helpWidth = clamp(dragBaseHelp - delta, HELP_MIN, HELP_MAX);
+        }}
+        onDragEnd={() => saveLayoutValue("helpWidth", helpWidth)}
+      />
+      <div class="shrink-0" style="width: {helpWidth}px">
+        <HelpPane
+          engine={selectedEngine}
+          onClose={() => {
+            showHelp = false;
+            saveLayoutValue("helpOpen", 0);
+          }}
+          onInsert={(text) => appStore.insertSqlSnippet(text)}
         />
       </div>
     {/if}

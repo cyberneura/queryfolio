@@ -55,7 +55,7 @@ const READONLY_COMMANDS: &[&str] = &[
     "ZCARD", "ZCOUNT", "ZSCORE", "ZMSCORE", "ZRANK", "ZREVRANK", "ZSCAN",
     "ZRANDMEMBER", "ZLEXCOUNT",
     // stream
-    "XRANGE", "XREVRANGE", "XLEN", "XREAD", "XINFO",
+    "XRANGE", "XREVRANGE", "XLEN", "XREAD", "XINFO", "XPENDING",
     // bitmap / hyperloglog / geo
     "GETBIT", "BITCOUNT", "BITPOS", "BITFIELD_RO", "PFCOUNT",
     "GEOPOS", "GEODIST", "GEOSEARCH", "GEOHASH",
@@ -836,7 +836,8 @@ mod tests {
 
     #[test]
     fn test_readonly_whitelist() {
-        for cmd in ["GET", "MGET", "HGETALL", "SCAN", "ZRANGE", "INFO", "PING"] {
+        // XPENDING は pending entries list を見るだけで書き込まない (XINFO と同類)
+        for cmd in ["GET", "MGET", "HGETALL", "SCAN", "ZRANGE", "INFO", "PING", "XPENDING"] {
             assert!(READONLY_COMMANDS.contains(&cmd), "{cmd} should be readonly");
         }
         for cmd in ["SET", "DEL", "HSET", "LPUSH", "EXPIRE", "FLUSHDB", "CONFIG"] {

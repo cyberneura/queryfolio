@@ -28,7 +28,7 @@ pub(crate) fn validate_component(name: &str) -> Result<&str, AppError> {
 /// クエリファイル名を正規化する (接続エンジンの拡張子を保証する)。
 /// ext は "sql" / "redis" などドット無しの拡張子 (engines::EngineCapabilities
 /// の file_extension)。
-fn normalize_file_name(name: &str, ext: &str) -> Result<String, AppError> {
+pub(crate) fn normalize_file_name(name: &str, ext: &str) -> Result<String, AppError> {
     let name = validate_component(name)?;
     let suffix = format!(".{}", ext.to_ascii_lowercase());
     if name.to_ascii_lowercase().ends_with(&suffix) {
@@ -278,6 +278,99 @@ pub fn read_query_file(
     Ok(fs::read_to_string(&path)?)
 }
 
+/// 同一ディレクトリの一時ファイルへ書いてから rename で置き換える。
+///
+/// `fs::write` は宛先を truncate してから書き足すため、書いている途中の状態が
+/// ディスク上に見える。CLI (`queryfolio write`) は**アプリ本体とは別プロセス**なので、
+/// 同じファイルへの同時書き込みや、実行中インスタンスの外部変更ウォッチャによる
+/// 読み取りが書き込みと重なりうる。その窓では中途半端な内容が読まれたり、
+/// 2 つの書き手の内容が混ざった壊れたクエリが残ったりする。
+/// rename は同一ファイルシステム内では atomic なので、読み手には「書き込み前」か
+/// 「書き込み後」のどちらかしか見えない (書き手同士も最後の 1 つが丸ごと勝つ)。
+///
+/// 一時ファイルは**必ず同じディレクトリに置く** (別ファイルシステムだと rename が
+/// EXDEV で失敗する)。名前はドット始まり + `.tmp` 拡張子なので、一覧・検索
+/// (list_query_file_names) には出ない。
+///
+/// Windows の `fs::rename` も `MOVEFILE_REPLACE_EXISTING` 相当で既存を置き換える
+/// (`move_query_file` が予約済みの空ファイルを rename で潰しているのと同じ前提)。
+fn write_file_atomic(path: &Path, content: &str) -> Result<(), AppError> {
+    /// 一時ファイル名が埋まっていた時に作り直す回数の上限。
+    /// 名前は pid + 連番なので通常は 1 回目で成功する (残骸やリンクがある時だけ進む)。
+    const MAX_TMP_FILE_ATTEMPTS: usize = 8;
+
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    /// 同一プロセス内で同じファイルへ同時に書いた時に一時ファイル名が衝突しないようにする
+    /// (プロセス間は pid で分かれる)。
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::QueryFile(format!("Invalid file path: {}", path.display())))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| AppError::QueryFile(format!("Invalid file name: {}", path.display())))?;
+    // 一時ファイルは `create_new` (`O_EXCL`) で作る。`File::create` はシンボリック
+    // リンクを辿って truncate するため、クラッシュで残った同名ファイルや、
+    // 事前に置かれたリンクがあると保存領域の外を壊しうる。名前が使われていたら
+    // 連番を進めて作り直す (同一プロセス内の同時書き込みや残骸との衝突)。
+    let mut tmp_path = PathBuf::new();
+    let mut file = None;
+    for _ in 0..MAX_TMP_FILE_ATTEMPTS {
+        let candidate = parent.join(format!(
+            ".{file_name}.{}-{}.tmp",
+            std::process::id(),
+            SEQ.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => {
+                tmp_path = candidate;
+                file = Some(f);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let Some(mut file) = file else {
+        return Err(AppError::QueryFile(format!(
+            "Could not create a temporary file to write: {}",
+            path.display()
+        )));
+    };
+
+    let written = (|| -> std::io::Result<()> {
+        // 既存ファイルのパーミッションを引き継ぐ (rename は中身ごと属性を差し替えるため、
+        // 引き継がないと利用者が 600 に絞ったクエリファイルが umask 既定に戻ってしまう)。
+        #[cfg(unix)]
+        if let Ok(meta) = fs::metadata(path) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(fs::Permissions::from_mode(meta.permissions().mode()));
+        }
+        file.write_all(content.as_bytes())?;
+        // rename の前に内容をディスクへ落とす (先に rename が耐久化されると、
+        // クラッシュ時に「名前はあるが中身が空」のファイルが残りうる)。
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 pub fn write_query_file(
     sqlfiles_dir: &Path,
     connection: &str,
@@ -289,7 +382,7 @@ pub fn write_query_file(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, content)?;
+    write_file_atomic(&path, content)?;
     Ok(())
 }
 
@@ -328,7 +421,7 @@ pub fn write_query_file_if_unchanged(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, content)?;
+    write_file_atomic(&path, content)?;
     Ok(true)
 }
 
@@ -351,6 +444,84 @@ pub fn create_query_file(
     }
     fs::write(&path, "")?;
     Ok(normalized)
+}
+
+/// `file` をシンボリックリンク解決込みで canonicalize し、`base` (これも
+/// canonicalize したもの) の配下に留まることを確かめる。保存領域外の実体を指す
+/// リンクを弾く多重防御。対象は既存ファイルのはずなので、canonicalize
+/// できない (存在しない等) 場合は拒否する。
+pub fn verify_within_dir(base: &Path, file: &Path) -> Result<(), AppError> {
+    let canonical_base = base.canonicalize().map_err(|e| {
+        AppError::QueryFile(format!("Cannot resolve the query files directory: {e}"))
+    })?;
+    let canonical_file = file
+        .canonicalize()
+        .map_err(|e| AppError::QueryFile(format!("Cannot open the file: {e}")))?;
+    if !canonical_file.starts_with(&canonical_base) {
+        return Err(AppError::QueryFile(
+            "The file resolves outside the query files directory".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// クエリファイルが無ければ空で作る (あれば内容はそのまま)。
+/// 正規化されたファイル名を返す。
+///
+/// `create_query_file` との違いは**既存を上書きも失敗もしない**こと。
+/// CLI (`queryfolio write <connection> <file-name>`) で内容を省略した時に使う:
+/// 「まだ無ければ作って開く / あればそのまま開く」が期待される挙動で、
+/// 既存の内容を空で潰してはいけない。
+///
+/// 作成は `create_new` (`O_EXCL`) で行い、存在確認と作成の間に他プロセスが
+/// 同名ファイルを作った場合も既存扱いにする (中身を消さない)。
+/// ただし既存が通常ファイルでない場合はエラーにする (下記参照)。
+pub fn ensure_query_file(
+    sqlfiles_dir: &Path,
+    connection: &str,
+    file_name: &str,
+    ext: &str,
+) -> Result<String, AppError> {
+    let normalized = normalize_file_name(file_name, ext)?;
+    let path = file_path(sqlfiles_dir, connection, &normalized, ext)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(_) => Ok(normalized),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // `O_EXCL` は「通常ファイルが既にある」時だけでなく、ディレクトリ・
+            // 壊れたシンボリックリンク・FIFO 等が同名で存在する時も AlreadyExists を返す。
+            // そのまま成功として返すと、CLI (`queryfolio write`) は書き出しに成功したつもりで
+            // 起動を続け、実際の失敗はフロントの読み込み時まで遅れる = 呼び出したエージェントは
+            // 終了ステータスから失敗を判別できない。開けるクエリファイルが本当にあるかを
+            // ここで確かめる (metadata はリンクを辿るので、壊れたリンクは Err になる)。
+            let meta = fs::metadata(&path).map_err(|e| {
+                AppError::QueryFile(format!(
+                    "The existing entry cannot be opened as a query file: {} ({e})",
+                    path.display()
+                ))
+            })?;
+            if !meta.is_file() {
+                return Err(AppError::QueryFile(format!(
+                    "The path already exists and is not a regular file: {}",
+                    path.display()
+                )));
+            }
+            // `metadata` はリンクを辿るため、**保存領域の外にある通常ファイル**を
+            // 指すシンボリックリンクは上の is_file() を通ってしまう。実行中インスタンス
+            // 側は同じ対象を verify_within_dir で拒否するので、ここで通すと
+            // 「CLI は終了ステータス 0 なのにファイルは開かれない」になる。
+            // 開く側と同じ判定をここでも行い、成功の意味を揃える。
+            verify_within_dir(sqlfiles_dir, &path)?;
+            Ok(normalized)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub fn delete_query_file(
@@ -532,6 +703,128 @@ mod tests {
             normalize_file_name("keys.sql", "redis").unwrap(),
             "keys.sql.redis"
         );
+    }
+
+    #[test]
+    fn test_ensure_query_file_creates_and_keeps_existing() {
+        let dir = test_dir().join("ensure");
+        let connection = "conn";
+
+        // 無ければ空で作る (拡張子も補う)
+        assert_eq!(
+            ensure_query_file(&dir, connection, "report", "sql").unwrap(),
+            "report.sql"
+        );
+        assert_eq!(read_query_file(&dir, connection, "report", "sql").unwrap(), "");
+
+        // 既存の内容は消さない (create_query_file と違いエラーにもしない)
+        write_query_file(&dir, connection, "report.sql", "SELECT 1;", "sql").unwrap();
+        assert_eq!(
+            ensure_query_file(&dir, connection, "report.sql", "sql").unwrap(),
+            "report.sql"
+        );
+        assert_eq!(
+            read_query_file(&dir, connection, "report", "sql").unwrap(),
+            "SELECT 1;"
+        );
+
+        // 不正な名前は作らずエラー
+        assert!(ensure_query_file(&dir, connection, "../evil", "sql").is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 同名でディレクトリ / 壊れたシンボリックリンクが居座っている時は、
+    /// 「既にあるので OK」ではなくエラーにする (開けるクエリファイルが無いため)。
+    #[test]
+    fn test_ensure_query_file_rejects_non_file() {
+        let dir = test_dir().join("ensure-non-file");
+        let connection = "conn";
+        let conn_dir = connection_dir(&dir, connection).unwrap();
+        fs::create_dir_all(&conn_dir).unwrap();
+
+        // ディレクトリ
+        fs::create_dir(conn_dir.join("dir-entry.sql")).unwrap();
+        assert!(ensure_query_file(&dir, connection, "dir-entry", "sql").is_err());
+
+        // 壊れたシンボリックリンク (リンク先が無い)
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                conn_dir.join("missing-target.sql"),
+                conn_dir.join("dangling.sql"),
+            )
+            .unwrap();
+            assert!(ensure_query_file(&dir, connection, "dangling", "sql").is_err());
+        }
+
+        // 保存領域の外にある**実在する通常ファイル**を指すリンク。
+        // metadata はリンクを辿るので is_file() は通ってしまうが、実行中
+        // インスタンス側は verify_within_dir で拒否する。ここで成功にすると
+        // 「CLI は 0 で終わったのにファイルは開かれない」になる。
+        #[cfg(unix)]
+        {
+            let outside = test_dir().join("ensure-non-file-outside");
+            fs::create_dir_all(&outside).unwrap();
+            let target = outside.join("real.sql");
+            fs::write(&target, "SELECT 1;").unwrap();
+            std::os::unix::fs::symlink(&target, conn_dir.join("escaping.sql")).unwrap();
+            assert!(ensure_query_file(&dir, connection, "escaping", "sql").is_err());
+
+            // 保存領域の**中**を指すリンクは、開く側 (verify_within_dir) が
+            // 受け入れるのでこちらも受け入れる (判定を食い違わせない)。
+            let inside = conn_dir.join("inside.sql");
+            fs::write(&inside, "SELECT 1;").unwrap();
+            std::os::unix::fs::symlink(&inside, conn_dir.join("linked.sql")).unwrap();
+            assert!(ensure_query_file(&dir, connection, "linked", "sql").is_ok());
+
+            let _ = fs::remove_dir_all(&outside);
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 書き込みは一時ファイル + rename で行い、宛先を途中の状態で晒さない。
+    /// 一時ファイルを残さないこと・既存のパーミッションを引き継ぐことも確認する。
+    #[test]
+    fn test_write_query_file_is_atomic() {
+        let dir = test_dir().join("atomic");
+        let connection = "conn";
+
+        write_query_file(&dir, connection, "report", "SELECT 1;", "sql").unwrap();
+        let conn_dir = connection_dir(&dir, connection).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = conn_dir.join("report.sql");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            write_query_file(&dir, connection, "report", "SELECT 2;", "sql").unwrap();
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "既存ファイルのパーミッションを引き継ぐこと"
+            );
+        }
+
+        assert_eq!(
+            read_query_file(&dir, connection, "report", "sql").unwrap(),
+            if cfg!(unix) { "SELECT 2;" } else { "SELECT 1;" }
+        );
+
+        // 一時ファイルが残っていない (残ると一覧・検索には出ないがゴミになる)
+        let leftovers: Vec<String> = fs::read_dir(&conn_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "一時ファイルが残っている: {leftovers:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
