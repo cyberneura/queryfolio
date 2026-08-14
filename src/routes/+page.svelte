@@ -139,6 +139,9 @@
     if (!result || target.logLabel === null) {
       return;
     }
+    // 見出しに入れるのは実行が終わった時刻。下の確認ダイアログを開いたまま
+    // にされると承認した時刻になってしまうので、待つ前に採る
+    const executedAt = formatRunLogTimestamp(new Date());
     // 大量の行はエディタを埋めてしまうので、書き戻す前に確認する
     if (
       result.rows.length >= RUN_LOG_CONFIRM_ROWS &&
@@ -148,7 +151,7 @@
     }
     const block = formatRunLogBlock(
       target.logLabel,
-      formatRunLogTimestamp(new Date()),
+      executedAt,
       runLogBody(result),
     );
     // `\c` / `USE` は実行そのものが切替なので、その文が切り替えた先は
