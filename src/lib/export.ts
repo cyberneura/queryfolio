@@ -119,6 +119,44 @@ export const toTsvRange = (
   return lines.join("\n");
 };
 
+/// 総文字数とセルあたりの文字数に上限を設けた TSV 化。
+/// 打ち切ったかどうかを一緒に返す。
+///
+/// `db.rs` は sqlx 経路でセルの文字数を切り詰めないため、100KB の TEXT や
+/// 長い JSON がそのままフロントへ届く。全セルを走査する処理は行数ではなく
+/// **総文字数**にコストが比例するので、行数の上限だけでは足りない
+/// (499 行 × 100KB のセルでも数百 MB になりうる)。
+export const toTsvCapped = (
+  result: QueryResult,
+  maxChars: number,
+  maxCellChars: number,
+): { text: string; truncated: boolean } => {
+  let truncated = false;
+  const cap = (field: string): string => {
+    if (field.length <= maxCellChars) {
+      return field;
+    }
+    truncated = true;
+    return `${field.slice(0, maxCellChars)}…`;
+  };
+  const lines = [
+    result.columns.map((c) => cap(sanitizeTsv(escapeHeaderFormula(c)))).join("\t"),
+  ];
+  let total = lines[0].length;
+  for (const row of result.rows) {
+    if (total >= maxChars) {
+      truncated = true;
+      break;
+    }
+    const line = row
+      .map((v) => cap(sanitizeTsv(escapeFormulaInjection(v, cellToString(v)))))
+      .join("\t");
+    lines.push(line);
+    total += line.length + 1;
+  }
+  return { text: lines.join("\n"), truncated };
+};
+
 export const toTsv = (result: QueryResult): string => {
   const sanitize = sanitizeTsv;
   const lines = [

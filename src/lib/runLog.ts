@@ -1,5 +1,5 @@
 import type { QueryResult } from "$lib/api";
-import { toTsv } from "$lib/export";
+import { toTsvCapped } from "$lib/export";
 
 /// 書き戻したログブロックの先頭に置くマーカー (U+1F5D2 + 異体字セレクタ)。
 /// 既存ブロックの検出はセレクタ無しの U+1F5D2 で行うため、手で消されても拾える
@@ -7,6 +7,16 @@ export const RUN_LOG_RESULT_MARKER = "\u{1F5D2}\u{FE0F}";
 
 /// この行数以上の結果は、書き戻す前に確認ダイアログを出す
 export const RUN_LOG_CONFIRM_ROWS = 500;
+
+/// 書き戻す TSV の総文字数の上限。
+/// **行数の確認ダイアログだけでは足りない** — セルの文字数に上限が無いため、
+/// 499 行でも長い TEXT / JSON 列があれば数百 MB になり、CodeMirror への
+/// 挿入と自動保存でアプリが固まる。超えた分は打ち切って本文にその旨を書く
+const MAX_BODY_CHARS = 200_000;
+
+/// 書き戻す TSV の 1 セルあたりの文字数の上限。
+/// 総量の上限だけでは 1 行が巨大なケース (列数 × 長い TEXT) を防げない
+const MAX_CELL_CHARS = 2_000;
 
 /// ログのラベル (マーカー行のうち 📝 より後ろ) の長さ上限。
 /// 1 行コメント全部が見出しになると読みにくいため切り詰める
@@ -101,19 +111,25 @@ export const formatRunLogTimestamp = (date: Date): string => {
 };
 
 /// 結果をログの本文 (TSV) にする。
-/// 行を返さない文 (INSERT 等) は影響行数を書く。表示が絞られている場合は
-/// その旨も残す (後から読んだ人が全件だと誤解しないように)
+/// 行を返さない文 (INSERT 等) は影響行数を書く。全件でない場合は理由ごとに
+/// その旨を残す (後から読んだ人が全件だと誤解しないように)。
+/// 3 つは同時に起こりうるので、独立した注記として並べる
 export const runLogBody = (result: QueryResult): string => {
   if (result.columns.length === 0) {
     return result.affected_rows === null
       ? "(no rows)"
       : `(${result.affected_rows} rows affected)`;
   }
-  const lines = [toTsv(result)];
+  const { text, truncated } = toTsvCapped(result, MAX_BODY_CHARS, MAX_CELL_CHARS);
+  const lines = [text];
   if (result.applied_limit !== null) {
     lines.push(`(limited to ${result.applied_limit} rows)`);
-  } else if (result.truncated) {
-    lines.push("(truncated)");
+  }
+  if (result.truncated) {
+    lines.push("(the result itself was truncated)");
+  }
+  if (truncated) {
+    lines.push("(this log was truncated — see the result table for the full output)");
   }
   return lines.join("\n");
 };
