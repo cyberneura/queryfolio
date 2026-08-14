@@ -957,17 +957,10 @@ async fn get_active_schema(
         return Ok(Some(schema));
     }
     let server = state.find_server(&connection).await?;
-    if server.schema.is_some() {
-        return Ok(server.schema);
-    }
-    // redis は schema 未設定でも database 0 に繋ぐ (engines/redis.rs の connect)。
-    // ここで None を返すと、Database 欄のプルダウンが「どの選択肢とも一致しない」
-    // 状態になり、表示上は先頭の 0 が選ばれているのにアプリの状態は未設定、
-    // という食い違いが残る。実際の接続先を返して揃える (CYBERNEURA-DEV-408)
-    if matches!(db::parse_engine(&server.engine), Ok(db::Engine::Redis)) {
-        return Ok(Some("0".to_string()));
-    }
-    Ok(None)
+    Ok(db::resolve_active_schema(
+        &server.engine,
+        server.schema.as_deref(),
+    ))
 }
 
 /// 指定接続のプールと SSH トンネルを破棄する。
