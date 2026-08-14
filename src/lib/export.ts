@@ -126,33 +126,63 @@ export const toTsvRange = (
 /// 長い JSON がそのままフロントへ届く。全セルを走査する処理は行数ではなく
 /// **総文字数**にコストが比例するので、行数の上限だけでは足りない
 /// (499 行 × 100KB のセルでも数百 MB になりうる)。
+///
+/// 上限の効かせ方に 2 つの要点がある:
+/// - **切り詰めは sanitize より先に行う。** 後で切ると、捨てる分まで
+///   正規表現で走査することになり、上限を付けた意味が無くなる。
+/// - **予算の判定はセル単位で行う。** 行の頭でだけ見ると、列数の多い結果
+///   (1,600 列 × 2,000 字) で 1 行ぶんまるごと予算を超過する。
+///
+/// 残る限界: オブジェクト値の `JSON.stringify` だけは切り詰めより先に走る
+/// (途中で打ち切れる標準の直列化が無いため)。予算を使い切った時点で以降の
+/// セルには触らないので、全体のコストは「予算 ÷ セル上限」個ぶんに収まる。
 export const toTsvCapped = (
   result: QueryResult,
   maxChars: number,
   maxCellChars: number,
 ): { text: string; truncated: boolean } => {
   let truncated = false;
-  const cap = (field: string): string => {
-    if (field.length <= maxCellChars) {
-      return field;
+  let total = 0;
+
+  // 数式インジェクション対策は先頭 1 文字の判定なので、切り詰めの前に済ませる
+  // (先頭に `'` を足すだけなので、後ろを切る操作と順序が入れ替わらない)
+  const field = (escaped: string): string => {
+    if (escaped.length <= maxCellChars) {
+      return sanitizeTsv(escaped);
     }
     truncated = true;
-    return `${field.slice(0, maxCellChars)}…`;
+    return `${sanitizeTsv(escaped.slice(0, maxCellChars))}…`;
   };
-  const lines = [
-    result.columns.map((c) => cap(sanitizeTsv(escapeHeaderFormula(c)))).join("\t"),
-  ];
-  let total = lines[0].length;
+
+  const header: string[] = [];
+  for (const column of result.columns) {
+    if (total >= maxChars) {
+      truncated = true;
+      break;
+    }
+    const text = field(escapeHeaderFormula(column));
+    header.push(text);
+    total += text.length + 1;
+  }
+  const lines = [header.join("\t")];
+
   for (const row of result.rows) {
     if (total >= maxChars) {
       truncated = true;
       break;
     }
-    const line = row
-      .map((v) => cap(sanitizeTsv(escapeFormulaInjection(v, cellToString(v)))))
-      .join("\t");
-    lines.push(line);
-    total += line.length + 1;
+    const fields: string[] = [];
+    for (const value of row) {
+      if (total >= maxChars) {
+        truncated = true;
+        break;
+      }
+      const text = field(escapeFormulaInjection(value, cellToString(value)));
+      fields.push(text);
+      total += text.length + 1;
+    }
+    lines.push(fields.join("\t"));
+    total += 1;
   }
   return { text: lines.join("\n"), truncated };
 };
