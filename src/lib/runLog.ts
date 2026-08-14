@@ -133,6 +133,21 @@ export const formatRunLogBlock = (
 /// ログブロックの開始 (`/* 🗒️`)。異体字セレクタは任意
 const RUN_LOG_BLOCK_OPEN = /^\/\*\s*\u{1F5D2}/u;
 
+/// pos から続く空白のうち、**完全な空行だけ**を読み飛ばした位置を返す
+/// (最後に越えた改行の直後。空行が 1 つも無ければ pos のまま)。
+///
+/// 空白をそのまま読み飛ばすと、次の行の字下げまで置換範囲に入ってしまい、
+/// 書き戻すたびに無関係な行のインデントが消える。
+const skipBlankLines = (doc: string, pos: number): number => {
+  let lineStart = pos;
+  for (let i = pos; i < doc.length && /\s/.test(doc[i]); i++) {
+    if (doc[i] === "\n") {
+      lineStart = i + 1;
+    }
+  }
+  return lineStart;
+};
+
 /// エディタへ書き戻す変更 (置換範囲と挿入テキスト)
 export interface RunLogWrite {
   from: number;
@@ -160,25 +175,22 @@ export const runLogWrite = (
   while (anchor < doc.length && /[ \t;]/.test(doc[anchor])) {
     anchor++;
   }
-  // 続く空行を読み飛ばした先が既存のログブロックか
-  let bodyStart = anchor;
-  while (bodyStart < doc.length && /\s/.test(doc[bodyStart])) {
-    bodyStart++;
+  // 続く空白を飛ばした先が既存のログブロックか (字下げされていても拾う)
+  let contentStart = anchor;
+  while (contentStart < doc.length && /\s/.test(doc[contentStart])) {
+    contentStart++;
   }
-  // 既存ブロックが無い場合も読み飛ばした空行ごと置き換える
+  // 既存ブロックが無い場合も、間の空行は置換範囲に含める
   // (毎回同じ空行数に揃え、書き戻しを繰り返しても空行が増えないようにする)
-  let to = bodyStart;
-  if (RUN_LOG_BLOCK_OPEN.test(doc.slice(bodyStart, bodyStart + 16))) {
+  let to = skipBlankLines(doc, anchor);
+  if (RUN_LOG_BLOCK_OPEN.test(doc.slice(contentStart, contentStart + 16))) {
     // 本文中の `*/` は escapeBlockComment で潰してあるので、
     // 最初に見つかる `*/` がこのブロックの終端
-    const close = doc.indexOf("*/", bodyStart);
+    const close = doc.indexOf("*/", contentStart);
     if (close < 0) {
       return null;
     }
-    to = close + 2;
-    while (to < doc.length && /\s/.test(doc[to])) {
-      to++;
-    }
+    to = skipBlankLines(doc, close + 2);
   }
   return { from: anchor, to, insert: `\n\n${block}\n\n` };
 };
