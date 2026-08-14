@@ -1251,10 +1251,13 @@ pub async fn list_schemas(
                 .unwrap_or("main");
             Ok(vec![path.to_string()])
         }
-        // Redis / Elasticsearch / DynamoDB に database 一覧の概念は無い
+        // Redis の「database」は番号 (CYBERNEURA-DEV-408)。
+        // 数はサーバー設定なのでモジュール側で問い合わせる
+        DbPool::Redis(client) => crate::engines::redis::list_databases(client).await,
+        // Elasticsearch / DynamoDB に database 一覧の概念は無い
         // (capabilities.supports_schemas = false でフロントは呼ばないが、
         // 直接呼ばれても壊れないよう空を返す)
-        DbPool::Redis(_) | DbPool::Elasticsearch(_) | DbPool::DynamoDb(_) => Ok(vec![]),
+        DbPool::Elasticsearch(_) | DbPool::DynamoDb(_) => Ok(vec![]),
     }
 }
 
@@ -2040,8 +2043,65 @@ fn sqlite_value_to_json(row: &SqliteRow, i: usize) -> serde_json::Value {
     decode_fallback!(row, i)
 }
 
+/// 接続設定の `schema` から「アクティブスキーマ」として見せる値を決める。
+///
+/// redis だけ扱いが違う。`engines/redis.rs` の connect は schema を trim して
+/// 見るので、**未設定も空白だけも database 0 に繋ぐ**。ここでその両方を
+/// `Some("0")` に正規化しないと、Database 欄のプルダウンが「どの選択肢とも
+/// 一致しない」状態になり、表示上は先頭の 0 が選ばれているのにアプリの状態は
+/// 空、という食い違いが残る (CYBERNEURA-DEV-408)。
+pub fn resolve_active_schema(engine: &str, schema: Option<&str>) -> Option<String> {
+    let is_redis = matches!(parse_engine(engine), Ok(Engine::Redis));
+    match schema {
+        Some(s) if !(is_redis && s.trim().is_empty()) => Some(s.to_string()),
+        _ if is_redis => Some("0".to_string()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn resolve_active_schema_keeps_explicit_values() {
+        assert_eq!(
+            super::resolve_active_schema("redis", Some("3")),
+            Some("3".to_string())
+        );
+        assert_eq!(
+            super::resolve_active_schema("postgres", Some("public")),
+            Some("public".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_active_schema_defaults_redis_to_zero() {
+        // 未設定・空文字・空白だけは、いずれも connect 側が database 0 に
+        // 繋ぐので同じ扱いにする。
+        for schema in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                super::resolve_active_schema("redis", schema),
+                Some("0".to_string()),
+                "schema={schema:?}"
+            );
+        }
+        // エイリアスでも同じ
+        assert_eq!(
+            super::resolve_active_schema("valkey", Some("")),
+            Some("0".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_active_schema_leaves_other_engines_untouched() {
+        assert_eq!(super::resolve_active_schema("postgres", None), None);
+        // redis 以外では空文字をそのまま返す (この正規化は redis 固有)
+        assert_eq!(
+            super::resolve_active_schema("postgres", Some("")),
+            Some(String::new())
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -299,6 +299,70 @@ fn parse_command_line(line: &str) -> Result<Vec<Vec<u8>>, AppError> {
     Ok(args)
 }
 
+/// `CONFIG GET databases` が取れなかった場合に使う database 数。
+/// Redis / Valkey の既定値。
+const DEFAULT_DATABASE_COUNT: i64 = 16;
+
+/// プルダウンに並べる database 番号の上限。
+/// `CONFIG GET databases` は理屈上いくらでも大きい値を返せるので、
+/// 選択肢の生成が暴れないよう頭を押さえる。
+const MAX_DATABASE_COUNT: i64 = 1024;
+
+/// database 番号の一覧 ("0" 〜 "N-1") を作る。
+///
+/// 0 以下や壊れた値は既定値に、大きすぎる値は MAX_DATABASE_COUNT に丸める。
+fn database_names(count: i64) -> Vec<String> {
+    let count = if count <= 0 {
+        DEFAULT_DATABASE_COUNT
+    } else {
+        count.min(MAX_DATABASE_COUNT)
+    };
+    (0..count).map(|db| db.to_string()).collect()
+}
+
+/// 選択できる database 番号の一覧 ("0" 〜 "N-1") を返す (CYBERNEURA-DEV-408)。
+///
+/// 数は `CONFIG GET databases` で取る。ACL で CONFIG を禁止している環境や、
+/// マネージドサービスで応答が返らない環境があるため、**取れなければ既定の 16 に
+/// 倒す** (一覧が出ないより、既定値で出したほうが使える)。
+/// 値が壊れていた場合も同じ扱いにする。
+///
+/// 既定値へ倒れた場合、実際の database 数が 16 より多い環境では 16 以降を
+/// プルダウンから選べない。ただし**設定 / オーバーライドで現在選ばれている番号は
+/// 一覧に無くても選択肢に残る** (EditorToolbar が activeSchema を option として
+/// 足すため)。逆に 16 未満の環境では存在しない番号が並ぶ。**選んだ時点では成功として
+/// 扱われ、失敗するのは次のクエリ**になる。これは redis に限らず Database 欄の共通の
+/// 挙動で (`set_active_schema` はオーバーライドを保存するだけ。接続して検証するのは
+/// メタコマンドの経路のみ)、失敗時は `rollback_schema_override` が元へ戻すので
+/// 壊れた状態にはならない。選択時に検証しようとすると、接続を遅延確立する設計
+/// (AGENTS.md の「接続 (SSH トンネル) の遅延確立」) とぶつかるため踏み込まない。
+pub async fn list_databases(client: &redis::Client) -> Result<Vec<String>, AppError> {
+    let count = match open_connection(client).await {
+        Ok(mut conn) => {
+            let mut cmd = redis::cmd("CONFIG");
+            cmd.arg("GET").arg("databases");
+            // 応答は ["databases", "16"] (RESP2) か {databases: 16} (RESP3)。
+            // どちらも 2 要素の文字列列として読めるので Vec<String> で受ける。
+            //
+            // PING と同じくタイムアウトを掛ける。open_connection が見るのは接続の
+            // 確立までで、TCP は繋がるのに応答しない相手 (止まった SSH トンネル /
+            // half-open なサービス) だとこの await が戻らなくなる。
+            // 落ちたら既定値へ倒す (一覧が出ないより既定値で出したほうが使える)
+            let reply: Result<Vec<String>, _> =
+                match tokio::time::timeout(CONNECT_TIMEOUT, cmd.query_async(&mut conn)).await {
+                    Ok(reply) => reply,
+                    Err(_) => Ok(Vec::new()),
+                };
+            reply
+                .ok()
+                .and_then(|values| values.get(1).and_then(|v| v.parse::<i64>().ok()))
+                .unwrap_or(DEFAULT_DATABASE_COUNT)
+        }
+        Err(_) => DEFAULT_DATABASE_COUNT,
+    };
+    Ok(database_names(count))
+}
+
 /// 接続先アドレスを組み立てる。`tls` が true なら TLS 付き (`rediss://` 相当)。
 ///
 /// `insecure` は常に false。ここを true にすると任意のサイト向けの正当な証明書が
@@ -708,6 +772,20 @@ mod tests {
         assert_eq!(parse_command_line("").unwrap(), Vec::<Vec<u8>>::new());
         // マルチバイト文字は UTF-8 のまま
         assert_eq!(parsed("GET キー"), vec!["GET", "キー"]);
+    }
+
+    /// database 番号の一覧は 0 始まりの連番 (CYBERNEURA-DEV-408)。
+    /// 壊れた値や大きすぎる値でプルダウンが暴れないことも固定する。
+    #[test]
+    fn test_database_names() {
+        assert_eq!(database_names(3), vec!["0", "1", "2"]);
+        assert_eq!(database_names(16).len(), 16);
+        assert_eq!(database_names(16).last().unwrap(), "15");
+        // 0 以下は既定値に倒す (一覧が空だとプルダウンが出ない)
+        assert_eq!(database_names(0).len(), DEFAULT_DATABASE_COUNT as usize);
+        assert_eq!(database_names(-1).len(), DEFAULT_DATABASE_COUNT as usize);
+        // 大きすぎる値は頭を押さえる
+        assert_eq!(database_names(100_000).len(), MAX_DATABASE_COUNT as usize);
     }
 
     /// tls: true が黙って無視され、平文 TCP で接続していた不具合

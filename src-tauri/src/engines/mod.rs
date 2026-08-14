@@ -55,7 +55,9 @@ const SQL_CAPABILITIES: EngineCapabilities = EngineCapabilities {
 const REDIS_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     editor_language: "redis",
     file_extension: "redis",
-    supports_schemas: false,
+    // Redis の「スキーマ」は database 番号 (CYBERNEURA-DEV-408)。
+    // SELECT で切り替える概念が接続にあるので、一覧と切替を提供する
+    supports_schemas: true,
     supports_tables: false,
     supports_explain: false,
     supports_format: false,
@@ -129,7 +131,11 @@ mod tests {
         let redis = capabilities_for_name("redis");
         assert_eq!(redis.editor_language, "redis");
         assert_eq!(redis.file_extension, "redis");
-        assert!(!redis.supports_schemas);
+        // Redis の「スキーマ」は database 番号。Database 欄で切り替えられる
+        // (CYBERNEURA-DEV-408)
+        assert!(redis.supports_schemas);
+        // エイリアスも同じ capability
+        assert!(capabilities_for_name("valkey").supports_schemas);
         assert!(!redis.supports_tables);
         assert!(!redis.supports_explain);
         assert!(!redis.supports_format);

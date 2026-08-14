@@ -957,7 +957,10 @@ async fn get_active_schema(
         return Ok(Some(schema));
     }
     let server = state.find_server(&connection).await?;
-    Ok(server.schema)
+    Ok(db::resolve_active_schema(
+        &server.engine,
+        server.schema.as_deref(),
+    ))
 }
 
 /// 指定接続のプールと SSH トンネルを破棄する。
