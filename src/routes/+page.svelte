@@ -131,6 +131,10 @@
     // editor 参照は常に「今開いているファイル」を指す。target の範囲照合だけ
     // では、たまたま同じ位置に同じ SQL がある別ファイルへ書いてしまう
     const tabId = appStore.activeEditorTabId;
+    // アクティブスキーマ (database) も控える。実行中に Database 欄を
+    // 切り替えられると、タブも SQL も変わらないまま切替前のスキーマの結果が
+    // ファイルに残り、後から読んだ人には現在のスキーマの結果に見える
+    const schema = appStore.activeSchema;
     const result = await appStore.runQuery(target.sql);
     if (!result || target.logLabel === null) {
       return;
@@ -147,8 +151,12 @@
       formatRunLogTimestamp(new Date()),
       runLogBody(result),
     );
+    // `\c` / `USE` は実行そのものが切替なので、その文が切り替えた先は
+    // 「変わっていない」とみなす (この結果は切替後のスキーマのもの)
+    const expectedSchema = result.switched_schema ?? schema;
     const outcome =
-      appStore.activeEditorTabId === tabId
+      appStore.activeEditorTabId === tabId &&
+      appStore.activeSchema === expectedSchema
         ? (editor?.writeRunLog(target, block) ?? "stale")
         : "stale";
     switch (outcome) {
