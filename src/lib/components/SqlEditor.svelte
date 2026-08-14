@@ -22,6 +22,8 @@
   import { formatSql } from "$lib/sqlFormat";
   import { redisLanguage } from "$lib/editor/redisLanguage";
   import { esLanguage } from "$lib/editor/esLanguage";
+  import { findRunLogLabel, runLogWrite } from "$lib/runLog";
+  import type { RunTarget } from "$lib/runLog";
 
   interface Props {
     content: string;
@@ -31,7 +33,9 @@
     /// スキーマベース補完用のテーブル名 → カラム名リスト (未取得なら null)
     schemaMap: Record<string, string[]> | null;
     onChange: (content: string) => void;
-    onRun: (sql: string) => void;
+    /// 実行対象 (SQL とエディタ上の範囲、📝 マーカーの有無) を渡す。
+    /// 呼び出し側は結果が返った後に writeRunLog() で同じ target を戻す
+    onRun: (target: RunTarget) => void;
     /// 選択範囲が変わるたびに呼ぶ。複数行選択かどうか (Replace Multiline
     /// ボタンの表示条件) を通知する。選択テキスト自体は開く時点で
     /// getMainSelection() で snapshot するのでここでは渡さない
@@ -358,6 +362,68 @@
     return state.sliceDoc(range.from, range.to);
   };
 
+  /// 実行対象を、書き戻しに必要な情報 (範囲と 📝 ラベル) ごと取り出す。
+  /// 実行対象が無い / 空白だけの場合は null。
+  ///
+  /// ログの書き戻しは SQL のブロックコメント (`/* ... */`) を使うため、
+  /// SQL 言語のエディタでのみマーカーを見る (redis / es は行コメントの
+  /// 記法もブロックコメントも異なる)
+  const runTargetAt = (state: EditorState): RunTarget | null => {
+    const range = executionTargetRange(state, state.selection.main.head);
+    if (!range) {
+      return null;
+    }
+    const sql = state.sliceDoc(range.from, range.to);
+    if (!sql.trim()) {
+      return null;
+    }
+    return {
+      sql,
+      from: range.from,
+      to: range.to,
+      logLabel: isSqlLanguage()
+        ? findRunLogLabel(state.doc.toString(), range.from)
+        : null,
+    };
+  };
+
+  /// 書き戻しの結果。stale = 対象範囲がズレた (書かない)、
+  /// broken = 既存ログブロックが `*/` で閉じていない (書かない)
+  export type RunLogOutcome = "written" | "stale" | "broken";
+
+  /// 実行した文の直後へ結果ログのブロックコメントを書き戻す公開メソッド。
+  ///
+  /// クエリの実行中に編集・ファイル切替が起きていると target の範囲は
+  /// 別の場所を指すため、範囲のテキストが実行した SQL と一致する時だけ書く
+  /// (replaceRangeIfMatches と同じ考え方)。カーソル位置とフォーカスは
+  /// 動かさない — 書き戻しは実行完了後の非同期な差し込みなので、
+  /// その間にユーザーが別の場所を編集していることがある。
+  export function writeRunLog(
+    target: RunTarget,
+    block: string,
+  ): RunLogOutcome {
+    if (!view) {
+      return "stale";
+    }
+    const state = view.state;
+    if (
+      target.from < 0 ||
+      target.to < target.from ||
+      target.to > state.doc.length ||
+      state.sliceDoc(target.from, target.to) !== target.sql
+    ) {
+      return "stale";
+    }
+    const write = runLogWrite(state.doc.toString(), target.to, block);
+    if (!write) {
+      return "broken";
+    }
+    view.dispatch({
+      changes: { from: write.from, to: write.to, insert: write.insert },
+    });
+    return "written";
+  }
+
   // カーソル位置の文の行に枠線・背景を付けるハイライトプラグイン
   const statementHighlight = ViewPlugin.fromClass(
     class {
@@ -406,9 +472,12 @@
 
   // ツールバーの Run ボタンから呼ぶための公開メソッド
   export function runCurrentStatement() {
-    const statement = getCurrentStatement();
-    if (statement.trim()) {
-      onRun(statement);
+    if (!view) {
+      return;
+    }
+    const target = runTargetAt(view.state);
+    if (target) {
+      onRun(target);
     }
   }
 
@@ -447,9 +516,9 @@
     {
       key: "Mod-Enter",
       run: (editorView) => {
-        const statement = currentStatementText(editorView.state);
-        if (statement.trim()) {
-          onRun(statement);
+        const target = runTargetAt(editorView.state);
+        if (target) {
+          onRun(target);
         }
         return true;
       },
