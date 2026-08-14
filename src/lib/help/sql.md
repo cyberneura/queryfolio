@@ -113,6 +113,37 @@ reading.
 off it is allowed for a read (`EXPLAIN ANALYZE SELECT …`) and refused when the
 analysed statement writes. The Explain button always uses plain `EXPLAIN`.
 
+## Run and log
+
+Put a 📝 at the start of a line comment above a statement and running it writes
+the result back into the file, right under the statement:
+
+```sql
+-- 📝 Step 1
+SELECT id, rating_count FROM comics ORDER BY id LIMIT 3;
+
+/* 🗒️ Step 1 2026-08-14 23:19:21
+id	rating_count
+187	1
+340	0
+339	0
+*/
+```
+
+The text after 📝 becomes the heading, so a file can carry several labelled
+steps. The result still appears in the table below as usual — the comment is a
+copy, kept in the file so the next reader (or an AI agent) sees the query and
+its output together.
+
+Running the same statement again rewrites that one block instead of stacking a
+new one, so the file holds the latest result and nothing older. The marker has
+to be the first thing in the comment (`-- 📝 …`), and it has to sit in the run
+of line comments directly above the statement — further comment lines may
+follow it, but a blank line in between detaches it.
+
+Results of 500 rows or more ask for confirmation before the write, since a large
+paste fills the file. Declining still leaves the result in the table.
+
 ## Editing results
 
 With Writable on, a cell in the result grid can be edited in place when the

@@ -1529,8 +1529,10 @@ const prepareTargetTab = (): ResultTab | null => {
   return resultTabs[resultTabs.length - 1];
 };
 
-/// タブに記録された接続・SQL でクエリを実行し、結果をタブへ書き込む
-const executeTab = async (tab: ResultTab) => {
+/// タブに記録された接続・SQL でクエリを実行し、結果をタブへ書き込む。
+/// 成功した場合はその結果を返す (エラー・キャンセル・タブ破棄では null)。
+/// 呼び出し側が結果を後処理する (📝 マーカーのログ書き戻し等) のに使う
+const executeTab = async (tab: ResultTab): Promise<QueryResult | null> => {
   tab.running = true;
   // 失敗時に前回の結果を誤認・誤エクスポートしないよう、実行前にクリアする
   tab.result = null;
@@ -1563,7 +1565,7 @@ const executeTab = async (tab: ResultTab) => {
   // 実行中に設定再読込などでタブが破棄されていた場合は、
   // 存在しないタブ (detached なオブジェクト) へ書き込まず結果を捨てる
   if (!resultTabs.some((t) => t.id === tab.id)) {
-    return;
+    return null;
   }
   tab.result = result;
   tab.error = error;
@@ -1579,6 +1581,7 @@ const executeTab = async (tab: ResultTab) => {
   // 実行中クエリの間はトンネルを切れないため、エディタタブを全て閉じた後に
   // クエリだけ走り続けていた場合は、完了したこのタイミングで切断を再判定する。
   maybeDisconnectIfIdle(tab.connection);
+  return result;
 };
 
 /// `\c` によるスキーマ切替をフロントの状態へ反映する。
@@ -1714,7 +1717,10 @@ const fetchResultWithoutDefaultLimit = async (
   );
 };
 
-const runQuery = async (sql: string) => {
+/// エディタから SQL を実行する。成功した場合はその結果を返す
+/// (実行しなかった場合・失敗・キャンセルは null)。
+/// 呼び出し側は返り値を見て 📝 マーカーのログ書き戻しを判断する
+const runQuery = async (sql: string): Promise<QueryResult | null> => {
   // 実行先の接続を await 前に固定する。以降の await (保存・危険文の確認モーダル) の
   // 間に接続が切り替わっても、確認した接続と実行する接続が食い違わないようにする
   // (旧 SQL を新 DB で実行してしまう事故を防ぐ)。
@@ -1722,39 +1728,39 @@ const runQuery = async (sql: string) => {
   // 実行前ガードの通知は、既存の結果タブを覆わないよう toast で出す
   if (!connection) {
     toast.warning("Select a connection first");
-    return;
+    return null;
   }
   if (!sql.trim()) {
     toast.warning("There is no SQL statement to run");
-    return;
+    return null;
   }
   // 同一接続の並列実行を抑止する (別タブで実行中でも拒否)
   if (isConnectionRunning(connection)) {
     toast.warning(
       "A query is already running on this connection. Cancel it or wait for it to finish.",
     );
-    return;
+    return null;
   }
   // 未保存タブは best-effort で保存 (失敗しても実行は止めない。SQL はメモリ上の値)
   await flushPendingSave();
   // 危険な文 (WHERE 無し UPDATE/DELETE、DROP/TRUNCATE) は、実行を許可した
   // 接続でも実行前に確認する。キャンセルされたら何もしない
   if (!(await confirmIfDangerous(connection, sql))) {
-    return;
+    return null;
   }
   // 確認モーダルの間に接続が切り替わっていたら、別 DB で実行しないよう中止する
   if (selectedConnection !== connection) {
-    return;
+    return null;
   }
   errorMessage = null;
   const tab = prepareTargetTab();
   if (!tab) {
-    return;
+    return null;
   }
   tab.sql = sql;
   tab.connection = connection;
   tab.schema = activeSchema;
-  await executeTab(tab);
+  return await executeTab(tab);
 };
 
 /// カーソル位置の文にエンジン別の EXPLAIN プレフィックスを付けて実行する。

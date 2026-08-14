@@ -4,6 +4,13 @@
   import { toast } from "svelte-sonner";
   import { ensureConfigFile, frontendReady } from "$lib/api";
   import type { OpenTarget } from "$lib/api";
+  import {
+    RUN_LOG_CONFIRM_ROWS,
+    formatRunLogBlock,
+    formatRunLogTimestamp,
+    runLogBody,
+  } from "$lib/runLog";
+  import type { RunTarget } from "$lib/runLog";
   import appStore from "$lib/stores/app.svelte";
   import Toolbar from "$lib/components/Toolbar.svelte";
   import EditorToolbar from "$lib/components/EditorToolbar.svelte";
@@ -19,6 +26,7 @@
   import ConfigEditorModal from "$lib/components/ConfigEditorModal.svelte";
   import AiAnalysisModal from "$lib/components/AiAnalysisModal.svelte";
   import DangerousConfirmModal from "$lib/components/DangerousConfirmModal.svelte";
+  import RunLogConfirmModal from "$lib/components/RunLogConfirmModal.svelte";
   import SearchModal from "$lib/components/SearchModal.svelte";
   import ChatPane from "$lib/components/ChatPane.svelte";
   import HelpPane from "$lib/components/HelpPane.svelte";
@@ -55,7 +63,8 @@
     configEditorMode !== null ||
     appStore.aiAnalysis !== null ||
     appStore.aiExplanation !== null ||
-    appStore.dangerousConfirmReason !== null;
+    appStore.dangerousConfirmReason !== null ||
+    runLogConfirm !== null;
 
   /// グローバルショートカット。
   /// - Cmd+K (mac) / Ctrl+K で検索モーダルを開閉する
@@ -92,6 +101,83 @@
     void appStore.endEditorTabCycle();
   }
   let editor: SqlEditor | undefined = $state();
+
+  /// 大量の行をエディタへ書き戻す前の確認ダイアログ。null = 出していない
+  let runLogConfirm = $state<{
+    rows: number;
+    resolve: (ok: boolean) => void;
+  } | null>(null);
+
+  /// 書き戻してよいかを尋ね、応答 (true = 書く) を待つ。
+  /// 未応答のものが残っていれば却下してから差し替える (危険文の確認と同じ)
+  const confirmRunLog = (rows: number): Promise<boolean> =>
+    new Promise((resolve) => {
+      runLogConfirm?.resolve(false);
+      runLogConfirm = { rows, resolve };
+    });
+
+  function resolveRunLogConfirm(ok: boolean) {
+    const pending = runLogConfirm;
+    runLogConfirm = null;
+    pending?.resolve(ok);
+  }
+
+  /// エディタからの実行。`-- 📝 <label>` が付いた文は、実行後にその下へ
+  /// 結果を TSV のブロックコメント (Run and Log) として書き戻す。
+  /// 結果テーブルへの表示は書き戻しの有無に関わらず通常どおり行われる。
+  async function runStatement(target: RunTarget) {
+    // 実行を開始したエディタタブを控える。SqlEditor は
+    // {#key appStore.activeEditorTabId} でタブ切替のたびに作り直されるため、
+    // editor 参照は常に「今開いているファイル」を指す。target の範囲照合だけ
+    // では、たまたま同じ位置に同じ SQL がある別ファイルへ書いてしまう
+    const tabId = appStore.activeEditorTabId;
+    // アクティブスキーマ (database) も控える。実行中に Database 欄を
+    // 切り替えられると、タブも SQL も変わらないまま切替前のスキーマの結果が
+    // ファイルに残り、後から読んだ人には現在のスキーマの結果に見える
+    const schema = appStore.activeSchema;
+    const result = await appStore.runQuery(target.sql);
+    if (!result || target.logLabel === null) {
+      return;
+    }
+    // 見出しに入れるのは実行が終わった時刻。下の確認ダイアログを開いたまま
+    // にされると承認した時刻になってしまうので、待つ前に採る
+    const executedAt = formatRunLogTimestamp(new Date());
+    // 大量の行はエディタを埋めてしまうので、書き戻す前に確認する
+    if (
+      result.rows.length >= RUN_LOG_CONFIRM_ROWS &&
+      !(await confirmRunLog(result.rows.length))
+    ) {
+      return;
+    }
+    // ラベルは書き戻す直前に本文から取り直したものを使う (SqlEditor が渡す)
+    const buildBlock = (label: string) =>
+      formatRunLogBlock(label, executedAt, runLogBody(result));
+    // `\c` / `USE` は実行そのものが切替なので、その文が切り替えた先は
+    // 「変わっていない」とみなす (この結果は切替後のスキーマのもの)
+    const expectedSchema = result.switched_schema ?? schema;
+    const outcome =
+      appStore.activeEditorTabId === tabId &&
+      appStore.activeSchema === expectedSchema
+        ? (editor?.writeRunLog(target, buildBlock) ?? "stale")
+        : "stale";
+    switch (outcome) {
+      case "stale":
+        // 実行中に編集・タブ切替が起きて対象がズレた場合。無関係な位置へ
+        // 書き込むより、書かずに知らせる方が安全
+        toast.warning(
+          "The editor changed while the query was running — the log was not written.",
+        );
+        break;
+      case "unmarked":
+        // 実行中にマーカーを消した = 書き戻しの取り消しなので黙って従う
+        break;
+      case "broken":
+        toast.warning(
+          "The existing log block is missing its closing */ — the log was not written.",
+        );
+        break;
+    }
+  }
 
   // Replace Multiline: エディタの複数行選択状態と、右側の置換ペインの表示。
   // ペインを開いた時点の選択範囲を snapshot し、差し込み時に範囲がズレて
@@ -482,7 +568,7 @@
                     editorLanguage={selectedCapabilities?.editor_language ?? null}
                     schemaMap={appStore.schemaMap}
                     onChange={(content) => appStore.updateEditorContent(content)}
-                    onRun={(sql) => appStore.runQuery(sql)}
+                    onRun={(target) => void runStatement(target)}
                     onSelectionChange={(info) => {
                       hasMultilineSelection = info.hasMultilineSelection;
                     }}
@@ -644,5 +730,14 @@
     reason={appStore.dangerousConfirmReason}
     onConfirm={() => appStore.confirmDangerous()}
     onCancel={() => appStore.cancelDangerous()}
+  />
+{/if}
+
+<!-- 📝 マーカー付きの文で、行数の多い結果をエディタへ書き戻す前の確認 -->
+{#if runLogConfirm !== null}
+  <RunLogConfirmModal
+    rows={runLogConfirm.rows}
+    onConfirm={() => resolveRunLogConfirm(true)}
+    onCancel={() => resolveRunLogConfirm(false)}
   />
 {/if}
