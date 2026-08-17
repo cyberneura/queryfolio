@@ -1,8 +1,18 @@
 name: Release
 
-# 手動実行 (workflow_dispatch) のみ。push では自動ビルドしない。
-# ローカルからは `pnpm release [patch|minor|major]` で起動する (scripts/release.sh)。
+# リリースは main の src-tauri/tauri.conf.json の version で決まる。version を変えて
+# main に載せればリリースされ、変えなければ何度 push しても何も起きない。
+# ローカルからは `pnpm release [patch|minor|major]` (scripts/release.sh) で採番して
+# push する。
+#
+# 実行可否を決めるのは diff ではなく「その version がリリース済みか」。squash / rebase /
+# 直 push で diff は変わるが結果は変わらない (冪等)。path フィルターを付けないのも
+# 同じ理由で、bump が想定外の形で入っても取りこぼさないため。
 on:
+  push:
+    branches: [main]
+  # version は正しいのに、その時の run が (API の一時障害等で) 失敗した場合の再実行用。
+  # 同じ判定を通るので、公開済みの version をもう一度出すことはできない。
   workflow_dispatch:
 
 # GitHub Release の作成とアセットアップロードに contents: write が必要。
@@ -23,7 +33,75 @@ concurrency:
   queue: max
 
 jobs:
+  # ビルドに 30 分以上かける前に、その version がまだリリースされていないことだけを
+  # 確かめる。ここが false を返す限り、push のたびに macOS / Windows ランナーが動く
+  # ことはない。
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.decide.outputs.release }}
+    steps:
+      # dispatch は自分の ref を指定できる。未公開 version を載せたブランチが、
+      # そのブランチの内容でリリースされてしまわないようにする (push では main 以外
+      # 起こり得ないが、dispatch では起こる)。
+      - name: Refuse to release from anywhere but main
+        if: github.ref != 'refs/heads/main'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::releases come from main, and this run is on ${REF}"
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          if [ -z "$VERSION" ]; then
+            echo "::error::could not read the version out of src-tauri/tauri.conf.json"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether this version still needs releasing
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # このエンドポイントが答えるのは公開済みの Release だけ (draft にはまだ tag が
+          # 無いので見つからない)。それがここで訊きたいことでもある: 失敗した run が
+          # 残した draft は、同じ version で再実行して埋め直す。
+          #
+          # 404 だけを「未リリース」と読む。rate limit や障害をそう読むと、公開済みの
+          # version をもう一度ビルドして publish ジョブが二重に公開しにいく。
+          status=$(gh api "repos/${GH_REPO}/releases/tags/v${VERSION}" \
+            --silent --include 2>/dev/null | head -n 1 | awk '{print $2}' || true)
+          case "$status" in
+            404)
+              echo "release=true" >> "$GITHUB_OUTPUT"
+              echo "Releasing v${VERSION}"
+              ;;
+            200)
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              echo "v${VERSION} is already released; nothing to do."
+              ;;
+            *)
+              echo "::error::could not tell whether v${VERSION} exists (HTTP ${status:-none}). Not guessing."
+              exit 1
+              ;;
+          esac
+
   build:
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -176,7 +254,8 @@ jobs:
   # 全プラットフォームのビルド・アップロードが成功した時のみ draft を公開する。
   # どれかが失敗した場合は draft のまま残る (不完全な Release は公開されない)。
   publish:
-    needs: build
+    needs: [plan, build]
+    if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -192,73 +271,3 @@ jobs:
           VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
           gh release edit "v${VERSION}" --draft=false --latest
 
-  # 公開後に Homebrew tap (cyberneura/homebrew-tap) の Cask を新バージョンへ更新する。
-  # taskshoot-cli の cargo-dist と同じ運用 (同じ tap、同じ HOMEBREW_TAP_TOKEN 名の PAT)。
-  # Tauri アプリは cargo-dist に乗れないため、Cask の生成とコミットはここで直接行う。
-  # Cask は version と sha256 を直書きするので、この更新を怠ると `brew install` が
-  # 古いバージョンを配り続ける。secret 欠落時は黙ってスキップせず失敗させる
-  # (Release 自体は publish 済みなので、このジョブの失敗が公開を妨げることはない)。
-  homebrew:
-    needs: publish
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-
-      - name: Check Homebrew tap token
-        env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
-            echo "::error::Missing repository secret HOMEBREW_TAP_TOKEN (PAT with contents:write on cyberneura/homebrew-tap; same one taskshoot-cli uses). The cask was NOT updated."
-            exit 1
-          fi
-
-      - name: Download released dmg
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          gh release download "v${VERSION}" --pattern '*_universal.dmg' --output queryfolio.dmg
-          echo "DMG_SHA256=$(sha256sum queryfolio.dmg | cut -d' ' -f1)" >> "$GITHUB_ENV"
-
-      - name: Update Homebrew cask
-        env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          cat > queryfolio.rb <<EOF
-          cask "queryfolio" do
-            version "${VERSION}"
-            sha256 "${DMG_SHA256}"
-
-            url "https://github.com/cyberneura/queryfolio/releases/download/v#{version}/QueryFolio_#{version}_universal.dmg"
-            name "QueryFolio"
-            desc "Multi-purpose SQL GUI client"
-            homepage "https://github.com/cyberneura/queryfolio"
-
-            livecheck do
-              url :url
-              strategy :github_latest
-            end
-
-            app "QueryFolio.app"
-
-            zap trash: [
-              "~/.config/queryfolio",
-              "~/Library/Caches/com.cyberneura.queryfolio",
-              "~/Library/Preferences/com.cyberneura.queryfolio.plist",
-              "~/Library/Saved Application State/com.cyberneura.queryfolio.savedState",
-              "~/Library/WebKit/com.cyberneura.queryfolio",
-            ]
-          end
-          EOF
-          # gh api PUT は既存ファイルの更新に現在の blob sha を要求する (初回作成時は不要)。
-          CURRENT_SHA=$(gh api repos/cyberneura/homebrew-tap/contents/Casks/queryfolio.rb -q .sha 2>/dev/null || true)
-          gh api -X PUT repos/cyberneura/homebrew-tap/contents/Casks/queryfolio.rb \
-            -f message="Update queryfolio cask to v${VERSION}" \
-            -f content="$(base64 -w0 queryfolio.rb)" \
-            ${CURRENT_SHA:+-f sha="$CURRENT_SHA"}
