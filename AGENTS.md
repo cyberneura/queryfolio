@@ -23,21 +23,21 @@ pnpm check              # svelte-check (型チェック)
 cd src-tauri && cargo test   # Rust ユニットテスト
 cd src-tauri && cargo check  # Rust 型チェック
 pnpm tauri build        # リリースビルド
-pnpm release            # version 採番 → main へ push → Release ワークフロー起動 → watch (patch|minor|major)
+pnpm release            # version 採番 → main へ push (これがリリースを始める) → watch (patch|minor|major)
 fab release             # 同上 (fab release:minor 等)
 fab -l                  # fab タスク一覧 (dev / check / unittest / build_local / release / releases)
 ```
 
-リリースは `.github/workflows/release.yml` (workflow_dispatch のみ) で macOS universal dmg (Developer ID 署名 + 公証 + staple) と Windows NSIS インストーラ (署名なし) を matrix で並列ビルドし、**draft** Release にアップロード → 全プラットフォーム成功後に `publish` ジョブが公開する。起動は `scripts/release.sh` (`pnpm release` / `fab release`)。設計の詳細はグローバルスキル `tauri-github-actions-release`、公開までの runbook は `publish-macos-release` スキル (`.claude/skills/publish-macos-release/`。署名 Secrets の初回設定手順を含む)。設計上の要点:
+リリースは main の `src-tauri/tauri.conf.json` の version を変えると始まる (`.github/workflows/release.yml` の `on: push`。`plan` ジョブが「その version がリリース済みか」を releases API に訊き、404 の時だけビルドへ進む — 判定が diff でなく状態なので、squash / rebase / 直 push で結果が変わらない)。macOS universal dmg (Developer ID 署名 + 公証 + staple) と Windows NSIS インストーラ (署名なし) を matrix で並列ビルドし、**draft** Release にアップロード → 全プラットフォーム成功後に `publish` ジョブが公開する。version の採番と push は `scripts/release.sh` (`pnpm release` / `fab release`) が行い、その後は push で始まった run を watch する (起動はしない)。設計の詳細はグローバルスキル `tauri-github-actions-release`、公開までの runbook は `publish-macos-release` スキル (`.claude/skills/publish-macos-release/`。署名 Secrets の初回設定手順を含む)。設計上の要点:
 
 - **draft → publish 分離が必須**: matrix の 2 ジョブが同じ `v<version>` Release を作るため、`releaseDraft: false` だと先に終わった方だけの不完全な Release が即公開される。
 - **version は毎回インクリメント必須**: 公開済みと同じ version で再実行すると tauri-action が draft 状態の不一致でエラーになる。だから `scripts/release.sh` が採番を自動化している (bump し忘れ事故を構造的に消す)。
 - **`pnpm publish` は使えない** (pnpm 組み込みコマンドで上書き不可)。コマンド名は `release`。
 - **`uses:` は全て commit SHA 固定** (行末コメントが元のタグ)。Apple の証明書・認証情報を扱うジョブなので、tauri-action だけ固定しても先行ステップの action が改変されれば同じこと。checkout は `persist-credentials: false` で write 権限の token を `.git/config` に残さない。`APPLE_*` は macOS ジョブにのみ渡す (Windows には空文字)。
 - **`tauriScript: pnpm exec tauri`** を必ず指定する。省くと tauri-action は pnpm プロジェクトに対して `pnpm tauri build` を実行し、package.json の `tauri` スクリプト (`APPLE_SIGNING_IDENTITY='...' tauri`) が走る。シェルのインライン代入は継承 env より強いので、**workflow が渡した `secrets.APPLE_SIGNING_IDENTITY` が黙って無視される** (加えて Windows のシェルでは構文エラーになる)。`pnpm exec tauri` はスクリプトを経由しない。
-- **`cancel-in-progress: false` + `queue: max`**: 1 dispatch = 1 version なので、キャンセルされた run の version は (bump コミットは main に載ったまま) 永久に公開されなくなる。走行中の run を守る (`cancel-in-progress: false`) だけでは足りず、既定の `queue: single` は pending を 1 件しか保持せず新しい dispatch で既存 pending を捨てるため、`queue: max` (最大 100 件) も要る。CI 分数より取りこぼし防止を優先する。
-- **Homebrew 配布**: `brew install --cask cyberneura/tap/queryfolio` (tap は cyberneura/homebrew-tap、`Casks/queryfolio.rb`)。publish 後の `homebrew` ジョブが dmg の sha256 を計算して Cask を新バージョンへ書き換える (taskshoot-cli の cargo-dist と同じ運用。認証は同じ PAT を `HOMEBREW_TAP_TOKEN` secret として queryfolio 側にも登録)。Cask は version / sha256 直書きなので、このジョブが失敗すると brew が古いバージョンを配り続ける — secret 欠落は黙ってスキップせず失敗させる。
-- **弱点**: `pnpm release` は main へ直接 push するため、ブランチ保護 (PR 必須) を掛けると破綻する。
+- **`cancel-in-progress: false` + `queue: max`**: 1 push = 1 version なので、キャンセルされた run の version は (bump コミットは main に載ったまま) 公開されないまま残る (`workflow_dispatch` で拾い直せるが、気付かなければ同じこと)。走行中の run を守る (`cancel-in-progress: false`) だけでは足りず、既定の `queue: single` は pending を 1 件しか保持せず新しい push で既存 pending を捨てるため、`queue: max` (最大 100 件) も要る。CI 分数より取りこぼし防止を優先する。
+- **Homebrew 配布**: `brew install --cask cyberneura/tap/queryfolio` (tap は cyberneura/homebrew-tap、`Casks/queryfolio.rb`)。**Cask の更新は tap 側が毎時行う** (tap の `scripts/update.py` が各プロジェクトの latest release を見て version / url / sha256 を書き換える)。このリポジトリから tap へ push しない — そうすると tap に書ける PAT を全プロジェクトへ配ることになるため。以前あった `homebrew` ジョブと `HOMEBREW_TAP_TOKEN` secret は不要 (CYBERNEURA-DEV-481)。
+- **弱点**: `pnpm release` は main へ直接 push するため、ブランチ保護 (PR 必須) を掛けると破綻する (version を変える PR をマージする形なら、workflow 側はそのままで動く)。
 
 ## アーキテクチャ
 

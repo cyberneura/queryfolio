@@ -7,8 +7,10 @@ description: QueryFolio をビルドして GitHub Release として公開 (サ�
 
 macOS 版 (universal dmg) と Windows 版 (NSIS インストーラ) を GitHub Actions でビルドし、
 GitHub Release としてサイト (ダウンロードページ) で公開するまでの runbook。
-ビルドは `.github/workflows/release.yml` (workflow_dispatch のみ)、起動は
-`scripts/release.sh` (`pnpm release` / `fab release`)。構成の設計判断はグローバルスキル
+ビルドは `.github/workflows/release.yml`。**main の `src-tauri/tauri.conf.json` の
+version を変えて push すると始まる** (`plan` ジョブが「その version がリリース済みか」を
+訊き、未リリースの時だけビルドへ進む)。version の採番と push は `scripts/release.sh`
+(`pnpm release` / `fab release`)。構成の設計判断はグローバルスキル
 `tauri-github-actions-release` に書いてある。
 
 ## 前提
@@ -35,7 +37,8 @@ pnpm release major     # 0.1.0 -> 1.0.0
 1. `gh` の認証、`main` ブランチ・クリーンツリー・`HEAD == origin/main` を検証
 2. `src-tauri/tauri.conf.json` の version を bump し、`package.json` にも同期
 3. `chore: release v<version>` として commit → `origin/main` へ push
-4. `release.yml` を dispatch し、起動した run を `gh run watch --exit-status` で追う
+4. その push で始まった run を探し、`gh run watch --exit-status` で追う
+   (リリースを始めるのは push であってスクリプトではない)
 
 ワークフローは matrix で macOS (universal dmg / Developer ID 署名 + 公証 + staple) と
 Windows (NSIS exe / 署名なし) を並列ビルドし、`v<version>` の **draft** Release に
@@ -100,7 +103,8 @@ printf '2YN5TLNQ9J' | gh secret set APPLE_TEAM_ID
 ## トラブルシューティング
 
 - **tauri-action がタグ/draft 状態の不一致で失敗する** → 公開済みと同じ version で再実行している。
-  `pnpm release` は毎回 bump するので通常起きない。手で dispatch した時に起きる。
+  `pnpm release` は毎回 bump するので通常起きない。`plan` ジョブが公開済み version を
+  弾くので、同じ version を push しても再ビルドはされない。
   残骸を消す: `gh release delete v<version> --cleanup-tag --yes`
 - **`spctl` が `source=Developer ID` (Notarized でない)** → 公証が走っていない。macOS ジョブのログで
   tauri-action の notarize ステップを確認し、`APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` を疑う。
