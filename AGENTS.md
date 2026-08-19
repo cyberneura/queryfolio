@@ -85,6 +85,94 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
 - `lib/sqlFormat.ts` — SQL 整形器 (自前トークナイザ。SELECT / UNION 系のみ整形し、INSERT / UPDATE / WITH 等やパース不能な文は原文維持。整形結果を再トークナイズして入力とトークン列が一致しなければ原文に戻す安全ネット付き)
 - Run and Log (`lib/runLog.ts`) — `-- 📝 <label>` を頭に置いた行コメントの直下にある文を実行すると、その文の下へ結果を `/* 🗒️ <label> <実行時刻>` で始まるブロックコメント (TSV) として書き戻す (CYBERNEURA-DEV-447。**runandlog** (CYBERNEURA-DEV-442) の SQL エディタ版)。結果テーブルへの表示は従来どおりで、書き戻しはその複製。マーカーの検出 (`findRunLogLabel`) は「実行対象の直前に連続する行コメント」と「実行対象 [from, to) の先頭に含まれるコメント」だけを見る (実行対象の外では、間に空行や別の文があれば別の文のマーカー)。設計上の要点: (1) **書き戻す本文の `*/` と `/*` は必ず潰す** (`escapeBlockComment`)。`*/` を残すとコメントがそこで閉じ、続くデータ行がそのまま SQL として実行される。`/*` も残せない — PostgreSQL のブロックコメントは**入れ子になる**ため、閉じない `/*` があると以降のファイル全体がコメントに飲まれる。(2) **再実行は既存ブロックを置き換える** (runandlog と同じで、何度実行してもブロックは 1 つ)。`/* 🗒️` の直後の最初の `*/` を終端とみなせるのは (1) で本文から `*/` を消しているから。閉じていない既存ブロックは書かずに知らせる (壊れたコメントの前に足すと入れ子が増えるだけ)。(3) 挿入位置は文末の空白と `;` を越えた後ろ (lang-sql の Statement は `;` を含むが、含まない場合にセミコロンの手前へ挟み込まないため)。前後の空行は 1 行に正規化するので、同じ結果を書けばテキストは変わらない (冪等)。(4) **実行完了は非同期**なので、書き戻し前に「エディタタブが実行開始時のままか」「アクティブスキーマが実行開始時のままか (`\c` / `USE` が切り替えた先は除く)」「対象範囲のテキストが実行した SQL と一致するか」の 3 つを照合し、**ラベルは書き戻す時点の本文から取り直す** (SQL が変わらなくてもマーカー行だけ編集されうるうえ、同じ長さの書き換えは範囲の照合を素通りする。マーカーごと消されていれば取り消しとみなして何も書かない) (`SqlEditor.writeRunLog`。`replaceRangeIfMatches` と同じ考え方)。ズレていたら書かずに toast で知らせる。カーソルとフォーカスは動かさない (待っている間にユーザーが別の場所を編集している)。(5) 500 行以上は書き戻す前に確認ダイアログ (`RunLogConfirmModal`) を出す。**行数の上限だけでは足りない** — セルの文字数に上限が無いため 499 行でも長い TEXT / JSON 列があれば数百 MB になる。総文字数とセルあたりの文字数でも打ち切り (`toTsvCapped`)、打ち切ったことを本文に書く。(6) 対象は **SQL 言語のエディタのみ** (redis / es は行コメントもブロックコメントも記法が違う)。lang-sql はブロックコメントを必ず Statement の兄弟ノードにするので、書き戻したブロックが次の文の実行範囲に混ざることはない。(7) **行コメントは Statement の兄弟になるとは限らない**。中身の無い `--` だけの行があると lang-sql はそれを LineComment にせず、**その行から SQL までが 1 つの Statement になる** — 説明のコメント・空行・`-- 📝 ラベル` の行がまとめて実行範囲に入る。そのため `findRunLogLabel` の前方スキャン (実行範囲の先頭のコメントを読み飛ばして SQL 本体を探す処理) は**空行で止めてはいけない** (CYBERNEURA-DEV-516)。代わりに実行範囲の終端 `to` で止める — 範囲の外へ出ると次の文のマーカーを拾ってしまう
 
+## CLI (GUI を起動しないオプション)
+
+`--help` / `--version` / `--list-servers` は標準出力に書いて `std::process::exit` で終わる。
+`cli.rs` にまとめてあり、`run()` が Tauri を組み立てる前 (write の書き出しよりも前) に
+`cli::info_command_from_args` で判定する。
+
+- **サブコマンドが先に来たら見ない**。`queryfolio write conn a.sql "--help"` の第 3 引数は
+  書き出す内容であってオプションではない。位置固定ではなく走査にしているのは、macOS が
+  `.app` 起動時に `-psn_0_12345` のような引数を先頭へ差し込むことがあるため
+  (`route_from_cli_args` と同じ理由)。
+- **`--list-servers` はパスワードと SSH の鍵・パスフレーズを出さない。** 出す項目は
+  `ConnectionInfo` (フロントへ渡す機密を含まない射影) とフォルダ名だけで、`ServerConfig` を
+  直接読むのは TLS の判定だけ。項目を増やす時もこの経路を守ること (テストで担保している)。
+- TLS 列は mysql / postgres / redis では**実効モードをそのまま出す**
+  (`disable` / `prefer` / `require` / `verify-ca` / `verify-full`)。既定の `prefer` は
+  「TLS を試み、張れなければ平文に降格し証明書も検証しない」なので、yes/no に丸めると
+  暗号化されていない接続に気付けなくなる。実効モードを持たないエンジンは `tls` を `on` / `off` で出す。
+  **`ConnectionInfo::sql_ssl_mode` が `None` でもそのまま `tls` に落とさないこと** —
+  `None` には「実効モードの概念が無いエンジン」だけでなく「`engine` / `ssl_mode` の値が
+  不正で解決できなかった」場合も含まれ、後者を `on` / `off` で出すと**接続時にエラーになる
+  設定を有効な TLS 設定として見せる** (`ssl_mode: requre` の書き間違いが `off` = 平文で
+  繋がる、と読める)。決められない時は `invalid` と出す (`ssl_summary`)。
+  **ただし `invalid` を出すのは「その値で実際に接続が失敗するエンジン」だけ** —
+  `ssl_mode` を読むのは `db::connect` の mysql / postgres の分岐だけで、
+  elasticsearch / sqlite / duckdb / dynamodb の経路は見ない。共有テンプレート等で
+  不正な `ssl_mode` が紛れ込んでいてもそれらは普通に繋がるので、`invalid` と出すと
+  使える接続を壊れているように見せる。`invalid` の意味は「この設定では繋がらない」で
+  あって「設定に無効な値が書いてある」ではない。
+  **`ssl_mode` が解決できても組み合わせで拒否される設定は `invalid`** — `ssl_root_cert` を
+  検証しないモード (`disable` / `prefer` / `require`。`ssl_mode` 省略時の既定 `prefer` を
+  含む) と併記すると `sql_ssl_root_cert` がエラーにするため `db::connect` は必ず失敗する。
+  実効モードだけ見て `prefer` と出すと繋がらない接続を有効に見せることになる。
+  ただし**ルート CA がファイルとして実在するか (`ssl_root_cert_path` の `is_file`) までは
+  見ない** — 表示の組み立てはファイルシステムに触らない純粋な関数として単体テストで
+  固めてあり、後から置ける不在ファイルは設定の誤りとも違う。
+  **`tls` が実際の接続方式を決めていないエンジンでも、そのまま出さないこと** —
+  dynamodb の `host` / `port` / `tls` は dynamodb-local 向けのエンドポイント上書き専用で、
+  `host` を書かない通常の AWS 接続は SDK が地域エンドポイントを常に https で解決する
+  (`build_client` は `host` がある時しか `endpoint_url` を組み立てない)。既定の
+  `tls: false` を出すと**暗号化されている接続を平文と読ませる**ので、上書きが無ければ
+  `on` を出す (`has_endpoint_override`)。エンジンを足す時は「`tls` がそのエンジンの
+  実際の接続方式を決めているか」を先に確認すること。
+  **ただし「`host` が無い = 地域エンドポイント」でもない。** `aws_config::defaults` は
+  エンドポイント上書きの設定も読むので、`AWS_ENDPOINT_URL=http://localhost:8000` が
+  効いていれば平文で繋がる。環境変数は `cli::aws_endpoint_override` が SDK と同じ
+  優先順 (`AWS_IGNORE_CONFIGURED_ENDPOINT_URLS` → `AWS_ENDPOINT_URL_DYNAMODB` →
+  `AWS_ENDPOINT_URL`) で解決し、URL のスキームから `on` / `off` を出す。解決は
+  `lib.rs` の `run_info_command` で行って `format_server_list` へ渡す (表の組み立ては
+  プロセスの環境にも依存しない純粋な関数に保つ)。**`~/.aws/config` の `endpoint_url` /
+  `services` セクションは見ていない** — ファイルを読まない経路に保ちたいうえ、SDK の
+  プロファイル解決を写すと本体とずれた第二の実装になるため。プロファイルで上書きして
+  いる環境では `on` と出る (既知の限界)。
+- **`--list-servers` は dynamodb の USER を `(hidden)` にする。** この `user` は AWS の
+  アクセスキー ID であって DB のユーザー名ではなく (`folder_meta.rs` が同じ理由で
+  `(aws access key, hidden)` に差し替え、`sqlfiles_folder_name` はハッシュ化している)、
+  端末とシェル履歴に残す値ではない (`user_cell`)。未設定の `-` とは別の語にしてある —
+  「静的キーを設定していない」と「設定しているが出さない」は別の事実なので。
+  **`ConnectionInfo` は「フロントへ渡してよい」射影であって「端末に出してよい」射影ではない。**
+  `user` のようにエンジンで意味が変わるフィールドがあるので、列を足す時は素通しにしない。
+- **Windows の release ビルドはコンソールを持たない。** `main.rs` の
+  `windows_subsystem = "windows"` により GUI サブシステムでリンクされるため、
+  `GetStdHandle(STD_OUTPUT_HANDLE)` が無効ハンドルを返し `print!` が黙って捨てられる。
+  表示が目的の情報系オプションでは機能しないので、表示の前に
+  `cli::attach_parent_console` (`AttachConsole(ATTACH_PARENT_PROCESS)`) で親プロセスの
+  コンソールへ繋ぎ直す。**実機の Windows では未検証** (開発ホストにも CI にも Windows が
+  無いため、Windows ターゲットでの型検査までしか行えていない)。
+- **上記で直るのは出力先だけで、「シェルが終了を待たない」ことは直らない。** GUI
+  サブシステムの exe を cmd.exe / PowerShell から起動すると、シェルは終了を待たずに
+  プロンプトへ戻る。そのため対話シェルでは (1) 出力が次のプロンプトの後に現れることがあり、
+  (2) `%ERRORLEVEL%` / `$LASTEXITCODE` が情報系オプションの終了コードにならない。
+  リダイレクトとパイプは通常どおり動く (ハンドルは継承され、読み手は書き込み側の
+  クローズまで待つ) ので、スクリプトから使う分には影響しない。
+  **これを直すにはコンソールサブシステムの別 exe を配布物に足すしかなく、GUI 起動時に
+  コンソール窓が出る副作用と、この環境では検証できない配布物の変更を伴う。**
+  アプリの主目的は GUI なので、その取引はしていない。対話シェルで終了コードまで要るなら
+  `Start-Process -Wait queryfolio -ArgumentList '--list-servers'` を使う。
+- 表示の組み立て (`help_text` / `format_server_list`) は Tauri にもファイルシステムにも
+  依存しない純粋な関数にして単体テストで固めてある。設定の読み込みと出力は `lib.rs` の
+  `run_info_command`。`--list-servers` は設定読み込みに失敗したら stderr に書いて 1 で終わる。
+- **版番号は `CARGO_PKG_VERSION` ではなく `tauri.conf.json` の `version`。** リリースは
+  そちらの version で決まる (`release.yml`) 一方、`src-tauri/Cargo.toml` の version は
+  追随していないので、`CARGO_PKG_VERSION` を出すと配布物が 0.1.4 でも `--version` は
+  0.1.0 と答えてしまう。`build.rs` が `tauri.conf.json` を読んで `QUERYFOLIO_VERSION` として
+  埋め込み (読めなければビルドを失敗させる)、`cli.rs` の `APP_VERSION` がそれを使う。
+  ずれの再発は `test_version_comes_from_the_tauri_config` が止める。
+- macOS の `.app` からは `open -a QueryFolio --args --list-servers` では標準出力が返らない。
+  `QueryFolio.app/Contents/MacOS/queryfolio --list-servers` とバイナリを直接叩く。
+
 ## `queryfolio://` スキーム / CLI (ファイルを開く)
 
 保存済みのクエリファイルを、URL スキームまたは CLI からパス指定で開ける。どちらも

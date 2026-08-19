@@ -39,6 +39,7 @@ https://github.com/user-attachments/assets/90439816-49c8-4ebd-a068-b102cfe9c7aa
 - Window size / position restored across restarts
 - Open a saved query file by path from a `queryfolio://open/<path>` URL or the `queryfolio open <path>` CLI subcommand (restricted to files under the query files directory; reuses the running window)
 - Write and open a query file from the CLI with `queryfolio write <connection> <file-name> [content]` (content can also be piped in on stdin) — for AI agents that prepare a query for review
+- Inspect the configuration without launching the app: `queryfolio --help`, `queryfolio --version`, `queryfolio --list-servers`
 
 ## Setup
 
@@ -126,6 +127,36 @@ queryfolio write reporting monthly.sql
 - Content is written only when it is actually given. An **empty** stdin is treated as "no content" so that a GUI launch (`open -a QueryFolio --args write ...`, whose stdin is `/dev/null`) cannot silently blank an existing file. Existing content is otherwise overwritten.
 - The file is written by the process you launch, before the running window is asked to open it — stdin cannot be forwarded to an already-running instance. If writing fails (unknown connection, invalid name, stdin larger than 10 MiB, I/O error), the reason is printed to stderr and the command exits non-zero without opening anything.
 - `write` is **CLI-only**: there is no `queryfolio://write/...` URL. A web page can make the browser open a `queryfolio://` URL, and dropping arbitrary SQL into the query files directory that way would be a trap waiting for the next person who runs it.
+
+### Inspecting the configuration from the CLI
+
+These options print to stdout and exit without launching the app or touching an already-running window.
+
+```shell
+queryfolio --help           # usage, including the open / write subcommands
+queryfolio --version
+queryfolio --list-servers   # the configured connections
+```
+
+`--list-servers` prints the resolved query files directory, then one row per connection: name, engine, host, port, user, database, TLS, whether an SSH tunnel is used, and the query file folder. **Passwords and SSH keys or passphrases are never printed** — the row is built from the same non-secret projection (`ConnectionInfo`) that is handed to the frontend.
+
+The TLS column shows the effective mode for mysql / postgres / redis (`disable` / `prefer` / `require` / `verify-ca` / `verify-full`) rather than a yes/no, because the default `prefer` falls back to plaintext without verifying the certificate; collapsing it into "enabled" would hide that. Other engines show the `tls` flag as `on` / `off`. A connection shows `invalid` when it cannot connect at all with the setting it has: an unresolvable `engine`, an unsupported `ssl_mode` on mysql / postgres, or an `ssl_root_cert` combined with a mode that does not verify it (`disable` / `prefer` / `require`, including the `prefer` you get by leaving `ssl_mode` out) — that combination is rejected rather than silently ignored. Whether the certificate file exists is not checked here. An unsupported `ssl_mode` on an engine that never reads it (elasticsearch / sqlite / duckdb / dynamodb) is not reported as `invalid`, because those connections work — `invalid` means "this will not connect", not "there is a stray value in the config". A dynamodb connection without a `host` shows the scheme the AWS SDK will actually use: `host` / `port` / `tls` there override the endpoint for dynamodb-local, and without that override the SDK resolves the regional endpoint over HTTPS unless `AWS_ENDPOINT_URL_DYNAMODB` / `AWS_ENDPOINT_URL` point somewhere else (both are honoured here, as is `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS`). An `endpoint_url` set in `~/.aws/config` rather than in the environment is not read, so such a connection is shown as `on`.
+
+The USER column shows `(hidden)` for dynamodb, because that `user` is the AWS access key ID rather than a database user name. It is deliberately not the same as `-` (not configured): a connection using static keys and one falling back to `aws_profile` or the default credential chain are different things to know about.
+
+The config is read the same way the app reads it, including `config_override_command`, so this also works when the connections come from an external command rather than from `config.yml`.
+
+On Windows the release build is linked as a GUI application and has no console of its own, so these commands attach to the console of the process that started them before printing. Redirecting to a file or a pipe works as usual.
+
+Two consequences of that remain, and they are deliberate rather than oversights: because the shell does not wait for a GUI-subsystem program, in an interactive `cmd.exe` or PowerShell session the output can arrive after the prompt has already been redrawn, and `%ERRORLEVEL%` / `$LASTEXITCODE` will not carry the exit code of the option you ran. Removing them would mean shipping a second, console-subsystem executable in the installer, which puts a console window on every GUI launch. Use `Start-Process -Wait queryfolio -ArgumentList '--list-servers'` when you need the shell to wait.
+
+On macOS, call the binary inside the bundle — `open -a QueryFolio --args --list-servers` does not give you the output back:
+
+```shell
+/Applications/QueryFolio.app/Contents/MacOS/queryfolio --list-servers
+```
+
+An option is only recognised before a subcommand, so `queryfolio write conn a.sql "-- help"` writes that content instead of printing the help.
 
 ## Development
 
