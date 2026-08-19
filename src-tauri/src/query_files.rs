@@ -309,9 +309,19 @@ fn ensure_dir_700(dir: &Path) -> Result<(), AppError> {
         current = path.parent();
     }
 
-    // 浅い方から作る。
+    // 浅い方から作る。**作る時点で 0700 を指定する** (`DirBuilder::mode`)。
+    // 作ってから chmod する形だと、その間にクラッシュしたディレクトリが umask 既定の
+    // まま残り、次回以降は「既存」として扱われて締め直されない。
+    // umask は指定したモードからビットを落とすことしかできないので、作成時点で
+    // 他ユーザーに開くことはない。落とされた所有者ビットは直後に戻す。
     for path in missing.iter().rev() {
-        match fs::create_dir(path) {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(path) {
             Ok(()) => {
                 #[cfg(unix)]
                 {
@@ -340,6 +350,21 @@ fn create_new_options_600() -> fs::OpenOptions {
         options.mode(0o600);
     }
     options
+}
+
+/// `create_new_options_600` でファイルを新規作成する。
+///
+/// `mode` は umask でビットを落とされるため、所有者ビットまで落とす umask (0700 等) の
+/// 下では読み書きできない 000 のファイルが残る。作成直後に 0600 を設定して戻す
+/// (config.rs が config.yml を作る時と同じ形)。
+fn create_new_file_600(path: &Path) -> std::io::Result<fs::File> {
+    let file = create_new_options_600().open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
 /// 同一ディレクトリの一時ファイルへ書いてから rename で置き換える。
@@ -389,7 +414,7 @@ fn write_file_atomic(path: &Path, content: &str) -> Result<(), AppError> {
             std::process::id(),
             SEQ.fetch_add(1, AtomicOrdering::Relaxed)
         ));
-        match create_new_options_600().open(&candidate) {
+        match create_new_file_600(&candidate) {
             Ok(f) => {
                 tmp_path = candidate;
                 file = Some(f);
@@ -504,7 +529,7 @@ pub fn create_query_file(
     }
     // `create_new` (`O_EXCL`) にすることで、上の存在確認と作成の間に他プロセスが
     // 作ったファイルを潰さない (`fs::write` は既存を truncate する)。
-    create_new_options_600().open(&path)?;
+    create_new_file_600(&path)?;
     Ok(normalized)
 }
 
@@ -549,7 +574,7 @@ pub fn ensure_query_file(
     if let Some(parent) = path.parent() {
         ensure_dir_700(parent)?;
     }
-    match create_new_options_600().open(&path) {
+    match create_new_file_600(&path) {
         Ok(_) => Ok(normalized),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // `O_EXCL` は「通常ファイルが既にある」時だけでなく、ディレクトリ・
@@ -695,7 +720,7 @@ pub fn move_query_file(
     // そのファイルを失う。O_EXCL の作成なら「無ければ作る」が atomic なので、
     // 予約に成功した = その名前は自分のものだと確定できる。
     let to_path = to_dir.join(&normalized);
-    match create_new_options_600().open(&to_path) {
+    match create_new_file_600(&to_path) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             return Err(AppError::QueryFile(format!(
