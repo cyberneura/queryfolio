@@ -127,6 +127,16 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
   `tls: false` を出すと**暗号化されている接続を平文と読ませる**ので、上書きが無ければ
   `on` を出す (`has_endpoint_override`)。エンジンを足す時は「`tls` がそのエンジンの
   実際の接続方式を決めているか」を先に確認すること。
+  **ただし「`host` が無い = 地域エンドポイント」でもない。** `aws_config::defaults` は
+  エンドポイント上書きの設定も読むので、`AWS_ENDPOINT_URL=http://localhost:8000` が
+  効いていれば平文で繋がる。環境変数は `cli::aws_endpoint_override` が SDK と同じ
+  優先順 (`AWS_IGNORE_CONFIGURED_ENDPOINT_URLS` → `AWS_ENDPOINT_URL_DYNAMODB` →
+  `AWS_ENDPOINT_URL`) で解決し、URL のスキームから `on` / `off` を出す。解決は
+  `lib.rs` の `run_info_command` で行って `format_server_list` へ渡す (表の組み立ては
+  プロセスの環境にも依存しない純粋な関数に保つ)。**`~/.aws/config` の `endpoint_url` /
+  `services` セクションは見ていない** — ファイルを読まない経路に保ちたいうえ、SDK の
+  プロファイル解決を写すと本体とずれた第二の実装になるため。プロファイルで上書きして
+  いる環境では `on` と出る (既知の限界)。
 - **`--list-servers` は dynamodb の USER を `(hidden)` にする。** この `user` は AWS の
   アクセスキー ID であって DB のユーザー名ではなく (`folder_meta.rs` が同じ理由で
   `(aws access key, hidden)` に差し替え、`sqlfiles_folder_name` はハッシュ化している)、

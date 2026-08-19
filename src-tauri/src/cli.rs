@@ -170,7 +170,7 @@ fn user_cell(server: &ServerConfig, info: &ConnectionInfo) -> String {
     }
 }
 
-/// エンドポイントを上書きしているか (dynamodb-local 等を指しているか)。
+/// 接続設定でエンドポイントを上書きしているか (dynamodb-local 等を指しているか)。
 ///
 /// 判定は [`crate::engines::dynamodb::build_client`] の分岐と揃える。
 /// あちらが `endpoint_url` を組み立てる条件そのものなので、ずれると
@@ -182,6 +182,59 @@ fn has_endpoint_override(server: &ServerConfig) -> bool {
         .as_deref()
         .map(str::trim)
         .is_some_and(|host| !host.is_empty())
+}
+
+/// AWS SDK がエンドポイント上書きとして読む**環境変数**を、SDK と同じ優先順で解決する。
+///
+/// 接続設定に `host` を書いていない dynamodb 接続でも、SDK は地域エンドポイントとは
+/// 限らない: `aws_config::defaults` は環境変数とプロファイルの `endpoint_url` 設定を
+/// 見るため、`AWS_ENDPOINT_URL=http://localhost:8000` が効いていれば**平文**で繋がる。
+/// 「`host` が無い = https」と決め打つと、その環境で平文の接続を `on` と見せることになる。
+///
+/// 優先順は aws-config の `endpoint_url` / `env_service_config` に合わせる:
+/// `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS` が真なら上書きは無視され、そうでなければ
+/// サービス個別 (`AWS_ENDPOINT_URL_DYNAMODB`) → 全体 (`AWS_ENDPOINT_URL`) の順。
+///
+/// **プロファイルファイル (`~/.aws/config`) の `endpoint_url` / `services` セクションは
+/// 見ていない。** ここはファイルシステムに触らない純粋な経路に保ちたいうえ、SDK の
+/// プロファイル解決 (プロファイル名の決定・`services` セクションの参照・
+/// `AWS_CONFIG_FILE` 等) を写すと本体とずれた第二の実装になる。プロファイルで
+/// エンドポイントを上書きしている環境では、この列は地域エンドポイント (`on`) を出す。
+///
+/// 環境変数の読み取りを引数にしているのはテストのため (プロセスの環境変数を
+/// 書き換えるテストは並列実行で干渉する)。
+pub fn aws_endpoint_override(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let non_empty = |value: String| {
+        let trimmed = value.trim().to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    };
+    let ignored = get("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS")
+        .and_then(non_empty)
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    if ignored {
+        return None;
+    }
+    get("AWS_ENDPOINT_URL_DYNAMODB")
+        .and_then(non_empty)
+        .or_else(|| get("AWS_ENDPOINT_URL").and_then(non_empty))
+}
+
+/// プロセスの環境変数から [`aws_endpoint_override`] を解決する。
+pub fn aws_endpoint_override_from_env() -> Option<String> {
+    aws_endpoint_override(|key| std::env::var(key).ok())
+}
+
+/// エンドポイント URL のスキームから SSL 欄の値を決める。
+///
+/// SDK は解釈できない値を警告して捨て、地域エンドポイント (https) に戻すので、
+/// スキームが読めなければ `on` を出す (`aws_config` の `parse_url`)。
+fn scheme_summary(endpoint: &str) -> &'static str {
+    let lower = endpoint.trim().to_ascii_lowercase();
+    if lower.starts_with("http://") {
+        "off"
+    } else {
+        "on"
+    }
 }
 
 /// TLS / SSL の状態を 1 語で表す。
@@ -224,7 +277,7 @@ fn has_endpoint_override(server: &ServerConfig) -> bool {
 /// して見せることになる。**ファイルとして開けるか (`db::ssl_root_cert_path` の
 /// `is_file`) までは見ない** — この一覧の組み立てはファイルシステムに触らない純粋な
 /// 関数として単体テストで固めてあり、後から置ける不在ファイルは設定の誤りとも違う。
-fn ssl_summary(server: &ServerConfig, info: &ConnectionInfo) -> String {
+fn ssl_summary(server: &ServerConfig, info: &ConnectionInfo, aws_endpoint: Option<&str>) -> String {
     // エンジン名自体が解決できない接続は、どの経路でも繋がらない
     let Ok(engine) = crate::db::parse_engine(&server.engine) else {
         return INVALID.to_string();
@@ -241,10 +294,15 @@ fn ssl_summary(server: &ServerConfig, info: &ConnectionInfo) -> String {
     if let Some(mode) = &info.sql_ssl_mode {
         return mode.clone();
     }
-    // エンドポイント上書きの無い dynamodb は SDK が https で解決するので、
-    // 上書き用の tls フラグではなく実際の接続方式を出す
+    // 接続設定でエンドポイントを上書きしていない dynamodb は、tls フラグではなく
+    // SDK が実際に解決するエンドポイントの方式を出す (環境変数の上書きが無ければ
+    // 地域エンドポイントの https)
     if engine == Engine::DynamoDb && !has_endpoint_override(server) {
-        return "on".to_string();
+        return match aws_endpoint {
+            Some(endpoint) => scheme_summary(endpoint),
+            None => "on",
+        }
+        .to_string();
     }
     if server.tls { "on" } else { "off" }.to_string()
 }
@@ -282,7 +340,11 @@ fn sanitize_cell(value: &str) -> String {
 /// 「端末に出してよい」射影ではない。`user` のように**エンジンによって意味が
 /// 変わるフィールド**があるので、そのまま流さず [`user_cell`] のような
 /// 用途別の判断を挟むこと。
-pub fn format_server_list(servers: &[ServerConfig], sqlfiles_dir: &Path) -> String {
+pub fn format_server_list(
+    servers: &[ServerConfig],
+    sqlfiles_dir: &Path,
+    aws_endpoint: Option<&str>,
+) -> String {
     let mut out = format!(
         "Query files directory: {}\n",
         sanitize_cell(&sqlfiles_dir.display().to_string())
@@ -305,7 +367,7 @@ pub fn format_server_list(servers: &[ServerConfig], sqlfiles_dir: &Path) -> Stri
                     .unwrap_or_else(|| EMPTY.to_string()),
                 user_cell(server, &info),
                 info.schema.clone().unwrap_or_else(|| EMPTY.to_string()),
-                ssl_summary(server, &info),
+                ssl_summary(server, &info, aws_endpoint),
                 if info.has_ssh_tunnel { "yes" } else { EMPTY }.to_string(),
                 server.sqlfiles_folder_name(),
             ];
@@ -436,7 +498,7 @@ mod tests {
 
     #[test]
     fn test_format_server_list_never_shows_the_password() {
-        let out = format_server_list(&[server("reporting")], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[server("reporting")], Path::new("/tmp/sqlfiles"), None);
         assert!(
             !out.contains("s3cret"),
             "the password must not be printed:\n{out}"
@@ -466,7 +528,7 @@ mod tests {
              \x20 identity_agent: /run/user/1000/secret-agent.sock\n",
         )
         .expect("test fixture should parse");
-        let out = format_server_list(&[with_tunnel], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[with_tunnel], Path::new("/tmp/sqlfiles"), None);
 
         for secret in [
             "db-p4ssword",
@@ -496,7 +558,7 @@ mod tests {
         let aws: ServerConfig =
             serde_yaml::from_str("name: events\nengine: dynamodb\nschema: ap-northeast-1\n")
                 .expect("test fixture should parse");
-        let out = format_server_list(&[aws], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[aws], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains(" on"), "{out}");
         assert!(!out.contains(" off"), "{out}");
 
@@ -505,7 +567,7 @@ mod tests {
             "name: events\nengine: dynamodb\nschema: ap-northeast-1\nhost: \"   \"\n",
         )
         .expect("test fixture should parse");
-        let out = format_server_list(&[blank_host], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[blank_host], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains(" on"), "{out}");
 
         // host を書いた = dynamodb-local 等のエンドポイント上書き。ここでは tls が効く
@@ -514,7 +576,7 @@ mod tests {
              host: 127.0.0.1\nport: 8000\n",
         )
         .expect("test fixture should parse");
-        let out = format_server_list(&[local], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[local], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains(" off"), "{out}");
 
         let local_tls: ServerConfig = serde_yaml::from_str(
@@ -522,15 +584,132 @@ mod tests {
              host: 127.0.0.1\nport: 8000\ntls: true\n",
         )
         .expect("test fixture should parse");
-        let out = format_server_list(&[local_tls], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[local_tls], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains(" on"), "{out}");
 
         // 実効モードを持たない他のエンジンは今までどおり tls をそのまま出す
         let es: ServerConfig =
             serde_yaml::from_str("name: search\nengine: elasticsearch\nhost: es.example.com\n")
                 .expect("test fixture should parse");
-        let out = format_server_list(&[es], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[es], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains(" off"), "{out}");
+    }
+
+    /// `host` を書いていない dynamodb でも、環境変数でエンドポイントを上書きして
+    /// いれば地域エンドポイントとは限らない。SDK が実際に使う方を出す。
+    #[test]
+    fn test_format_server_list_follows_the_aws_endpoint_environment() {
+        let aws: ServerConfig =
+            serde_yaml::from_str("name: events\nengine: dynamodb\nschema: ap-northeast-1\n")
+                .expect("test fixture should parse");
+
+        // AWS_ENDPOINT_URL=http://... は平文。これを on と出すと、平文の接続を
+        // 暗号化されていると読ませることになる
+        let out = format_server_list(
+            std::slice::from_ref(&aws),
+            Path::new("/tmp/sqlfiles"),
+            Some("http://localhost:8000"),
+        );
+        assert!(out.contains(" off"), "{out}");
+
+        let out = format_server_list(
+            std::slice::from_ref(&aws),
+            Path::new("/tmp/sqlfiles"),
+            Some("https://dynamodb.ap-northeast-1.amazonaws.com"),
+        );
+        assert!(out.contains(" on"), "{out}");
+        assert!(!out.contains(" off"), "{out}");
+
+        // SDK は解釈できない値を警告して捨て、地域エンドポイントへ戻す
+        let out = format_server_list(
+            std::slice::from_ref(&aws),
+            Path::new("/tmp/sqlfiles"),
+            Some("not-a-url"),
+        );
+        assert!(out.contains(" on"), "{out}");
+
+        // 接続設定に host がある = 明示のエンドポイント上書き。こちらが優先されるので
+        // 環境変数ではなく tls を見る (build_client が endpoint_url を組み立てる)
+        let local: ServerConfig = serde_yaml::from_str(
+            "name: local\nengine: dynamodb\nschema: ap-northeast-1\n\
+             host: 127.0.0.1\nport: 8000\ntls: true\n",
+        )
+        .expect("test fixture should parse");
+        let out = format_server_list(
+            &[local],
+            Path::new("/tmp/sqlfiles"),
+            Some("http://localhost:9999"),
+        );
+        assert!(out.contains(" on"), "{out}");
+
+        // 他のエンジンは AWS の環境変数と無関係
+        let es: ServerConfig =
+            serde_yaml::from_str("name: search\nengine: elasticsearch\nhost: es.example.com\n")
+                .expect("test fixture should parse");
+        let out = format_server_list(
+            &[es],
+            Path::new("/tmp/sqlfiles"),
+            Some("https://localhost:8000"),
+        );
+        assert!(out.contains(" off"), "{out}");
+    }
+
+    /// 環境変数の優先順は aws-config に合わせる。
+    #[test]
+    fn test_aws_endpoint_override_precedence() {
+        let env = |pairs: &[(&str, &str)]| {
+            let owned: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            move |key: &str| {
+                owned
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+
+        assert_eq!(aws_endpoint_override(env(&[])), None);
+
+        // サービス個別が全体より優先
+        assert_eq!(
+            aws_endpoint_override(env(&[
+                ("AWS_ENDPOINT_URL", "http://global:1"),
+                ("AWS_ENDPOINT_URL_DYNAMODB", "http://service:2"),
+            ])),
+            Some("http://service:2".to_string())
+        );
+        assert_eq!(
+            aws_endpoint_override(env(&[("AWS_ENDPOINT_URL", "http://global:1")])),
+            Some("http://global:1".to_string())
+        );
+
+        // AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true なら上書きは効かない
+        assert_eq!(
+            aws_endpoint_override(env(&[
+                ("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "TRUE"),
+                ("AWS_ENDPOINT_URL_DYNAMODB", "http://service:2"),
+            ])),
+            None
+        );
+        // true 以外の値は無視 (false / 空文字で上書きを殺さない)
+        assert_eq!(
+            aws_endpoint_override(env(&[
+                ("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false"),
+                ("AWS_ENDPOINT_URL", "http://global:1"),
+            ])),
+            Some("http://global:1".to_string())
+        );
+
+        // 空 / 空白だけの値は未設定として扱い、次の候補へ落とす
+        assert_eq!(
+            aws_endpoint_override(env(&[
+                ("AWS_ENDPOINT_URL_DYNAMODB", "   "),
+                ("AWS_ENDPOINT_URL", " http://global:1 "),
+            ])),
+            Some("http://global:1".to_string())
+        );
     }
 
     /// dynamodb の `user` は AWS のアクセスキー ID なので USER 欄に出さない。
@@ -545,7 +724,7 @@ mod tests {
              user: AKIAIOSFODNN7EXAMPLE\npassword: wJalrXUtnFEMI\n",
         )
         .expect("test fixture should parse");
-        let out = format_server_list(&[dynamo], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[dynamo], Path::new("/tmp/sqlfiles"), None);
 
         // engine の綴りが DynamoDB / dynamodb のどちらでも伏せる
         assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"), "{out}");
@@ -555,7 +734,7 @@ mod tests {
         assert!(out.contains("events"), "{out}");
 
         // 他のエンジンの user はユーザー名なので今までどおり出す
-        let out = format_server_list(&[server("reporting")], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[server("reporting")], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains("app"), "{out}");
         assert!(!out.contains(HIDDEN), "{out}");
     }
@@ -570,7 +749,7 @@ mod tests {
              host: \"h\\u001b[31mred\\u001b[0m\"\nuser: \"a\\tb\"\n",
         )
         .expect("test fixture should parse");
-        let out = format_server_list(&[hostile], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[hostile], Path::new("/tmp/sqlfiles"), None);
 
         // 見出し 1 行 + 接続 1 行 + 先頭の情報行 + 空行 だけ
         assert_eq!(
@@ -584,7 +763,7 @@ mod tests {
 
     #[test]
     fn test_format_server_list_shows_the_requested_columns() {
-        let out = format_server_list(&[server("reporting")], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[server("reporting")], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains("Query files directory: /tmp/sqlfiles"));
         for expected in [
             "NAME", "ENGINE", "HOST", "PORT", "USER", "DATABASE", "SSL", "SSH", "FOLDER",
@@ -603,14 +782,14 @@ mod tests {
     fn test_format_server_list_reports_the_effective_ssl_mode() {
         // ssl_mode も tls も無い postgres は prefer (平文に降格しうる)。
         // yes/no に丸めるとこの区別が消えるので、実効モードをそのまま出す
-        let out = format_server_list(&[server("reporting")], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[server("reporting")], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains("prefer"), "{out}");
 
         let tls: ServerConfig = serde_yaml::from_str(
             "name: secure\nengine: postgres\nhost: db.example.com\ntls: true\n",
         )
         .expect("test fixture should parse");
-        let out = format_server_list(&[tls], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[tls], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains("verify-full"), "{out}");
 
         // 実効モードを持たないエンジンは tls をそのまま出す
@@ -618,7 +797,7 @@ mod tests {
             "name: search\nengine: elasticsearch\nhost: es.example.com\ntls: true\n",
         )
         .expect("test fixture should parse");
-        let out = format_server_list(&[es], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[es], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains(" on"), "{out}");
     }
 
@@ -633,7 +812,7 @@ mod tests {
             "name: typo\nengine: postgres\nhost: db.example.com\nssl_mode: requre\n",
         )
         .expect("test fixture should parse");
-        let out = format_server_list(&[bad_mode], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[bad_mode], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains(INVALID), "{out}");
         // 「平文で繋がる」と読める表示にはしない
         assert!(!out.contains(" off"), "{out}");
@@ -641,7 +820,7 @@ mod tests {
         let bad_engine: ServerConfig =
             serde_yaml::from_str("name: unknown\nengine: mysqll\nhost: db.example.com\n")
                 .expect("test fixture should parse");
-        let out = format_server_list(&[bad_engine], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[bad_engine], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains(INVALID), "{out}");
 
         // `ssl_mode` を読まないエンジンは巻き込まない。共有テンプレート等で不正な値が
@@ -657,7 +836,7 @@ mod tests {
                  ssl_mode: {mode}\nssl_root_cert: /etc/ssl/ca.pem\n"
             ))
             .expect("test fixture should parse");
-            let out = format_server_list(&[cert_without_verify], Path::new("/tmp/sqlfiles"));
+            let out = format_server_list(&[cert_without_verify], Path::new("/tmp/sqlfiles"), None);
             assert!(out.contains(INVALID), "{mode}:\n{out}");
             // 解決できる実効モードの方を出してはいけない (繋がらないので)
             assert!(!out.contains(&format!(" {mode}")), "{mode}:\n{out}");
@@ -669,7 +848,7 @@ mod tests {
              ssl_root_cert: /etc/ssl/ca.pem\n",
         )
         .expect("test fixture should parse");
-        let out = format_server_list(&[cert_without_mode], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[cert_without_mode], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains(INVALID), "{out}");
 
         // 空の ssl_root_cert も同じくエラーになる (黙って未設定に倒さない)
@@ -678,7 +857,7 @@ mod tests {
              ssl_mode: verify-full\nssl_root_cert: \"  \"\n",
         )
         .expect("test fixture should parse");
-        let out = format_server_list(&[empty_cert], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[empty_cert], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains(INVALID), "{out}");
 
         // 検証するモードとの併記は正しい設定なので、実効モードをそのまま出す。
@@ -688,7 +867,7 @@ mod tests {
              ssl_mode: verify-ca\nssl_root_cert: /nonexistent/ca.pem\n",
         )
         .expect("test fixture should parse");
-        let out = format_server_list(&[verifying], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[verifying], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains("verify-ca"), "{out}");
         assert!(!out.contains(INVALID), "{out}");
 
@@ -698,7 +877,7 @@ mod tests {
                  schema: s\nssl_mode: requre\n"
             ))
             .expect("test fixture should parse");
-            let out = format_server_list(&[ignores_ssl_mode], Path::new("/tmp/sqlfiles"));
+            let out = format_server_list(&[ignores_ssl_mode], Path::new("/tmp/sqlfiles"), None);
             assert!(!out.contains(INVALID), "{engine}:\n{out}");
         }
 
@@ -707,7 +886,7 @@ mod tests {
         let es: ServerConfig =
             serde_yaml::from_str("name: search\nengine: elasticsearch\nhost: es.example.com\n")
                 .expect("test fixture should parse");
-        let out = format_server_list(&[es], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[es], Path::new("/tmp/sqlfiles"), None);
         assert!(!out.contains(INVALID), "{out}");
         assert!(out.contains(" off"), "{out}");
     }
@@ -717,7 +896,7 @@ mod tests {
         let sqlite: ServerConfig =
             serde_yaml::from_str("name: local\nengine: sqlite\nschema: /tmp/a.db\n")
                 .expect("test fixture should parse");
-        let out = format_server_list(&[sqlite], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[sqlite], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains("local"));
         // host / port / user が無い行でも列がずれない
         assert!(out.contains(EMPTY));
@@ -725,7 +904,7 @@ mod tests {
 
     #[test]
     fn test_format_server_list_with_no_connection() {
-        let out = format_server_list(&[], Path::new("/tmp/sqlfiles"));
+        let out = format_server_list(&[], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains("No connection is configured."), "{out}");
     }
 }

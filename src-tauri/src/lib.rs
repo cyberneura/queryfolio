@@ -2060,7 +2060,14 @@ fn run_info_command(command: cli::InfoCommand) -> i32 {
                 let config = AppConfig::load_merged().await?;
                 let servers = config.resolve_servers()?;
                 let sqlfiles_dir = config.resolve_sqlfiles_dir()?;
-                Ok::<String, AppError>(cli::format_server_list(&servers, &sqlfiles_dir))
+                // エンドポイント上書きの環境変数はここで解決する
+                // (cli.rs の表の組み立てはプロセスの環境に依存しない純粋な関数に保つ)
+                let aws_endpoint = cli::aws_endpoint_override_from_env();
+                Ok::<String, AppError>(cli::format_server_list(
+                    &servers,
+                    &sqlfiles_dir,
+                    aws_endpoint.as_deref(),
+                ))
             });
             match result {
                 Ok(text) => {
