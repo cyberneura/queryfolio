@@ -362,7 +362,14 @@ fn create_new_file_600(path: &Path) -> std::io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        // モードを付けられないなら、作ったファイルを残さずに失敗させる。
+        // 中途半端に緩いファイルを置いていくくらいなら作成そのものを失敗させる方がよい
+        // (fchmod が拒否されるのは一部のネットワーク FS 等に限られる)。
+        if let Err(e) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(e);
+        }
     }
     Ok(file)
 }
