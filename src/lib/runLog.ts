@@ -5,12 +5,21 @@ import { toTsvCapped } from "$lib/export";
 /// 既存ブロックの検出はセレクタ無しの U+1F5D2 で行うため、手で消されても拾える
 export const RUN_LOG_RESULT_MARKER = "\u{1F5D2}\u{FE0F}";
 
-/// この行数以上の結果は、書き戻す前に確認ダイアログを出す
-export const RUN_LOG_CONFIRM_ROWS = 500;
+/// この行数を**超える**結果は、書き戻す前に確認ダイアログを出す。
+/// ちょうどこの行数なら全部書いても同じ量なので訊かない。
+///
+/// 同じ値が「一部だけ書く」を選んだ時の行数にもなる (ダイアログの選択肢が
+/// 「全部書く / この行数だけ書く / 書かない」なので、閾値と別の値にすると
+/// 何行になるのか説明できない)
+export const RUN_LOG_CONFIRM_ROWS = 200;
+
+/// 行数の多い結果を書き戻す前の確認ダイアログでの選択。
+/// `limited` は [`RUN_LOG_CONFIRM_ROWS`] 行だけ書く
+export type RunLogChoice = "all" | "limited" | "cancel";
 
 /// 書き戻す TSV の総文字数の上限。
 /// **行数の確認ダイアログだけでは足りない** — セルの文字数に上限が無いため、
-/// 499 行でも長い TEXT / JSON 列があれば数百 MB になり、CodeMirror への
+/// 数行でも長い TEXT / JSON 列があれば数百 MB になり、CodeMirror への
 /// 挿入と自動保存でアプリが固まる。超えた分は打ち切って本文にその旨を書く
 const MAX_BODY_CHARS = 200_000;
 
@@ -135,17 +144,37 @@ export const formatRunLogTimestamp = (date: Date): string => {
 /// 結果をログの本文 (TSV) にする。
 /// 行を返さない文 (INSERT 等) は影響行数を書く。全件でない場合は理由ごとに
 /// その旨を残す (後から読んだ人が全件だと誤解しないように)。
-/// 3 つは同時に起こりうるので、独立した注記として並べる
-export const runLogBody = (result: QueryResult): string => {
+/// 同時に起こりうるので、独立した注記として並べる。
+///
+/// `maxRows` を渡すとその行数だけを書き、`(limited to N rows)` を添える
+/// (確認ダイアログで「一部だけ書く」を選んだ場合)。
+export const runLogBody = (result: QueryResult, maxRows?: number): string => {
   if (result.columns.length === 0) {
     return result.affected_rows === null
       ? "(no rows)"
       : `(${result.affected_rows} rows affected)`;
   }
-  const { text, truncated } = toTsvCapped(result, MAX_BODY_CHARS, MAX_CELL_CHARS);
+  // 行数を絞る時は結果そのものを差し替える (toTsvCapped は文字数の上限しか見ない)
+  const capped =
+    maxRows !== undefined && result.rows.length > maxRows
+      ? { ...result, rows: result.rows.slice(0, maxRows) }
+      : null;
+  const { text, truncated } = toTsvCapped(
+    capped ?? result,
+    MAX_BODY_CHARS,
+    MAX_CELL_CHARS,
+  );
   const lines = [text];
-  if (result.applied_limit !== null) {
-    lines.push(`(limited to ${result.applied_limit} rows)`);
+  if (capped !== null) {
+    lines.push(`(limited to ${capped.rows.length} rows)`);
+  }
+  // **auto LIMIT が付いているだけでは「抑制された」ことにならない。**
+  // LIMIT 500 を付けても 5 行しか返らなければ何も落ちていないので、書くと
+  // 「まだ続きがある」という誤った警告になる。行数が上限に達している時だけ書く
+  // (ちょうど上限の時に続きがあるかは分からないので、その場合は書く側に倒す)。
+  // 「一部だけ書く」の注記とは別の事実なので、文言も読み分けられるようにする
+  if (result.applied_limit !== null && result.rows.length >= result.applied_limit) {
+    lines.push(`(the query was limited to ${result.applied_limit} rows)`);
   }
   if (result.truncated) {
     lines.push("(the result itself was truncated)");
