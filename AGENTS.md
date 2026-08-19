@@ -102,6 +102,18 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
   (`disable` / `prefer` / `require` / `verify-ca` / `verify-full`)。既定の `prefer` は
   「TLS を試み、張れなければ平文に降格し証明書も検証しない」なので、yes/no に丸めると
   暗号化されていない接続に気付けなくなる。実効モードを持たないエンジンは `tls` を `on` / `off` で出す。
+  **`ConnectionInfo::sql_ssl_mode` が `None` でもそのまま `tls` に落とさないこと** —
+  `None` には「実効モードの概念が無いエンジン」だけでなく「`engine` / `ssl_mode` の値が
+  不正で解決できなかった」場合も含まれ、後者を `on` / `off` で出すと**接続時にエラーになる
+  設定を有効な TLS 設定として見せる** (`ssl_mode: requre` の書き間違いが `off` = 平文で
+  繋がる、と読める)。決められない時は `invalid` と出す (`ssl_summary`)。
+- **Windows の release ビルドはコンソールを持たない。** `main.rs` の
+  `windows_subsystem = "windows"` により GUI サブシステムでリンクされるため、
+  `GetStdHandle(STD_OUTPUT_HANDLE)` が無効ハンドルを返し `print!` が黙って捨てられる。
+  表示が目的の情報系オプションでは機能しないので、表示の前に
+  `cli::attach_parent_console` (`AttachConsole(ATTACH_PARENT_PROCESS)`) で親プロセスの
+  コンソールへ繋ぎ直す。**実機の Windows では未検証** (開発ホストにも CI にも Windows が
+  無いため、Windows ターゲットでの型検査までしか行えていない)。
 - 表示の組み立て (`help_text` / `format_server_list`) は Tauri にもファイルシステムにも
   依存しない純粋な関数にして単体テストで固めてある。設定の読み込みと出力は `lib.rs` の
   `run_info_command`。`--list-servers` は設定読み込みに失敗したら stderr に書いて 1 で終わる。

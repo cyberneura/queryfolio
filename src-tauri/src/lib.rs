@@ -2042,6 +2042,10 @@ fn apply_cli_write_route(
 /// 出力だけを行う。`--list-servers` は設定を読むので失敗しうる。その場合は
 /// 標準エラーへ書いて 1 で終わる (呼び出したスクリプトが失敗を判別できるように)。
 fn run_info_command(command: cli::InfoCommand) -> i32 {
+    // Windows の release ビルドはコンソールを持たないため、書く前に繋ぎ直す
+    // (詳細は cli::attach_parent_console)。他の OS では何もしない
+    cli::attach_parent_console();
+
     match command {
         cli::InfoCommand::Help => {
             print!("{}", cli::help_text());

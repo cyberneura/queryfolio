@@ -100,6 +100,41 @@ pub fn version_text() -> String {
     format!("QueryFolio {APP_VERSION}")
 }
 
+/// Windows で、情報系オプションの出力を呼び出し元の端末へ届ける。
+///
+/// `main.rs` の `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]` により、
+/// **Windows の release ビルドは GUI サブシステムとしてリンクされ、プロセスにコンソールが
+/// 割り当てられない**。この状態では Rust の std が書き込み先とする
+/// `GetStdHandle(STD_OUTPUT_HANDLE)` が無効ハンドルを返し、`print!` の内容が
+/// 黙って捨てられる (端末には何も出ないまま終了する)。表示そのものが目的の
+/// `--help` / `--version` / `--list-servers` では機能が成立しないので、表示の前に
+/// 親プロセス (起動した cmd.exe / PowerShell) のコンソールへ繋ぎ直す。
+///
+/// 標準出力が既に有効な場合 (パイプやファイルへのリダイレクト、親にコンソールが無い等) は
+/// `AttachConsole` が失敗するだけで、元の書き込み先がそのまま使われる。戻り値を見ないのは
+/// そのため — ここでの失敗は「今までどおり」であって、報告できることが無い。
+/// C ランタイム流の `freopen("CONOUT$")` に相当する処理は要らない
+/// (Rust の std は書き込みのたびに `GetStdHandle` を引き直すため)。
+///
+/// **この経路は実機の Windows では未検証** (開発ホストにも CI にも Windows が無い)。
+/// 呼ぶのは情報系オプションの表示直前だけなので、失敗しても現状どおり出力が出ないだけで、
+/// GUI 起動の経路には影響しない。
+#[cfg(windows)]
+pub fn attach_parent_console() {
+    // (DWORD)-1 = ATTACH_PARENT_PROCESS
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+
+    extern "system" {
+        fn AttachConsole(dwProcessId: u32) -> i32;
+    }
+
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
+/// Windows 以外では何もしない (常にコンソールへ書ける)。
+#[cfg(not(windows))]
+pub fn attach_parent_console() {}
+
 /// `--list-servers` の表の列。
 const COLUMNS: [&str; 9] = [
     "NAME", "ENGINE", "HOST", "PORT", "USER", "DATABASE", "SSL", "SSH", "FOLDER",
@@ -107,6 +142,10 @@ const COLUMNS: [&str; 9] = [
 
 /// 値が無い欄の表示。
 const EMPTY: &str = "-";
+
+/// 設定が壊れていて TLS の状態を決められない欄の表示。
+/// 有効なモード名 (`disable` / `prefer` / ...) とも `on` / `off` とも被らない語にする。
+const INVALID: &str = "invalid";
 
 /// TLS / SSL の状態を 1 語で表す。
 ///
@@ -117,12 +156,24 @@ const EMPTY: &str = "-";
 ///
 /// それ以外のエンジン (elasticsearch / dynamodb 等) には実効モードが無いので、
 /// 設定の `tls` をそのまま `on` / `off` で出す。
+///
+/// **`sql_ssl_mode` が `None` でも、そのまま `tls` に落としてはいけない。**
+/// `ConnectionInfo::from` は「実効モードを持たないエンジン」だけでなく
+/// 「`engine` / `ssl_mode` の値が不正で解決できなかった」場合も `None` にする。
+/// 後者を `tls` の `on` / `off` として出すと、**接続時にエラーになる設定を
+/// 有効な TLS 設定として見せる**ことになる (`ssl_mode: requre` の書き間違いが
+/// `off` = 平文で繋がる、と読める)。この列は接続の安全性を確認するためのものなので、
+/// 決められない時は `invalid` と出して隠さない。
 fn ssl_summary(server: &ServerConfig, info: &ConnectionInfo) -> String {
-    match &info.sql_ssl_mode {
-        Some(mode) => mode.clone(),
-        None if server.tls => "on".to_string(),
-        None => "off".to_string(),
+    if let Some(mode) = &info.sql_ssl_mode {
+        return mode.clone();
     }
+    // sql_ssl_mode() が Err になるのは ssl_mode が設定されていて解決できない時だけ
+    // (未設定なら tls から既定値を返す) なので、未設定の接続を誤って invalid にはしない
+    if server.sql_ssl_mode().is_err() || crate::db::parse_engine(&server.engine).is_err() {
+        return INVALID.to_string();
+    }
+    if server.tls { "on" } else { "off" }.to_string()
 }
 
 /// 表のセルに出す前に制御文字を可視表現へ落とす。
@@ -414,6 +465,38 @@ mod tests {
         .expect("test fixture should parse");
         let out = format_server_list(&[es], Path::new("/tmp/sqlfiles"));
         assert!(out.contains(" on"), "{out}");
+    }
+
+    /// 解決できない設定を「有効な TLS 設定」として見せない。
+    ///
+    /// `ConnectionInfo::sql_ssl_mode` は値が不正な時も `None` になるため、素直に
+    /// `tls` へ落とすと `ssl_mode: requre` (書き間違い) が `off` = 平文で繋がる、と
+    /// 読めてしまう。実際には接続時にエラーになるだけで、そんなモードは存在しない。
+    #[test]
+    fn test_format_server_list_marks_unresolvable_ssl_settings() {
+        let bad_mode: ServerConfig = serde_yaml::from_str(
+            "name: typo\nengine: postgres\nhost: db.example.com\nssl_mode: requre\n",
+        )
+        .expect("test fixture should parse");
+        let out = format_server_list(&[bad_mode], Path::new("/tmp/sqlfiles"));
+        assert!(out.contains(INVALID), "{out}");
+        // 「平文で繋がる」と読める表示にはしない
+        assert!(!out.contains(" off"), "{out}");
+
+        let bad_engine: ServerConfig =
+            serde_yaml::from_str("name: unknown\nengine: mysqll\nhost: db.example.com\n")
+                .expect("test fixture should parse");
+        let out = format_server_list(&[bad_engine], Path::new("/tmp/sqlfiles"));
+        assert!(out.contains(INVALID), "{out}");
+
+        // ssl_mode を書いていない接続を巻き込まないこと (実効モードを持たない
+        // エンジンは今までどおり tls の on / off)
+        let es: ServerConfig =
+            serde_yaml::from_str("name: search\nengine: elasticsearch\nhost: es.example.com\n")
+                .expect("test fixture should parse");
+        let out = format_server_list(&[es], Path::new("/tmp/sqlfiles"));
+        assert!(!out.contains(INVALID), "{out}");
+        assert!(out.contains(" off"), "{out}");
     }
 
     #[test]

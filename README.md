@@ -140,9 +140,11 @@ queryfolio --list-servers   # the configured connections
 
 `--list-servers` prints the resolved query files directory, then one row per connection: name, engine, host, port, user, database, TLS, whether an SSH tunnel is used, and the query file folder. **Passwords and SSH keys or passphrases are never printed** — the row is built from the same non-secret projection (`ConnectionInfo`) that is handed to the frontend.
 
-The TLS column shows the effective mode for mysql / postgres / redis (`disable` / `prefer` / `require` / `verify-ca` / `verify-full`) rather than a yes/no, because the default `prefer` falls back to plaintext without verifying the certificate; collapsing it into "enabled" would hide that. Other engines show the `tls` flag as `on` / `off`.
+The TLS column shows the effective mode for mysql / postgres / redis (`disable` / `prefer` / `require` / `verify-ca` / `verify-full`) rather than a yes/no, because the default `prefer` falls back to plaintext without verifying the certificate; collapsing it into "enabled" would hide that. Other engines show the `tls` flag as `on` / `off`. A connection whose `engine` or `ssl_mode` cannot be resolved shows `invalid` instead — such a connection fails when you try to use it, so reporting it as `on` or `off` would present a broken setting as a working one.
 
 The config is read the same way the app reads it, including `config_override_command`, so this also works when the connections come from an external command rather than from `config.yml`.
+
+On Windows the release build is linked as a GUI application and has no console of its own, so these commands attach to the console of the process that started them before printing. Redirecting to a file or a pipe works as usual.
 
 On macOS, call the binary inside the bundle — `open -a QueryFolio --args --list-servers` does not give you the output back:
 
