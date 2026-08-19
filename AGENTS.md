@@ -85,6 +85,35 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
 - `lib/sqlFormat.ts` — SQL 整形器 (自前トークナイザ。SELECT / UNION 系のみ整形し、INSERT / UPDATE / WITH 等やパース不能な文は原文維持。整形結果を再トークナイズして入力とトークン列が一致しなければ原文に戻す安全ネット付き)
 - Run and Log (`lib/runLog.ts`) — `-- 📝 <label>` を頭に置いた行コメントの直下にある文を実行すると、その文の下へ結果を `/* 🗒️ <label> <実行時刻>` で始まるブロックコメント (TSV) として書き戻す (CYBERNEURA-DEV-447。**runandlog** (CYBERNEURA-DEV-442) の SQL エディタ版)。結果テーブルへの表示は従来どおりで、書き戻しはその複製。マーカーの検出 (`findRunLogLabel`) は「実行対象の直前に連続する行コメント」と「実行対象 [from, to) の先頭に含まれるコメント」だけを見る (実行対象の外では、間に空行や別の文があれば別の文のマーカー)。設計上の要点: (1) **書き戻す本文の `*/` と `/*` は必ず潰す** (`escapeBlockComment`)。`*/` を残すとコメントがそこで閉じ、続くデータ行がそのまま SQL として実行される。`/*` も残せない — PostgreSQL のブロックコメントは**入れ子になる**ため、閉じない `/*` があると以降のファイル全体がコメントに飲まれる。(2) **再実行は既存ブロックを置き換える** (runandlog と同じで、何度実行してもブロックは 1 つ)。`/* 🗒️` の直後の最初の `*/` を終端とみなせるのは (1) で本文から `*/` を消しているから。閉じていない既存ブロックは書かずに知らせる (壊れたコメントの前に足すと入れ子が増えるだけ)。(3) 挿入位置は文末の空白と `;` を越えた後ろ (lang-sql の Statement は `;` を含むが、含まない場合にセミコロンの手前へ挟み込まないため)。前後の空行は 1 行に正規化するので、同じ結果を書けばテキストは変わらない (冪等)。(4) **実行完了は非同期**なので、書き戻し前に「エディタタブが実行開始時のままか」「アクティブスキーマが実行開始時のままか (`\c` / `USE` が切り替えた先は除く)」「対象範囲のテキストが実行した SQL と一致するか」の 3 つを照合し、**ラベルは書き戻す時点の本文から取り直す** (SQL が変わらなくてもマーカー行だけ編集されうるうえ、同じ長さの書き換えは範囲の照合を素通りする。マーカーごと消されていれば取り消しとみなして何も書かない) (`SqlEditor.writeRunLog`。`replaceRangeIfMatches` と同じ考え方)。ズレていたら書かずに toast で知らせる。カーソルとフォーカスは動かさない (待っている間にユーザーが別の場所を編集している)。(5) 500 行以上は書き戻す前に確認ダイアログ (`RunLogConfirmModal`) を出す。**行数の上限だけでは足りない** — セルの文字数に上限が無いため 499 行でも長い TEXT / JSON 列があれば数百 MB になる。総文字数とセルあたりの文字数でも打ち切り (`toTsvCapped`)、打ち切ったことを本文に書く。(6) 対象は **SQL 言語のエディタのみ** (redis / es は行コメントもブロックコメントも記法が違う)。lang-sql はブロックコメントを必ず Statement の兄弟ノードにするので、書き戻したブロックが次の文の実行範囲に混ざることはない。(7) **行コメントは Statement の兄弟になるとは限らない**。中身の無い `--` だけの行があると lang-sql はそれを LineComment にせず、**その行から SQL までが 1 つの Statement になる** — 説明のコメント・空行・`-- 📝 ラベル` の行がまとめて実行範囲に入る。そのため `findRunLogLabel` の前方スキャン (実行範囲の先頭のコメントを読み飛ばして SQL 本体を探す処理) は**空行で止めてはいけない** (CYBERNEURA-DEV-516)。代わりに実行範囲の終端 `to` で止める — 範囲の外へ出ると次の文のマーカーを拾ってしまう
 
+## CLI (GUI を起動しないオプション)
+
+`--help` / `--version` / `--list-servers` は標準出力に書いて `std::process::exit` で終わる。
+`cli.rs` にまとめてあり、`run()` が Tauri を組み立てる前 (write の書き出しよりも前) に
+`cli::info_command_from_args` で判定する。
+
+- **サブコマンドが先に来たら見ない**。`queryfolio write conn a.sql "--help"` の第 3 引数は
+  書き出す内容であってオプションではない。位置固定ではなく走査にしているのは、macOS が
+  `.app` 起動時に `-psn_0_12345` のような引数を先頭へ差し込むことがあるため
+  (`route_from_cli_args` と同じ理由)。
+- **`--list-servers` はパスワードと SSH の鍵・パスフレーズを出さない。** 出す項目は
+  `ConnectionInfo` (フロントへ渡す機密を含まない射影) とフォルダ名だけで、`ServerConfig` を
+  直接読むのは TLS の判定だけ。項目を増やす時もこの経路を守ること (テストで担保している)。
+- TLS 列は mysql / postgres / redis では**実効モードをそのまま出す**
+  (`disable` / `prefer` / `require` / `verify-ca` / `verify-full`)。既定の `prefer` は
+  「TLS を試み、張れなければ平文に降格し証明書も検証しない」なので、yes/no に丸めると
+  暗号化されていない接続に気付けなくなる。実効モードを持たないエンジンは `tls` を `on` / `off` で出す。
+- 表示の組み立て (`help_text` / `format_server_list`) は Tauri にもファイルシステムにも
+  依存しない純粋な関数にして単体テストで固めてある。設定の読み込みと出力は `lib.rs` の
+  `run_info_command`。`--list-servers` は設定読み込みに失敗したら stderr に書いて 1 で終わる。
+- **版番号は `CARGO_PKG_VERSION` ではなく `tauri.conf.json` の `version`。** リリースは
+  そちらの version で決まる (`release.yml`) 一方、`src-tauri/Cargo.toml` の version は
+  追随していないので、`CARGO_PKG_VERSION` を出すと配布物が 0.1.4 でも `--version` は
+  0.1.0 と答えてしまう。`build.rs` が `tauri.conf.json` を読んで `QUERYFOLIO_VERSION` として
+  埋め込み (読めなければビルドを失敗させる)、`cli.rs` の `APP_VERSION` がそれを使う。
+  ずれの再発は `test_version_comes_from_the_tauri_config` が止める。
+- macOS の `.app` からは `open -a QueryFolio --args --list-servers` では標準出力が返らない。
+  `QueryFolio.app/Contents/MacOS/queryfolio --list-servers` とバイナリを直接叩く。
+
 ## `queryfolio://` スキーム / CLI (ファイルを開く)
 
 保存済みのクエリファイルを、URL スキームまたは CLI からパス指定で開ける。どちらも

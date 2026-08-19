@@ -1,4 +1,5 @@
 mod ai;
+mod cli;
 mod config;
 mod db;
 mod engines;
@@ -2035,6 +2036,42 @@ fn apply_cli_write_route(
     })
 }
 
+/// GUI を起動しない CLI オプションを処理し、プロセスの終了コードを返す。
+///
+/// 表示の組み立ては [`crate::cli`] の純粋な関数に任せ、ここは設定の読み込みと
+/// 出力だけを行う。`--list-servers` は設定を読むので失敗しうる。その場合は
+/// 標準エラーへ書いて 1 で終わる (呼び出したスクリプトが失敗を判別できるように)。
+fn run_info_command(command: cli::InfoCommand) -> i32 {
+    match command {
+        cli::InfoCommand::Help => {
+            print!("{}", cli::help_text());
+            0
+        }
+        cli::InfoCommand::Version => {
+            println!("{}", cli::version_text());
+            0
+        }
+        cli::InfoCommand::ListServers => {
+            let result = tauri::async_runtime::block_on(async {
+                let config = AppConfig::load_merged().await?;
+                let servers = config.resolve_servers()?;
+                let sqlfiles_dir = config.resolve_sqlfiles_dir()?;
+                Ok::<String, AppError>(cli::format_server_list(&servers, &sqlfiles_dir))
+            });
+            match result {
+                Ok(text) => {
+                    print!("{text}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("[cli] failed to read the config: {e}");
+                    1
+                }
+            }
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     use tauri::Emitter;
@@ -2049,6 +2086,11 @@ pub fn run() {
     // (config_override_command を 1 起動で 2 度実行しない)。
     let preflight_config = {
         let argv: Vec<String> = std::env::args().skip(1).collect();
+        // --help / --version / --list-servers は表示だけして終わる
+        // (GUI もウインドウも起動しない)。write の書き出しより前に見る。
+        if let Some(command) = cli::info_command_from_args(&argv) {
+            std::process::exit(run_info_command(command));
+        }
         match router::route_from_cli_args(&argv) {
             Some(route) => match apply_cli_write_route(&route) {
                 Ok(config) => config,

@@ -39,6 +39,7 @@ https://github.com/user-attachments/assets/90439816-49c8-4ebd-a068-b102cfe9c7aa
 - Window size / position restored across restarts
 - Open a saved query file by path from a `queryfolio://open/<path>` URL or the `queryfolio open <path>` CLI subcommand (restricted to files under the query files directory; reuses the running window)
 - Write and open a query file from the CLI with `queryfolio write <connection> <file-name> [content]` (content can also be piped in on stdin) — for AI agents that prepare a query for review
+- Inspect the configuration without launching the app: `queryfolio --help`, `queryfolio --version`, `queryfolio --list-servers`
 
 ## Setup
 
@@ -126,6 +127,30 @@ queryfolio write reporting monthly.sql
 - Content is written only when it is actually given. An **empty** stdin is treated as "no content" so that a GUI launch (`open -a QueryFolio --args write ...`, whose stdin is `/dev/null`) cannot silently blank an existing file. Existing content is otherwise overwritten.
 - The file is written by the process you launch, before the running window is asked to open it — stdin cannot be forwarded to an already-running instance. If writing fails (unknown connection, invalid name, stdin larger than 10 MiB, I/O error), the reason is printed to stderr and the command exits non-zero without opening anything.
 - `write` is **CLI-only**: there is no `queryfolio://write/...` URL. A web page can make the browser open a `queryfolio://` URL, and dropping arbitrary SQL into the query files directory that way would be a trap waiting for the next person who runs it.
+
+### Inspecting the configuration from the CLI
+
+These options print to stdout and exit without launching the app or touching an already-running window.
+
+```shell
+queryfolio --help           # usage, including the open / write subcommands
+queryfolio --version
+queryfolio --list-servers   # the configured connections
+```
+
+`--list-servers` prints the resolved query files directory, then one row per connection: name, engine, host, port, user, database, TLS, whether an SSH tunnel is used, and the query file folder. **Passwords and SSH keys or passphrases are never printed** — the row is built from the same non-secret projection (`ConnectionInfo`) that is handed to the frontend.
+
+The TLS column shows the effective mode for mysql / postgres / redis (`disable` / `prefer` / `require` / `verify-ca` / `verify-full`) rather than a yes/no, because the default `prefer` falls back to plaintext without verifying the certificate; collapsing it into "enabled" would hide that. Other engines show the `tls` flag as `on` / `off`.
+
+The config is read the same way the app reads it, including `config_override_command`, so this also works when the connections come from an external command rather than from `config.yml`.
+
+On macOS, call the binary inside the bundle — `open -a QueryFolio --args --list-servers` does not give you the output back:
+
+```shell
+/Applications/QueryFolio.app/Contents/MacOS/queryfolio --list-servers
+```
+
+An option is only recognised before a subcommand, so `queryfolio write conn a.sql "-- help"` writes that content instead of printing the help.
 
 ## Development
 
