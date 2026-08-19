@@ -107,6 +107,12 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
   不正で解決できなかった」場合も含まれ、後者を `on` / `off` で出すと**接続時にエラーになる
   設定を有効な TLS 設定として見せる** (`ssl_mode: requre` の書き間違いが `off` = 平文で
   繋がる、と読める)。決められない時は `invalid` と出す (`ssl_summary`)。
+  **ただし `invalid` を出すのは「その値で実際に接続が失敗するエンジン」だけ** —
+  `ssl_mode` を読むのは `db::connect` の mysql / postgres の分岐だけで、
+  elasticsearch / sqlite / duckdb / dynamodb の経路は見ない。共有テンプレート等で
+  不正な `ssl_mode` が紛れ込んでいてもそれらは普通に繋がるので、`invalid` と出すと
+  使える接続を壊れているように見せる。`invalid` の意味は「この設定では繋がらない」で
+  あって「設定に無効な値が書いてある」ではない。
   **`tls` が実際の接続方式を決めていないエンジンでも、そのまま出さないこと** —
   dynamodb の `host` / `port` / `tls` は dynamodb-local 向けのエンドポイント上書き専用で、
   `host` を書かない通常の AWS 接続は SDK が地域エンドポイントを常に https で解決する

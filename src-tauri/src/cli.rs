@@ -10,6 +10,7 @@
 //! 要件なので、テストで担保する)。
 
 use crate::config::{ConnectionInfo, ServerConfig};
+use crate::db::Engine;
 use std::path::Path;
 
 /// GUI を起動せず、標準出力に書いて終わるオプション。
@@ -207,18 +208,29 @@ fn has_endpoint_override(server: &ServerConfig) -> bool {
 /// 有効な TLS 設定として見せる**ことになる (`ssl_mode: requre` の書き間違いが
 /// `off` = 平文で繋がる、と読める)。この列は接続の安全性を確認するためのものなので、
 /// 決められない時は `invalid` と出して隠さない。
+///
+/// **逆に、`invalid` を出す範囲は「その値で実際に接続が失敗するエンジン」に限る。**
+/// `ssl_mode` を読むのは `db::connect` の mysql / postgres の分岐だけで、
+/// elasticsearch / sqlite / duckdb / dynamodb の接続経路は見ない。共有テンプレート等で
+/// 不正な `ssl_mode` が紛れ込んでいても**それらは普通に繋がる**ので、`invalid` と
+/// 出すと使える接続を壊れているように見せることになる。`invalid` の意味は
+/// 「この設定では繋がらない」であって「設定に無効な値が書いてある」ではない。
 fn ssl_summary(server: &ServerConfig, info: &ConnectionInfo) -> String {
     if let Some(mode) = &info.sql_ssl_mode {
         return mode.clone();
     }
+    // エンジン名自体が解決できない接続は、どの経路でも繋がらない
+    let Ok(engine) = crate::db::parse_engine(&server.engine) else {
+        return INVALID.to_string();
+    };
     // sql_ssl_mode() が Err になるのは ssl_mode が設定されていて解決できない時だけ
     // (未設定なら tls から既定値を返す) なので、未設定の接続を誤って invalid にはしない
-    if server.sql_ssl_mode().is_err() || crate::db::parse_engine(&server.engine).is_err() {
+    if matches!(engine, Engine::MySql | Engine::Postgres) && server.sql_ssl_mode().is_err() {
         return INVALID.to_string();
     }
     // エンドポイント上書きの無い dynamodb は SDK が https で解決するので、
     // 上書き用の tls フラグではなく実際の接続方式を出す
-    if server.engine.eq_ignore_ascii_case("dynamodb") && !has_endpoint_override(server) {
+    if engine == Engine::DynamoDb && !has_endpoint_override(server) {
         return "on".to_string();
     }
     if server.tls { "on" } else { "off" }.to_string()
@@ -618,6 +630,20 @@ mod tests {
                 .expect("test fixture should parse");
         let out = format_server_list(&[bad_engine], Path::new("/tmp/sqlfiles"));
         assert!(out.contains(INVALID), "{out}");
+
+        // `ssl_mode` を読まないエンジンは巻き込まない。共有テンプレート等で不正な値が
+        // 紛れ込んでいても、これらの接続経路 (db::connect の該当分岐 / engines/) は
+        // sql_ssl_mode を見ないので普通に繋がる。`invalid` の意味は「この設定では
+        // 繋がらない」なので、使える接続を壊れているように見せてはいけない
+        for engine in ["elasticsearch", "sqlite", "duckdb", "dynamodb"] {
+            let ignores_ssl_mode: ServerConfig = serde_yaml::from_str(&format!(
+                "name: {engine}-conn\nengine: {engine}\nhost: h.example.com\n\
+                 schema: s\nssl_mode: requre\n"
+            ))
+            .expect("test fixture should parse");
+            let out = format_server_list(&[ignores_ssl_mode], Path::new("/tmp/sqlfiles"));
+            assert!(!out.contains(INVALID), "{engine}:\n{out}");
+        }
 
         // ssl_mode を書いていない接続を巻き込まないこと (実効モードを持たない
         // エンジンは今までどおり tls の on / off)
