@@ -147,6 +147,28 @@ const EMPTY: &str = "-";
 /// 有効なモード名 (`disable` / `prefer` / ...) とも `on` / `off` とも被らない語にする。
 const INVALID: &str = "invalid";
 
+/// 値そのものが資格情報なので伏せた欄の表示。
+/// `EMPTY` (未設定) と区別できる語にする — 「AWS のキーを設定していない」と
+/// 「設定しているが出していない」は別の話なので、同じ `-` にはしない。
+const HIDDEN: &str = "(hidden)";
+
+/// USER 欄に出す値。
+///
+/// **dynamodb の `user` は AWS のアクセスキー ID で、DB のユーザー名ではない。**
+/// 秘密鍵ほどではないが資格情報の片割れの識別子なので、端末やその履歴・
+/// ログに残す値ではない。`folder_meta.rs` が同じ理由で `(aws access key, hidden)`
+/// に差し替えているのと同じ扱いにする (こちらは表の 1 列なので短い語にする)。
+///
+/// 他のエンジンの `user` はただのユーザー名なので、そのまま出す
+/// (どのアカウントで繋ぐ設定なのかは、この一覧を見る目的そのもの)。
+fn user_cell(server: &ServerConfig, info: &ConnectionInfo) -> String {
+    match info.user.as_deref() {
+        Some(_) if server.engine.eq_ignore_ascii_case("dynamodb") => HIDDEN.to_string(),
+        Some(user) => user.to_string(),
+        None => EMPTY.to_string(),
+    }
+}
+
 /// TLS / SSL の状態を 1 語で表す。
 ///
 /// mysql / postgres / redis は実効モード ([`ConnectionInfo::sql_ssl_mode`]) を
@@ -199,10 +221,16 @@ fn sanitize_cell(value: &str) -> String {
 
 /// `--list-servers` の本文を組み立てる。
 ///
-/// **パスワード・SSH の鍵やパスフレーズは出さない。** 出す項目は
-/// [`ConnectionInfo`] (フロントへ渡す「機密を含まない」射影) と
+/// **パスワード・SSH の鍵やパスフレーズ・AWS のアクセスキー ID は出さない。**
+/// 出す項目は [`ConnectionInfo`] (フロントへ渡す「機密を含まない」射影) と
 /// フォルダ名だけに限り、[`ServerConfig`] のフィールドを直接読むのは
-/// TLS の判定 (`tls`) だけにしている。項目を増やす時もこの経路を守ること。
+/// TLS の判定 (`tls`) と USER 欄の伏せ字判定 (`engine`) だけにしている。
+/// 項目を増やす時もこの経路を守ること。
+///
+/// なお [`ConnectionInfo`] は「フロント (自分の画面) に渡してよい」射影であって
+/// 「端末に出してよい」射影ではない。`user` のように**エンジンによって意味が
+/// 変わるフィールド**があるので、そのまま流さず [`user_cell`] のような
+/// 用途別の判断を挟むこと。
 pub fn format_server_list(servers: &[ServerConfig], sqlfiles_dir: &Path) -> String {
     let mut out = format!(
         "Query files directory: {}\n",
@@ -224,7 +252,7 @@ pub fn format_server_list(servers: &[ServerConfig], sqlfiles_dir: &Path) -> Stri
                 info.port
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| EMPTY.to_string()),
-                info.user.clone().unwrap_or_else(|| EMPTY.to_string()),
+                user_cell(server, &info),
                 info.schema.clone().unwrap_or_else(|| EMPTY.to_string()),
                 ssl_summary(server, &info),
                 if info.has_ssh_tunnel { "yes" } else { EMPTY }.to_string(),
@@ -403,6 +431,33 @@ mod tests {
         }
         // トンネルを使っていることは分かる (SSH 列)
         assert!(out.contains("yes"), "{out}");
+    }
+
+    /// dynamodb の `user` は AWS のアクセスキー ID なので USER 欄に出さない。
+    ///
+    /// `ConnectionInfo` は「機密を含まない」射影だが、それは**フロントへ渡す**
+    /// 基準であって端末に出す基準ではない。ここを素通しにすると、資格情報の
+    /// 識別子が端末とシェル履歴・ログに残る。
+    #[test]
+    fn test_format_server_list_hides_the_aws_access_key_id() {
+        let dynamo: ServerConfig = serde_yaml::from_str(
+            "name: events\nengine: DynamoDB\nschema: ap-northeast-1\n\
+             user: AKIAIOSFODNN7EXAMPLE\npassword: wJalrXUtnFEMI\n",
+        )
+        .expect("test fixture should parse");
+        let out = format_server_list(&[dynamo], Path::new("/tmp/sqlfiles"));
+
+        // engine の綴りが DynamoDB / dynamodb のどちらでも伏せる
+        assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"), "{out}");
+        assert!(!out.contains("wJalrXUtnFEMI"), "{out}");
+        assert!(out.contains(HIDDEN), "{out}");
+        // 接続そのものは一覧に出る (行ごと消してしまわない)
+        assert!(out.contains("events"), "{out}");
+
+        // 他のエンジンの user はユーザー名なので今までどおり出す
+        let out = format_server_list(&[server("reporting")], Path::new("/tmp/sqlfiles"));
+        assert!(out.contains("app"), "{out}");
+        assert!(!out.contains(HIDDEN), "{out}");
     }
 
     #[test]

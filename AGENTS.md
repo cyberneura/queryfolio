@@ -114,6 +114,16 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
   `cli::attach_parent_console` (`AttachConsole(ATTACH_PARENT_PROCESS)`) で親プロセスの
   コンソールへ繋ぎ直す。**実機の Windows では未検証** (開発ホストにも CI にも Windows が
   無いため、Windows ターゲットでの型検査までしか行えていない)。
+- **上記で直るのは出力先だけで、「シェルが終了を待たない」ことは直らない。** GUI
+  サブシステムの exe を cmd.exe / PowerShell から起動すると、シェルは終了を待たずに
+  プロンプトへ戻る。そのため対話シェルでは (1) 出力が次のプロンプトの後に現れることがあり、
+  (2) `%ERRORLEVEL%` / `$LASTEXITCODE` が情報系オプションの終了コードにならない。
+  リダイレクトとパイプは通常どおり動く (ハンドルは継承され、読み手は書き込み側の
+  クローズまで待つ) ので、スクリプトから使う分には影響しない。
+  **これを直すにはコンソールサブシステムの別 exe を配布物に足すしかなく、GUI 起動時に
+  コンソール窓が出る副作用と、この環境では検証できない配布物の変更を伴う。**
+  アプリの主目的は GUI なので、その取引はしていない。対話シェルで終了コードまで要るなら
+  `Start-Process -Wait queryfolio -ArgumentList '--list-servers'` を使う。
 - 表示の組み立て (`help_text` / `format_server_list`) は Tauri にもファイルシステムにも
   依存しない純粋な関数にして単体テストで固めてある。設定の読み込みと出力は `lib.rs` の
   `run_info_command`。`--list-servers` は設定読み込みに失敗したら stderr に書いて 1 で終わる。

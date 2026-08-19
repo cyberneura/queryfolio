@@ -146,6 +146,8 @@ The config is read the same way the app reads it, including `config_override_com
 
 On Windows the release build is linked as a GUI application and has no console of its own, so these commands attach to the console of the process that started them before printing. Redirecting to a file or a pipe works as usual.
 
+Two consequences of that remain, and they are deliberate rather than oversights: because the shell does not wait for a GUI-subsystem program, in an interactive `cmd.exe` or PowerShell session the output can arrive after the prompt has already been redrawn, and `%ERRORLEVEL%` / `$LASTEXITCODE` will not carry the exit code of the option you ran. Removing them would mean shipping a second, console-subsystem executable in the installer, which puts a console window on every GUI launch. Use `Start-Process -Wait queryfolio -ArgumentList '--list-servers'` when you need the shell to wait.
+
 On macOS, call the binary inside the bundle — `open -a QueryFolio --args --list-servers` does not give you the output back:
 
 ```shell
