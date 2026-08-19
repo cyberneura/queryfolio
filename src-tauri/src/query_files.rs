@@ -278,6 +278,102 @@ pub fn read_query_file(
     Ok(fs::read_to_string(&path)?)
 }
 
+/// 保存領域のディレクトリを作る。**Unix では自分が作った階層だけ**を 0700 にする。
+///
+/// クエリファイルには WHERE の実値・テーブル名・DDL が入り、同じ内容を保存する
+/// 実行履歴 (history.rs) は 0700 / 0600 で明示的に絞ってある。作成時のモードを
+/// 指定しないと umask 既定 (通常 0755 / 0644) になり、同一ホストの他ユーザーから
+/// 読めてしまう (CYBERNEURA-DEV-510)。Windows ではモードの概念が無く、ACL は
+/// 従来どおり親ディレクトリからの継承に任せる。
+///
+/// `create_dir_all` + `set_permissions` にしないのは 2 つの理由から:
+/// - `create_dir_all` は途中の階層 (保存ルート等) も作るが、モードを設定できるのは
+///   最終ディレクトリだけで、間の階層が umask 既定のまま残る
+/// - 「存在するか」を見てから作ると、その間に他プロセスが作ったディレクトリまで
+///   締め直してしまう (相手がより厳しく作っていた場合は逆に緩める)
+///
+/// 代わりに階層ごとに `create_dir` を使う。「無ければ作る」が 1 回のシステムコールで
+/// 完結し、既にあれば `AlreadyExists` が返るので、**自分が作った時だけ**モードを
+/// 設定できる。既存ディレクトリのモードは変えない (利用者が意図的に緩めた設定を
+/// 後から締め直さない。書き込み時に既存のパーミッションを引き継ぐ write_file_atomic と
+/// 同じ考え方)。
+fn ensure_dir_700(dir: &Path) -> Result<(), AppError> {
+    // 作る必要がある階層を、深い方から順に集める。
+    let mut missing = Vec::new();
+    let mut current = Some(dir);
+    while let Some(path) = current {
+        if path.as_os_str().is_empty() || path.is_dir() {
+            break;
+        }
+        missing.push(path);
+        current = path.parent();
+    }
+
+    // 浅い方から作る。**作る時点で 0700 を指定する** (`DirBuilder::mode`)。
+    // 作ってから chmod する形だと、その間にクラッシュしたディレクトリが umask 既定の
+    // まま残り、次回以降は「既存」として扱われて締め直されない。
+    // umask は指定したモードからビットを落とすことしかできないので、作成時点で
+    // 他ユーザーに開くことはない。落とされた所有者ビットは直後に戻す。
+    for path in missing.iter().rev() {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+                }
+            }
+            // 競合して他プロセスが先に作った。モードは相手のものを尊重する。
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// 新規作成するための共通オプション (`O_EXCL`)。**Unix ではモードを 600 にする。**
+///
+/// `create_new` なので既存は潰さない。history.rs の `open_options_600` と同じ意図で、
+/// 新規作成分のモードだけを絞る。Windows ではモード指定が効かず、ACL は従来どおり。
+fn create_new_options_600() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+}
+
+/// `create_new_options_600` でファイルを新規作成する。
+///
+/// `mode` は umask でビットを落とされるため、所有者ビットまで落とす umask (0700 等) の
+/// 下では読み書きできない 000 のファイルが残る。作成直後に 0600 を設定して戻す
+/// (config.rs が config.yml を作る時と同じ形)。
+fn create_new_file_600(path: &Path) -> std::io::Result<fs::File> {
+    let file = create_new_options_600().open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // モードを付けられないなら、作ったファイルを残さずに失敗させる。
+        // 中途半端に緩いファイルを置いていくくらいなら作成そのものを失敗させる方がよい
+        // (fchmod が拒否されるのは一部のネットワーク FS 等に限られる)。
+        if let Err(e) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(e);
+        }
+    }
+    Ok(file)
+}
+
 /// 同一ディレクトリの一時ファイルへ書いてから rename で置き換える。
 ///
 /// `fs::write` は宛先を truncate してから書き足すため、書いている途中の状態が
@@ -325,11 +421,7 @@ fn write_file_atomic(path: &Path, content: &str) -> Result<(), AppError> {
             std::process::id(),
             SEQ.fetch_add(1, AtomicOrdering::Relaxed)
         ));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        match create_new_file_600(&candidate) {
             Ok(f) => {
                 tmp_path = candidate;
                 file = Some(f);
@@ -380,7 +472,7 @@ pub fn write_query_file(
 ) -> Result<(), AppError> {
     let path = file_path(sqlfiles_dir, connection, file_name, ext)?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        ensure_dir_700(parent)?;
     }
     write_file_atomic(&path, content)?;
     Ok(())
@@ -419,7 +511,7 @@ pub fn write_query_file_if_unchanged(
         Err(e) => return Err(e.into()),
     }
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        ensure_dir_700(parent)?;
     }
     write_file_atomic(&path, content)?;
     Ok(true)
@@ -440,9 +532,11 @@ pub fn create_query_file(
         )));
     }
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        ensure_dir_700(parent)?;
     }
-    fs::write(&path, "")?;
+    // `create_new` (`O_EXCL`) にすることで、上の存在確認と作成の間に他プロセスが
+    // 作ったファイルを潰さない (`fs::write` は既存を truncate する)。
+    create_new_file_600(&path)?;
     Ok(normalized)
 }
 
@@ -485,13 +579,9 @@ pub fn ensure_query_file(
     let normalized = normalize_file_name(file_name, ext)?;
     let path = file_path(sqlfiles_dir, connection, &normalized, ext)?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        ensure_dir_700(parent)?;
     }
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
+    match create_new_file_600(&path) {
         Ok(_) => Ok(normalized),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // `O_EXCL` は「通常ファイルが既にある」時だけでなく、ディレクトリ・
@@ -614,7 +704,7 @@ pub fn move_query_file(
         return Ok(normalized);
     }
 
-    fs::create_dir_all(&to_dir)?;
+    ensure_dir_700(&to_dir)?;
 
     // 大文字小文字だけが違う同名ファイルを先に弾く (case-insensitive FS の実挙動
     // と揃え、rename_query_file の判定とも一致させる)。列挙に失敗したら
@@ -637,11 +727,7 @@ pub fn move_query_file(
     // そのファイルを失う。O_EXCL の作成なら「無ければ作る」が atomic なので、
     // 予約に成功した = その名前は自分のものだと確定できる。
     let to_path = to_dir.join(&normalized);
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&to_path)
-    {
+    match create_new_file_600(&to_path) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             return Err(AppError::QueryFile(format!(
@@ -780,6 +866,50 @@ mod tests {
 
             let _ = fs::remove_dir_all(&outside);
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 新規作成分のパーミッションを 0600 / ディレクトリを 0700 に絞る
+    /// (CYBERNEURA-DEV-510)。同じ内容を保存する history.rs と水準を揃える。
+    #[cfg(unix)]
+    #[test]
+    fn test_new_query_files_are_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir().join("permissions");
+        let connection = "conn";
+
+        let mode_of = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        // create_query_file (空ファイルの新規作成)。保存ルートごと未作成の状態から始める
+        assert!(!dir.exists());
+        create_query_file(&dir, connection, "created", "sql").unwrap();
+        let conn_dir = connection_dir(&dir, connection).unwrap();
+        assert_eq!(
+            mode_of(&dir),
+            0o700,
+            "保存ルートも 0700 (途中の階層を残さない)"
+        );
+        assert_eq!(mode_of(&conn_dir), 0o700, "接続ディレクトリは 0700");
+        assert_eq!(mode_of(&conn_dir.join("created.sql")), 0o600);
+
+        // ensure_query_file (CLI が「無ければ作る」に使う経路)
+        ensure_query_file(&dir, connection, "ensured", "sql").unwrap();
+        assert_eq!(mode_of(&conn_dir.join("ensured.sql")), 0o600);
+
+        // write_query_file (一時ファイル + rename。新規作成なので引き継ぐ元が無い)
+        write_query_file(&dir, connection, "written", "SELECT 1;", "sql").unwrap();
+        assert_eq!(mode_of(&conn_dir.join("written.sql")), 0o600);
+
+        // 既存ディレクトリのモードは変えない (利用者が緩めた設定を勝手に締め直さない)
+        fs::set_permissions(&conn_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        write_query_file(&dir, connection, "second", "SELECT 2;", "sql").unwrap();
+        assert_eq!(
+            mode_of(&conn_dir),
+            0o755,
+            "既存ディレクトリのパーミッションは変更しないこと"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
