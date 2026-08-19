@@ -382,7 +382,7 @@
       from: range.from,
       to: range.to,
       logLabel: isSqlLanguage()
-        ? findRunLogLabel(state.doc.toString(), range.from)
+        ? findRunLogLabel(state.doc.toString(), range.from, range.to)
         : null,
     };
   };
@@ -422,7 +422,7 @@
       return "stale";
     }
     const doc = state.doc.toString();
-    const label = findRunLogLabel(doc, target.from);
+    const label = findRunLogLabel(doc, target.from, target.to);
     if (label === null) {
       return "unmarked";
     }

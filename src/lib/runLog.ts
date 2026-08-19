@@ -61,24 +61,46 @@ const lineIndexOf = (lines: string[], offset: number): number => {
   return lines.length - 1;
 };
 
-/// エディタ本文 doc の中で、位置 from から始まる実行対象に付いた
+/// エディタ本文 doc の中で、実行対象 [from, to) に付いた
 /// `-- 📝 <label>` マーカーを探す。無ければ null。
 ///
 /// 見るのは実行対象の直前に**連続する**行コメントだけ (間に空行や別の文が
 /// あれば、それは別の文に付いたマーカーなので対象外)。加えて実行対象の
 /// 先頭がコメント行のこともある (lang-sql が直前のコメントを Statement に
-/// 含める場合) ため、範囲の先頭側に続くコメント行も同じ並びとして扱う。
+/// 含める場合) ため、範囲の先頭側に続くコメント行も同じ並びとして扱う
+/// (こちらは空行が挟まっていても同じ並びとみなす。理由は下記)。
 ///
 /// マーカー行が複数あれば SQL に最も近いものを採用する。
-export const findRunLogLabel = (doc: string, from: number): string | null => {
+export const findRunLogLabel = (
+  doc: string,
+  from: number,
+  to: number,
+): string | null => {
   const lines = doc.split("\n");
   const startLine = lineIndexOf(lines, from);
-  // 実行範囲の先頭に含まれるコメント行を読み飛ばし、SQL 本体の開始行を得る
+  // 実行範囲の先頭に含まれるコメント行を読み飛ばし、SQL 本体の開始行を得る。
+  //
+  // ここで**空行も読み飛ばす**のは、実行範囲の中では空行が並びの切れ目に
+  // ならないため。lang-sql は中身の無い `--` の行を LineComment として
+  // 扱わないので、そこから SQL までが丸ごと 1 つの Statement になる
+  // (説明のコメント → 空行 → `-- 📝 ラベル` → SQL という書き方は普通に
+  // ありうる)。空行で止めるとマーカー行まで辿り着けない (CYBERNEURA-DEV-516)。
+  //
+  // 読み飛ばしを実行範囲の中に閉じるために lastLine で止める。範囲の外へ
+  // 出ると、次の文に付いたマーカーを自分のものとして拾ってしまう。
+  //
+  // to は範囲の終端 (排他) なので、行を引くのは to - 1。to をそのまま渡すと、
+  // to がちょうど行頭に来た時に範囲外の行まで含んでしまう
+  const lastLine = to > from ? lineIndexOf(lines, to - 1) : startLine;
   let end = startLine;
-  while (end < lines.length && isLineComment(lines[end])) {
+  while (
+    end <= lastLine &&
+    (isLineComment(lines[end]) || lines[end].trim() === "")
+  ) {
     end++;
   }
-  // その直前に連続するコメント行まで遡る
+  // その直前に連続するコメント行まで遡る。
+  // こちらは実行範囲の外なので、空行は従来どおり並びの切れ目として扱う
   let begin = startLine;
   while (begin > 0 && isLineComment(lines[begin - 1])) {
     begin--;
