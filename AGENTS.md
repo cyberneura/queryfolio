@@ -113,6 +113,13 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
   不正な `ssl_mode` が紛れ込んでいてもそれらは普通に繋がるので、`invalid` と出すと
   使える接続を壊れているように見せる。`invalid` の意味は「この設定では繋がらない」で
   あって「設定に無効な値が書いてある」ではない。
+  **`ssl_mode` が解決できても組み合わせで拒否される設定は `invalid`** — `ssl_root_cert` を
+  検証しないモード (`disable` / `prefer` / `require`。`ssl_mode` 省略時の既定 `prefer` を
+  含む) と併記すると `sql_ssl_root_cert` がエラーにするため `db::connect` は必ず失敗する。
+  実効モードだけ見て `prefer` と出すと繋がらない接続を有効に見せることになる。
+  ただし**ルート CA がファイルとして実在するか (`ssl_root_cert_path` の `is_file`) までは
+  見ない** — 表示の組み立てはファイルシステムに触らない純粋な関数として単体テストで
+  固めてあり、後から置ける不在ファイルは設定の誤りとも違う。
   **`tls` が実際の接続方式を決めていないエンジンでも、そのまま出さないこと** —
   dynamodb の `host` / `port` / `tls` は dynamodb-local 向けのエンドポイント上書き専用で、
   `host` を書かない通常の AWS 接続は SDK が地域エンドポイントを常に https で解決する

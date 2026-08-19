@@ -215,18 +215,31 @@ fn has_endpoint_override(server: &ServerConfig) -> bool {
 /// 不正な `ssl_mode` が紛れ込んでいても**それらは普通に繋がる**ので、`invalid` と
 /// 出すと使える接続を壊れているように見せることになる。`invalid` の意味は
 /// 「この設定では繋がらない」であって「設定に無効な値が書いてある」ではない。
+///
+/// **`ssl_mode` が解決できても、TLS 設定の組み合わせが拒否される場合がある。**
+/// `ssl_root_cert` を検証しないモード (`disable` / `prefer` / `require`) と併記した
+/// 設定は `sql_ssl_root_cert` がエラーにするため (sqlx が CA を黙って無視するので、
+/// 「CA を指定したから検証されている」という誤解を放置しない設計)、`db::connect` は
+/// 必ず失敗する。実効モードだけ見て `prefer` と出すと、繋がらない接続を有効な設定と
+/// して見せることになる。**ファイルとして開けるか (`db::ssl_root_cert_path` の
+/// `is_file`) までは見ない** — この一覧の組み立てはファイルシステムに触らない純粋な
+/// 関数として単体テストで固めてあり、後から置ける不在ファイルは設定の誤りとも違う。
 fn ssl_summary(server: &ServerConfig, info: &ConnectionInfo) -> String {
-    if let Some(mode) = &info.sql_ssl_mode {
-        return mode.clone();
-    }
     // エンジン名自体が解決できない接続は、どの経路でも繋がらない
     let Ok(engine) = crate::db::parse_engine(&server.engine) else {
         return INVALID.to_string();
     };
     // sql_ssl_mode() が Err になるのは ssl_mode が設定されていて解決できない時だけ
-    // (未設定なら tls から既定値を返す) なので、未設定の接続を誤って invalid にはしない
-    if matches!(engine, Engine::MySql | Engine::Postgres) && server.sql_ssl_mode().is_err() {
+    // (未設定なら tls から既定値を返す) なので、未設定の接続を誤って invalid にはしない。
+    // sql_ssl_root_cert() は ssl_root_cert が未設定なら mode を見ないので、
+    // 2 つとも呼ぶ必要がある (前者は値の解決、後者は組み合わせの検証)
+    if matches!(engine, Engine::MySql | Engine::Postgres)
+        && (server.sql_ssl_mode().is_err() || server.sql_ssl_root_cert().is_err())
+    {
         return INVALID.to_string();
+    }
+    if let Some(mode) = &info.sql_ssl_mode {
+        return mode.clone();
     }
     // エンドポイント上書きの無い dynamodb は SDK が https で解決するので、
     // 上書き用の tls フラグではなく実際の接続方式を出す
@@ -635,6 +648,50 @@ mod tests {
         // 紛れ込んでいても、これらの接続経路 (db::connect の該当分岐 / engines/) は
         // sql_ssl_mode を見ないので普通に繋がる。`invalid` の意味は「この設定では
         // 繋がらない」なので、使える接続を壊れているように見せてはいけない
+        // ssl_mode が解決できても、組み合わせが拒否される設定は繋がらない。
+        // ssl_root_cert を検証しないモードと併記すると sql_ssl_root_cert が
+        // エラーにするため、db::connect は必ず失敗する
+        for mode in ["disable", "prefer", "require"] {
+            let cert_without_verify: ServerConfig = serde_yaml::from_str(&format!(
+                "name: ca-{mode}\nengine: postgres\nhost: db.example.com\n\
+                 ssl_mode: {mode}\nssl_root_cert: /etc/ssl/ca.pem\n"
+            ))
+            .expect("test fixture should parse");
+            let out = format_server_list(&[cert_without_verify], Path::new("/tmp/sqlfiles"));
+            assert!(out.contains(INVALID), "{mode}:\n{out}");
+            // 解決できる実効モードの方を出してはいけない (繋がらないので)
+            assert!(!out.contains(&format!(" {mode}")), "{mode}:\n{out}");
+        }
+
+        // ssl_mode を省略した場合の既定は prefer なので、これも検証されない
+        let cert_without_mode: ServerConfig = serde_yaml::from_str(
+            "name: ca-default\nengine: postgres\nhost: db.example.com\n\
+             ssl_root_cert: /etc/ssl/ca.pem\n",
+        )
+        .expect("test fixture should parse");
+        let out = format_server_list(&[cert_without_mode], Path::new("/tmp/sqlfiles"));
+        assert!(out.contains(INVALID), "{out}");
+
+        // 空の ssl_root_cert も同じくエラーになる (黙って未設定に倒さない)
+        let empty_cert: ServerConfig = serde_yaml::from_str(
+            "name: ca-empty\nengine: postgres\nhost: db.example.com\n\
+             ssl_mode: verify-full\nssl_root_cert: \"  \"\n",
+        )
+        .expect("test fixture should parse");
+        let out = format_server_list(&[empty_cert], Path::new("/tmp/sqlfiles"));
+        assert!(out.contains(INVALID), "{out}");
+
+        // 検証するモードとの併記は正しい設定なので、実効モードをそのまま出す。
+        // **ファイルが実在するかは見ない** (この関数はファイルシステムに触らない)
+        let verifying: ServerConfig = serde_yaml::from_str(
+            "name: ca-ok\nengine: postgres\nhost: db.example.com\n\
+             ssl_mode: verify-ca\nssl_root_cert: /nonexistent/ca.pem\n",
+        )
+        .expect("test fixture should parse");
+        let out = format_server_list(&[verifying], Path::new("/tmp/sqlfiles"));
+        assert!(out.contains("verify-ca"), "{out}");
+        assert!(!out.contains(INVALID), "{out}");
+
         for engine in ["elasticsearch", "sqlite", "duckdb", "dynamodb"] {
             let ignores_ssl_mode: ServerConfig = serde_yaml::from_str(&format!(
                 "name: {engine}-conn\nengine: {engine}\nhost: h.example.com\n\
