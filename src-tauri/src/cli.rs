@@ -169,6 +169,20 @@ fn user_cell(server: &ServerConfig, info: &ConnectionInfo) -> String {
     }
 }
 
+/// エンドポイントを上書きしているか (dynamodb-local 等を指しているか)。
+///
+/// 判定は [`crate::engines::dynamodb::build_client`] の分岐と揃える。
+/// あちらが `endpoint_url` を組み立てる条件そのものなので、ずれると
+/// 「上書きしていないのに `tls` を出す」「上書きしているのに `on` と出す」の
+/// どちらかになる。
+fn has_endpoint_override(server: &ServerConfig) -> bool {
+    server
+        .host
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|host| !host.is_empty())
+}
+
 /// TLS / SSL の状態を 1 語で表す。
 ///
 /// mysql / postgres / redis は実効モード ([`ConnectionInfo::sql_ssl_mode`]) を
@@ -178,6 +192,13 @@ fn user_cell(server: &ServerConfig, info: &ConnectionInfo) -> String {
 ///
 /// それ以外のエンジン (elasticsearch / dynamodb 等) には実効モードが無いので、
 /// 設定の `tls` をそのまま `on` / `off` で出す。
+///
+/// **ただし `tls` が実際の接続方式を決めていないエンジンでは、そのまま出さない。**
+/// dynamodb の `host` / `port` / `tls` は dynamodb-local 向けのエンドポイント上書き
+/// 専用で、`host` を書かない通常の AWS 接続では SDK が地域エンドポイントを
+/// **常に https で解決する** (`engines::dynamodb::build_client` は `host` がある時しか
+/// `endpoint_url` を組み立てない)。`tls` の既定値 `false` をそのまま出すと、
+/// 暗号化されている接続を `off` = 平文と読ませることになる。
 ///
 /// **`sql_ssl_mode` が `None` でも、そのまま `tls` に落としてはいけない。**
 /// `ConnectionInfo::from` は「実効モードを持たないエンジン」だけでなく
@@ -194,6 +215,11 @@ fn ssl_summary(server: &ServerConfig, info: &ConnectionInfo) -> String {
     // (未設定なら tls から既定値を返す) なので、未設定の接続を誤って invalid にはしない
     if server.sql_ssl_mode().is_err() || crate::db::parse_engine(&server.engine).is_err() {
         return INVALID.to_string();
+    }
+    // エンドポイント上書きの無い dynamodb は SDK が https で解決するので、
+    // 上書き用の tls フラグではなく実際の接続方式を出す
+    if server.engine.eq_ignore_ascii_case("dynamodb") && !has_endpoint_override(server) {
+        return "on".to_string();
     }
     if server.tls { "on" } else { "off" }.to_string()
 }
@@ -431,6 +457,55 @@ mod tests {
         }
         // トンネルを使っていることは分かる (SSH 列)
         assert!(out.contains("yes"), "{out}");
+    }
+
+    /// dynamodb の `tls` は dynamodb-local 向けのエンドポイント上書き専用なので、
+    /// `host` を書かない通常の AWS 接続にそのまま出さない。
+    ///
+    /// SDK は地域エンドポイントを常に https で解決するため、`tls` の既定値
+    /// (false) を出すと**暗号化されている接続を平文と読ませる**ことになる。
+    /// この列は接続の安全性を確認するためのものなので、誤りの向きとしては最悪。
+    #[test]
+    fn test_format_server_list_reports_https_for_the_aws_dynamodb_endpoint() {
+        // host 無し = AWS の地域エンドポイント。tls を書いていなくても https
+        let aws: ServerConfig =
+            serde_yaml::from_str("name: events\nengine: dynamodb\nschema: ap-northeast-1\n")
+                .expect("test fixture should parse");
+        let out = format_server_list(&[aws], Path::new("/tmp/sqlfiles"));
+        assert!(out.contains(" on"), "{out}");
+        assert!(!out.contains(" off"), "{out}");
+
+        // 空白だけの host も「未指定」(build_client の trim と揃える)
+        let blank_host: ServerConfig = serde_yaml::from_str(
+            "name: events\nengine: dynamodb\nschema: ap-northeast-1\nhost: \"   \"\n",
+        )
+        .expect("test fixture should parse");
+        let out = format_server_list(&[blank_host], Path::new("/tmp/sqlfiles"));
+        assert!(out.contains(" on"), "{out}");
+
+        // host を書いた = dynamodb-local 等のエンドポイント上書き。ここでは tls が効く
+        let local: ServerConfig = serde_yaml::from_str(
+            "name: local\nengine: dynamodb\nschema: ap-northeast-1\n\
+             host: 127.0.0.1\nport: 8000\n",
+        )
+        .expect("test fixture should parse");
+        let out = format_server_list(&[local], Path::new("/tmp/sqlfiles"));
+        assert!(out.contains(" off"), "{out}");
+
+        let local_tls: ServerConfig = serde_yaml::from_str(
+            "name: local\nengine: dynamodb\nschema: ap-northeast-1\n\
+             host: 127.0.0.1\nport: 8000\ntls: true\n",
+        )
+        .expect("test fixture should parse");
+        let out = format_server_list(&[local_tls], Path::new("/tmp/sqlfiles"));
+        assert!(out.contains(" on"), "{out}");
+
+        // 実効モードを持たない他のエンジンは今までどおり tls をそのまま出す
+        let es: ServerConfig =
+            serde_yaml::from_str("name: search\nengine: elasticsearch\nhost: es.example.com\n")
+                .expect("test fixture should parse");
+        let out = format_server_list(&[es], Path::new("/tmp/sqlfiles"));
+        assert!(out.contains(" off"), "{out}");
     }
 
     /// dynamodb の `user` は AWS のアクセスキー ID なので USER 欄に出さない。

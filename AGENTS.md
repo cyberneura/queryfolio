@@ -107,6 +107,20 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
   不正で解決できなかった」場合も含まれ、後者を `on` / `off` で出すと**接続時にエラーになる
   設定を有効な TLS 設定として見せる** (`ssl_mode: requre` の書き間違いが `off` = 平文で
   繋がる、と読める)。決められない時は `invalid` と出す (`ssl_summary`)。
+  **`tls` が実際の接続方式を決めていないエンジンでも、そのまま出さないこと** —
+  dynamodb の `host` / `port` / `tls` は dynamodb-local 向けのエンドポイント上書き専用で、
+  `host` を書かない通常の AWS 接続は SDK が地域エンドポイントを常に https で解決する
+  (`build_client` は `host` がある時しか `endpoint_url` を組み立てない)。既定の
+  `tls: false` を出すと**暗号化されている接続を平文と読ませる**ので、上書きが無ければ
+  `on` を出す (`has_endpoint_override`)。エンジンを足す時は「`tls` がそのエンジンの
+  実際の接続方式を決めているか」を先に確認すること。
+- **`--list-servers` は dynamodb の USER を `(hidden)` にする。** この `user` は AWS の
+  アクセスキー ID であって DB のユーザー名ではなく (`folder_meta.rs` が同じ理由で
+  `(aws access key, hidden)` に差し替え、`sqlfiles_folder_name` はハッシュ化している)、
+  端末とシェル履歴に残す値ではない (`user_cell`)。未設定の `-` とは別の語にしてある —
+  「静的キーを設定していない」と「設定しているが出さない」は別の事実なので。
+  **`ConnectionInfo` は「フロントへ渡してよい」射影であって「端末に出してよい」射影ではない。**
+  `user` のようにエンジンで意味が変わるフィールドがあるので、列を足す時は素通しにしない。
 - **Windows の release ビルドはコンソールを持たない。** `main.rs` の
   `windows_subsystem = "windows"` により GUI サブシステムでリンクされるため、
   `GetStdHandle(STD_OUTPUT_HANDLE)` が無効ハンドルを返し `print!` が黙って捨てられる。
