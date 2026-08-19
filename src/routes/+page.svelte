@@ -10,7 +10,7 @@
     formatRunLogTimestamp,
     runLogBody,
   } from "$lib/runLog";
-  import type { RunTarget } from "$lib/runLog";
+  import type { RunLogChoice, RunTarget } from "$lib/runLog";
   import appStore from "$lib/stores/app.svelte";
   import Toolbar from "$lib/components/Toolbar.svelte";
   import EditorToolbar from "$lib/components/EditorToolbar.svelte";
@@ -105,21 +105,21 @@
   /// 大量の行をエディタへ書き戻す前の確認ダイアログ。null = 出していない
   let runLogConfirm = $state<{
     rows: number;
-    resolve: (ok: boolean) => void;
+    resolve: (choice: RunLogChoice) => void;
   } | null>(null);
 
-  /// 書き戻してよいかを尋ね、応答 (true = 書く) を待つ。
+  /// 書き戻してよいかを尋ね、選択を待つ。
   /// 未応答のものが残っていれば却下してから差し替える (危険文の確認と同じ)
-  const confirmRunLog = (rows: number): Promise<boolean> =>
+  const confirmRunLog = (rows: number): Promise<RunLogChoice> =>
     new Promise((resolve) => {
-      runLogConfirm?.resolve(false);
+      runLogConfirm?.resolve("cancel");
       runLogConfirm = { rows, resolve };
     });
 
-  function resolveRunLogConfirm(ok: boolean) {
+  function resolveRunLogConfirm(choice: RunLogChoice) {
     const pending = runLogConfirm;
     runLogConfirm = null;
-    pending?.resolve(ok);
+    pending?.resolve(choice);
   }
 
   /// エディタからの実行。`-- 📝 <label>` が付いた文は、実行後にその下へ
@@ -142,16 +142,19 @@
     // 見出しに入れるのは実行が終わった時刻。下の確認ダイアログを開いたまま
     // にされると承認した時刻になってしまうので、待つ前に採る
     const executedAt = formatRunLogTimestamp(new Date());
-    // 大量の行はエディタを埋めてしまうので、書き戻す前に確認する
-    if (
-      result.rows.length >= RUN_LOG_CONFIRM_ROWS &&
-      !(await confirmRunLog(result.rows.length))
-    ) {
-      return;
+    // 大量の行はエディタを埋めてしまうので、書き戻す前に「全部書く / 先頭だけ書く /
+    // 書かない」を選ばせる。ちょうど上限の結果は全部書いても同じ量なので訊かない
+    let maxRows: number | undefined;
+    if (result.rows.length > RUN_LOG_CONFIRM_ROWS) {
+      const choice = await confirmRunLog(result.rows.length);
+      if (choice === "cancel") {
+        return;
+      }
+      maxRows = choice === "limited" ? RUN_LOG_CONFIRM_ROWS : undefined;
     }
     // ラベルは書き戻す直前に本文から取り直したものを使う (SqlEditor が渡す)
     const buildBlock = (label: string) =>
-      formatRunLogBlock(label, executedAt, runLogBody(result));
+      formatRunLogBlock(label, executedAt, runLogBody(result, maxRows));
     // `\c` / `USE` は実行そのものが切替なので、その文が切り替えた先は
     // 「変わっていない」とみなす (この結果は切替後のスキーマのもの)
     const expectedSchema = result.switched_schema ?? schema;
@@ -737,7 +740,7 @@
 {#if runLogConfirm !== null}
   <RunLogConfirmModal
     rows={runLogConfirm.rows}
-    onConfirm={() => resolveRunLogConfirm(true)}
-    onCancel={() => resolveRunLogConfirm(false)}
+    limit={RUN_LOG_CONFIRM_ROWS}
+    onChoose={resolveRunLogConfirm}
   />
 {/if}
