@@ -226,13 +226,25 @@ pub fn aws_endpoint_override_from_env() -> Option<String> {
 
 /// エンドポイント URL のスキームから SSL 欄の値を決める。
 ///
-/// SDK は解釈できない値を警告して捨て、地域エンドポイント (https) に戻すので、
-/// スキームが読めなければ `on` を出す (`aws_config` の `parse_url`)。
+/// **`https://` でない限り `on` を出さない。** この列の `on` は「暗号化されている」の
+/// 意味なので、確認できない値を丸め込む先にしてはいけない。
+///
+/// `aws_config` の `parse_url` は `url::Url::parse` が通れば受理するため、
+/// `ftp://...` のような http(s) 以外のスキームもそのまま SDK へ渡り、接続時に失敗する。
+/// 繋がらない設定なので `invalid` を出す (`ssl_mode` の不正値と同じ扱い)。
+/// 逆に URL として解釈できない値は SDK が警告して捨て、地域エンドポイント (https) に
+/// 戻すので `on`。
 fn scheme_summary(endpoint: &str) -> &'static str {
     let lower = endpoint.trim().to_ascii_lowercase();
-    if lower.starts_with("http://") {
+    if lower.starts_with("https://") {
+        "on"
+    } else if lower.starts_with("http://") {
         "off"
+    } else if lower.contains("://") {
+        // http(s) 以外のスキーム。SDK は受理するが、この URL では接続できない
+        INVALID
     } else {
+        // URL として解釈できない値。parse_url がエラーにするので上書きは効かない
         "on"
     }
 }
@@ -620,6 +632,14 @@ mod tests {
         assert!(out.contains(" on"), "{out}");
         assert!(!out.contains(" off"), "{out}");
 
+        // 大文字のスキームでも判定できること (SDK は大小を区別しない)
+        let out = format_server_list(
+            std::slice::from_ref(&aws),
+            Path::new("/tmp/sqlfiles"),
+            Some("HTTP://localhost:8000"),
+        );
+        assert!(out.contains(" off"), "{out}");
+
         // SDK は解釈できない値を警告して捨て、地域エンドポイントへ戻す
         let out = format_server_list(
             std::slice::from_ref(&aws),
@@ -627,6 +647,18 @@ mod tests {
             Some("not-a-url"),
         );
         assert!(out.contains(" on"), "{out}");
+
+        // http(s) 以外のスキームは SDK が受理するが接続できない。
+        // **確認できない値を on に丸めない** (この列の on は「暗号化されている」の意味)
+        for endpoint in ["ftp://localhost:8000", "ws://localhost:8000"] {
+            let out = format_server_list(
+                std::slice::from_ref(&aws),
+                Path::new("/tmp/sqlfiles"),
+                Some(endpoint),
+            );
+            assert!(out.contains(INVALID), "{endpoint}:\n{out}");
+            assert!(!out.contains(" on"), "{endpoint}:\n{out}");
+        }
 
         // 接続設定に host がある = 明示のエンドポイント上書き。こちらが優先されるので
         // 環境変数ではなく tls を見る (build_client が endpoint_url を組み立てる)
