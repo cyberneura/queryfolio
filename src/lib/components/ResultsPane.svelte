@@ -1771,8 +1771,15 @@
           <i class="bi bi-x-lg" aria-hidden="true"></i>
         </button>
       </div>
+      <!--
+        SQL は行末で折り返し、高さは内容に合わせる (CYBERNEURA-DEV-578)。
+        flex-1 だと短い SQL でもモーダルが 80vh まで伸び、長い SQL は
+        横スクロールバーの向こう側に隠れて読めなかった。
+        max-h-75 は Tailwind 4 の動的スペーシング (0.25rem * 75) で 300px。
+        break-words は折り返し位置の無い長いリテラルのためのもの。
+      -->
       <pre
-        class="min-h-0 flex-1 overflow-auto px-3 py-2 font-mono text-xs text-zinc-200"
+        class="max-h-75 min-h-0 overflow-auto px-3 py-2 font-mono text-xs break-words whitespace-pre-wrap text-zinc-200"
         data-annotate="text-edits-preview-sql">{previewStatements
           .map((s) => `${s};`)
           .join("\n")}</pre>
