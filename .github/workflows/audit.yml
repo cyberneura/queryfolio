@@ -1,0 +1,76 @@
+name: Audit
+
+# 依存の既知脆弱性を定期的に見る (CYBERNEURA-DEV-577)。
+#
+# **pull_request では動かさない。** このリポジトリは PR チェックを持たない運用で、
+# ここに PR トリガーを足すと「上流に新しい advisory が出た日」に無関係な PR まで
+# まとめて赤くなり、マージが止まる。audit が見ているのは変更差分ではなく
+# 依存ツリーの現在の状態なので、PR ごとに回す必要もない。
+#
+# 既知で今は動かせないものは無視リストに入れてある:
+#   - Rust: src-tauri/.cargo/audit.toml (理由と外す条件を書くこと)
+#   - npm: 無視の仕組みは使っていない。残っているのは @sveltejs/kit が抱える
+#     cookie <0.7.0 (low) だけで、kit の更新待ち
+on:
+  schedule:
+    # 毎週月曜 09:00 JST (00:00 UTC)
+    - cron: "0 0 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # npm と cargo は**別ジョブに分ける**。同じジョブに並べると、片方が
+  # 見つけた時点で後続ステップが skip され、もう片方の結果がその週まるごと
+  # 見えなくなる (JS の指摘 1 件で Rust の指摘が隠れる)。
+  npm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: pnpm audit
+        # **`pnpm install` はしない。** audit は pnpm-lock.yaml だけで動く (実測確認済み)。
+        # install すると、監査しようとしている依存の postinstall などを毎週 CI で
+        # 実行することになり、侵害された依存があった時にそれを走らせる側になる。
+        #
+        # low は落とさない。今残っている low は @sveltejs/kit が抱える cookie <0.7.0
+        # だけで、kit が範囲を上げるまで手が無い。ここで赤にすると「上流待ちの 1 件」で
+        # 毎週赤が続き、本当に新しいものが出た時に気付けなくなる
+        run: pnpm audit --audit-level moderate
+
+  cargo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+
+      - name: Install cargo-audit
+        # cargo audit は Cargo.lock だけを読むので、依存のビルドは要らない
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit
+        # audit.toml は cargo-audit が .cargo/audit.toml しか読まないため、
+        # src-tauri を作業ディレクトリにして実行する
+        working-directory: src-tauri
+        run: cargo audit
