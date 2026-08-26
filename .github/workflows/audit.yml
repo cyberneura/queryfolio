@@ -21,7 +21,10 @@ permissions:
   contents: read
 
 jobs:
-  audit:
+  # npm と cargo は**別ジョブに分ける**。同じジョブに並べると、片方が
+  # 見つけた時点で後続ステップが skip され、もう片方の結果がその週まるごと
+  # 見えなくなる (JS の指摘 1 件で Rust の指摘が隠れる)。
+  npm:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -48,6 +51,14 @@ jobs:
         # だけで、kit が範囲を上げるまで手が無い。ここで赤にすると「上流待ちの 1 件」で
         # 毎週赤が続き、本当に新しいものが出た時に気付けなくなる
         run: pnpm audit --audit-level moderate
+
+  cargo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
