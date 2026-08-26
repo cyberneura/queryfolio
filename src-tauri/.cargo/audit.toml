@@ -1,0 +1,43 @@
+# cargo audit の設定 (CYBERNEURA-DEV-577)
+#
+# ここに書く ID は「調べたうえで、今は上げようが無い / 影響しない」と判断したもの。
+# **見なかったことにするための場所ではない。** 目的は、audit の出力に本当に新しいものだけが
+# 残るようにして、毎回同じ行を読み飛ばす習慣を作らないこと。
+#
+# 追加する時は必ず理由と、いつ外せるかを書く。上流が直したら消すこと。
+
+[advisories]
+ignore = [
+  # rsa 0.9.10 — Marvin Attack (タイミングサイドチャネルによる鍵回復の可能性)
+  #
+  # 経路: sqlx > sqlx-mysql > rsa。**修正版が存在しない** (RustSec の Solution も
+  # "No fixed upgrade is available!")。sqlx で MySQL を使う限り消えない。
+  #
+  # **そもそも脆弱な処理に到達しない。** Marvin が漏らすのは
+  # **秘密鍵を使う復号 (と署名) のタイミング**であって、暗号化ではない。
+  # sqlx-mysql が rsa を使うのは caching_sha2_password / sha256_password の
+  # ハンドシェイクで、**サーバーの公開鍵でパスワードを暗号化する 1 方向だけ**。
+  # クライアントは RSA の秘密鍵を持たず、復号も署名もしない。
+  #
+  # 外す条件: sqlx が rsa を使わなくなるか、rsa に定時間実装が入ったら。
+  # **sqlx-mysql が RSA の復号・署名を行うようになったら、この判断は無効になる。**
+  "RUSTSEC-2023-0071",
+
+  # rkyv 0.7.46 — Rc/Arc を含むアーカイブの検証不足による境界外読み取り
+  #
+  # 経路: rust_decimal の **オプション機能** (`rkyv = ["dep:rkyv"]`)。
+  # このアプリはその feature を有効にしていないため、**rkyv はコンパイルされない**。
+  # Cargo.lock には載る (lockfile はオプション依存も含めて解決を記録するため) ので
+  # cargo audit が拾うが、バイナリには入らない。
+  #
+  # 確認方法 (どちらも空になる):
+  #   cargo tree -e normal -i rkyv --target all
+  #   cargo tree -e features -i rust_decimal --target all | grep rkyv
+  #
+  # そもそも信頼できない rkyv アーカイブを deserialize する箇所はアプリ側にも無い。
+  #
+  # 外す条件: rust_decimal が rkyv 0.8 系へ上げたら (現時点の最新 1.42.1 はまだ 0.7 系)。
+  # もしくは、この feature を有効にする理由ができた時点で**この ignore を消して**
+  # 実際に上がっているか確かめること。
+  "RUSTSEC-2026-0235",
+]
