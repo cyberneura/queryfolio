@@ -11,13 +11,24 @@ name: Release
 on:
   push:
     branches: [main]
+  # PR では test ジョブだけが走る (plan 以降は if で止めてある)。門番のテストを
+  # マージ前に同じ定義で回すためで、リリース経路とテストの内容がずれない。
+  pull_request:
   # version は正しいのに、その時の run が (API の一時障害等で) 失敗した場合の再実行用。
   # 同じ判定を通るので、公開済みの version をもう一度出すことはできない。
   workflow_dispatch:
 
-# GitHub Release の作成とアセットアップロードに contents: write が必要。
-permissions:
-  contents: write
+# 既定は権限なし。必要な job にだけ与える。特に test は PR が持ち込んだコードを
+# 実行するので contents: read までしか渡さない (同一リポジトリからの PR では
+# GITHUB_TOKEN が write を持ちうるため、ここを既定に任せない)。
+#
+# この workflow は pull_request でも起動するが、「PR で workflow 自体を書き換えれば
+# contents: write のジョブを動かせる」ことにはならない。public リポジトリの fork から
+# の pull_request では、permissions の記述に関わらず GITHUB_TOKEN が read-only に
+# 切り下げられ secrets も渡らない (write token を渡す設定があるのは private リポジトリ
+# 側の話で、ここには無い)。同一リポジトリのブランチから PR を出せるのは既に write
+# 権限を持つ相手だけなので、そちらも権限の昇格にはならない。
+permissions: {}
 
 # 同時に走らないよう直列化する。1 回の dispatch が 1 つの version に対応するため、
 # キャンセルされた run の version は (bump コミットは main に載ったまま) 永久に
@@ -27,8 +38,15 @@ permissions:
 #     「pending は 1 件だけ。新しく queue されたら既存の pending をキャンセルして
 #     置き換える」なので、3 回連続で dispatch すると真ん中の version が消える。
 # (queue: max と cancel-in-progress: true の併用は validation error になる)
+#
+# PR の検査 run は「1 push = 1 version」の直列化とは無関係なので、リリース用の
+# グループへ入れない。同じグループにすると PR が 1 本走るだけでリリースが pending に
+# 積まれる (cancel-in-progress: false なので待たされ続ける)。さらに commit ごとに
+# 別グループにして、PR 側では直列化そのものを効かせない — ここで PR をまとめると
+# 同じ PR へ連続 push した時に古い commit の検査が順番待ちを作り、最新 commit の
+# 結果が最も遅れる (この設定では cancel-in-progress を PR だけ true にはできない)。
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('{0}-{1}', github.ref, github.sha) || 'release' }}
   cancel-in-progress: false
   queue: max
 
@@ -36,9 +54,15 @@ jobs:
   # ビルドに 30 分以上かける前に、その version がまだリリースされていないことだけを
   # 確かめる。ここが false を返す限り、push のたびに macOS / Windows ランナーが動く
   # ことはない。
+  # PR ではリリース判定そのものが無意味なので走らせない。この job が skipped に
+  # なると、依存している build / publish も (always() を使っていないので) skipped に
+  # なる — PR では test だけが動く。
   plan:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
       release: ${{ steps.decide.outputs.release }}
@@ -99,9 +123,84 @@ jobs:
               ;;
           esac
 
-  build:
+  # リリースビルドの門番。方針: cyberneura/cyberneura-github-actions の
+  # docs/build-requires-tests.md
+  #
+  # runs-on を build と同じ macOS / Windows にしてあるのは方針のルール 4 による。
+  # lib.rs の #[cfg(target_os = "macos")] や cli.rs の Windows 専用コード
+  # (attach_parent_console) は、他の OS では 1 行もコンパイルされない。ubuntu で
+  # cargo test を回しても、配布物に入るコードの一部を検査しないまま通してしまう。
+  test:
+    # push / dispatch では、実際にリリースする version の時だけ走らせる。plan を
+    # 通さず無条件に走らせると、リリースを伴わない main への push のたびに
+    # macOS / Windows ランナーが動く — plan を置いた目的そのものが無くなる。
+    # PR では plan が skipped になり、既定ではこの job も道連れで skipped になる
+    # ので、!cancelled() で自動スキップを外してからイベント名で判定する
+    # (plan が失敗した時は needs.plan.result で止まる)。
     needs: plan
+    if: >-
+      ${{ !cancelled()
+          && (github.event_name == 'pull_request'
+              || (needs.plan.result == 'success'
+                  && needs.plan.outputs.release == 'true')) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10.26.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # ビルド用ではないので matrix.rust-targets (universal 用の 2 アーキ) は要らない。
+      # ホストターゲットでテストする。
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+
+      - name: Cache Rust (cargo + target)
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # cargo test でも build.rs は走る。tauri-build は frontendDist (../build) が
+      # 実在しないとアプリのコードへ到達する前に落ちるので、先にフロントを作る。
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Type-check frontend
+        run: pnpm check
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  build:
+    # test を通らずにビルドしない。needs は同じ run の job にしか効かないので、
+    # テストを別 workflow に切り出さないこと。
+    needs: [plan, test]
     if: needs.plan.outputs.release == 'true'
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -258,6 +357,8 @@ jobs:
     if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

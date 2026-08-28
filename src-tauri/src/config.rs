@@ -1479,15 +1479,34 @@ server_templates:
         config
     }
 
+    /// 「渡した YAML を 1 行そのまま吐くだけ」の config_override_command を組み立てる。
+    ///
+    /// Windows には `/bin/echo` が無いので cmd.exe の echo を使う (この 2 つのテストは
+    /// リリースビルドと同じ OS で回る = Windows でも走る)。
+    ///
+    /// 引数に空白を含めないのが肝。空白があると std が引数を引用符で囲むため、
+    /// cmd.exe の echo はその引用符ごと出力してしまい YAML が壊れる。echo は
+    /// 受け取った引数を空白で連ねて出すので、shlex に分けさせれば同じ 1 行になる。
+    /// そのため呼び出し側は YAML を**二重引用符付きのスカラー**として書く
+    /// (`: ` を含む文字列を YAML の平文スカラーには書けないが、引用すれば
+    /// バックスラッシュエスケープが要らず、shlex も空白で素直に分割できる)。
+    fn echo_command(yaml: &str) -> String {
+        if cfg!(windows) {
+            format!("cmd /c echo {yaml}")
+        } else {
+            format!("/bin/echo {yaml}")
+        }
+    }
+
     /// load_merged の実経路 (設定読み込み → コマンド実行 → マージ) を通す。
     /// QUERYFOLIO_CONFIG_YAML を使うのでこのプロセスで env を触る唯一のテスト
     /// (他のテストは config_from_yaml を使い env を読まない)。
     #[tokio::test]
     async fn test_load_merged_runs_command_and_merges_result() {
+        let command = echo_command("default_limit: 7");
         std::env::set_var(
             "QUERYFOLIO_CONFIG_YAML",
-            "servers: []\ndefault_limit: 500\n\
-             config_override_command: /bin/echo default_limit:\\ 7\n",
+            format!("servers: []\ndefault_limit: 500\nconfig_override_command: \"{command}\"\n"),
         );
         let config = AppConfig::load_merged().await.unwrap();
         std::env::remove_var("QUERYFOLIO_CONFIG_YAML");
@@ -1495,15 +1514,16 @@ server_templates:
         // 取得 YAML の値が適用され、キー自体は落ちている
         assert_eq!(config.default_limit(), 7);
         assert!(config.override_command().unwrap().is_none());
-        assert!(config.info().unwrap().source.contains("/bin/echo"));
+        assert!(config.info().unwrap().source.contains("echo"));
     }
 
     #[tokio::test]
     async fn test_override_command_is_executed_and_merged() {
-        // /bin/echo で上書き YAML を出力させ、load_merged と同じ経路を通す
-        let yaml = run_source_command(
-            "/bin/echo -n servers:\\n  - name: fetched\\n    engine: sqlite\\n    schema: /tmp/x.db\\n",
-        )
+        // echo で上書き YAML を出力させ、load_merged と同じ経路を通す。
+        // 1 行に収めるためフロースタイルで書く (echo に改行は出せない)
+        let yaml = run_source_command(&echo_command(
+            "servers: [{name: fetched, engine: sqlite, schema: /tmp/x.db}]",
+        ))
         .await
         .unwrap();
         assert!(yaml.contains("fetched"));
