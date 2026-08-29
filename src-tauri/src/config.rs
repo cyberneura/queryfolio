@@ -1151,6 +1151,13 @@ fn supplemented_path() -> String {
 }
 
 pub(crate) fn supplement_path(base: &str) -> String {
+    // 補うのは Unix の定番ディレクトリで、区切り文字も `:` 前提。Windows の PATH は
+    // `;` 区切りなので、そのまま `:` で連結すると PATH の最後の要素が
+    // `C:\last\entry:/opt/homebrew/bin` という実在しない 1 要素に化けて消える。
+    // Windows で足す意味のあるディレクトリも無いので、素通しする。
+    if cfg!(windows) {
+        return base.to_string();
+    }
     let mut path = base.to_string();
     for extra in ["/opt/homebrew/bin", "/usr/local/bin"] {
         let already = base.split(':').any(|p| p == extra);
@@ -1964,6 +1971,7 @@ servers:
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_supplement_path() {
         // 無ければ追加される
         let path = supplement_path("/usr/bin:/bin");
@@ -1973,6 +1981,17 @@ servers:
         let path = supplement_path("/opt/homebrew/bin:/usr/bin");
         let count = path.split(':').filter(|p| *p == "/opt/homebrew/bin").count();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_supplement_path_windows_passthrough() {
+        // Windows の PATH は `;` 区切りなので何も足さずに素通しする。
+        // 特に最後の要素が壊れないこと (`C:\tools:/opt/homebrew/bin` にならない) を見る。
+        let base = r"C:\Windows\system32;C:\tools";
+        assert_eq!(supplement_path(base), base);
+        // 空の PATH でも空のまま返る (`:/opt/homebrew/bin` のような値を作らない)。
+        assert_eq!(supplement_path(""), "");
     }
 
     #[test]
