@@ -13,6 +13,7 @@
   } from "@codemirror/view";
   import type { DecorationSet } from "@codemirror/view";
   import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
+  import { search, searchKeymap } from "@codemirror/search";
   import { syntaxTree, HighlightStyle, syntaxHighlighting } from "@codemirror/language";
   import { tags as t } from "@lezer/highlight";
   import { autocompletion, completionKeymap } from "@codemirror/autocomplete";
@@ -20,6 +21,7 @@
   import type { SQLNamespace } from "@codemirror/lang-sql";
   import { oneDark } from "@codemirror/theme-one-dark";
   import { formatSql } from "$lib/sqlFormat";
+  import { vscodeMultiSelection } from "$lib/editor/vscodeEditing";
   import { redisLanguage } from "$lib/editor/redisLanguage";
   import { esLanguage } from "$lib/editor/esLanguage";
   import { findRunLogLabel, runLogWrite } from "$lib/runLog";
@@ -588,8 +590,18 @@
           drawSelection(),
           history(),
           autocompletion(),
+          // 検索パネルはエディタの上端に出す (ConfigEditorModal と揃える)
+          search({ top: true }),
+          // VSCode 互換のマルチカーソル / 複数選択 (Alt+click, Shift+Alt+drag,
+          // Mod-l)。Mod-d / Mod-Shift-l は下の searchKeymap 側にある
+          vscodeMultiSelection,
           // Mod-Enter を defaultKeymap より先に評価させる
           runKeymap,
+          // searchKeymap を defaultKeymap より先に置く。Escape がどちらにも
+          // あり、検索パネルを開いている間は「パネルを閉じる」を勝たせるため
+          // (閉じるパネルが無ければ false を返して defaultKeymap の
+          // simplifySelection へ落ちる)
+          keymap.of(searchKeymap),
           keymap.of([
             ...defaultKeymap,
             ...historyKeymap,
