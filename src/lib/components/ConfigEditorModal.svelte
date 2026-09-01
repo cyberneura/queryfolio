@@ -18,6 +18,7 @@
   import { linter, lintGutter, type Diagnostic } from "@codemirror/lint";
   import { parseDocument } from "yaml";
   import { oneDark } from "@codemirror/theme-one-dark";
+  import { vscodeMultiSelection } from "$lib/editor/vscodeEditing";
   import {
     readConfigFile,
     readOverrideConfigYaml,
@@ -153,6 +154,9 @@
           history(),
           // 検索パネルはエディタの上端に出す (下端だとフッターのボタン列と隣接して紛らわしい)
           search({ top: true }),
+          // VSCode 互換のマルチカーソル / 複数選択 (SqlEditor と揃える)。
+          // Mod-d / Mod-Shift-l は searchKeymap 側にある
+          vscodeMultiSelection,
           keymap.of(searchKeymap),
           // Escape の扱い。searchKeymap より後 = 検索パネルを開いている間は
           // 「パネルを閉じる」が勝つ。defaultKeymap より前 = テキスト選択中でも
