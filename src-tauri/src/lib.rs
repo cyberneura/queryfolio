@@ -1865,9 +1865,13 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
         builder.build()?
     };
 
-    let reload_item = MenuItemBuilder::with_id("reload_config_file", "Reload config file")
-        .accelerator("CmdOrCtrl+R")
-        .build(app)?;
+    // アクセラレータは付けない。以前は CmdOrCtrl+R を割り当てていたが、
+    // ブラウザのリロードと同じキーなのに実際に起きるのは reload_config_file =
+    // 全エディタタブの破棄・接続の張り直し・チャットの中断で、ページの再読込の
+    // つもりで押すとアプリ全体が初期状態へ戻る (CYBERNEURA-DEV-648)。
+    // 破壊的なうえ取り消せないので、Config メニューからの明示的な選択だけにする
+    let reload_item =
+        MenuItemBuilder::with_id("reload_config_file", "Reload config file").build(app)?;
     let reveal_item =
         MenuItemBuilder::with_id("reveal_config_folder", "Reveal config folder").build(app)?;
     let config_menu = {
