@@ -158,6 +158,35 @@ On macOS, call the binary inside the bundle — `open -a QueryFolio --args --lis
 
 An option is only recognised before a subcommand, so `queryfolio write conn a.sql "-- help"` writes that content instead of printing the help.
 
+## Agent skill
+
+The repository ships a skill that teaches an AI coding agent how QueryFolio stores things on
+disk — the query file layout, the connection → folder mapping, the CLI above, the query
+history, and the `-- 📝` **Run and Log** marker, which is how an agent gets the result of a
+query it cannot run itself: it writes the marked SQL, you run it in QueryFolio, and the result
+is written back into the same file as a block comment for the agent to read.
+
+| Skill | What it covers |
+|---|---|
+| [`queryfolio`](skills/queryfolio/SKILL.md) | Query files, config, history, the CLI, and Run and Log |
+
+It is a plain `skills/<name>/SKILL.md` directory, so any tool that reads that layout can
+install it.
+
+### With `npx skills` (Claude Code, Codex, Cursor, OpenCode, …)
+
+```shell
+npx skills add cyberneura/queryfolio --list                # see what the repo offers
+npx skills add cyberneura/queryfolio --skill queryfolio    # into ./<agent>/skills (this project)
+npx skills add cyberneura/queryfolio --skill queryfolio -g # into ~/<agent>/skills (all projects)
+```
+
+Use `--skill queryfolio` to install just this one: the repository also carries an internal
+release-workflow skill under `.claude/skills/`, which the CLI lists as well but which is only
+useful when working on QueryFolio itself.
+
+Installing the skill does not install QueryFolio; see [Install](#install) for that.
+
 ## Development
 
 ```shell

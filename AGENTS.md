@@ -217,6 +217,7 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
 - **アプリ名の表記はユーザーに見える箇所では「QueryFolio」に統一する** (ウインドウタイトル / ツールバー / productName / 生成される設定ファイルのコメント / README 見出し等)。リポジトリ名・bundle identifier (com.cyberneura.queryfolio)・crate 名は小文字の queryfolio のまま。
 
 - **アプリ内メッセージ (UI ラベル・トースト・placeholder・エラーメッセージ・自動生成される設定ファイルのコメント) はすべて英語で書く**。Rust の AppError 等、フロントに表示される文字列も対象。コードコメントは日本語でよい。
+- **`skills/queryfolio/SKILL.md` は実装の事実を複製しているので、該当箇所を変えたら一緒に直す** (`npx skills add cyberneura/queryfolio` で配布され、エージェントがこれを読んで行動する)。特に Run and Log の定数 (`RUN_LOG_CONFIRM_ROWS` / `MAX_BODY_CHARS` / `MAX_CELL_CHARS` / 注記の文言)、クエリファイルのパーミッションと並び順、`--list-servers` の列の決め方、`resolve_write_content` の stdin の扱い、外部変更ウォッチャの挙動。**散文は実行されないので陳腐化しても CI が落ちない** — 実際、このスキルの元にした旧版は 5 箇所が実装とズレていた (確認ダイアログの閾値 500 → 200、`sqlfiles/` のパーミッション、`config.yml` の 600 化、外部変更の 3-way マージ、一覧の並び順)。
 - ユーザーアクションを受ける要素には `data-annotate="<識別子>"` を付ける (E2E テスト用)。
 - `window.prompt` / `alert` / `confirm` は使わない (ブラウザ自動化がブロックされる + UX)。
 - 64bit 整数は JS の Number.MAX_SAFE_INTEGER を超えると Tauri invoke 境界で丸められるため、db.rs の json_i64 / json_u64 で範囲外は文字列化している。
