@@ -164,9 +164,10 @@ queryfolio open ~/.config/queryfolio/sqlfiles/db.example.com_postgres_prod_app/m
   frontmatter, no metadata header, no sidecar file. UTF-8 is required.
 - The file list is sorted by name **descending**, with digit runs compared numerically, and
   the extension excluded from the comparison. Modification time is never consulted. The app's
-  default name for a new file is `YYYYMMDD-HHMM.sql` (plus a counter on collision), so names
-  that start with a date sort chronologically. Give a file a name that says what it is
-  (`performance-tuning.sql`) so it does not disappear among the dated ones.
+  default name for a new file is `YYYYMMDD-HHMM` plus the connection engine's extension (and a
+  counter on collision), so names that start with a date sort chronologically. Give a file a
+  name that says what it is (`performance-tuning.sql`) so it does not disappear among the
+  dated ones.
 
 ## Run and Log — get results back from the user
 
@@ -278,10 +279,9 @@ d	count
    )"
    ```
 
-2. `queryfolio open <path>` hands the file to the running window. If you placed the file
-   without using the CLI at all, say so — the app does not scan the directory, so the file
-   does not appear in the FILES list until the user switches connections. (Both commands
-   launch the app and block when no window is open; run them in the background.)
+2. `queryfolio open <path>` hands the file to the running window, refreshing the FILES list on
+   the way in. (Both commands launch the app and block when no window is open; run them in the
+   background.)
 3. Tell the user to put the cursor on the statement and run it.
 4. Read the file again and parse the `/* 🗒️ …` block.
 
