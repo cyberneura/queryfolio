@@ -32,7 +32,7 @@ queryfolio --version
 | Column | Meaning |
 |---|---|
 | `NAME` | Connection name — this is what `queryfolio write` takes |
-| `ENGINE` | `postgres` / `mysql` / `sqlite` / `duckdb` / `redis` / `elasticsearch` / `dynamodb` |
+| `ENGINE` | The engine string as configured, not canonicalized — an alias prints as written (`valkey` for redis, `es` / `opensearch`, `mariadb`, `postgresql`) |
 | `HOST` `PORT` `USER` `DATABASE` | Where it connects (`-` when unset) |
 | `SSL` | See below |
 | `SSH` | `yes` when the connection goes through an SSH tunnel |
@@ -142,7 +142,9 @@ queryfolio open ~/.config/queryfolio/sqlfiles/db.example.com_postgres_prod_app/m
 - **Both subcommands block when the app is not already running**: they launch it and do not
   return. Run them in the background and do not wait. The file is written before the app
   starts, so a timeout does not lose the content. When a window is already open, the command
-  hands the file to it and returns.
+  hands the file to it and returns. **Neither holds on Windows**, where the release build is a
+  GUI-subsystem binary: the shell returns immediately and does not carry the exit code, so
+  read the file back to confirm the write instead of trusting the status there.
 - `write` is CLI-only; there is no `queryfolio://write/...` URL (a web page can make the
   browser open a `queryfolio://` URL, and dropping arbitrary SQL where someone will later run
   it is a trap). `queryfolio://open//absolute/path.sql` does exist.
@@ -238,12 +240,13 @@ d	count
 
   **A result carrying any of these may not be the complete answer.**
 - A statement with no result set (INSERT / UPDATE / DELETE) writes `(N rows affected)` when
-  the engine reports a count. DynamoDB's PartiQL writes do not get one back from the API, so
-  they fall through to `(no rows)`.
-- **A SELECT that matched nothing writes a header row and no data rows** — column names are
-  filled in even at zero rows, so a nearly empty block is a real, empty result rather than a
-  failed write-back. `(no rows)` appears only when neither columns nor an affected count could
-  be determined.
+  the engine reports a count.
+- **On the SQL engines, a SELECT that matched nothing writes a header row and no data rows** —
+  column names are filled in even at zero rows, so a nearly empty block is a real, empty result
+  rather than a failed write-back.
+- `(no rows)` is written when neither column names nor an affected count could be determined.
+  DynamoDB lands here for both of the cases above: PartiQL writes get no count back from the
+  API, and an empty PartiQL SELECT has no items to take column names from.
 - The body is TSV with a header row, but it is not a faithful dump of the values: tabs and
   newlines inside a cell become spaces, and a **string** cell starting with `=` `+` `-` `@`
   gets a leading `'` (spreadsheet formula guard; numbers are left alone). Split on tabs, but
@@ -262,7 +265,10 @@ d	count
 
 ### The loop, in practice
 
-1. Write the statement with its marker — one command with the CLI:
+1. Write the statement with its marker — one command with the CLI. **Passing content replaces
+   the whole file**, so use a name you have not used yet, or read the existing file first and
+   pass it back with your statement appended; an earlier round's queries and log blocks live
+   in there:
 
    ```bash
    queryfolio write <connection> investigate-orders.sql "$(cat <<'SQL'
