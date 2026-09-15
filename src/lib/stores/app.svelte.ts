@@ -21,6 +21,10 @@ const AUTO_SAVE_DELAY_MS = 1000;
 
 /// 開いているクエリファイルがアプリ外で変更されていないか調べる間隔 (ms)。
 const FILE_WATCH_INTERVAL_MS = 2500;
+/// FILES ペインの一覧 (更新日時・サイズ) を取り直す間隔。開いていないファイルの外部変更や
+/// 同じ内容での書き直し (mtime だけが変わる) はタブの内容比較では検知できないため、
+/// ウォッチャの tick のついでに一覧そのものを定期的に取り直す (CYBERNEURA-DEV-774)
+const FILE_LIST_REFRESH_INTERVAL_MS = 10_000;
 
 /// 結果タブの上限。超過時は最も古い非ピン留めタブを破棄する
 const MAX_RESULT_TABS = 10;
@@ -922,6 +926,10 @@ const openFileByTarget = async (connection: string, fileName: string) => {
     if (selectedConnection !== connection) {
       return;
     }
+  } else {
+    // 一覧にあるファイルでも、CLI の write が中身を書き換えていれば更新日時とサイズが
+    // 変わっている。開くのは待たせない (表示だけの問題)
+    refreshFileEntries(connection);
   }
   // 既に開いているタブなら、アクティブにする前にディスクの内容と突き合わせる。
   // CLI の `queryfolio write` はこのプロセスの外でファイルを書き換えるため、
@@ -1266,7 +1274,19 @@ const refreshFileEntries = (connection: string) => {
     .listQueryFiles(connection)
     .then((latest) => {
       // 取得を待つ間に別接続へ移っていたら、その一覧も上書きしない
-      if (selectedConnection === connection && version === fileEntriesVersion) {
+      if (selectedConnection !== connection || version !== fileEntriesVersion) {
+        return;
+      }
+      // 定期取得でほとんどは変化が無いので、同じなら書き換えない (再描画させない)
+      const same =
+        latest.length === fileEntries.length &&
+        latest.every(
+          (e, i) =>
+            e.file_name === fileEntries[i].file_name &&
+            e.modified_ms === fileEntries[i].modified_ms &&
+            e.size === fileEntries[i].size,
+        );
+      if (!same) {
         setFileEntries(latest);
       }
     })
@@ -2373,6 +2393,8 @@ const checkTabForExternalChange = async (tabId: number) => {
   }
 };
 
+let lastFileListRefreshAt = 0;
+
 const fileWatchTick = async () => {
   if (fileWatchTicking) {
     return;
@@ -2383,6 +2405,13 @@ const fileWatchTick = async () => {
     const ids = editorTabs.map((t) => t.id);
     for (const id of ids) {
       await checkTabForExternalChange(id);
+    }
+    if (
+      selectedConnection &&
+      Date.now() - lastFileListRefreshAt >= FILE_LIST_REFRESH_INTERVAL_MS
+    ) {
+      lastFileListRefreshAt = Date.now();
+      refreshFileEntries(selectedConnection);
     }
     // 閉じられたタブの通知記録を掃除する。
     const alive = new Set(editorTabs.map((t) => t.id));
