@@ -354,10 +354,13 @@
 
     // メニューの Close Tab (Cmd+W / Ctrl+W)。ウインドウは閉じず、アクティブな
     // エディタタブだけを閉じる。タブが無ければ何もしない。モーダルが開いている間も
-    // 何もしない (見えない裏でタブが閉じる状態を作らない。Ctrl+Tab と同じ扱い)
+    // 何もしない (見えない裏でタブが閉じる状態を作らない。Ctrl+Tab と同じ扱い)。
+    // isModalOpen はこのページが状態を持つモーダルしか知らないので、各コンポーネントが
+    // 自前で開くモーダル (ResultsPane のセル編集プレビュー等) は、モーダルの
+    // ルート要素に付けた data-modal で拾う
     const unlistenCloseTabPromise = listen("menu-close-editor-tab", () => {
       const id = appStore.activeEditorTabId;
-      if (id === null || isModalOpen()) {
+      if (id === null || isModalOpen() || document.querySelector("[data-modal]")) {
         return;
       }
       appStore.closeEditorTab(id);

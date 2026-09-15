@@ -119,6 +119,7 @@
   class="fixed inset-0 z-20 flex items-start justify-center bg-black/60 pt-[15vh]"
   role="presentation"
   data-annotate="backdrop-search-modal"
+  data-modal
   onclick={(e) => {
     if (e.target === e.currentTarget) {
       onClose();
