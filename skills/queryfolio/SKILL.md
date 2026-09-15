@@ -162,12 +162,15 @@ queryfolio open ~/.config/queryfolio/sqlfiles/db.example.com_postgres_prod_app/m
   directly.
 - The content is plain SQL (or Redis commands / Kibana-Console-style requests). There is no
   frontmatter, no metadata header, no sidecar file. UTF-8 is required.
-- The file list is sorted by name **descending**, with digit runs compared numerically, and
-  the extension excluded from the comparison. Modification time is never consulted. The app's
-  default name for a new file is `YYYYMMDD-HHMM` plus the connection engine's extension (and a
-  counter on collision), so names that start with a date sort chronologically. Give a file a
-  name that says what it is (`performance-tuning.sql`) so it does not disappear among the
-  dated ones.
+- The FILES pane lists files by **modification time, newest first**, and shows each file's
+  modification time (`YYYY-mm-dd HH:MM` and a relative form such as `3 days ago`) and size
+  under its name. A file you write or save moves to the top. Files with the same
+  modification time keep name order. The search modal (Cmd+K) is different: it orders
+  matches by name **descending**, with digit runs compared numerically and the extension
+  excluded from the comparison. The app's default name for a new file is `YYYYMMDD-HHMM` plus
+  the connection engine's extension (and a counter on collision), so names that start with a
+  date sort chronologically there. Give a file a name that says what it is
+  (`performance-tuning.sql`) so it does not disappear among the dated ones.
 
 ## Run and Log — get results back from the user
 

@@ -163,12 +163,64 @@ fn list_query_file_names(dir: &Path, ext: &str) -> Result<Vec<String>, AppError>
 }
 
 /// 接続のクエリファイル一覧を返す (名前降順 = 新しいものが先頭)。
+/// アプリの一覧は list_query_file_entries (更新日時順) に移ったので、名前順の並びを
+/// テストで確かめるためだけに残している
+#[cfg(test)]
 pub fn list_query_files(
     sqlfiles_dir: &Path,
     connection: &str,
     ext: &str,
 ) -> Result<Vec<String>, AppError> {
     list_query_file_names(&connection_dir(sqlfiles_dir, connection)?, ext)
+}
+
+/// FILES ペインの 1 行 (ファイル名 + 更新日時 + サイズ)。
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct QueryFileEntry {
+    /// ファイル名 (拡張子付き)
+    pub file_name: String,
+    /// 最終更新日時 (UNIX エポックからのミリ秒)。OS から取れなければ None
+    pub modified_ms: Option<i64>,
+    /// ファイルサイズ (バイト)
+    pub size: u64,
+}
+
+/// FILES ペイン用の一覧。**更新日時の降順** (最近編集したものが先頭) で返す
+/// (CYBERNEURA-DEV-774)。
+///
+/// 列挙条件 (隠しファイル・拡張子) は list_query_file_names と共有し、その名前順を
+/// 安定ソートの初期順にする。更新日時が同じもの (と取れないもの) はその中で名前順の
+/// ままになり、取れないものは末尾に回る。
+///
+/// 検索 (search_query_files) と list_query_files は名前順のまま。保存のたびに
+/// 並びが変わってよいのは、日時を並べて見せる FILES ペインだけ。
+pub fn list_query_file_entries(
+    sqlfiles_dir: &Path,
+    connection: &str,
+    ext: &str,
+) -> Result<Vec<QueryFileEntry>, AppError> {
+    let dir = connection_dir(sqlfiles_dir, connection)?;
+    let mut entries: Vec<QueryFileEntry> = list_query_file_names(&dir, ext)?
+        .into_iter()
+        // 列挙と stat の間に消えたファイルは一覧に出さない (開けないため)
+        .filter_map(|file_name| {
+            let meta = fs::metadata(dir.join(&file_name)).ok()?;
+            let modified_ms = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|d| i64::try_from(d.as_millis()).ok());
+            Some(QueryFileEntry {
+                file_name,
+                modified_ms,
+                size: meta.len(),
+            })
+        })
+        .collect();
+    // Option の順序は None < Some なので、降順にすると取れないものが末尾に来る。
+    // sort_by_key は安定ソートなので、同じ日時の中では名前順が保たれる
+    entries.sort_by_key(|e| std::cmp::Reverse(e.modified_ms));
+    Ok(entries)
 }
 
 /// クエリファイル検索の 1 ヒット。
@@ -997,6 +1049,63 @@ mod tests {
         assert_eq!(natural_cmp("apple", "banana"), Ordering::Less);
         // 日付部分も数値として比較される (桁数が同じなので辞書順と一致する)
         assert_eq!(natural_cmp("20260102-1200", "20260315-1830"), Ordering::Less);
+    }
+
+    #[test]
+    fn test_list_query_file_entries_sorts_by_modified_desc() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = test_dir().join("entries");
+        let connection = "entries-conn";
+        create_query_file(&dir, connection, "b-old", "sql").unwrap();
+        create_query_file(&dir, connection, "a-new", "sql").unwrap();
+        create_query_file(&dir, connection, "c-mid", "sql").unwrap();
+        create_query_file(&dir, connection, "z-tie", "sql").unwrap();
+        create_query_file(&dir, connection, "y-tie", "sql").unwrap();
+        write_query_file(&dir, connection, "c-mid.sql", "select 1;", "sql").unwrap();
+        let conn_dir = connection_dir(&dir, connection).unwrap();
+        let set = |name: &str, secs: u64| {
+            fs::File::options()
+                .write(true)
+                .open(conn_dir.join(name))
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+        set("b-old.sql", 1_700_000_000);
+        set("c-mid.sql", 1_750_000_000);
+        set("a-new.sql", 1_800_000_000);
+        set("z-tie.sql", 1_600_000_000);
+        set("y-tie.sql", 1_600_000_000);
+
+        let entries = list_query_file_entries(&dir, connection, "sql").unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| e.file_name.as_str())
+                .collect::<Vec<_>>(),
+            // 同じ日時の 2 つは名前順 (降順) のまま
+            vec![
+                "a-new.sql",
+                "c-mid.sql",
+                "b-old.sql",
+                "z-tie.sql",
+                "y-tie.sql"
+            ]
+        );
+        assert_eq!(entries[0].modified_ms, Some(1_800_000_000_000));
+        assert_eq!(entries[1].size, "select 1;".len() as u64);
+        assert_eq!(entries[0].size, 0);
+        // 名前順の一覧 (検索と共有) は変わらない
+        assert_eq!(
+            list_query_files(&dir, connection, "sql").unwrap(),
+            vec![
+                "z-tie.sql",
+                "y-tie.sql",
+                "c-mid.sql",
+                "b-old.sql",
+                "a-new.sql"
+            ]
+        );
     }
 
     #[test]
