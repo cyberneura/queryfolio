@@ -737,10 +737,10 @@ fn list_query_history(
 async fn list_query_files(
     state: tauri::State<'_, AppState>,
     connection: String,
-) -> Result<Vec<String>, AppError> {
+) -> Result<Vec<query_files::QueryFileEntry>, AppError> {
     let server = state.find_server(&connection).await?;
     let ext = engines::capabilities_for_name(&server.engine).file_extension;
-    let files = query_files::list_query_files(
+    let files = query_files::list_query_file_entries(
         &state.resolve_sqlfiles_dir().await?,
         &server.sqlfiles_folder_name(),
         ext,

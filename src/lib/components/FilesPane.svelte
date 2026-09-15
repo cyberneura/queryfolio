@@ -2,6 +2,7 @@
   import { toast } from "svelte-sonner";
   import appStore from "$lib/stores/app.svelte";
   import { setFileDragPayload } from "$lib/fileDrag";
+  import { formatFileSize, formatModifiedAt, formatRelativeTime } from "$lib/fileMeta";
 
   interface Props {
     /// HISTORY / TABLES タブへの切り替え (タブ状態は +page.svelte が持つ)
@@ -23,12 +24,29 @@
   /// CONNECTIONS ペインへドラッグ中のファイル (ドラッグ元を薄く表示するため)
   let draggingFile = $state<string | null>(null);
 
+  /// 相対表記 (`3 days ago`) の基準時刻。開きっぱなしでも表記が古びないよう 1 分ごとに進める
+  let clock = $state(Date.now());
+  $effect(() => {
+    const timer = setInterval(() => {
+      clock = Date.now();
+    }, 60_000);
+    return () => clearInterval(timer);
+  });
+
+  /// ファイル名の下に出す 1 行 (`2026-09-15 17:30 · 3 days ago · 4 KB`)。
+  /// 更新日時が取れないファイルはサイズだけ
+  const metaLine = (modifiedMs: number | null, size: number) =>
+    modifiedMs === null
+      ? formatFileSize(size)
+      : `${formatModifiedAt(modifiedMs)} · ${formatRelativeTime(modifiedMs, clock)} · ${formatFileSize(size)}`;
+
   /// エンジン別のクエリファイル拡張子 (ドット付き。例 ".sql" / ".redis")
   const fileSuffix = $derived(`.${appStore.selectedFileExtension}`);
 
   // デフォルトのファイル名: YYYYMMDD-HHMM (拡張子はバックエンドが付与)。
-  // 日付が先頭にあると名前順ソートが時系列になり探しやすい。一覧は名前の降順
-  // (query_files.rs の list_query_file_names) なので、新しいファイルほど上に出る。
+  // 日付が先頭にあると名前でも時系列が分かり探しやすい。一覧そのものは更新日時の
+  // 降順 (query_files.rs の list_query_file_entries) だが、検索結果は名前の降順
+  // (list_query_file_names) なので、名前でも新しいファイルほど上に出るようにしておく。
   // 同一分内の連続作成で衝突しないよう、既存ファイルと重複する場合は
   // -2, -3 ... を付けて一意化する。ゼロ埋めはしないが、一覧側が数字を数値として
   // 比較するため -9 と -10 の並びも作成順どおりになる。
@@ -255,7 +273,7 @@
       <!-- ドラッグ & ドロップのハンドラを持つ行に正しい ARIA ロールを与えるため、
            一覧部分だけを role="list" で包む (作成フォームや空メッセージは含めない) -->
       <div role="list">
-        {#each appStore.files as fileName (fileName)}
+        {#each appStore.fileEntries as { file_name: fileName, modified_ms, size } (fileName)}
           <div
             role="listitem"
             class="group relative flex items-center gap-1 pr-1 hover:bg-zinc-800 {appStore.selectedFile ===
@@ -298,14 +316,22 @@
               </form>
             {:else}
               <button
-                class="min-w-0 flex-1 truncate px-3 py-1.5 text-left text-sm text-zinc-200"
+                class="min-w-0 flex-1 px-3 py-1 text-left"
                 data-annotate="button-file-{fileName}"
                 onclick={() => handleNameClick(fileName)}
               >
-                {fileName}
-                {#if appStore.selectedFile === fileName && appStore.dirty}
-                  <span class="text-zinc-500" title="Unsaved">*</span>
-                {/if}
+                <span class="block truncate text-sm text-zinc-200">
+                  {fileName}
+                  {#if appStore.selectedFile === fileName && appStore.dirty}
+                    <span class="text-zinc-500" title="Unsaved">*</span>
+                  {/if}
+                </span>
+                <span
+                  class="block truncate text-[10px] leading-tight text-zinc-500"
+                  data-annotate="file-meta-{fileName}"
+                >
+                  {metaLine(modified_ms, size)}
+                </span>
               </button>
               <button
                 class="shrink-0 rounded px-1 py-0.5 text-zinc-500 hover:bg-zinc-700 hover:text-zinc-200 {openMenuFile ===

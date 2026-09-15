@@ -21,6 +21,10 @@ const AUTO_SAVE_DELAY_MS = 1000;
 
 /// 開いているクエリファイルがアプリ外で変更されていないか調べる間隔 (ms)。
 const FILE_WATCH_INTERVAL_MS = 2500;
+/// FILES ペインの一覧 (更新日時・サイズ) を取り直す間隔。開いていないファイルの外部変更や
+/// 同じ内容での書き直し (mtime だけが変わる) はタブの内容比較では検知できないため、
+/// ウォッチャの tick のついでに一覧そのものを定期的に取り直す (CYBERNEURA-DEV-774)
+const FILE_LIST_REFRESH_INTERVAL_MS = 10_000;
 
 /// 結果タブの上限。超過時は最も古い非ピン留めタブを破棄する
 const MAX_RESULT_TABS = 10;
@@ -91,7 +95,17 @@ let selectedConnection = $state<string | null>(null);
 /// 文しか実行できない (バックエンドが強制)。事故防止のためセッションごとに
 /// OFF から始め、永続化しない (再起動で勝手に書き込み可にはしない)。
 let writable = $state(false);
-let files = $state<string[]>([]);
+/// FILES ペインの一覧 (更新日時の降順。日時とサイズ付き)
+let fileEntries = $state<api.QueryFileEntry[]>([]);
+/// fileEntries を書き換えるたびに進める。後から解決した古い取得結果で新しい一覧を
+/// 上書きしないため (refreshFileEntries は投げっぱなしで重なりうる)
+let fileEntriesVersion = 0;
+const setFileEntries = (entries: api.QueryFileEntry[]) => {
+  fileEntriesVersion++;
+  fileEntries = entries;
+};
+/// 一覧のファイル名だけ (存在確認・連番の採番用。並びは fileEntries と同じ)
+const files = $derived(fileEntries.map((e) => e.file_name));
 let editorTabs = $state<EditorTab[]>([]);
 let activeEditorTabId = $state<number | null>(null);
 let resultTabs = $state<ResultTab[]>([]);
@@ -299,7 +313,7 @@ const reloadConnections = async (): Promise<boolean> => {
   selectedConnection = null;
   // 設定リロードで接続が入れ替わるため、Writable も安全側 (OFF) へ戻す
   writable = false;
-  files = [];
+  setFileEntries([]);
   // 設定が丸ごと入れ替わるため、開いているエディタタブを全て破棄する
   if (autoSaveTimer) {
     clearTimeout(autoSaveTimer);
@@ -429,7 +443,7 @@ const saveAllDirtyTabs = async (): Promise<boolean> => {
 const applyConnectionContext = async (name: string): Promise<boolean> => {
   const generation = ++connectionContextGeneration;
   const defaultSchema = connections.find((c) => c.name === name)?.schema ?? null;
-  let loadedFiles: string[] = [];
+  let loadedFiles: api.QueryFileEntry[] = [];
   let filesError: string | null = null;
   try {
     loadedFiles = await api.listQueryFiles(name);
@@ -465,7 +479,7 @@ const applyConnectionContext = async (name: string): Promise<boolean> => {
   }
   selectedConnection = name;
   errorMessage = filesError;
-  files = filesError ? [] : loadedFiles;
+  setFileEntries(filesError ? [] : loadedFiles);
   activeSchema = schema;
   // スキーマ一覧・補完マップは接続を張るため、選択時点では取得しない
   // (「選択した瞬間にトンネルが開く」のを避ける)。プルダウンは現在のスキーマのみを
@@ -900,7 +914,7 @@ const openFileByTarget = async (connection: string, fileName: string) => {
     try {
       const latest = await api.listQueryFiles(connection);
       if (selectedConnection === connection) {
-        files = latest;
+        setFileEntries(latest);
       }
     } catch {
       // 一覧の更新に失敗してもファイルは開ける (表示だけの問題)。
@@ -912,6 +926,10 @@ const openFileByTarget = async (connection: string, fileName: string) => {
     if (selectedConnection !== connection) {
       return;
     }
+  } else {
+    // 一覧にあるファイルでも、CLI の write が中身を書き換えていれば更新日時とサイズが
+    // 変わっている。開くのは待たせない (表示だけの問題)
+    refreshFileEntries(connection);
   }
   // 既に開いているタブなら、アクティブにする前にディスクの内容と突き合わせる。
   // CLI の `queryfolio write` はこのプロセスの外でファイルを書き換えるため、
@@ -1019,7 +1037,7 @@ const createFile = async (fileName: string) => {
     if (selectedConnection !== connection) {
       return;
     }
-    files = await api.listQueryFiles(connection);
+    setFileEntries(await api.listQueryFiles(connection));
     await selectFile(normalized);
   } catch (e) {
     errorMessage = toErrorMessage(e);
@@ -1042,7 +1060,7 @@ const deleteFile = async (fileName: string) => {
     }
     // タブを閉じる過程で接続が切り替わっていなければ一覧を更新する
     if (selectedConnection === connection) {
-      files = await api.listQueryFiles(connection);
+      setFileEntries(await api.listQueryFiles(connection));
     }
   } catch (e) {
     errorMessage = toErrorMessage(e);
@@ -1072,7 +1090,7 @@ const renameFile = async (
     const normalized = await api.renameQueryFile(connection, oldName, newName);
     // リネーム中に接続が切り替わっていたら、旧接続の一覧で上書きしない
     if (selectedConnection === connection) {
-      files = await api.listQueryFiles(connection);
+      setFileEntries(await api.listQueryFiles(connection));
     }
     // 開いているタブのファイル名を追従させる
     for (const t of editorTabs) {
@@ -1146,7 +1164,7 @@ const moveFileToConnection = async (
   // 移動元だけを見ると移動したファイルが一覧に出てこない。
   const shown = selectedConnection;
   if (shown === fromConnection || shown === toConnection) {
-    files = await api.listQueryFiles(shown);
+    setFileEntries(await api.listQueryFiles(shown));
   }
   errorMessage = null;
   return true;
@@ -1221,6 +1239,7 @@ const saveEditorTab = async (
       if (tab.content === saved) {
         tab.dirty = false;
       }
+      refreshFileEntries(tab.connection);
       return true;
     }
     await api.writeQueryFile(tab.connection, tab.file, saved);
@@ -1233,11 +1252,45 @@ const saveEditorTab = async (
     if (tab.content === saved) {
       tab.dirty = false;
     }
+    refreshFileEntries(tab.connection);
     return true;
   } catch (e) {
     errorMessage = `Failed to save the file: ${toErrorMessage(e)}`;
     return false;
   }
+};
+
+// 保存や外部変更でファイルの更新日時とサイズが変わるので、その接続の一覧を表示中なら
+// 取り直す (FILES ペインは更新日時の降順で日時とサイズを出している。CYBERNEURA-DEV-774)。
+// 表示だけの問題なので失敗は無視し、待たせない (保存の成否とは切り離す)。
+const refreshFileEntries = (connection: string) => {
+  if (selectedConnection !== connection) {
+    return;
+  }
+  // 取得を始めた時点の版。解決までに一覧が書き換わっていたら (後から始めた取得や
+  // ファイル作成・削除など)、この古い結果では上書きしない
+  const version = ++fileEntriesVersion;
+  void api
+    .listQueryFiles(connection)
+    .then((latest) => {
+      // 取得を待つ間に別接続へ移っていたら、その一覧も上書きしない
+      if (selectedConnection !== connection || version !== fileEntriesVersion) {
+        return;
+      }
+      // 定期取得でほとんどは変化が無いので、同じなら書き換えない (再描画させない)
+      const same =
+        latest.length === fileEntries.length &&
+        latest.every(
+          (e, i) =>
+            e.file_name === fileEntries[i].file_name &&
+            e.modified_ms === fileEntries[i].modified_ms &&
+            e.size === fileEntries[i].size,
+        );
+      if (!same) {
+        setFileEntries(latest);
+      }
+    })
+    .catch(() => {});
 };
 
 // アクティブなエディタタブを保存する (Toolbar 等から明示保存する場合用)。
@@ -2256,6 +2309,7 @@ const checkTabForExternalChange = async (tabId: number) => {
     cancelPendingSaveFor(tabId);
     conflictNotified.delete(tabId);
     toast.info(`Reloaded "${file}" (changed on disk)`);
+    refreshFileEntries(connection);
     return;
   }
   if (tab.content === disk) {
@@ -2264,6 +2318,8 @@ const checkTabForExternalChange = async (tabId: number) => {
     tab.dirty = false;
     tab.conflicted = false;
     conflictNotified.delete(tabId);
+    // 内容が同じでも書き直されていれば更新日時は変わっている
+    refreshFileEntries(connection);
     return;
   }
   // base / local / remote が三者三様 → 3-way マージを試みる。
@@ -2297,6 +2353,7 @@ const checkTabForExternalChange = async (tabId: number) => {
     }
     if (wrote) {
       // マージ結果をディスクへ反映できた。ディスクは今 merged。
+      refreshFileEntries(connection);
       t2.diskContent = merged;
       t2.conflicted = false;
       conflictNotified.delete(tabId);
@@ -2336,6 +2393,8 @@ const checkTabForExternalChange = async (tabId: number) => {
   }
 };
 
+let lastFileListRefreshAt = 0;
+
 const fileWatchTick = async () => {
   if (fileWatchTicking) {
     return;
@@ -2346,6 +2405,13 @@ const fileWatchTick = async () => {
     const ids = editorTabs.map((t) => t.id);
     for (const id of ids) {
       await checkTabForExternalChange(id);
+    }
+    if (
+      selectedConnection &&
+      Date.now() - lastFileListRefreshAt >= FILE_LIST_REFRESH_INTERVAL_MS
+    ) {
+      lastFileListRefreshAt = Date.now();
+      refreshFileEntries(selectedConnection);
     }
     // 閉じられたタブの通知記録を掃除する。
     const alive = new Set(editorTabs.map((t) => t.id));
@@ -2416,6 +2482,9 @@ export default {
   },
   get files() {
     return files;
+  },
+  get fileEntries() {
+    return fileEntries;
   },
   /// 開いているエディタタブ (全接続横断・多段表示)
   get editorTabs() {

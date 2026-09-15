@@ -165,8 +165,19 @@ export const listQueryHistory = (
   limit?: number,
 ) => invoke<QueryHistoryEntry[]>("list_query_history", { connection, search, limit });
 
+/// FILES ペインの 1 行 (バックエンドの query_files::QueryFileEntry に対応)
+export interface QueryFileEntry {
+  /// ファイル名 (拡張子付き)
+  file_name: string;
+  /// 最終更新日時 (UNIX エポックからのミリ秒)。取れなければ null
+  modified_ms: number | null;
+  /// ファイルサイズ (バイト)
+  size: number;
+}
+
+/// 接続のクエリファイル一覧 (更新日時の降順 = 最近編集したものが先頭)
 export const listQueryFiles = (connection: string) =>
-  invoke<string[]>("list_query_files", { connection });
+  invoke<QueryFileEntry[]>("list_query_files", { connection });
 
 /// クエリファイル検索の 1 ヒット (バックエンドの query_files::FileSearchHit に対応)
 export interface FileSearchHit {
