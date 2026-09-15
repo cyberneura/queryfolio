@@ -1748,6 +1748,7 @@
   <div
     class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6"
     data-annotate="modal-edits-preview"
+    data-modal
   >
     <div
       class="flex max-h-[80vh] w-full max-w-3xl flex-col rounded border border-zinc-700 bg-zinc-900 shadow-xl"

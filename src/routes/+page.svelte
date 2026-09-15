@@ -352,6 +352,20 @@
       openConfigEditor("source");
     });
 
+    // メニューの Close Tab (Cmd+W / Ctrl+W)。ウインドウは閉じず、アクティブな
+    // エディタタブだけを閉じる。タブが無ければ何もしない。モーダルが開いている間も
+    // 何もしない (見えない裏でタブが閉じる状態を作らない。Ctrl+Tab と同じ扱い)。
+    // isModalOpen はこのページが状態を持つモーダルしか知らないので、各コンポーネントが
+    // 自前で開くモーダル (ResultsPane のセル編集プレビュー等) は、モーダルの
+    // ルート要素に付けた data-modal で拾う
+    const unlistenCloseTabPromise = listen("menu-close-editor-tab", () => {
+      const id = appStore.activeEditorTabId;
+      if (id === null || isModalOpen() || document.querySelector("[data-modal]")) {
+        return;
+      }
+      appStore.closeEditorTab(id);
+    });
+
     // 開く指定を直列で処理するキュー。openFileByTarget は selectConnection を呼び、
     // ストアの世代ガードが後発の接続切替で先行分をキャンセルするため、複数を並行で
     // 走らせると別接続のファイルが黙って飛ばされ得る。Promise チェーンで 1 件ずつ
@@ -430,6 +444,7 @@
       void unlistenPromise.then((unlisten) => unlisten());
       void unlistenEditPromise.then((unlisten) => unlisten());
       void unlistenEditSourcePromise.then((unlisten) => unlisten());
+      void unlistenCloseTabPromise.then((unlisten) => unlisten());
       void unlistenOpenFilePromise.then((unlisten) => unlisten());
       void unlistenOpenFileErrPromise.then((unlisten) => unlisten());
     };
