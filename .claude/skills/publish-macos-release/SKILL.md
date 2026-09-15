@@ -40,14 +40,16 @@ pnpm release major     # 0.1.0 -> 1.0.0
 4. その push で始まった run を探し、`gh run watch --exit-status` で追う
    (リリースを始めるのは push であってスクリプトではない)
 
-ワークフローは matrix で macOS (universal dmg / Developer ID 署名 + 公証 + staple) と
-Windows (NSIS exe / 署名なし) を並列ビルドし、`v<version>` の **draft** Release に
-アップロードする。全プラットフォームが成功すると `publish` ジョブが
-`gh release edit "v<version>" --draft=false --latest` で公開する。所要 15〜25 分程度。
+ワークフローは `draft` ジョブで `v<version>` の **draft** Release を 1 つ用意し、matrix で
+macOS (universal dmg / Developer ID 署名 + 公証 + staple) と Windows (NSIS exe / 署名なし) を
+並列ビルドしてその draft にアップロードする。全プラットフォームが成功すると `publish` ジョブが
+公開直前にリリース判定をやり直し、draft を公開する (tag はその run の commit に作られる)。
+所要 15〜25 分程度。
 
-> どれかのプラットフォームが失敗した場合、Release は **draft のまま残る**。
-> 修正して再実行する時は version が上がるので (再度 `pnpm release`)、残った draft と
-> タグは掃除する: `gh release delete v<version> --cleanup-tag --yes`
+> どれかのプラットフォームが失敗した場合、Release は **draft のまま残る**。原因を直して
+> main に push すれば、同じ version のまま次の run がその draft を再利用して公開する
+> (version は未公開のままなので上げなくてよい)。version を上げて出し直すなら、残った
+> draft は消しておく: `gh release delete v<version> --yes`
 
 ### 2. 成果物を検証する (公開後 / 初回は必ず)
 
@@ -102,10 +104,12 @@ printf '2YN5TLNQ9J' | gh secret set APPLE_TEAM_ID
 
 ## トラブルシューティング
 
-- **tauri-action がタグ/draft 状態の不一致で失敗する** → 公開済みと同じ version で再実行している。
-  `pnpm release` は毎回 bump するので通常起きない。`plan` ジョブが公開済み version を
-  弾くので、同じ version を push しても再ビルドはされない。
-  残骸を消す: `gh release delete v<version> --cleanup-tag --yes`
+- **`draft` ジョブが "found N draft releases" で失敗する** → 同じ tag の draft が複数残っている
+  (この構成になる前の run の残骸)。どれに上げるか決められないので止めている。
+  `gh api repos/cyberneura/queryfolio/releases --jq '.[] | select(.draft) | [.id, .tag_name, .created_at] | @tsv'`
+  で確認し、不要な方を `gh api -X DELETE repos/cyberneura/queryfolio/releases/<id>` で消して再実行する。
+- **push したのにリリースされない (plan が release=false)** → その version が公開済みか、
+  公開中の最新より古い。plan ジョブのログに理由が出る。
 - **`spctl` が `source=Developer ID` (Notarized でない)** → 公証が走っていない。macOS ジョブのログで
   tauri-action の notarize ステップを確認し、`APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` を疑う。
   app 用パスワードは通常の Apple ID パスワードでは代用できない。
@@ -113,8 +117,8 @@ printf '2YN5TLNQ9J' | gh secret set APPLE_TEAM_ID
   `.p12` に秘密鍵が入っていない。"Import Apple Developer certificate" ステップの
   `security find-identity` の出力に Developer ID が出ているか見る。
 - **Windows ジョブだけ失敗して Release が draft のまま** → Release は公開されない (仕様)。
-  ログを直して version を上げて再実行する。急ぐなら手で
-  `gh release edit v<version> --draft=false --latest` で macOS 分だけ公開できる。
+  原因を直して push (または Actions の "Re-run failed jobs") すれば同じ draft に上げ直して公開する。
+  急ぐなら手で `gh release edit v<version> --draft=false --latest` で macOS 分だけ公開できる。
 - **`pnpm release` が "working tree is not clean" / "does not match origin/main" で止まる** →
   ビルドは origin/main の内容で走るため、ローカルとズレたままリリースさせない安全弁。
   commit / push してから再実行する。

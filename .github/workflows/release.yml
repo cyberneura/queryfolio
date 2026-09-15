@@ -1,9 +1,10 @@
 name: Release
 
-# リリースは main の src-tauri/tauri.conf.json の version で決まる。version を変えて
-# main に載せればリリースされ、変えなければ何度 push しても何も起きない。
+# リリースは main の src-tauri/tauri.conf.json の version で決まる。まだリリースされて
+# いない (かつ公開中の最新より新しい) version を main に載せればリリースされ、
+# リリース済みの version のままなら何度 push しても何も起きない。
 # ローカルからは `pnpm release [patch|minor|major]` (scripts/release.sh) で採番して
-# push する。
+# push する。PR の中で version を上げてマージしても同じようにリリースされる。
 #
 # 実行可否を決めるのは diff ではなく「その version がリリース済みか」。squash / rebase /
 # 直 push で diff は変わるが結果は変わらない (冪等)。path フィルターを付けないのも
@@ -39,6 +40,11 @@ permissions: {}
 #     置き換える」なので、3 回連続で dispatch すると真ん中の version が消える。
 # (queue: max と cancel-in-progress: true の併用は validation error になる)
 #
+# run 単位で直列なので、後続の run の plan は先行 run の publish が終わってから走り、
+# 同じ version を二重にビルドしない。ただし pending の消化順は push 順とは限らない
+# (GitHub は開始順を保証しない)。新しい version が先に公開された後で古い version の
+# run が回ってきても、plan が「最新より古い」で止める。
+#
 # PR の検査 run は「1 push = 1 version」の直列化とは無関係なので、リリース用の
 # グループへ入れない。同じグループにすると PR が 1 本走るだけでリリースが pending に
 # 積まれる (cancel-in-progress: false なので待たされ続ける)。さらに commit ごとに
@@ -51,9 +57,9 @@ concurrency:
   queue: max
 
 jobs:
-  # ビルドに 30 分以上かける前に、その version がまだリリースされていないことだけを
-  # 確かめる。ここが false を返す限り、push のたびに macOS / Windows ランナーが動く
-  # ことはない。
+  # ビルドに 30 分以上かける前に、その version がまだリリースされておらず、公開中の
+  # 最新より新しいことを確かめる。ここが false を返す限り、push のたびに
+  # macOS / Windows ランナーが動くことはない。
   # PR ではリリース判定そのものが無意味なので走らせない。この job が skipped に
   # なると、依存している build / publish も (always() を使っていないので) skipped に
   # なる — PR では test だけが動く。
@@ -93,6 +99,9 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      # 判定の中身は scripts/release-decide.sh。publish が公開直前にも同じ判定を使う。
+      # `release=$(...)` を代入で受けるのは、スクリプトの失敗 (判定不能) で step を
+      # 落とすため (echo の引数の中でコマンド置換が失敗しても -e は効かない)。
       - name: Decide whether this version still needs releasing
         id: decide
         env:
@@ -100,28 +109,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # このエンドポイントが答えるのは公開済みの Release だけ (draft にはまだ tag が
-          # 無いので見つからない)。それがここで訊きたいことでもある: 失敗した run が
-          # 残した draft は、同じ version で再実行して埋め直す。
-          #
-          # 404 だけを「未リリース」と読む。rate limit や障害をそう読むと、公開済みの
-          # version をもう一度ビルドして publish ジョブが二重に公開しにいく。
-          status=$(gh api "repos/${GH_REPO}/releases/tags/v${VERSION}" \
-            --silent --include 2>/dev/null | head -n 1 | awk '{print $2}' || true)
-          case "$status" in
-            404)
-              echo "release=true" >> "$GITHUB_OUTPUT"
-              echo "Releasing v${VERSION}"
-              ;;
-            200)
-              echo "release=false" >> "$GITHUB_OUTPUT"
-              echo "v${VERSION} is already released; nothing to do."
-              ;;
-            *)
-              echo "::error::could not tell whether v${VERSION} exists (HTTP ${status:-none}). Not guessing."
-              exit 1
-              ;;
-          esac
+          release=$(bash scripts/release-decide.sh)
+          echo "release=$release" >> "$GITHUB_OUTPUT"
 
   # リリースビルドの門番。方針: cyberneura/cyberneura-github-actions の
   # docs/build-requires-tests.md
@@ -194,10 +183,73 @@ jobs:
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
+  # matrix の全ジョブが成果物を上げる先の draft Release を、ビルドの前に 1 つだけ用意する。
+  #
+  # tauri-action に tagName だけを渡すと、各ジョブがビルド後に「その tag の Release を
+  # 一覧から探し、無ければ作る」。macOS と Windows のビルドがほぼ同時に終わると (キャッシュが
+  # 効いた再実行など) 両方が「無い」と判断し、同じ tag の draft が 2 つできる。publish は
+  # そのうち片方しか公開できず、もう片方のプラットフォームの成果物が Release から欠ける。
+  # ここで作った id を releaseId で渡せば、tauri-action は探しも作りもせずそこへ上げる。
+  #
+  # 失敗した run が残した draft は再利用し、target_commitish をこの run の commit に
+  # 直す (draft を最初に作った run の commit のまま公開すると、tag が中身と食い違う)。
+  draft:
+    # test を通らないうちは draft を作らない (失敗するたびに空の draft が残るため)。
+    needs: [plan, test]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
+    steps:
+      - name: Find or create the draft release
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: v${{ needs.plan.outputs.version }}
+        run: |
+          # draft は tag からは引けない (releases/tags/<tag> は 404 を返す) ので一覧から探す。
+          # contents: write のトークンなら一覧に draft も含まれる。
+          found=$(gh api --paginate "repos/${GH_REPO}/releases?per_page=100" \
+            --jq '.[] | select(.tag_name == env.TAG) | "\(.id) \(.draft)"')
+          published=$(printf '%s\n' "$found" | awk '$2 == "false" { n++ } END { print n + 0 }')
+          drafts=$(printf '%s\n' "$found" | awk '$2 == "true" { print $1 }')
+          draft_count=$(printf '%s\n' "$found" | awk '$2 == "true" { n++ } END { print n + 0 }')
+          if [ "$published" -gt 0 ]; then
+            echo "::error::${TAG} is already published, but plan decided to release it. Not touching it."
+            exit 1
+          fi
+          # どれに上げるべきかを決められない。黙って 1 つ選ぶと、残りの draft と成果物が
+          # 分かれたまま公開される。不要な draft を消してから再実行する。
+          if [ "$draft_count" -gt 1 ]; then
+            echo "::error::found ${draft_count} draft releases for ${TAG} (ids: $(echo $drafts)). Delete all but one, then re-run."
+            exit 1
+          fi
+          if [ "$draft_count" -eq 1 ]; then
+            id="$drafts"
+            gh api -X PATCH "repos/${GH_REPO}/releases/${id}" \
+              -f target_commitish="${GITHUB_SHA}" --silent
+            echo "Reusing draft ${id} for ${TAG} (target set to ${GITHUB_SHA})."
+          else
+            id=$(gh api -X POST "repos/${GH_REPO}/releases" \
+              -f tag_name="${TAG}" -f name="QueryFolio ${TAG}" \
+              -F draft=true -F prerelease=false \
+              -f target_commitish="${GITHUB_SHA}" --jq '.id')
+            echo "Created draft ${id} for ${TAG}."
+          fi
+          if ! [[ "$id" =~ ^[0-9]+$ ]]; then
+            echo "::error::could not get the id of the draft release for ${TAG} (got '${id}')."
+            exit 1
+          fi
+          echo "release_id=$id" >> "$GITHUB_OUTPUT"
+
   build:
     # test を通らずにビルドしない。needs は同じ run の job にしか効かないので、
     # テストを別 workflow に切り出さないこと。
-    needs: [plan, test]
+    needs: [plan, test, draft]
     if: needs.plan.outputs.release == 'true'
     permissions:
       contents: write
@@ -321,12 +373,11 @@ jobs:
           }
           rm "$RUNNER_TEMP/certificate.p12"
 
-      # tauri.conf.json の version から v<version> タグの Release を作成し、
-      # ビルド成果物をアップロードする。並列 matrix の片方だけで公開状態に
-      # ならないよう draft で作成し、全プラットフォーム成功後に publish ジョブで公開する。
-      # 注意: 公開済みバージョンと同じ version で再実行すると、tauri-action が
-      # draft 状態の不一致でエラーになる。必ず version を上げてから実行すること
-      # (scripts/release.sh が採番するので、通常は `pnpm release` から起動する)。
+      # draft ジョブが用意した draft Release (releaseId) にビルド成果物をアップロードする。
+      # 並列 matrix の片方だけで公開状態にならないよう、全プラットフォーム成功後に
+      # publish ジョブで公開する。releaseId を渡すと tauri-action は Release を
+      # 探しも作りもしないので、tagName / releaseName / releaseDraft は渡さない
+      # (Release の名前と tag は draft ジョブが決める)。
       # macOS の APPLE_* を渡すと tauri-action が Developer ID 署名 + 公証 + staple を
       # 自動で行う。Apple 認証情報を受け取るため、可変タグ @v0 ではなく commit SHA に
       # 固定する (タグが差し替えられて secrets を抜かれるサプライチェーン攻撃を防ぐ)。
@@ -344,16 +395,13 @@ jobs:
           # あちらはローカル署名用に APPLE_SIGNING_IDENTITY を env 前置きで
           # ハードコードしており、Windows のシェルでは構文エラーになる。
           tauriScript: pnpm exec tauri
-          tagName: v__VERSION__
-          releaseName: QueryFolio v__VERSION__
-          releaseDraft: true
-          prerelease: false
+          releaseId: ${{ needs.draft.outputs.release_id }}
           args: ${{ matrix.args }}
 
   # 全プラットフォームのビルド・アップロードが成功した時のみ draft を公開する。
   # どれかが失敗した場合は draft のまま残る (不完全な Release は公開されない)。
   publish:
-    needs: [plan, build]
+    needs: [plan, draft, build]
     if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -365,10 +413,26 @@ jobs:
         with:
           persist-credentials: false
 
+      # 公開直前に plan と同じ判定をやり直す。「Re-run failed jobs」は成功済みの plan を
+      # 再実行せず当時の release=true を使い回すので、その間に新しい version が
+      # 公開されていると make_latest で最新を巻き戻してしまう。止めた場合 draft は残る。
+      #
+      # 公開は tag 名ではなく draft ジョブが返した id で行う (同じ tag の draft が
+      # 他にあっても取り違えない)。target_commitish もここで改めてこの run の commit に
+      # 合わせる — tag は draft を公開した時にその commit に作られる。
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ needs.draft.outputs.release_id }}
         run: |
           VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          gh release edit "v${VERSION}" --draft=false --latest
+          release=$(VERSION="$VERSION" bash scripts/release-decide.sh)
+          if [ "$release" != "true" ]; then
+            echo "::error::v${VERSION} should no longer be published (see the message above); leaving the draft as it is."
+            exit 1
+          fi
+          gh api -X PATCH "repos/${GH_REPO}/releases/${RELEASE_ID}" \
+            -F draft=false -f make_latest=true \
+            -f target_commitish="${GITHUB_SHA}" --silent
 

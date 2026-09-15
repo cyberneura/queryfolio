@@ -54,8 +54,8 @@ def release(bump='patch'):
         fab release:major        # 0.1.0 -> 1.0.0
 
     Thin wrapper around `pnpm release` (scripts/release.sh): it bumps the version
-    in tauri.conf.json / package.json, commits and pushes to main, dispatches the
-    Release workflow, and follows the run. The workflow builds the macOS universal
+    in tauri.conf.json / package.json, commits and pushes to main (the push starts
+    the Release workflow), and follows the run. The workflow builds the macOS universal
     dmg (Developer ID signed + notarized) and the Windows NSIS installer, then
     publishes the draft Release once every platform succeeded. See the
     `publish-macos-release` skill for the full runbook.
