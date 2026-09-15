@@ -1792,7 +1792,8 @@ fn about_metadata(app: &tauri::AppHandle) -> tauri::menu::AboutMetadata<'_> {
 /// 設定されている時だけ出す。
 ///
 /// 構成は tauri の `Menu::default` を踏襲する (アプリメニュー / View は macOS のみ、
-/// File の quit は macOS 以外のみ)。設定関連の項目は
+/// File の quit は macOS 以外のみ)。ただし Close Window は置かず、File に
+/// Close Tab (CmdOrCtrl+W) を置く (CYBERNEURA-DEV-773)。設定関連の項目は
 /// プラットフォームに関わらず Config サブメニューにまとめる
 /// (アプリメニューと Config に散らばっていると探しにくいため)。
 fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
@@ -1828,8 +1829,17 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
             .build()?
     };
 
+    // CmdOrCtrl+W はウインドウではなくアクティブなエディタタブを閉じる。
+    // 定義済みの Close Window は macOS で Cmd+W を持ち、ウインドウが 1 枚のこのアプリでは
+    // 押すとアプリごと閉じてしまう。そのため File / Window のどちらにも置かない
+    // (メニューのキー割り当ては WebView より先に NSApp が処理するので、フロントの
+    // keydown で preventDefault しても止められない)。閉じる対象の判断は
+    // エディタタブと開いているモーダルを知っているフロントに任せる
+    let close_tab_item = MenuItemBuilder::with_id("close_editor_tab", "Close Tab")
+        .accelerator("CmdOrCtrl+W")
+        .build(app)?;
     let file_menu = {
-        let builder = SubmenuBuilder::new(app, "File").close_window();
+        let builder = SubmenuBuilder::new(app, "File").item(&close_tab_item);
         #[cfg(not(target_os = "macos"))]
         let builder = builder.quit();
         builder.build()?
@@ -1848,14 +1858,10 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
     // Window / Help は tauri と同じ固定 ID で作る。macOS の init_app_menu は
     // この ID でメニューを探して NSApp の windowsMenu / helpMenu に登録するため、
     // ID が無いとウインドウ一覧やヘルプ検索が付かなくなる
-    let window_menu = {
-        let builder = SubmenuBuilder::with_id(app, tauri::menu::WINDOW_SUBMENU_ID, "Window")
-            .minimize()
-            .maximize();
-        #[cfg(target_os = "macos")]
-        let builder = builder.separator();
-        builder.close_window().build()?
-    };
+    let window_menu = SubmenuBuilder::with_id(app, tauri::menu::WINDOW_SUBMENU_ID, "Window")
+        .minimize()
+        .maximize()
+        .build()?;
     // tauri のデフォルトメニュー同様、macOS では中身を持たない
     // (About はアプリメニュー側にあり、システムがヘルプ検索を足す)
     let help_menu = {
@@ -2164,6 +2170,11 @@ pub fn run() {
             "edit_config_file" => {
                 if let Err(e) = app.emit("menu-edit-config", ()) {
                     eprintln!("[menu] failed to emit edit config event: {e}");
+                }
+            }
+            "close_editor_tab" => {
+                if let Err(e) = app.emit("menu-close-editor-tab", ()) {
+                    eprintln!("[menu] failed to emit close editor tab event: {e}");
                 }
             }
             "view_override_config" => {

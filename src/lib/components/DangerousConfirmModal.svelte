@@ -13,6 +13,7 @@
   class="fixed inset-0 z-10 flex items-center justify-center bg-black/60"
   role="presentation"
   data-annotate="backdrop-dangerous-modal"
+  data-modal
   onclick={(e) => {
     if (e.target === e.currentTarget) {
       onCancel();
