@@ -16,7 +16,7 @@
   import { search, searchKeymap } from "@codemirror/search";
   import { syntaxTree, HighlightStyle, syntaxHighlighting } from "@codemirror/language";
   import { tags as t } from "@lezer/highlight";
-  import { autocompletion, completionKeymap } from "@codemirror/autocomplete";
+  import { acceptCompletion, autocompletion, completionKeymap } from "@codemirror/autocomplete";
   import { sql, MySQL, PostgreSQL, SQLite } from "@codemirror/lang-sql";
   import type { SQLNamespace } from "@codemirror/lang-sql";
   import { oneDark } from "@codemirror/theme-one-dark";
@@ -606,6 +606,10 @@
             ...defaultKeymap,
             ...historyKeymap,
             ...completionKeymap,
+            // 補完候補が出ている間の Tab は候補の確定 (VSCode と同じ)。completionKeymap は
+            // Enter でしか確定しないため足している。候補が無ければ acceptCompletion が
+            // false を返し、次の indentWithTab でインデントになる
+            { key: "Tab", run: acceptCompletion },
             indentWithTab,
           ]),
           languageCompartment.of(
