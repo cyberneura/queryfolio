@@ -216,8 +216,10 @@ Grab the latest installer from the [Releases page](https://github.com/cyberneura
 
 ## Release
 
-Releases are built on GitHub Actions (`.github/workflows/release.yml`, manual trigger only)
-and published as a GitHub Release. Bump the version and kick off the build with one command:
+Releases are built on GitHub Actions (`.github/workflows/release.yml`) and published as a
+GitHub Release. A push to `main` releases the version in `src-tauri/tauri.conf.json` if it is
+not published yet and is newer than the latest release; otherwise nothing happens. Bump the
+version and push it with one command:
 
 ```shell
 pnpm release                 # 0.1.0 -> 0.1.1 (patch)
@@ -228,19 +230,18 @@ fab -l                       # list all tasks (dev / check / unittest / build_lo
 ```
 
 The script requires a clean `main` in sync with `origin/main`. It bumps the version in
-`src-tauri/tauri.conf.json` and `package.json`, pushes the bump commit, dispatches the
-workflow, and follows the run. The workflow builds the macOS universal dmg (Developer ID
-signed + notarized + stapled) and the Windows NSIS installer in parallel, uploads both to a
-**draft** Release, and publishes it only after every platform succeeded (a missing signing
+`src-tauri/tauri.conf.json` and `package.json`, pushes the bump commit, follows the run that
+push started, and checks that the Release was actually published. The workflow creates one
+**draft** Release, builds the macOS universal dmg (Developer ID signed + notarized + stapled)
+and the Windows NSIS installer in parallel, uploads both to that draft, and publishes it only
+after every platform succeeded (a missing signing
 secret fails the macOS job up front, so an unsigned or un-notarized build is never
 published). See the `publish-macos-release` skill (`.claude/skills/publish-macos-release/`)
 for the full runbook, including how to verify the published dmg and the one-time
 signing-secrets setup.
 
-After the Release is published, the `homebrew` job updates the cask in
-[cyberneura/homebrew-tap](https://github.com/cyberneura/homebrew-tap) (`Casks/queryfolio.rb`)
-to the new version. It authenticates with the `HOMEBREW_TAP_TOKEN` repository secret — a PAT
-with `contents: write` on the tap repository, the same token taskshoot-cli uses.
+The cask in [cyberneura/homebrew-tap](https://github.com/cyberneura/homebrew-tap)
+(`Casks/queryfolio.rb`) follows the latest Release on its own; the tap checks every hour.
 
 ## License
 

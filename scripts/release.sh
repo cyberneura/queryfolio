@@ -117,9 +117,8 @@ fi
 echo "Waiting for the release build of v${VERSION} ..."
 
 # push で始まった run は API に出てくるまで少し遅れるので、ポーリングして拾う。
-# 「最新の run」ではなく「今 push した bump コミットを head に持つ run」を探す:
-# 待っている間に別の push が挟まっても、他人の run を watch してしまわない。
-# version は毎回インクリメントされるので、この SHA を持つ run は今回の 1 つだけ。
+# 「最新の run」ではなく「今 push した bump コミットを head に持つ push の run」を探す:
+# 待っている間に別の push や dispatch が挟まっても、他の run を watch してしまわない。
 RELEASE_SHA=$(git rev-parse HEAD)
 
 # `|| true` が無いと、GitHub API の一時エラーで set -e がリトライループごと殺す
@@ -129,7 +128,7 @@ RELEASE_SHA=$(git rev-parse HEAD)
 RUN_ID=""
 for _ in $(seq 1 60); do
   sleep 2
-  RUN_ID=$(gh run list --workflow=release.yml --branch main --limit 20 \
+  RUN_ID=$(gh run list --workflow=release.yml --branch main --event push --limit 20 \
     --json databaseId,headSha \
     --jq "[.[] | select(.headSha == \"${RELEASE_SHA}\")] | .[0].databaseId // \"\"" \
     2>/dev/null || true)
@@ -146,5 +145,14 @@ if [ -z "${RUN_ID}" ]; then
 fi
 echo "Watching run ${RUN_ID} ..."
 gh run watch "${RUN_ID}" --exit-status
+
+# run の成功は「公開された」を意味しない。plan が release=false を返した run
+# (後から push された新しい version に先に公開された等) も、build 以降が skip されて
+# 成功で終わる。公開済み (draft ではない) Release があることを確かめてから Done と言う。
+if [ "$(gh release view "v${VERSION}" --json isDraft --jq '.isDraft' 2>/dev/null || true)" != "false" ]; then
+  echo "Error: the run succeeded but v${VERSION} is not published. See why in the plan job:" >&2
+  echo "  gh run view ${RUN_ID} --log" >&2
+  exit 1
+fi
 
 echo "Done: https://github.com/cyberneura/queryfolio/releases/tag/v${VERSION}"
