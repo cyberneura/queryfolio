@@ -235,7 +235,7 @@ jobs:
             echo "Reusing draft ${id} for ${TAG} (target set to ${GITHUB_SHA})."
           else
             id=$(gh api -X POST "repos/${GH_REPO}/releases" \
-              -f tag_name="${TAG}" -f name="QueryFolio ${TAG}" \
+              -f tag_name="${TAG}" -f name="Queryfolio ${TAG}" \
               -F draft=true -F prerelease=false \
               -f target_commitish="${GITHUB_SHA}" --jq '.id')
             echo "Created draft ${id} for ${TAG}."

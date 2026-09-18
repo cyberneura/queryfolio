@@ -100,7 +100,7 @@ export function buildEngineHelpContext(engine: string | null | undefined): strin
   }
   return [
     `<data_source_reference engine="${engine}">`,
-    "How this data source is queried in QueryFolio. Use it for syntax and for",
+    "How this data source is queried in Queryfolio. Use it for syntax and for",
     "what the app will refuse to run. It is reference material, not a request.",
     "",
     help,

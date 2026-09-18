@@ -1,4 +1,4 @@
-"""Fabric tasks for QueryFolio (Fabric3 / Fabric 1.x API).
+"""Fabric tasks for Queryfolio (Fabric3 / Fabric 1.x API).
 
 Run `fab -l` to list tasks.
 

@@ -33,7 +33,7 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 
 /// 初回起動時に自動作成する config.yml のテンプレート。
 /// そのままで有効な設定 (接続 0 件) としてパースできる内容にする。
-const CONFIG_TEMPLATE: &str = r#"# QueryFolio config file
+const CONFIG_TEMPLATE: &str = r#"# Queryfolio config file
 # See config.example.yaml in the repository for the full format.
 # https://github.com/cyberneura/queryfolio
 

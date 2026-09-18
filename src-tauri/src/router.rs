@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(route_from_cli_args(&["--flag", "value"]), None);
         // argv[0] (プログラムパス) が混ざっていても拾える
         assert_eq!(
-            route_from_cli_args(&["/Applications/QueryFolio.app/queryfolio", "open", "/tmp/a.sql"]),
+            route_from_cli_args(&["/Applications/Queryfolio.app/queryfolio", "open", "/tmp/a.sql"]),
             Some(Route::OpenFile {
                 path: "/tmp/a.sql".to_string(),
             })

@@ -1,4 +1,4 @@
-# QueryFolio 設定ファイルのサンプル。
+# Queryfolio 設定ファイルのサンプル。
 # ~/.config/queryfolio/config.yml (または config.yaml) に置く。
 #
 # 開発・テスト用に QUERYFOLIO_CONFIG_YAML 環境変数でこのファイル全体の内容を

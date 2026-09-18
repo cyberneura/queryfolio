@@ -147,7 +147,7 @@ paste fills the file. Declining still leaves the result in the table.
 ## Editing results
 
 With Writable on, a cell in the result grid can be edited in place when the
-result carries enough key information to identify its row; QueryFolio generates
+result carries enough key information to identify its row; Queryfolio generates
 the `UPDATE`. Engines without that support hide the affordance.
 
 ## What is blocked, and why

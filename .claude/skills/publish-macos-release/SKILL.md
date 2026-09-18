@@ -1,9 +1,9 @@
 ---
 name: publish-macos-release
-description: QueryFolio をビルドして GitHub Release として公開 (サイトで配布) する手順。「mac 版をリリース」「アプリを公開」「新しいバージョンを配布」「release the mac app」「publish a new build」と言及された時に使う。`pnpm release` で version 採番 → GitHub Actions で macOS dmg (署名 + 公証) と Windows インストーラをビルド → 全プラットフォーム成功時に自動公開 → 公開された成果物の署名・公証を検証してダウンロード導線を確認する、一連の作業を扱う。
+description: Queryfolio をビルドして GitHub Release として公開 (サイトで配布) する手順。「mac 版をリリース」「アプリを公開」「新しいバージョンを配布」「release the mac app」「publish a new build」と言及された時に使う。`pnpm release` で version 採番 → GitHub Actions で macOS dmg (署名 + 公証) と Windows インストーラをビルド → 全プラットフォーム成功時に自動公開 → 公開された成果物の署名・公証を検証してダウンロード導線を確認する、一連の作業を扱う。
 ---
 
-# QueryFolio のリリース手順
+# Queryfolio のリリース手順
 
 macOS 版 (universal dmg) と Windows 版 (NSIS インストーラ) を GitHub Actions でビルドし、
 GitHub Release としてサイト (ダウンロードページ) で公開するまでの runbook。
@@ -58,13 +58,17 @@ DMG を落として署名・公証・universal を実機確認する:
 ```shell
 VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
 gh release download "v${VERSION}" --pattern '*.dmg' --dir /tmp/qf-release --clobber
-hdiutil attach -nobrowse -quiet /tmp/qf-release/QueryFolio_${VERSION}_universal.dmg
-APP=/Volumes/QueryFolio/QueryFolio.app
+hdiutil attach -nobrowse -quiet /tmp/qf-release/Queryfolio_${VERSION}_universal.dmg
+APP=/Volumes/Queryfolio/Queryfolio.app
 codesign -dv --verbose=2 "$APP"      # Authority=Developer ID Application: Cyberneura K.K. (2YN5TLNQ9J) / flags=...runtime
 spctl -a -vvv "$APP"                 # → accepted / source=Notarized Developer ID
 xcrun stapler validate "$APP"        # → The validate action worked!
-lipo -archs "$APP/Contents/MacOS/QueryFolio"   # → x86_64 arm64
-hdiutil detach -quiet /Volumes/QueryFolio
+# バンドル内の実行バイナリは crate 名のまま小文字。tauri は mainBinaryName を
+# 指定しない限り cargo の出力バイナリ名をそのまま使うので、productName
+# (Queryfolio) ではない。ここを productName に揃えるとファイルが無くて落ちる
+# (CYBERNEURA-DEV-805 の時点で、元から大文字で書かれていて落ちる状態だった)。
+lipo -archs "$APP/Contents/MacOS/queryfolio"   # → x86_64 arm64
+hdiutil detach -quiet /Volumes/Queryfolio
 ```
 
 `source=Notarized Developer ID` と staple 成功が出れば、ユーザーがダウンロードして開いても

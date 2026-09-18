@@ -1783,7 +1783,7 @@ fn about_metadata(app: &tauri::AppHandle) -> tauri::menu::AboutMetadata<'_> {
 
 /// アプリのメニューバーを組み立てる。
 ///
-/// macOS のアプリメニュー (QueryFolio) は NSApplication がメインメニュー設置時の
+/// macOS のアプリメニュー (Queryfolio) は NSApplication がメインメニュー設置時の
 /// 内容で確定させるため、後から項目を insert しても反映されない。そのため
 /// tauri のデフォルトメニューを流用せず、アプリメニューを含めて丸ごと自前で組み、
 /// Builder::menu で最初の設置時から渡す。設定変更時はこの関数で組み直す。
@@ -1940,7 +1940,7 @@ const MAX_STDIN_CONTENT_BYTES: usize = 10 * 1024 * 1024;
 /// 「内容の指定なし」= `Ok(None)` として扱う (= 既存ファイルを潰さない):
 ///
 /// - 標準入力が端末 (対話シェルで内容を渡していない。読むと入力待ちで固まる)
-/// - 標準入力が空 (GUI 起動 `open -a QueryFolio --args write ...` の stdin は
+/// - 標準入力が空 (GUI 起動 `open -a Queryfolio --args write ...` の stdin は
 ///   /dev/null で即 EOF になる。これを「空で書け」と解釈すると、既存のクエリ
 ///   ファイルを黙って空にしてしまう)
 ///

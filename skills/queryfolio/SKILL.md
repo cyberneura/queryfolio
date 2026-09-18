@@ -1,11 +1,11 @@
 ---
 name: queryfolio
-description: Work with the files QueryFolio (a desktop SQL GUI client) keeps on disk — query files, config, execution history — and use the `-- 📝` Run and Log marker to have a human run a query in QueryFolio and hand the result back. Use when "QueryFolio", "~/.config/queryfolio", "sqlfiles", a QueryFolio query file or its query history is mentioned, when an agent should prepare SQL for the user to open in QueryFolio, or when an agent needs real data from a database it holds no credentials for. Not for editing SQL files unrelated to QueryFolio.
+description: Work with the files Queryfolio (a desktop SQL GUI client) keeps on disk — query files, config, execution history — and use the `-- 📝` Run and Log marker to have a human run a query in Queryfolio and hand the result back. Use when "Queryfolio", "~/.config/queryfolio", "sqlfiles", a Queryfolio query file or its query history is mentioned, when an agent should prepare SQL for the user to open in Queryfolio, or when an agent needs real data from a database it holds no credentials for. Not for editing SQL files unrelated to Queryfolio.
 ---
 
-# QueryFolio query files
+# Queryfolio query files
 
-[QueryFolio](https://github.com/cyberneura/queryfolio) is a desktop SQL GUI client. Its
+[Queryfolio](https://github.com/cyberneura/queryfolio) is a desktop SQL GUI client. Its
 query files are plain text files in a fixed two-level layout, so there is no need to drive
 the app: read and write them like any other file, or use the app's own CLI.
 
@@ -53,11 +53,11 @@ the settings it has"** (unknown engine, a bad `ssl_mode` on mysql / postgres, an
 `ssl_root_cert` paired with a mode that never verifies it) — not "there is a stray value in
 the config".
 
-On macOS call the binary inside the bundle; `open -a QueryFolio --args --list-servers` gives
+On macOS call the binary inside the bundle; `open -a Queryfolio --args --list-servers` gives
 you no output back:
 
 ```bash
-/Applications/QueryFolio.app/Contents/MacOS/queryfolio --list-servers
+/Applications/Queryfolio.app/Contents/MacOS/queryfolio --list-servers
 ```
 
 A version old enough not to have these options treats `--list-servers` as an unknown
@@ -190,7 +190,7 @@ WHERE created_at >= now() - interval '7 days'
 GROUP BY 1 ORDER BY 1;
 ```
 
-The file after the user runs it in QueryFolio:
+The file after the user runs it in Queryfolio:
 
 ```sql
 -- 📝 Orders per day, last 7 days
@@ -350,7 +350,7 @@ ship the contents somewhere else casually.
 
 ## Where the behaviour lives
 
-In the QueryFolio repository: `src-tauri/src/query_files.rs` (CRUD, path traversal),
+In the Queryfolio repository: `src-tauri/src/query_files.rs` (CRUD, path traversal),
 `src-tauri/src/config.rs` (`resolve_sqlfiles_dir` / `sqlfiles_folder_name`),
 `src-tauri/src/history.rs`, `src-tauri/src/cli.rs` (`--list-servers` and friends),
 `src-tauri/src/router.rs` (`open` / `write` and the `queryfolio://` URI). Run and Log is on

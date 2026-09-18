@@ -11,7 +11,7 @@ go in double quotes.
 tables
 ```
 
-`tables` is QueryFolio's own statement, not PartiQL — DynamoDB has no
+`tables` is Queryfolio's own statement, not PartiQL — DynamoDB has no
 `SHOW TABLES`. It calls `ListTables` directly, so it runs even with Writable
 off. The TABLES pane shows the same list along with each table's partition and
 sort key.
@@ -80,7 +80,7 @@ not the work.
 
 ## Row limits
 
-PartiQL has no `LIMIT`. QueryFolio requests one page at a time and stops once it
+PartiQL has no `LIMIT`. Queryfolio requests one page at a time and stops once it
 has `default_limit` rows (500 unless the connection says otherwise), then marks
 the result truncated. Narrow the `WHERE` clause rather than expecting a limit
 clause to save you.

@@ -2,7 +2,7 @@
 
 Ordinary SQL with a PostgreSQL-flavoured dialect, plus DuckDB's own extensions
 for reading files directly. The connection's `schema` (or `host`) is the path to
-the database file; it has to exist already — QueryFolio will not create one.
+the database file; it has to exist already — Queryfolio will not create one.
 
 ## Reading files as tables
 
