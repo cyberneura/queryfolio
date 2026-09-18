@@ -85,11 +85,11 @@ const BLOCKING_COMMANDS: &[&str] = &[
 fn unsupported_reason(args: &[Vec<u8>]) -> Option<String> {
     let name = command_name(args);
     if UNSUPPORTED_COMMANDS.contains(&name.as_str()) {
-        return Some(format!("{name} is not supported in QueryFolio"));
+        return Some(format!("{name} is not supported in Queryfolio"));
     }
     if BLOCKING_COMMANDS.contains(&name.as_str()) {
         return Some(format!(
-            "{name} is a blocking command and is not supported in QueryFolio"
+            "{name} is a blocking command and is not supported in Queryfolio"
         ));
     }
     if matches!(name.as_str(), "XREAD" | "XREADGROUP") {
@@ -112,7 +112,7 @@ fn unsupported_reason(args: &[Vec<u8>]) -> Option<String> {
             .any(|a| a.eq_ignore_ascii_case(b"BLOCK"));
         if has_block_option {
             return Some(format!(
-                "{name} with the BLOCK option is not supported in QueryFolio"
+                "{name} with the BLOCK option is not supported in Queryfolio"
             ));
         }
     }

@@ -60,7 +60,7 @@ const APP_VERSION: &str = env!("QUERYFOLIO_VERSION");
 pub fn help_text() -> String {
     let version = APP_VERSION;
     format!(
-        "QueryFolio {version} - a multi-purpose SQL GUI client
+        "Queryfolio {version} - a multi-purpose SQL GUI client
 
 USAGE:
     queryfolio                                       Launch the app
@@ -91,14 +91,14 @@ CONFIG
 
 On macOS the app bundle takes the same arguments after --args:
 
-    open -a QueryFolio --args open /path/to/query.sql
+    open -a Queryfolio --args open /path/to/query.sql
 "
     )
 }
 
 /// `--version` で表示する 1 行。
 pub fn version_text() -> String {
-    format!("QueryFolio {APP_VERSION}")
+    format!("Queryfolio {APP_VERSION}")
 }
 
 /// Windows で、情報系オプションの出力を呼び出し元の端末へ届ける。
@@ -490,8 +490,8 @@ mod tests {
             .as_str()
             .expect("version should be a string");
 
-        assert_eq!(version_text(), format!("QueryFolio {expected}"));
-        assert!(help_text().starts_with(&format!("QueryFolio {expected} ")));
+        assert_eq!(version_text(), format!("Queryfolio {expected}"));
+        assert!(help_text().starts_with(&format!("Queryfolio {expected} ")));
     }
 
     #[test]

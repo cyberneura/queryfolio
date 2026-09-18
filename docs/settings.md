@@ -1,6 +1,6 @@
 # Settings
 
-QueryFolio is configured through a single YAML file. This page explains where that
+Queryfolio is configured through a single YAML file. This page explains where that
 file lives and every key it accepts.
 
 For a ready-to-copy starting point, see [`config.example.yaml`](../config.example.yaml)
@@ -35,9 +35,9 @@ The config file lives at:
 
 `config.yaml` (the `.yaml` spelling) is also accepted; `config.yml` takes
 precedence when both exist. On first launch, if neither file is present,
-QueryFolio creates a starter `config.yml` for you.
+Queryfolio creates a starter `config.yml` for you.
 
-Because the file can contain plaintext passwords and other secrets, QueryFolio
+Because the file can contain plaintext passwords and other secrets, Queryfolio
 writes it with `0600` permissions (owner read/write only) on macOS/Linux. If an
 existing file has looser permissions, they are tightened to `0600` on load and on
 save. (On Windows, the platform's default file permissions apply.)
@@ -121,7 +121,7 @@ servers:
   Format, auto LIMIT, AI features, and the TABLES pane all work as for the
   other SQL engines. Like SQLite, put the **file path** in `schema` (`~` is
   expanded; if `schema` is omitted, `host` is used as the file path instead).
-  The file must already exist — QueryFolio does not create a new database
+  The file must already exist — Queryfolio does not create a new database
   file. `port` / `user` / `password` / `ssh_tunnel` are not used. Cell editing
   in the results grid is not available for DuckDB.
 
@@ -184,7 +184,7 @@ servers:
   **PartiQL** (DynamoDB's SQL-compatible language: `SELECT` / `INSERT` /
   `UPDATE` / `DELETE`) through the ExecuteStatement API, so the regular SQL
   editor, Format, and the `.sql` query-file extension are used. PartiQL has no
-  `LIMIT` clause; QueryFolio bounds the result with the API's page limit and
+  `LIMIT` clause; Queryfolio bounds the result with the API's page limit and
   reports truncation instead (no auto LIMIT is appended). `schema` is the
   **AWS region** (required). Credentials are resolved in this order:
   1. `user` / `password` as a static access key ID / secret access key,
@@ -370,7 +370,7 @@ password, private key, or (by default) the SSH agent.
 | `identity_agent` | ssh-agent socket to use (queryfolio extension, like OpenSSH's `IdentityAgent`). Use `none` to disable the agent. When omitted, it is resolved from `~/.ssh/config` (`IdentityAgent`) and then `$SSH_AUTH_SOCK`. Useful when the app is launched from Finder/Dock and does not inherit the right socket (e.g. the 1Password SSH agent). |
 
 **2. Delegate to the system `ssh` client (`ssh_config`).** Set `ssh_config` to a
-`Host` alias from your `~/.ssh/config`. QueryFolio then runs the system `ssh`
+`Host` alias from your `~/.ssh/config`. Queryfolio then runs the system `ssh`
 client (`ssh -N -L`) instead of libssh2, so **ProxyJump / multi-hop tunnels** and
 full `HostName` / `User` / `Port` resolution are handled by OpenSSH.
 
@@ -477,7 +477,7 @@ Notes:
   `/opt/homebrew/bin` and `/usr/local/bin`. It has a 60-second timeout.
 - The merged config is cached once per session (the getter can take a few seconds
   plus Touch ID), and cleared on reload.
-- If the key exists but is not a non-empty string, that is an error (QueryFolio
+- If the key exists but is not a non-empty string, that is an error (Queryfolio
   will not silently fall back to the local-only config).
 - Menu bar **Config → View override config yaml (Copy only)** appears when
   this key is set. It runs the command every time and shows the fetched YAML for
@@ -589,7 +589,7 @@ Sub-query `LIMIT`s, `FOR UPDATE`, and similar cases are skipped conservatively.
 
 ## Query file storage (`sqlfiles_dir`, `folder_name`)
 
-QueryFolio auto-saves per-connection query files as
+Queryfolio auto-saves per-connection query files as
 `<sqlfiles_dir>/<folder>/<name>.sql`.
 
 ```yaml

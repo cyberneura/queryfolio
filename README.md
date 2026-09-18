@@ -1,4 +1,4 @@
-# QueryFolio
+# Queryfolio
 
 SQL client desktop app. A lightweight, multi-purpose SQL GUI client.
 
@@ -9,7 +9,7 @@ UI rather than left as dead buttons.
 
 https://github.com/user-attachments/assets/90439816-49c8-4ebd-a068-b102cfe9c7aa
 
-![QueryFolio screenshot](docs/screenshot.png)
+![Queryfolio screenshot](docs/screenshot.png)
 
 ## Features
 
@@ -124,7 +124,7 @@ queryfolio write reporting monthly.sql
 ```
 
 - The connection name is the `name` of a server in the config; the file gets the connection engine's extension (`.sql` / `.redis` / `.es`) if it is missing, and the connection's folder is created if needed.
-- Content is written only when it is actually given. An **empty** stdin is treated as "no content" so that a GUI launch (`open -a QueryFolio --args write ...`, whose stdin is `/dev/null`) cannot silently blank an existing file. Existing content is otherwise overwritten.
+- Content is written only when it is actually given. An **empty** stdin is treated as "no content" so that a GUI launch (`open -a Queryfolio --args write ...`, whose stdin is `/dev/null`) cannot silently blank an existing file. Existing content is otherwise overwritten.
 - The file is written by the process you launch, before the running window is asked to open it — stdin cannot be forwarded to an already-running instance. If writing fails (unknown connection, invalid name, stdin larger than 10 MiB, I/O error), the reason is printed to stderr and the command exits non-zero without opening anything.
 - `write` is **CLI-only**: there is no `queryfolio://write/...` URL. A web page can make the browser open a `queryfolio://` URL, and dropping arbitrary SQL into the query files directory that way would be a trap waiting for the next person who runs it.
 
@@ -150,20 +150,20 @@ On Windows the release build is linked as a GUI application and has no console o
 
 Two consequences of that remain, and they are deliberate rather than oversights: because the shell does not wait for a GUI-subsystem program, in an interactive `cmd.exe` or PowerShell session the output can arrive after the prompt has already been redrawn, and `%ERRORLEVEL%` / `$LASTEXITCODE` will not carry the exit code of the option you ran. Removing them would mean shipping a second, console-subsystem executable in the installer, which puts a console window on every GUI launch. Use `Start-Process -Wait queryfolio -ArgumentList '--list-servers'` when you need the shell to wait.
 
-On macOS, call the binary inside the bundle — `open -a QueryFolio --args --list-servers` does not give you the output back:
+On macOS, call the binary inside the bundle — `open -a Queryfolio --args --list-servers` does not give you the output back:
 
 ```shell
-/Applications/QueryFolio.app/Contents/MacOS/queryfolio --list-servers
+/Applications/Queryfolio.app/Contents/MacOS/queryfolio --list-servers
 ```
 
 An option is only recognised before a subcommand, so `queryfolio write conn a.sql "-- help"` writes that content instead of printing the help.
 
 ## Agent skill
 
-The repository ships a skill that teaches an AI coding agent how QueryFolio stores things on
+The repository ships a skill that teaches an AI coding agent how Queryfolio stores things on
 disk — the query file layout, the connection → folder mapping, the CLI above, the query
 history, and the `-- 📝` **Run and Log** marker, which is how an agent gets the result of a
-query it cannot run itself: it writes the marked SQL, you run it in QueryFolio, and the result
+query it cannot run itself: it writes the marked SQL, you run it in Queryfolio, and the result
 is written back into the same file as a block comment for the agent to read.
 
 | Skill | What it covers |
@@ -183,9 +183,9 @@ npx skills add cyberneura/queryfolio --skill queryfolio -g # into ~/<agent>/skil
 
 Use `--skill queryfolio` to install just this one: the repository also carries an internal
 release-workflow skill under `.claude/skills/`, which the CLI lists as well but which is only
-useful when working on QueryFolio itself.
+useful when working on Queryfolio itself.
 
-Installing the skill does not install QueryFolio; see [Install](#install) for that.
+Installing the skill does not install Queryfolio; see [Install](#install) for that.
 
 ## Development
 
@@ -209,9 +209,9 @@ brew install --cask cyberneura/tap/queryfolio
 
 Grab the latest installer from the [Releases page](https://github.com/cyberneura/queryfolio/releases/latest):
 
-- **macOS**: `QueryFolio_<version>_universal.dmg` (Apple Silicon + Intel). Signed with a
+- **macOS**: `Queryfolio_<version>_universal.dmg` (Apple Silicon + Intel). Signed with a
   Developer ID certificate and notarized by Apple, so it opens without a Gatekeeper warning.
-- **Windows**: `QueryFolio_<version>_x64-setup.exe` (NSIS installer). It is *not* code signed,
+- **Windows**: `Queryfolio_<version>_x64-setup.exe` (NSIS installer). It is *not* code signed,
   so SmartScreen shows "Windows protected your PC" — choose **More info › Run anyway**.
 
 ## Release
