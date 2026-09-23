@@ -66,6 +66,16 @@ impl SshTunnel {
                     "ssh_tunnel.ssh_config must not be empty".into(),
                 ));
             }
+            // `-` 始まりのエイリアスは ssh にオプションとして解釈される
+            // (`-oProxyCommand=...` で任意コマンド実行になる)。ssh_config は
+            // config_override_command が取得する YAML からも設定できるため、
+            // 取得 YAML にコマンドを実行させないという境界を守るために弾く。
+            // argv 側でも `--` で区切っている (start_system_ssh 参照)。
+            if alias.starts_with('-') {
+                return Err(AppError::Config(
+                    "ssh_tunnel.ssh_config must not start with '-'".into(),
+                ));
+            }
             return start_system_ssh(alias, target_host, target_port);
         }
 
@@ -156,6 +166,8 @@ fn start_system_ssh(
         .arg(format!("ConnectTimeout={connect_timeout_secs}"))
         .arg("-L")
         .arg(&forward)
+        // これ以降をオプションとして解釈させない (エイリアスによる引数注入の防止)
+        .arg("--")
         .arg(alias)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1264,6 +1276,29 @@ mod tests {
             SshTunnel::start(&cfg, "localhost", 5432),
             Err(AppError::Config(_))
         ));
+    }
+
+    /// `-` 始まりの ssh_config は ssh のオプションとして解釈されるため、
+    /// spawn せずに設定エラーを返すこと (取得 YAML からの引数注入の回帰テスト)。
+    #[test]
+    fn start_rejects_ssh_config_starting_with_dash() {
+        for alias in ["-oProxyCommand=touch /tmp/queryfolio-pwned", "  -F/dev/null"] {
+            let cfg = SshTunnelConfig {
+                host: String::new(),
+                port: 22,
+                user: String::new(),
+                ssh_config: Some(alias.into()),
+                password: None,
+                private_key_path: None,
+                private_key_passphrase: None,
+                identity_agent: None,
+            };
+            match SshTunnel::start(&cfg, "localhost", 5432) {
+                Err(AppError::Config(msg)) => assert!(msg.contains("must not start with '-'")),
+                Err(e) => panic!("expected AppError::Config for {alias:?}, got {e}"),
+                Ok(_) => panic!("expected AppError::Config for {alias:?}, got Ok"),
+            }
+        }
     }
 
     /// ssh_config も host も無ければ (libssh2 経路で host 必須) エラーを返すこと。
