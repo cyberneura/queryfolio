@@ -24,8 +24,8 @@
   import { vscodeMultiSelection } from "$lib/editor/vscodeEditing";
   import { redisLanguage } from "$lib/editor/redisLanguage";
   import { esLanguage } from "$lib/editor/esLanguage";
-  import { findRunLogLabel, runLogWrite } from "$lib/runLog";
-  import type { RunTarget } from "$lib/runLog";
+  import { findRunLogLabel, planRunLogWrite } from "$lib/runLog";
+  import type { RunLogOutcome, RunTarget } from "$lib/runLog";
 
   interface Props {
     content: string;
@@ -389,21 +389,9 @@
     };
   };
 
-  /// 書き戻しの結果。stale = 対象範囲がズレた (書かない)、
-  /// unmarked = 📝 マーカーが消えていた (書かない)、
-  /// broken = 既存ログブロックが `*/` で閉じていない (書かない)
-  export type RunLogOutcome = "written" | "stale" | "unmarked" | "broken";
-
   /// 実行した文の直後へ結果ログのブロックコメントを書き戻す公開メソッド。
-  ///
-  /// クエリの実行中に編集・ファイル切替が起きていると target の範囲は
-  /// 別の場所を指すため、範囲のテキストが実行した SQL と一致する時だけ書く
-  /// (replaceRangeIfMatches と同じ考え方)。
-  ///
-  /// **ラベルは書き戻す時点の本文から取り直す。** SQL 本体が変わらなくても
-  /// マーカー行だけは編集されうるうえ、同じ長さの書き換え (`Step 1` →
-  /// `Step 2`) では範囲の照合を素通りする。マーカーごと消されていれば
-  /// 書き戻しの取り消しなので、何も書かずに unmarked を返す。
+  /// 書けるかどうかの判定 (範囲の照合・ラベルの取り直し) は
+  /// planRunLogWrite (runLog.ts) を参照。
   ///
   /// カーソル位置とフォーカスは動かさない — 書き戻しは実行完了後の非同期な
   /// 差し込みなので、その間にユーザーが別の場所を編集していることがある。
@@ -414,23 +402,9 @@
     if (!view) {
       return "stale";
     }
-    const state = view.state;
-    if (
-      target.from < 0 ||
-      target.to < target.from ||
-      target.to > state.doc.length ||
-      state.sliceDoc(target.from, target.to) !== target.sql
-    ) {
-      return "stale";
-    }
-    const doc = state.doc.toString();
-    const label = findRunLogLabel(doc, target.from, target.to);
-    if (label === null) {
-      return "unmarked";
-    }
-    const write = runLogWrite(doc, target.to, buildBlock(label));
-    if (!write) {
-      return "broken";
+    const write = planRunLogWrite(view.state.doc.toString(), target, buildBlock);
+    if (typeof write === "string") {
+      return write;
     }
     view.dispatch({
       changes: { from: write.from, to: write.to, insert: write.insert },

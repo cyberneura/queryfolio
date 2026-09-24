@@ -9,6 +9,8 @@ import type {
   QueryResult,
 } from "$lib/api";
 import { merge3 } from "$lib/mergeText";
+import { planRunLogWrite } from "$lib/runLog";
+import type { RunLogOutcome, RunTarget } from "$lib/runLog";
 import {
   buildCycleOrder,
   forgetMru,
@@ -1387,6 +1389,81 @@ const updateEditorContent = (content: string) => {
   }
 };
 
+/// `-- 📝` の結果ログを、実行後に**非アクティブになったタブ**へ書き戻す
+/// (CYBERNEURA-DEV-858)。アクティブなタブへの書き戻しは SqlEditor.writeRunLog が
+/// 行う (編集中のカーソルを保つため CodeMirror の変更として入れる)。
+///
+/// エディタを経由せずタブの本文 (tab.content) を直接書き換える。判定はエディタ経路と
+/// 同じ planRunLogWrite (範囲の照合・ラベルの取り直し) に加えて:
+/// - タブが閉じられている / 別接続へ移っている → 書かない (stale)
+/// - 実行した接続のアクティブスキーマが実行開始時から変わっている → 書かない
+///   (別接続を開いている間は activeSchema が別接続のものなので、バックエンドに訊く)
+/// - 外部変更と衝突中のタブ → 書かない (conflicted)。解消はユーザーの明示操作に委ねる
+///
+/// 未編集の CRLF ファイルは tab.content が CRLF のままだが、CodeMirror は LF に
+/// 正規化した位置で target を作るので、照合の前に LF へ揃える。
+///
+/// スキーマの問い合わせを待つ間にそのタブがアクティブに戻ったら "active" を返す
+/// (呼び出し側がエディタ経路で書き直す。表示中の本文を丸ごと差し替えない)。
+///
+/// 書いたら即座に保存する。自動保存の予約は 1 タブ分しか持てないので、ここで
+/// 予約すると編集中の別タブの予約を奪ってしまう。
+const writeRunLogToInactiveTab = async (
+  tabId: number,
+  connection: string,
+  expectedSchema: string | null,
+  target: RunTarget,
+  buildBlock: (label: string) => string,
+): Promise<RunLogOutcome | "active"> => {
+  const findTab = () =>
+    editorTabs.find((t) => t.id === tabId && t.connection === connection);
+  if (!findTab()) {
+    return "stale";
+  }
+  let schema: string | null = activeSchema;
+  if (selectedConnection !== connection) {
+    // applyConnectionContext と同じ解決 (override が無ければ設定の既定値)
+    const defaultSchema =
+      connections.find((c) => c.name === connection)?.schema ?? null;
+    try {
+      schema = (await api.getActiveSchema(connection)) ?? defaultSchema;
+    } catch {
+      return "stale";
+    }
+    // 待つ間にその接続へ戻っていれば、フロントの値が最新
+    if (selectedConnection === connection) {
+      schema = activeSchema;
+    }
+  }
+  const tab = findTab();
+  if (!tab) {
+    return "stale";
+  }
+  if (activeEditorTabId === tabId) {
+    return "active";
+  }
+  if (schema !== expectedSchema) {
+    return "stale";
+  }
+  if (tab.conflicted) {
+    return "conflicted";
+  }
+  // CodeMirror と同じく改行を LF に揃えてから照合する (target の位置は LF 基準)。
+  // エディタ経路で書いた場合も doc.toString() が LF で返るので、結果は同じになる
+  const doc = tab.content.replace(/\r\n?/g, "\n");
+  const write = planRunLogWrite(doc, target, buildBlock);
+  if (typeof write === "string") {
+    return write;
+  }
+  tab.content = doc.slice(0, write.from) + write.insert + doc.slice(write.to);
+  tab.dirty = true;
+  // このタブに古い予約が残っていれば外す (下で今の内容を保存するので重複になる)
+  cancelPendingSaveFor(tabId);
+  // CAS 保存。失敗しても dirty のままタブに残り、errorMessage で知らせる
+  void saveEditorTab(tab);
+  return "written";
+};
+
 /// 履歴パネル・スキーマブラウザからの SQL 断片の挿入。
 /// 開いているファイルの末尾に追記する (既存の編集内容を上書きしないよう、
 /// 置換ではなく追記にする)。実行はしない。挿入できたら true を返す。
@@ -2605,6 +2682,7 @@ export default {
   discardActiveFileConflict,
   overwriteActiveFileConflict,
   updateEditorContent,
+  writeRunLogToInactiveTab,
   insertSqlSnippet,
   fixSqlWithAi,
   applyFixSuggestion,
