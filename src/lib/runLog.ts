@@ -261,3 +261,47 @@ export const runLogWrite = (
   }
   return { from: anchor, to, insert: `\n\n${block}\n\n` };
 };
+
+/// 書き戻しの結果。stale = 対象範囲がズレた (書かない)、
+/// unmarked = 📝 マーカーが消えていた (書かない)、
+/// broken = 既存ログブロックが `*/` で閉じていない (書かない)、
+/// conflicted = 書き込み先のタブが外部変更と衝突中 (書かない)
+export type RunLogOutcome =
+  | "written"
+  | "stale"
+  | "unmarked"
+  | "broken"
+  | "conflicted";
+
+/// 本文 doc に対して、実行対象 target の直後へログを書く変更を組み立てる。
+/// 書けない場合はその理由 (RunLogOutcome) を返す。
+///
+/// クエリの実行中に編集・ファイル切替が起きていると target の範囲は
+/// 別の場所を指すため、範囲のテキストが実行した SQL と一致する時だけ書く。
+///
+/// **ラベルは書き戻す時点の本文から取り直す。** SQL 本体が変わらなくても
+/// マーカー行だけは編集されうるうえ、同じ長さの書き換え (`Step 1` →
+/// `Step 2`) では範囲の照合を素通りする。マーカーごと消されていれば
+/// 書き戻しの取り消しなので、何も書かずに unmarked を返す。
+///
+/// エディタ (表示中のタブ) と、非アクティブなタブの本文 (store) の
+/// 両方から使う。
+export const planRunLogWrite = (
+  doc: string,
+  target: RunTarget,
+  buildBlock: (label: string) => string,
+): RunLogWrite | "stale" | "unmarked" | "broken" => {
+  if (
+    target.from < 0 ||
+    target.to < target.from ||
+    target.to > doc.length ||
+    doc.slice(target.from, target.to) !== target.sql
+  ) {
+    return "stale";
+  }
+  const label = findRunLogLabel(doc, target.from, target.to);
+  if (label === null) {
+    return "unmarked";
+  }
+  return runLogWrite(doc, target.to, buildBlock(label)) ?? "broken";
+};

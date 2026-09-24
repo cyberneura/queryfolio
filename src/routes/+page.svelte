@@ -10,7 +10,7 @@
     formatRunLogTimestamp,
     runLogBody,
   } from "$lib/runLog";
-  import type { RunLogChoice, RunTarget } from "$lib/runLog";
+  import type { RunLogChoice, RunLogOutcome, RunTarget } from "$lib/runLog";
   import appStore from "$lib/stores/app.svelte";
   import Toolbar from "$lib/components/Toolbar.svelte";
   import EditorToolbar from "$lib/components/EditorToolbar.svelte";
@@ -135,6 +135,9 @@
     // 切り替えられると、タブも SQL も変わらないまま切替前のスキーマの結果が
     // ファイルに残り、後から読んだ人には現在のスキーマの結果に見える
     const schema = appStore.activeSchema;
+    // 実行先の接続も控える (非アクティブになったタブへ書く時に、タブが別接続へ
+    // 移っていないかを照合する)
+    const connection = appStore.selectedConnection;
     const result = await appStore.runQuery(target.sql);
     if (!result || target.logLabel === null) {
       return;
@@ -158,15 +161,30 @@
     // `\c` / `USE` は実行そのものが切替なので、その文が切り替えた先は
     // 「変わっていない」とみなす (この結果は切替後のスキーマのもの)
     const expectedSchema = result.switched_schema ?? schema;
-    const outcome =
-      appStore.activeEditorTabId === tabId &&
-      appStore.activeSchema === expectedSchema
-        ? (editor?.writeRunLog(target, buildBlock) ?? "stale")
-        : "stale";
+    // 実行中に別のタブへ移っていたら、そのタブの本文へ直接書く
+    // (CYBERNEURA-DEV-858)。照合の条件はエディタ経路と同じで、
+    // 待つ間にタブへ戻ってきたら "active" が返るのでエディタ経路で書く
+    let outcome: RunLogOutcome | "active" = "active";
+    if (tabId !== null && connection !== null && appStore.activeEditorTabId !== tabId) {
+      outcome = await appStore.writeRunLogToInactiveTab(
+        tabId,
+        connection,
+        expectedSchema,
+        target,
+        buildBlock,
+      );
+    }
+    if (outcome === "active") {
+      outcome =
+        appStore.activeEditorTabId === tabId &&
+        appStore.activeSchema === expectedSchema
+          ? (editor?.writeRunLog(target, buildBlock) ?? "stale")
+          : "stale";
+    }
     switch (outcome) {
       case "stale":
-        // 実行中に編集・タブ切替が起きて対象がズレた場合。無関係な位置へ
-        // 書き込むより、書かずに知らせる方が安全
+        // 実行中に編集・タブのクローズ・スキーマ切替が起きて対象がズレた場合。
+        // 無関係な位置へ書き込むより、書かずに知らせる方が安全
         toast.warning(
           "The editor changed while the query was running — the log was not written.",
         );
@@ -177,6 +195,11 @@
       case "broken":
         toast.warning(
           "The existing log block is missing its closing */ — the log was not written.",
+        );
+        break;
+      case "conflicted":
+        toast.warning(
+          "The file has unresolved external changes — the log was not written.",
         );
         break;
     }

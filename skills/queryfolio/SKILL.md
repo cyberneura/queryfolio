@@ -257,8 +257,10 @@ d	count
   do not strip a leading `'` unconditionally — a value that really starts with `'` is written
   unchanged. Drop it only when the character after it is `=` `+` `-` or `@`.
 - The write-back happens **asynchronously after the run**, and is skipped (with a toast to the
-  user, nothing written) when the editor tab changed, the active schema changed, or the text
-  of the executed range no longer matches. Editing the file from outside while the user is
+  user, nothing written) when the tab was closed, the active schema changed, the file has
+  unresolved external changes, or the text of the executed range no longer matches. Switching
+  to another tab while the query runs is fine — the log is written into the tab that ran it
+  and saved. Editing the file from outside while the user is
   running it is the usual way to lose the result. If the marker itself was deleted during the
   run, that is treated as a cancellation and nothing is written.
 - **If the log block directly below the statement is missing its closing `*/`, nothing is
