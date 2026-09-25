@@ -86,7 +86,7 @@ default_limit: 500   # auto-appended to SELECTs without LIMIT (0 = disabled)
 ai:
   provider: openai   # only openai is supported for now
   api_key: sk-your-api-key
-  model: gpt-5.6-luna   # optional (default: gpt-5.6-luna)
+  model: gpt-6-luna     # optional (default: gpt-6-luna)
   base_url: https://api.openai.com/v1  # optional (for OpenAI-compatible APIs)
 ```
 
