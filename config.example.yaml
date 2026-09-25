@@ -262,9 +262,9 @@ server_templates:
 # ai:
 #   provider: openai   # 現状 openai のみ対応
 #   api_key: sk-your-api-key
-#   model: gpt-5.6-luna   # 任意 (省略時 gpt-5.6-luna)
+#   model: gpt-6-luna     # 任意 (省略時 gpt-6-luna)
 #   base_url: https://api.openai.com/v1  # 任意 (OpenAI 互換 API 用)
-#   # AI チャットは function calling を使う。gpt-5.x 系の推論モデルは
+#   # AI チャットは function calling を使う。gpt-6-luna 等の推論モデルは
 #   # /v1/chat/completions で tools を使う場合 reasoning_effort が "none" でないと
 #   # エラーになるため、接続先が OpenAI 公式なら省略時に "none" を送る。
 #   # base_url で OpenAI 互換 API を指している場合は、明示指定した時だけ送る
@@ -272,6 +272,8 @@ server_templates:
 #   # 空文字を指定すると常に送らない。
 #   # なお reasoning_effort が原因で拒否された場合は、そのパラメータを外して
 #   # 自動で 1 度だけ再送するため、受け付けないモデルでも設定変更なしで動く。
+#   # ただし gpt-6-astra は "none" を受け付けず、外すと tools 併用の制約で拒否される
+#   # ため、AI チャットには使えない (SQL 生成 / EXPLAIN 解説は tools を使わない)。
 #   tool_reasoning_effort: none   # 任意 ("" で送らない)
 
 # --- LIMIT 未指定の SELECT に自動付与する行数上限 (任意。デフォルト 500、0 で無効) ---

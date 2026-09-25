@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::AppError;
 
 /// model 省略時に使う OpenAI のデフォルトモデル。
-pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.6-luna";
+pub const DEFAULT_OPENAI_MODEL: &str = "gpt-6-luna";
 
 /// base_url 省略時の OpenAI API ベース URL。
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -17,15 +17,19 @@ const AI_REQUEST_TIMEOUT_SECS: u64 = 60;
 /// 接続先が OpenAI 公式の時に、tools (function calling) 付きのリクエストへ
 /// 付ける reasoning_effort のデフォルト。
 ///
-/// gpt-5.6-luna / gpt-5.6-terra のような推論モデルは、/v1/chat/completions で
-/// tools を使う場合 reasoning_effort が "none" でないと 400 を返す:
+/// gpt-6-luna / gpt-6-sol / gpt-5.6-luna / gpt-5.6-terra のような推論モデルは、
+/// /v1/chat/completions で tools を使う場合 reasoning_effort が "none" でないと
+/// 400 を返す:
 ///
-/// > Function tools with reasoning_effort are not supported for gpt-5.6-luna in
+/// > Function tools with reasoning_effort are not supported for gpt-6-luna in
 /// > /v1/chat/completions. To use function tools, use /v1/responses or set
 /// > reasoning_effort to 'none'.
 ///
 /// tools を渡すのは AI チャットだけなので、SQL 生成や EXPLAIN 解説の推論には
 /// 影響しない (そちらのリクエストには reasoning_effort を付けない)。
+///
+/// gpt-6-astra は "none" 自体を受け付けないため、/v1/chat/completions では
+/// tools を使えない (AI チャットは 400 になる)。
 const DEFAULT_TOOL_REASONING_EFFORT: &str = "none";
 
 /// エラーメッセージに含める API レスポンス本文の最大長。
@@ -288,7 +292,7 @@ impl From<ApiErrorResponse> for AppError {
 /// エラー応答が「reasoning_effort を受け付けない」ことによる拒否かを判定する。
 ///
 /// どの値なら通るかはモデルごとに違い、こちらから網羅的に把握できない
-/// (gpt-5.x 系は tools と併用するなら "none" が必須、gpt-4o 系はそもそも
+/// (gpt-6-luna 等は tools と併用するなら "none" が必須、gpt-4o 系はそもそも
 /// このパラメータを受け付けない)。モデル名の一覧を持ち回るのは
 /// 新モデルが出るたび破綻するので、拒否されたら外して 1 度だけやり直す。
 fn rejects_reasoning_effort(error: &ApiErrorResponse) -> bool {
@@ -820,11 +824,11 @@ mod tests {
 
     #[test]
     fn test_rejects_reasoning_effort_detects_parameter_rejection() {
-        // gpt-5.x 系で tools と併用した時のエラー (今回の不具合の発端)
+        // 推論モデルで reasoning_effort を省いて tools を渡した時のエラー
         let unsupported_combination = ApiErrorResponse {
             status: 400,
             body: "{\"error\":{\"message\":\"Function tools with reasoning_effort are not \
-                   supported for gpt-5.6-luna in /v1/chat/completions.\",\
+                   supported for gpt-6-luna in /v1/chat/completions.\",\
                    \"param\":\"reasoning_effort\"}}"
                 .into(),
         };
