@@ -24,6 +24,7 @@
   import ResultsPane from "$lib/components/ResultsPane.svelte";
   import ConfigInfoModal from "$lib/components/ConfigInfoModal.svelte";
   import ConfigEditorModal from "$lib/components/ConfigEditorModal.svelte";
+  import LicensesModal from "$lib/components/LicensesModal.svelte";
   import AiAnalysisModal from "$lib/components/AiAnalysisModal.svelte";
   import DangerousConfirmModal from "$lib/components/DangerousConfirmModal.svelte";
   import RunLogConfirmModal from "$lib/components/RunLogConfirmModal.svelte";
@@ -34,6 +35,8 @@
 
   let showSettings = $state(false);
   let showSearch = $state(false);
+  /// メニューの Third-Party Licenses から開くライセンス一覧
+  let showLicenses = $state(false);
   /// 設定エディタ。null = 閉じている
   let configEditorMode = $state<"config" | "source" | null>(null);
   /// 設定エディタに未保存の変更があるか (モード切替で巻き添え破棄しないため)
@@ -60,6 +63,7 @@
   const isModalOpen = () =>
     showSearch ||
     showSettings ||
+    showLicenses ||
     configEditorMode !== null ||
     appStore.aiAnalysis !== null ||
     appStore.aiExplanation !== null ||
@@ -374,6 +378,10 @@
     const unlistenEditSourcePromise = listen("menu-view-override-config", () => {
       openConfigEditor("source");
     });
+    // メニューの Third-Party Licenses (macOS はアプリメニュー、他は Help の About の直下)
+    const unlistenLicensesPromise = listen("menu-show-licenses", () => {
+      showLicenses = true;
+    });
 
     // メニューの Close Tab (Cmd+W / Ctrl+W)。ウインドウは閉じず、アクティブな
     // エディタタブだけを閉じる。タブが無ければ何もしない。モーダルが開いている間も
@@ -467,6 +475,7 @@
       void unlistenPromise.then((unlisten) => unlisten());
       void unlistenEditPromise.then((unlisten) => unlisten());
       void unlistenEditSourcePromise.then((unlisten) => unlisten());
+      void unlistenLicensesPromise.then((unlisten) => unlisten());
       void unlistenCloseTabPromise.then((unlisten) => unlisten());
       void unlistenOpenFilePromise.then((unlisten) => unlisten());
       void unlistenOpenFileErrPromise.then((unlisten) => unlisten());
@@ -733,6 +742,14 @@
   <ConfigInfoModal
     onClose={() => {
       showSettings = false;
+    }}
+  />
+{/if}
+
+{#if showLicenses}
+  <LicensesModal
+    onClose={() => {
+      showLicenses = false;
     }}
   />
 {/if}

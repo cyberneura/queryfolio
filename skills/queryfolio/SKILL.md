@@ -25,6 +25,7 @@ at all.
 queryfolio --list-servers   # query files directory + one row per connection
 queryfolio --help           # usage, including the open / write subcommands
 queryfolio --version
+queryfolio --license        # licenses of the bundled third-party libraries
 ```
 
 `--list-servers` prints `Query files directory: <path>` first, then a table:

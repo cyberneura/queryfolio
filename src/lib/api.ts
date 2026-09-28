@@ -386,6 +386,9 @@ export const frontendReady = () => invoke<LaunchResult>("frontend_ready");
 
 export const getConfigInfo = () => invoke<ConfigInfo>("get_config_info");
 
+/// 配布物に同梱している依存ライブラリのライセンス一覧 (THIRD-PARTY-NOTICES.txt の本文)。
+export const getThirdPartyNotices = () => invoke<string>("third_party_notices");
+
 /// config.yml が無ければテンプレートを作成する。作成した場合はそのパスを返す。
 export const ensureConfigFile = () =>
   invoke<string | null>("ensure_config_file");

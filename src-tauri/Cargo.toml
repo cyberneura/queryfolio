@@ -3,6 +3,9 @@ name = "queryfolio"
 version = "0.1.0"
 description = "A SQL client desktop app"
 authors = ["ytyng"]
+license = "MIT"
+# crates.io には出さない。cargo-about が自分自身を一覧に載せないための印でもある (about.toml の private)
+publish = false
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

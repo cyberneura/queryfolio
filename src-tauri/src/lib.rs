@@ -10,6 +10,7 @@ mod folder_meta;
 mod query_files;
 mod router;
 mod schema_info;
+mod third_party_notices;
 mod tunnel;
 
 use std::path::PathBuf;
@@ -1768,6 +1769,12 @@ fn dispatch_route(app: &tauri::AppHandle, route: router::Route, cwd: Option<Path
     });
 }
 
+/// 配布物に同梱している依存ライブラリのライセンス一覧 (Third-Party Licenses のモーダル)。
+#[tauri::command]
+fn third_party_notices() -> &'static str {
+    third_party_notices::NOTICES
+}
+
 /// About ダイアログに出すメタ情報 (tauri の Menu::default と同じ内容)。
 fn about_metadata(app: &tauri::AppHandle) -> tauri::menu::AboutMetadata<'_> {
     let package_info = app.package_info();
@@ -1807,6 +1814,9 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
     )
     .build(app)?;
     let show_source_item = config::has_config_override_command();
+    // About の直下に置く (macOS はアプリメニュー、他は Help メニュー)
+    let licenses_item =
+        MenuItemBuilder::with_id("show_licenses", "Third-Party Licenses").build(app)?;
 
     #[cfg(target_os = "macos")]
     let app_menu = {
@@ -1819,6 +1829,7 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
                 None,
                 Some(about_metadata(app)),
             )?)
+            .item(&licenses_item)
             .separator()
             .services()
             .separator()
@@ -1867,7 +1878,9 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
     let help_menu = {
         let builder = SubmenuBuilder::with_id(app, tauri::menu::HELP_SUBMENU_ID, "Help");
         #[cfg(not(target_os = "macos"))]
-        let builder = builder.about(Some(about_metadata(app)));
+        let builder = builder
+            .about(Some(about_metadata(app)))
+            .item(&licenses_item);
         builder.build()?
     };
 
@@ -2065,6 +2078,10 @@ fn run_info_command(command: cli::InfoCommand) -> i32 {
             println!("{}", cli::version_text());
             0
         }
+        cli::InfoCommand::License => {
+            print!("{}", third_party_notices::NOTICES);
+            0
+        }
         cli::InfoCommand::ListServers => {
             let result = tauri::async_runtime::block_on(async {
                 let config = AppConfig::load_merged().await?;
@@ -2107,7 +2124,7 @@ pub fn run() {
     // (config_override_command を 1 起動で 2 度実行しない)。
     let preflight_config = {
         let argv: Vec<String> = std::env::args().skip(1).collect();
-        // --help / --version / --list-servers は表示だけして終わる
+        // --help / --version / --license / --list-servers は表示だけして終わる
         // (GUI もウインドウも起動しない)。write の書き出しより前に見る。
         if let Some(command) = cli::info_command_from_args(&argv) {
             std::process::exit(run_info_command(command));
@@ -2175,6 +2192,11 @@ pub fn run() {
             "close_editor_tab" => {
                 if let Err(e) = app.emit("menu-close-editor-tab", ()) {
                     eprintln!("[menu] failed to emit close editor tab event: {e}");
+                }
+            }
+            "show_licenses" => {
+                if let Err(e) = app.emit("menu-show-licenses", ()) {
+                    eprintln!("[menu] failed to emit show licenses event: {e}");
                 }
             }
             "view_override_config" => {
@@ -2260,6 +2282,7 @@ pub fn run() {
             ai_chat,
             cancel_ai_chat,
             get_config_info,
+            third_party_notices,
             ensure_config_file,
             read_config_file,
             write_config_file,
