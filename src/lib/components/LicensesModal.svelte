@@ -19,18 +19,23 @@
     }
   });
 
+  // ネイティブメニューから開くので、設定エディタ等の別モーダルの上に重なることがある。
+  // Escape はこのモーダルだけを閉じたいので、capture で先に受けて下のモーダル
+  // (と CodeMirror) へ届けない
   const onWindowKeydown = (e: KeyboardEvent) => {
     if (e.key === "Escape") {
       e.preventDefault();
+      e.stopPropagation();
       onClose();
     }
   };
 </script>
 
-<svelte:window onkeydown={onWindowKeydown} />
+<svelte:window onkeydowncapture={onWindowKeydown} />
 
+<!-- 他のモーダル (最大 z-50: ResultsPane のセル編集プレビュー) より上に出す -->
 <div
-  class="fixed inset-0 z-10 flex items-center justify-center bg-black/60"
+  class="fixed inset-0 z-[60] flex items-center justify-center bg-black/60"
   role="presentation"
   data-annotate="backdrop-licenses-modal"
   data-modal

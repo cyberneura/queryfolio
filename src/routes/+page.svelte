@@ -746,14 +746,6 @@
   />
 {/if}
 
-{#if showLicenses}
-  <LicensesModal
-    onClose={() => {
-      showLicenses = false;
-    }}
-  />
-{/if}
-
 <!-- 設定ファイルのエディタ (メニューから開く)。mode で保存できる config と、
      編集はできるが保存できない source を切り替える。
      モーダル表示中でもネイティブメニューは操作できるため、mode が切り替わったら
@@ -797,5 +789,15 @@
     rows={runLogConfirm.rows}
     limit={RUN_LOG_CONFIRM_ROWS}
     onChoose={resolveRunLogConfirm}
+  />
+{/if}
+
+<!-- Third-Party Licenses (メニューから開く)。ネイティブメニューはモーダル表示中でも
+     選べるので、他のモーダルより後ろに置いて一番上に出す (LicensesModal の z-index も参照) -->
+{#if showLicenses}
+  <LicensesModal
+    onClose={() => {
+      showLicenses = false;
+    }}
   />
 {/if}
