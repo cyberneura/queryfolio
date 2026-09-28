@@ -39,7 +39,7 @@ https://github.com/user-attachments/assets/90439816-49c8-4ebd-a068-b102cfe9c7aa
 - Window size / position restored across restarts
 - Open a saved query file by path from a `queryfolio://open/<path>` URL or the `queryfolio open <path>` CLI subcommand (restricted to files under the query files directory; reuses the running window)
 - Write and open a query file from the CLI with `queryfolio write <connection> <file-name> [content]` (content can also be piped in on stdin) — for AI agents that prepare a query for review
-- Inspect the configuration without launching the app: `queryfolio --help`, `queryfolio --version`, `queryfolio --list-servers`
+- Inspect the configuration without launching the app: `queryfolio --help`, `queryfolio --version`, `queryfolio --list-servers` (`queryfolio --license` prints the third-party licenses)
 
 ## Setup
 
@@ -135,6 +135,7 @@ These options print to stdout and exit without launching the app or touching an 
 ```shell
 queryfolio --help           # usage, including the open / write subcommands
 queryfolio --version
+queryfolio --license        # licenses of the bundled third-party libraries
 queryfolio --list-servers   # the configured connections
 ```
 
@@ -245,4 +246,25 @@ The cask in [cyberneura/homebrew-tap](https://github.com/cyberneura/homebrew-tap
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
+
+## Third-party licenses
+
+[`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt) lists the licenses of the libraries
+bundled into the app: every Rust crate compiled into the macOS and Windows binaries, the C / C++
+libraries some of those crates build from source and link statically (OpenSSL, libssh2,
+zlib, SQLite, and the libraries DuckDB vendors in its `third_party/`), and the npm packages bundled into the web view (`dependencies` in
+`package.json` with their dependencies, plus the Svelte / SvelteKit runtime, svelte-sonner,
+Tailwind CSS and Bootstrap Icons). It is compiled into the app and shown by
+"Third-Party Licenses" in the application menu on macOS (the Help menu on Windows), and by
+`queryfolio --license`. Regenerate it after adding or updating a dependency; the Rust tests
+fail if a direct dependency is missing from it or a listed version is not in the lock files.
+
+```shell
+cargo install cargo-about --locked --features cli   # once
+pnpm notices
+```
+
+The script needs network access: cargo-about fetches license files for some crates, and the
+licenses of DuckDB's vendored libraries are downloaded from the DuckDB repository at the tag
+of the bundled DuckDB version.

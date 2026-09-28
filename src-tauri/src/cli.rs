@@ -1,4 +1,4 @@
-//! GUI を起動せずに終わる CLI オプション (`--help` / `--version` / `--list-servers`)。
+//! GUI を起動せずに終わる CLI オプション (`--help` / `--version` / `--license` / `--list-servers`)。
 //!
 //! `open` / `write` のサブコマンド ([`crate::router`]) は「アプリを起動して
 //! ファイルを開く」ためのものだが、ここで扱うのは**標準出力に書いて終了する**
@@ -20,6 +20,8 @@ pub enum InfoCommand {
     Help,
     /// バージョンを表示する。
     Version,
+    /// 同梱している依存ライブラリのライセンス一覧を表示する。
+    License,
     /// 設定されている接続の一覧を表示する。
     ListServers,
 }
@@ -41,6 +43,7 @@ pub fn info_command_from_args<S: AsRef<str>>(args: &[S]) -> Option<InfoCommand> 
             "open" | "write" => return None,
             "--help" | "-h" | "help" => return Some(InfoCommand::Help),
             "--version" | "-V" => return Some(InfoCommand::Version),
+            "--license" => return Some(InfoCommand::License),
             "--list-servers" => return Some(InfoCommand::ListServers),
             _ => {}
         }
@@ -69,6 +72,7 @@ USAGE:
     queryfolio --list-servers                        List the configured connections
     queryfolio --help                                Show this help
     queryfolio --version                             Show the version
+    queryfolio --license                             Show the licenses of the bundled libraries
 
 OPEN
     <path> has to be a query file directly under a connection folder in the
@@ -448,6 +452,10 @@ mod tests {
         );
         assert_eq!(info_command_from_args(&["-V"]), Some(InfoCommand::Version));
         assert_eq!(
+            info_command_from_args(&["--license"]),
+            Some(InfoCommand::License)
+        );
+        assert_eq!(
             info_command_from_args(&["--list-servers"]),
             Some(InfoCommand::ListServers)
         );
@@ -503,6 +511,7 @@ mod tests {
             "--list-servers",
             "--help",
             "--version",
+            "--license",
         ] {
             assert!(help.contains(expected), "help should mention {expected}");
         }
