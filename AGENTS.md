@@ -192,10 +192,15 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
   `src-tauri/about.toml` の `targets` で配布ターゲット (mac / Windows) だけに絞っている。
   依存が多いので 1 回 6 分ほどかかる。`accepted` に無いライセンスが出たら `--fail` で止まる。
   **GPL / LGPL / AGPL 系を accepted に足さないこと** (配布条件が変わる)。
-- C のソースを同梱して静的リンクする crate (openssl-src / libssh2-sys / libz-sys /
-  libsqlite3-sys) は、crate のライセンスとは別に C ライブラリ側のライセンスを
+- C / C++ のソースを同梱して静的リンクする crate (openssl-src / libssh2-sys / libz-sys /
+  libsqlite3-sys / libduckdb-sys) は、crate のライセンスとは別に同梱ライブラリ側のライセンスを
   "Native libraries" 節に載せている (スクリプトの `NATIVE`)。vendored の C ライブラリを
   足したらここにも足す。
+- DuckDB は `third_party/` に 20 以上のライブラリを同梱するが、crate の tarball には
+  ライセンスファイルが無い。スクリプトが tarball の `DUCKDB_VERSION` を読み、同じタグの
+  DuckDB リポジトリ (GitHub) から取ってくる (ネットワークが要る)。**`DUCKDB_THIRD_PARTY` に
+  無いディレクトリが増えたら生成が止まる** — ライセンスを確かめてから SPDX を足すこと
+  (mbedtls のように GPL との二択のものは許容側を選んだことを書く。GPL のみのものなら人間に回す)。
 - npm 側は `dependencies` を推移的に全部と、devDependencies だが webview に bundle される
   もの (スクリプトの `BUNDLED_DEV_PACKAGES`)。後者は `vite build` の sourcemap に現れる
   パッケージから決めた。devDependencies に bundle されるものを足したらここにも足す。

@@ -251,9 +251,9 @@ MIT. See [LICENSE](LICENSE).
 ## Third-party licenses
 
 [`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt) lists the licenses of the libraries
-bundled into the app: every Rust crate compiled into the macOS and Windows binaries, the C
+bundled into the app: every Rust crate compiled into the macOS and Windows binaries, the C / C++
 libraries some of those crates build from source and link statically (OpenSSL, libssh2,
-zlib, SQLite), and the npm packages bundled into the web view (`dependencies` in
+zlib, SQLite, and the libraries DuckDB vendors in its `third_party/`), and the npm packages bundled into the web view (`dependencies` in
 `package.json` with their dependencies, plus the Svelte / SvelteKit runtime, svelte-sonner,
 Tailwind CSS and Bootstrap Icons). It is compiled into the app and shown by
 "Third-Party Licenses" in the application menu on macOS (the Help menu on Windows), and by
@@ -264,3 +264,7 @@ fail if a direct dependency is missing from it or a listed version is not in the
 cargo install cargo-about --locked --features cli   # once
 pnpm notices
 ```
+
+The script needs network access: cargo-about fetches license files for some crates, and the
+licenses of DuckDB's vendored libraries are downloaded from the DuckDB repository at the tag
+of the bundled DuckDB version.

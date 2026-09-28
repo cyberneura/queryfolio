@@ -12,9 +12,10 @@
 #   パッケージを数えて決めた。devDependencies に bundle されるものを足したらここにも足す。
 # - Rust: cargo-about (`cargo install cargo-about --locked --features cli`)。
 #   設定は src-tauri/about.toml、書式は src-tauri/about.hbs。
-# - Native: crate が C のソースを同梱して静的リンクするライブラリ (OpenSSL / libssh2 /
-#   zlib / SQLite)。crate 自身のライセンスは Rust 節に出るが、同梱している C ライブラリの
-#   ライセンスは別物なので、crate のソースから本文を読んで載せる。
+# - Native: crate が C / C++ のソースを同梱して静的リンクするライブラリ (OpenSSL / libssh2 /
+#   zlib / SQLite / DuckDB が third_party に同梱するもの)。crate 自身のライセンスは Rust 節に
+#   出るが、同梱しているライブラリのライセンスは別物なので、crate のソース (DuckDB は同じ
+#   version のタグの DuckDB リポジトリ。GitHub へのネットワーク接続が要る) から本文を読んで載せる。
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -144,7 +145,7 @@ HEADER
 
   cat <<'HEADER'
 ################################################################################
-# Native libraries (C sources shipped inside the crates above and linked statically)
+# Native libraries (C and C++ sources shipped inside the crates above, linked statically)
 ################################################################################
 
 HEADER
@@ -188,6 +189,95 @@ for (const [crate, library, license, files] of NATIVE) {
     console.log("");
   }
 }
+
+// DuckDB (libduckdb-sys の bundled) は third_party/ に他のライブラリを同梱してまとめて
+// 静的リンクする。crate の tarball にはそれらのライセンスファイルが入っていないので、
+// tarball が同梱している DuckDB の version を読み、同じタグの DuckDB リポジトリから
+// third_party/<dir>/ のライセンスファイルを取ってくる。
+// 未知のディレクトリが増えたら止める: ライセンスを確かめずに載せると、GPL のような
+// 配布条件の変わるものが紛れても気付けないため。確かめてからここに足す。
+const DUCKDB_THIRD_PARTY = {
+  brotli: "MIT",
+  concurrentqueue: "BSD-2-Clause OR BSL-1.0",
+  fast_float: "MIT",
+  fastpforlib: "Apache-2.0",
+  fmt: "MIT",
+  fsst: "MIT",
+  httplib: "MIT",
+  hyperloglog: "MIT",
+  jaro_winkler: "MIT",
+  libpg_query: "BSD-3-Clause",
+  lz4: "BSD-2-Clause",
+  mbedtls: "Apache-2.0 OR GPL-2.0-or-later (used under Apache-2.0)",
+  miniz: "MIT",
+  parquet: "Apache-2.0",
+  pcg: "MIT",
+  pdqsort: "Zlib",
+  re2: "BSD-3-Clause",
+  ska_sort: "BSL-1.0",
+  skiplist: "MIT",
+  snappy: "BSD-3-Clause",
+  tdigest: "Apache-2.0",
+  thrift: "Apache-2.0",
+  utf8proc: "MIT AND Unicode-DFS-2015",
+  vergesort: "MIT",
+  yyjson: "MIT",
+  zstd: "BSD-3-Clause",
+};
+
+(async () => {
+  const { execFileSync } = require("child_process");
+  const [duckdbSys] = metadata.packages.filter((p) => p.name === "libduckdb-sys");
+  if (!duckdbSys) throw new Error("libduckdb-sys is not in cargo metadata");
+  const tarball = path.join(path.dirname(duckdbSys.manifest_path), "duckdb.tar.gz");
+  const pragma = execFileSync(
+    "tar",
+    ["xzf", tarball, "-O", "duckdb/src/function/table/version/pragma_version.cpp"],
+    { encoding: "utf8" },
+  );
+  const tag = pragma.match(/#define DUCKDB_VERSION "(v[0-9.]+)"/)?.[1];
+  if (!tag) throw new Error("could not read DUCKDB_VERSION from the libduckdb-sys tarball");
+  const dirs = [
+    ...new Set(
+      execFileSync("tar", ["tzf", tarball], { encoding: "utf8", maxBuffer: 64 << 20 })
+        .split("\n")
+        .map((line) => line.match(/^duckdb\/third_party\/([^/]+)\//)?.[1])
+        .filter(Boolean),
+    ),
+  ].sort();
+  const unknown = dirs.filter((d) => !(d in DUCKDB_THIRD_PARTY));
+  if (unknown.length) {
+    throw new Error(`DuckDB vendors libraries with unchecked licenses: ${unknown.join(", ")}`);
+  }
+
+  const tree = await fetch(`https://api.github.com/repos/duckdb/duckdb/git/trees/${tag}?recursive=1`);
+  if (!tree.ok) throw new Error(`GitHub tree API for duckdb ${tag}: HTTP ${tree.status}`);
+  const paths = (await tree.json()).tree.filter((e) => e.type === "blob").map((e) => e.path);
+  for (const dir of dirs) {
+    const files = paths
+      .filter((p) => p.startsWith(`third_party/${dir}/`))
+      .filter((p) => /^(LICEN[CS]E|COPYING|NOTICE)/i.test(path.basename(p)))
+      .sort();
+    if (files.length === 0) throw new Error(`no license file for duckdb third_party/${dir} at ${tag}`);
+    console.log("=".repeat(80));
+    console.log(`License: ${DUCKDB_THIRD_PARTY[dir]}`);
+    console.log("");
+    console.log("Used by:");
+    console.log(`  ${dir} (bundled by libduckdb-sys ${duckdbSys.version})`);
+    console.log("");
+    for (const f of files) {
+      const url = `https://raw.githubusercontent.com/duckdb/duckdb/${tag}/${f}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+      if (files.length > 1) console.log(`--- ${f.slice(`third_party/${dir}/`.length)} ---`);
+      console.log((await res.text()).replace(/\s+$/, ""));
+      console.log("");
+    }
+  }
+})().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
 NODE
 } > "$TMP"
 
