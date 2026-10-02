@@ -259,11 +259,8 @@ python3 ../astragal/resources/app-icons/build_icns.py \
 `icon.png` ← `icon-512.png`)。
 
 **1 枚のマスターを縮小して作らないこと。** 円柱の線は 1024px キャンバスで 32px (3.1%) なので、
-32px へ縮小すると 1px になって潰れる。1Password の権限ダイアログ
-(「Allow Queryfolio to use SSH key」) でアイコンがぼやけていたのがこれ
-(CYBERNEURA-DEV-825)。**Electron 製アプリは macOS から最大 32x32 しかアイコンを取れない**
-(`app.getFileIcon` の制限) ため、1Password はその 32px を拡大して表示している。
-効くのは大きいスロットを足すことではなく **32px の中身**。
+32px へ縮小すると 1px になって潰れる。Finder のリスト表示やメニューのように小さいサイズを
+引く場所では、そのサイズのエントリの中身がそのまま見える。
 
 `generate.py` は小さいサイズで 2 つの手当てをする:
 
