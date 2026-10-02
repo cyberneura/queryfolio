@@ -274,6 +274,10 @@ python3 ../astragal/resources/app-icons/build_icns.py \
 形の数値 (角丸半径・楕円・帯の位置) は既存の 1024px アイコンを採寸して決めた。変えるとアプリの
 見た目が変わるので、触る時は `rendered/icon-1024.png` を元画像と見比べること。
 
+**`.icns` は `build_icns.py` で作り、エントリを大きい順 (先頭が 1024px) に並べる。**
+1Password の SSH キー許可ダイアログは icns の先頭のエントリを拡大して表示するため、
+`pnpm tauri icon` / `iconutil` が書く小さい順 (先頭が 16px) の icns ではぼやける。
+
 `.icns` の中身は `../astragal/resources/app-icons/inspect_icns.py` で一覧できる。
 icns を扱う道具は astragal に集約してあり、このリポジトリには置かない。
 
