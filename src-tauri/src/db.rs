@@ -8,9 +8,11 @@ use base64::Engine as _;
 use futures::TryStreamExt;
 use serde::Serialize;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlRow, MySqlSslMode};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow, PgSslMode};
+use sqlx::postgres::{
+    PgConnectOptions, PgPoolOptions, PgRow, PgSslMode, PgTypeKind, PgValueFormat,
+};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
-use sqlx::{Column, Connection as _, Executor, Row, TypeInfo};
+use sqlx::{Column, Connection as _, Executor, Row, TypeInfo, ValueRef};
 
 use crate::config::{ServerConfig, SqlSslMode};
 use crate::error::AppError;
@@ -1947,7 +1949,103 @@ fn mysql_value_to_json(row: &MySqlRow, i: usize) -> serde_json::Value {
     decode_fallback!(row, i)
 }
 
+/// Postgres の配列のバイナリ表現 (arrayfuncs.c の array_send) を JSON 配列にする。
+/// 多次元配列は入れ子の配列、NULL 要素は null。要素の中身は `decode_element` が
+/// 変換する。sqlx の `Vec<T>` デコーダは 1 次元かつ添字が 1 始まりの配列しか
+/// 受け付けないため自前で読む (添字の下限は JSON に載せようがないので捨てる)。
+/// 形式が壊れていたら None (呼び出し側が `<undecodable>` に倒す)。
+fn pg_binary_array_to_json(
+    buf: &[u8],
+    decode_element: impl Fn(&[u8]) -> serde_json::Value,
+) -> Option<serde_json::Value> {
+    // Postgres の MAXDIM
+    const MAX_DIMS: usize = 6;
+
+    fn take<'a>(buf: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+        if buf.len() < n {
+            return None;
+        }
+        let (head, rest) = buf.split_at(n);
+        *buf = rest;
+        Some(head)
+    }
+    fn take_i32(buf: &mut &[u8]) -> Option<i32> {
+        take(buf, 4).map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    let mut buf = buf;
+    let ndim = usize::try_from(take_i32(&mut buf)?).ok()?;
+    // has-null フラグと要素型 OID は使わない (要素型は列の型情報から分かる)
+    take(&mut buf, 8)?;
+    if ndim == 0 {
+        return Some(serde_json::Value::Array(Vec::new()));
+    }
+    if ndim > MAX_DIMS {
+        return None;
+    }
+    let mut dims = Vec::with_capacity(ndim);
+    for _ in 0..ndim {
+        dims.push(usize::try_from(take_i32(&mut buf)?).ok()?);
+        // 添字の下限
+        take(&mut buf, 4)?;
+    }
+
+    // 要素は行優先で並んでいるので、次元ごとに再帰して入れ子にする
+    fn build(
+        dims: &[usize],
+        buf: &mut &[u8],
+        decode_element: &dyn Fn(&[u8]) -> serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let (&len, inner) = dims.split_first()?;
+        // 長さは巨大でも要素ごとに最低 4 バイト読むので、壊れた入力は
+        // 確保の前にバッファ不足で止まる
+        let mut items = Vec::with_capacity(len.min(buf.len() / 4));
+        for _ in 0..len {
+            if inner.is_empty() {
+                let elem_len = take_i32(buf)?;
+                if elem_len < 0 {
+                    items.push(serde_json::Value::Null);
+                } else {
+                    items.push(decode_element(take(buf, elem_len as usize)?));
+                }
+            } else {
+                items.push(build(inner, buf, decode_element)?);
+            }
+        }
+        Some(serde_json::Value::Array(items))
+    }
+    build(&dims, &mut buf, &decode_element)
+}
+
 fn pg_value_to_json(row: &PgRow, i: usize) -> serde_json::Value {
+    // ユーザー定義の enum 型 (とその配列) は sqlx の String デコーダの互換型
+    // (TEXT / VARCHAR 等) に含まれないため、そのままだと decode_fallback で
+    // `<undecodable>` になる。enum の値はテキスト / バイナリどちらの形式でも
+    // ラベルの UTF-8 なので、生の値をそのまま文字列として読む
+    let enum_value = match row.column(i).type_info().kind() {
+        PgTypeKind::Enum(_) => Some(false),
+        PgTypeKind::Array(elem) if matches!(elem.kind(), PgTypeKind::Enum(_)) => Some(true),
+        _ => None,
+    };
+    if let (Some(is_array), Ok(raw)) = (enum_value, row.try_get_raw(i)) {
+        if raw.is_null() {
+            return serde_json::Value::Null;
+        }
+        let format = raw.format();
+        let decoded = match (is_array, format) {
+            (true, PgValueFormat::Binary) => raw.as_bytes().ok().and_then(|bytes| {
+                pg_binary_array_to_json(bytes, |b| bytes_to_json(b.to_vec()))
+            }),
+            // テキスト形式の配列は `{a,b}` のリテラルのまま見せる
+            _ => raw
+                .as_str()
+                .ok()
+                .map(|label| serde_json::Value::String(label.to_string())),
+        };
+        if let Some(v) = decoded {
+            return v;
+        }
+    }
     let type_name = row.column(i).type_info().name().to_string();
     match type_name.as_str() {
         "BOOL" => {
@@ -3662,6 +3760,132 @@ mod tests {
             .unwrap();
             assert_eq!(result.row_count, 1);
         }
+    }
+
+    /// Postgres のユーザー定義 enum 型はラベル文字列として、その配列は
+    /// ラベルの (多次元なら入れ子の) 配列として表示する。
+    /// sqlx の String デコーダは TEXT / VARCHAR 等しか受け付けないため、
+    /// enum は専用に扱わないと `<undecodable: ...>` になる。
+    /// search_path 外のスキーマに置くのは、型名が `schema.type` と
+    /// スキーマ修飾で届くケース (実際に起きた形) を再現するため。
+    /// サーバーが要るので QUERYFOLIO_TEST_PG_URL がある時だけ走る。
+    #[tokio::test]
+    async fn test_pg_enum_decodes_as_label() {
+        let Ok(url) = std::env::var("QUERYFOLIO_TEST_PG_URL") else {
+            return;
+        };
+        let schema = format!(
+            "queryfolio_enum_probe_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(&format!("CREATE TYPE {schema}.mood AS ENUM ('happy', 'sad')"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let row = sqlx::query(&format!(
+            "SELECT 'sad'::{schema}.mood AS m, NULL::{schema}.mood AS n, \
+                    ARRAY['happy', NULL, 'sad']::{schema}.mood[] AS a, \
+                    '{{}}'::{schema}.mood[] AS e, \
+                    '{{{{happy,sad}},{{sad,happy}}}}'::{schema}.mood[] AS nested, \
+                    NULL::{schema}.mood[] AS na"
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let value = pg_value_to_json(&row, 0);
+        let null = pg_value_to_json(&row, 1);
+        let array = pg_value_to_json(&row, 2);
+        let empty = pg_value_to_json(&row, 3);
+        let nested = pg_value_to_json(&row, 4);
+        let null_array = pg_value_to_json(&row, 5);
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(value, serde_json::json!("sad"));
+        assert_eq!(null, serde_json::Value::Null);
+        assert_eq!(array, serde_json::json!(["happy", null, "sad"]));
+        assert_eq!(empty, serde_json::json!([]));
+        assert_eq!(nested, serde_json::json!([["happy", "sad"], ["sad", "happy"]]));
+        assert_eq!(null_array, serde_json::Value::Null);
+    }
+
+    /// array_send 形式のバイト列を組み立てる (次元ごとの長さと要素。None は NULL)
+    fn pg_array_bytes(dims: &[i32], elements: &[Option<&str>]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(dims.len() as i32).to_be_bytes());
+        buf.extend_from_slice(&0i32.to_be_bytes());
+        buf.extend_from_slice(&12345u32.to_be_bytes());
+        for &d in dims {
+            buf.extend_from_slice(&d.to_be_bytes());
+            buf.extend_from_slice(&1i32.to_be_bytes());
+        }
+        for e in elements {
+            match e {
+                Some(s) => {
+                    buf.extend_from_slice(&(s.len() as i32).to_be_bytes());
+                    buf.extend_from_slice(s.as_bytes());
+                }
+                None => buf.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        buf
+    }
+
+    fn label(b: &[u8]) -> serde_json::Value {
+        bytes_to_json(b.to_vec())
+    }
+
+    #[test]
+    fn test_pg_binary_array_to_json() {
+        let one_dim = pg_array_bytes(&[3], &[Some("a"), None, Some("b")]);
+        assert_eq!(
+            pg_binary_array_to_json(&one_dim, label),
+            Some(serde_json::json!(["a", null, "b"]))
+        );
+
+        let two_dim = pg_array_bytes(&[2, 2], &[Some("a"), Some("b"), Some("c"), Some("d")]);
+        assert_eq!(
+            pg_binary_array_to_json(&two_dim, label),
+            Some(serde_json::json!([["a", "b"], ["c", "d"]]))
+        );
+
+        let empty = pg_array_bytes(&[], &[]);
+        assert_eq!(pg_binary_array_to_json(&empty, label), Some(serde_json::json!([])));
+    }
+
+    /// 壊れた入力はパニックせず None (巨大な長さで確保を試みない)
+    #[test]
+    fn test_pg_binary_array_to_json_rejects_malformed() {
+        let full = pg_array_bytes(&[2], &[Some("abc"), Some("de")]);
+        for cut in 0..full.len() {
+            assert_eq!(pg_binary_array_to_json(&full[..cut], label), None, "cut at {cut}");
+        }
+        // 要素数だけ巨大で中身が無い
+        let huge = pg_array_bytes(&[i32::MAX], &[]);
+        assert_eq!(pg_binary_array_to_json(&huge, label), None);
+        // 負の次元数・次元長
+        let negative_dim = pg_array_bytes(&[-1], &[]);
+        assert_eq!(pg_binary_array_to_json(&negative_dim, label), None);
+        let mut negative_ndim = pg_array_bytes(&[], &[]);
+        negative_ndim[..4].copy_from_slice(&(-1i32).to_be_bytes());
+        assert_eq!(pg_binary_array_to_json(&negative_ndim, label), None);
+        // MAXDIM (6) を超える次元数
+        let too_deep = pg_array_bytes(&[1; 7], &[Some("a")]);
+        assert_eq!(pg_binary_array_to_json(&too_deep, label), None);
     }
 
     /// エージェント経路でも文レベルのガードは効き続ける
