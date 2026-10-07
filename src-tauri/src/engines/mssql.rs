@@ -415,12 +415,14 @@ pub async fn run_query_cancellable(
 /// キーワードが後続にあればガードが有効な接続では拒否する。
 /// `select` / `with` は入れない: サブクエリと `WITH (NOLOCK)` ヒントが 1 文の中に
 /// 普通に現れるため (後続の DML は `WITH ... DELETE` でも delete の語で捕まる)。
+/// `set` も入れない: `UPDATE ... SET` の中に必ず現れる (後続の `SET NOCOUNT ON`
+/// は書き込みではないので見逃してよい)。
 /// 列名が `update` のような文を素で書くと誤って拒否される側に倒れる
 /// (角括弧で書けば通る。Writable ON + allow_dangerous_statements で外せる)。
 const TRAILING_STATEMENT_KEYWORDS: &[&str] = &[
     "insert", "update", "delete", "merge", "create", "alter", "drop", "truncate", "grant",
-    "revoke", "deny", "exec", "execute", "declare", "set", "use", "begin", "commit", "rollback",
-    "save", "backup", "restore", "bulk", "kill", "go", "dbcc", "shutdown",
+    "revoke", "deny", "exec", "execute", "declare", "use", "begin", "commit", "rollback", "save",
+    "backup", "restore", "bulk", "kill", "go", "dbcc", "shutdown",
 ];
 
 /// 先頭の文の後ろに別の文が始まっている形か (セミコロンの無い複文)。
@@ -1185,7 +1187,6 @@ mod tests {
             "SELECT 1 EXEC sp_who",
             "select 1 go",
             "SELECT 1\nDECLARE @x INT",
-            "SELECT 1\nSET NOCOUNT ON",
         ] {
             assert!(contains_trailing_statement(sql), "{sql}");
         }
