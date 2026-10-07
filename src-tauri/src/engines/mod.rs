@@ -101,6 +101,8 @@ const DYNAMODB_CAPABILITIES: EngineCapabilities = EngineCapabilities {
 /// SQL Server は SQL エンジンだが、セル編集の適用経路 (run_statements) が
 /// sqlx 前提のため supports_editable_cells のみ false にする (DuckDB と同じ)。
 /// EXPLAIN は queryfolio の疑似文 (SET SHOWPLAN_ALL) として engines/mssql.rs が実装する。
+/// Format はフロントの sqlFormat.ts が mssql 方言 (角括弧識別子・`#temp`) を
+/// 知っているので使える (SqlEditor が engine から方言を渡す)。
 const MSSQL_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_editable_cells: false,
     ..SQL_CAPABILITIES

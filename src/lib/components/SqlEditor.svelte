@@ -492,7 +492,9 @@
       return;
     }
     const original = state.sliceDoc(range.from, range.to);
-    const formatted = formatSql(original);
+    // T-SQL は角括弧識別子と #temp を字句として知らないと壊す (sqlFormat.ts)
+    const dialect = /^(mssql|sqlserver)$/i.test(engine ?? "") ? "mssql" : undefined;
+    const formatted = formatSql(original, dialect);
     if (formatted === original) {
       return;
     }

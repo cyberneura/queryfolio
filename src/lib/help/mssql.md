@@ -54,6 +54,12 @@ procedure can write.
 
 ## Writing
 
+`INSERT` / `UPDATE` / `DELETE` and DDL report the affected row count. Statements
+that leave something on the session — `SET` options, `BEGIN TRANSACTION`, local
+temporary tables (`#name`) — and anything that may return rows (`EXEC`, `IF ... SELECT`,
+scripts starting with `DECLARE`) run as a plain batch instead, so the session keeps
+them; the row count is not shown for those.
+
 The AI assistant runs its queries on a connection of its own, inside
 `BEGIN TRANSACTION ... ROLLBACK`, because SQL Server has no read-only
 transaction. That undoes writes that get past the statement guard without

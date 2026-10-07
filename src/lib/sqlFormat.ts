@@ -25,6 +25,15 @@ interface Token {
   text: string;
 }
 
+/**
+ * 方言ごとの字句の違い。今あるのは T-SQL (mssql) だけ:
+ * - `[name]` の角括弧識別子を 1 トークンとして保つ (中の空白・記号は識別子の
+ *   一部で、`[order-id]` を `[order - id]` にすると別のオブジェクトになる)
+ * - `#temp` / `##global` の一時テーブル名を識別子として読む (他の方言では
+ *   `#` は MySQL 風の行コメントの始まり)
+ */
+export type SqlDialect = "mssql";
+
 // 大文字化して比較・出力するキーワード集合。関数名 (count/sum 等) は
 // ユーザーの記述を保つため意図的に含めない。
 const KEYWORDS = new Set<string>([
@@ -101,9 +110,10 @@ const isWordPart = (c: string): boolean =>
 
 // 入力文字列をトークン列へ分解する。文字列・コメントは 1 トークンとして
 // 中身をそのまま保持する。
-function tokenize(sql: string): Token[] {
+function tokenize(sql: string, dialect?: SqlDialect): Token[] {
   const tokens: Token[] = [];
   const n = sql.length;
+  const mssql = dialect === "mssql";
   let i = 0;
   while (i < n) {
     const c = sql[i];
@@ -126,8 +136,28 @@ function tokenize(sql: string): Token[] {
       continue;
     }
 
-    // 行コメント (# ...) — MySQL
-    if (c === "#") {
+    // 角括弧識別子 ([name]) — T-SQL。`]]` は `]` のエスケープ。閉じていない
+    // 場合は末尾まで 1 トークンにする (壊すより原文のまま返す側に倒す)
+    if (mssql && c === "[") {
+      let j = i + 1;
+      while (j < n) {
+        if (sql[j] === "]") {
+          if (sql[j + 1] === "]") {
+            j += 2;
+            continue;
+          }
+          j += 1;
+          break;
+        }
+        j += 1;
+      }
+      tokens.push({ type: "string", text: sql.slice(i, j) });
+      i = j;
+      continue;
+    }
+
+    // 行コメント (# ...) — MySQL。T-SQL では # は一時テーブル名の先頭
+    if (c === "#" && !mssql) {
       let j = i + 1;
       while (j < n && sql[j] !== "\n") j++;
       tokens.push({ type: "lineComment", text: sql.slice(i, j) });
@@ -189,8 +219,8 @@ function tokenize(sql: string): Token[] {
       }
     }
 
-    // 識別子・キーワード
-    if (isWordStart(c)) {
+    // 識別子・キーワード (T-SQL の #temp / ##global も識別子)
+    if (isWordStart(c) || (mssql && c === "#")) {
       let j = i + 1;
       while (j < n && isWordPart(sql[j])) j++;
       tokens.push({ type: "word", text: sql.slice(i, j) });
@@ -517,15 +547,15 @@ function renderClause(cl: Clause): string {
 // 空白を除いたトークン列を比較用のキー配列に変換する。
 // word は大文字小文字を無視し、それ以外 (文字列・コメント・数値・記号) は
 // 完全一致で比較する。
-function signature(sql: string): string[] {
-  return tokenize(sql)
+function signature(sql: string, dialect?: SqlDialect): string[] {
+  return tokenize(sql, dialect)
     .filter((t) => t.type !== "ws")
     .map((t) => (t.type === "word" ? t.text.toLowerCase() : t.text));
 }
 
-function sameTokens(a: string, b: string): boolean {
-  const sa = signature(a);
-  const sb = signature(b);
+function sameTokens(a: string, b: string, dialect?: SqlDialect): boolean {
+  const sa = signature(a, dialect);
+  const sb = signature(b, dialect);
   if (sa.length !== sb.length) return false;
   for (let i = 0; i < sa.length; i++) {
     if (sa[i] !== sb[i]) return false;
@@ -534,8 +564,8 @@ function sameTokens(a: string, b: string): boolean {
 }
 
 // 整形の本体。整形できない場合は null を返す。
-function tryFormat(sql: string): string | null {
-  let toks = tokenize(sql).filter((t) => t.type !== "ws");
+function tryFormat(sql: string, dialect?: SqlDialect): string | null {
+  let toks = tokenize(sql, dialect).filter((t) => t.type !== "ws");
   if (toks.length === 0) return null;
 
   // 行コメントを含む場合は安全のため整形しない (レイアウト崩しでコードを
@@ -587,12 +617,13 @@ function tryFormat(sql: string): string | null {
 }
 
 // SQL 文字列を整形して返す。整形できない・壊す恐れがある場合は原文を返す。
-export function formatSql(sql: string): string {
+// dialect は字句の違いだけ (SqlDialect 参照)。省略時は標準 SQL + MySQL 風。
+export function formatSql(sql: string, dialect?: SqlDialect): string {
   try {
-    const formatted = tryFormat(sql);
+    const formatted = tryFormat(sql, dialect);
     if (formatted === null) return sql;
     // 安全ネット: トークン列が変化していたら整形を破棄して原文を返す
-    if (!sameTokens(sql, formatted)) return sql;
+    if (!sameTokens(sql, formatted, dialect)) return sql;
     return formatted;
   } catch {
     return sql;

@@ -464,58 +464,39 @@ async fn execute(
     }
 }
 
-/// 先頭キーワードがこれなら行を返さない文として sp_executesql (execute) で
-/// 流し、影響行数を取る。それ以外 (SELECT 系はもちろん、EXEC や
-/// `IF EXISTS (...) SELECT ...` のような制御フロー、DECLARE から始まる
-/// スクリプトも) はバッチとして流して結果セットがあれば表にする —
-/// 制御フローの中身は先頭キーワードでは分からないので、行を取りこぼす側
-/// ではなく影響行数を取りこぼす側 (affected_rows = None) に倒す。
+/// 先頭キーワードがこれなら「行を返さず、影響行数に意味がある」文として
+/// sp_executesql (execute) で流す。それ以外はバッチ (simple_query) で流して
+/// 結果セットがあれば表にする (影響行数は None)。バッチ側に倒す理由は 2 つ:
+/// - SELECT 系・EXEC・`IF EXISTS (...) SELECT ...`・DECLARE から始まる
+///   スクリプトは中身が先頭キーワードでは分からない。行を取りこぼす側では
+///   なく影響行数を取りこぼす側に倒す
+/// - **sp_executesql はプロシージャのスコープで実行される**ので、その中で
+///   `SET` したセッション設定・`BEGIN TRANSACTION`・`#temp` の作成は呼び出しが
+///   終わると消える (トランザクションはエラー 266 になる)。接続に残すべき文は
+///   バッチで流さないと「次の文で消えている」になる (Codex レビューの指摘)
 const NO_ROWS_KEYWORDS: &[&str] = &[
-    "insert",
-    "update",
-    "delete",
-    "merge",
-    "create",
-    "alter",
-    "drop",
-    "truncate",
-    "grant",
-    "revoke",
-    "deny",
-    "set",
-    "use",
-    "commit",
-    "rollback",
-    "save",
-    "backup",
-    "restore",
-    "kill",
-    "checkpoint",
-    "bulk",
-    "raiserror",
-    "throw",
-    "waitfor",
+    "insert", "update", "delete", "merge", "create", "alter", "drop", "truncate", "grant",
+    "revoke", "deny", "backup", "restore", "bulk",
 ];
 
-/// 行を返し得る文か (バッチとして流すか)。readonly ガードは別で、ここへ
-/// 来るのは Writable な接続か読み取り文だけ。
+/// 行を返し得る文か / 接続に状態を残す文か (= バッチとして流すか)。
+/// readonly ガードは別で、ここへ来るのは Writable な接続か読み取り文だけ。
 fn is_mssql_fetch(sql: &str) -> bool {
     if is_fetch_statement(sql) {
         return true;
     }
     let cleaned = scan_sql(sql, Engine::MsSql).cleaned;
-    let mut words = cleaned
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .filter(|w| !w.is_empty());
-    let Some(first) = words.next() else {
-        return false;
-    };
-    // BEGIN TRAN / BEGIN TRANSACTION / BEGIN DISTRIBUTED TRAN は行を返さない。
-    // 素の BEGIN ... END ブロックは中に SELECT を持ち得る
-    if first == "begin" {
-        return !matches!(words.next(), Some("tran" | "transaction" | "distributed"));
-    }
+    let first = cleaned
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '#')
+        .find(|w| !w.is_empty())
+        .unwrap_or("");
     if !NO_ROWS_KEYWORDS.contains(&first) {
+        return true;
+    }
+    // ローカル一時テーブル (`#t` / `##t`) を触る文は、sp_executesql の
+    // スコープで作ると呼び出し終了時に消えるためバッチで流す。`#` は
+    // scan_sql が文字列・コメント・角括弧の中を空白化した後に見る
+    if cleaned.contains('#') {
         return true;
     }
     // INSERT / UPDATE / DELETE / MERGE ... OUTPUT は行を返す
@@ -1189,13 +1170,20 @@ mod tests {
         assert!(is_mssql_fetch("DECLARE @n INT = 1; SELECT @n"));
         assert!(is_mssql_fetch("BEGIN SELECT 1 END"));
         assert!(is_mssql_fetch("PRINT 'x'"));
-        // 行を返さない文は影響行数の経路
+        // 接続に状態を残す文も sp_executesql のスコープに閉じないようバッチで流す
+        // (Codex レビューの指摘: #temp は呼び出し終了時に消える)
+        assert!(is_mssql_fetch("BEGIN TRANSACTION"));
+        assert!(is_mssql_fetch("SET NOCOUNT ON"));
+        assert!(is_mssql_fetch("CREATE TABLE #stage (id INT)"));
+        assert!(is_mssql_fetch("INSERT INTO #stage VALUES (1)"));
+        assert!(is_mssql_fetch("DROP TABLE ##global_tmp"));
+        // 行を返さず接続にも何も残さない文は影響行数の経路
         assert!(!is_mssql_fetch("INSERT INTO t VALUES (1)"));
         assert!(!is_mssql_fetch("UPDATE t SET x = 'output' WHERE id = 1"));
-        assert!(!is_mssql_fetch("BEGIN TRANSACTION"));
-        assert!(!is_mssql_fetch("BEGIN TRAN t1"));
         assert!(!is_mssql_fetch("-- note\nCREATE TABLE t (id INT)"));
-        assert!(!is_mssql_fetch("SET NOCOUNT ON"));
+        // 文字列・角括弧の中の # は一時テーブルではない
+        assert!(!is_mssql_fetch("INSERT INTO t VALUES ('#1')"));
+        assert!(!is_mssql_fetch("DELETE FROM [a#b] WHERE id = 1"));
     }
 
     #[test]
