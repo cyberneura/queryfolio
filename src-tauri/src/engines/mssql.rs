@@ -495,8 +495,11 @@ fn is_mssql_fetch(sql: &str) -> bool {
     }
     // ローカル一時テーブル (`#t` / `##t`) を触る文は、sp_executesql の
     // スコープで作ると呼び出し終了時に消えるためバッチで流す。`#` は
-    // scan_sql が文字列・コメント・角括弧の中を空白化した後に見る
-    if cleaned.contains('#') {
+    // scan_sql が文字列・コメント・角括弧の中を空白化した後に見る。
+    // 角括弧で書かれた一時テーブル (`[#t]`) は空白化されて見えないので、
+    // 原文の `[#` も見る (文字列の中の `[#` にも反応するが、バッチ側に倒れる
+    // だけで害は無い: 影響行数が None になる)
+    if cleaned.contains('#') || sql.contains("[#") {
         return true;
     }
     // INSERT / UPDATE / DELETE / MERGE ... OUTPUT は行を返す
@@ -837,21 +840,20 @@ fn read_identifier(input: &str) -> (String, &str) {
     }
 }
 
-/// SQL に埋め込める修飾名を作る。既定スキーマ dbo は修飾しない。
-/// 各部分は角括弧で囲む (`[users]` / `[sales].[orders]`) — 修飾名はフロントが
-/// SQL へ挿入し、`split_qualified` が (schema, table) へ戻すので、空白・ドット・
-/// 予約語を含む名前でもどちらにも曖昧さが残らない。
+/// SQL に埋め込める修飾名を作る。**スキーマは dbo でも省かない**: ログインの
+/// 既定スキーマが dbo でないと、素の `[users]` はカタログが列挙した `dbo.users`
+/// ではなく既定スキーマ側の `users` を指してしまう (Codex レビューの指摘)。
+/// 各部分は角括弧で囲む (`[dbo].[users]` / `[sales].[orders]`) — 修飾名は
+/// フロントが SQL へ挿入し、`split_qualified` が (schema, table) へ戻すので、
+/// 空白・ドット・予約語を含む名前でもどちらにも曖昧さが残らない。
 fn qualified_name(schema: &str, name: &str) -> String {
-    if schema == DEFAULT_SCHEMA {
-        quote_identifier(name)
-    } else {
-        format!("{}.{}", quote_identifier(schema), quote_identifier(name))
-    }
+    format!("{}.{}", quote_identifier(schema), quote_identifier(name))
 }
 
 /// `qualified_name` が作った修飾名を (schema, table) に戻す。角括弧付きの部分は
-/// 中身に戻し、非修飾名は既定スキーマ dbo とみなす。読み切れない形 (閉じていない
-/// 括弧等) は最初のドットで割る従来の読み方に倒す。
+/// 中身に戻し、非修飾名 (`\d users` のように人が打ったもの) は既定スキーマ dbo
+/// とみなす。読み切れない形 (閉じていない括弧等) は最初のドットで割る従来の
+/// 読み方に倒す。
 pub(crate) fn split_qualified(table: &str) -> (String, String) {
     let (first, rest) = read_identifier(table);
     if rest.is_empty() {
@@ -1177,6 +1179,9 @@ mod tests {
         assert!(is_mssql_fetch("CREATE TABLE #stage (id INT)"));
         assert!(is_mssql_fetch("INSERT INTO #stage VALUES (1)"));
         assert!(is_mssql_fetch("DROP TABLE ##global_tmp"));
+        // 角括弧で書かれた一時テーブルも (scan_sql は角括弧の中を空白化する)
+        assert!(is_mssql_fetch("CREATE TABLE [#stage] (id INT)"));
+        assert!(is_mssql_fetch("INSERT INTO [dbo].[#stage] VALUES (1)"));
         // 行を返さず接続にも何も残さない文は影響行数の経路
         assert!(!is_mssql_fetch("INSERT INTO t VALUES (1)"));
         assert!(!is_mssql_fetch("UPDATE t SET x = 'output' WHERE id = 1"));
@@ -1295,12 +1300,17 @@ mod tests {
 
     #[test]
     fn test_qualified_names() {
-        // 常に角括弧: 予約語 (`Order`) も空白・ドット・`]` も同じ形で SQL に埋め込める
-        assert_eq!(qualified_name("dbo", "users"), "[users]");
-        assert_eq!(qualified_name("dbo", "Order"), "[Order]");
+        // 常に角括弧 + 常にスキーマ付き: 予約語 (`Order`) も空白・ドット・`]` も
+        // 同じ形で SQL に埋め込め、既定スキーマが dbo でないログインでも
+        // カタログが列挙したテーブルを指す
+        assert_eq!(qualified_name("dbo", "users"), "[dbo].[users]");
+        assert_eq!(qualified_name("dbo", "Order"), "[dbo].[Order]");
         assert_eq!(qualified_name("sales", "orders"), "[sales].[orders]");
-        assert_eq!(qualified_name("dbo", "Order Details"), "[Order Details]");
-        assert_eq!(qualified_name("dbo", "a.b"), "[a.b]");
+        assert_eq!(
+            qualified_name("dbo", "Order Details"),
+            "[dbo].[Order Details]"
+        );
+        assert_eq!(qualified_name("dbo", "a.b"), "[dbo].[a.b]");
         assert_eq!(qualified_name("my schema", "t]x"), "[my schema].[t]]x]");
         assert_eq!(
             split_qualified("users"),

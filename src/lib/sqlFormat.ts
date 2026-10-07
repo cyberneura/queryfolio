@@ -219,10 +219,11 @@ function tokenize(sql: string, dialect?: SqlDialect): Token[] {
       }
     }
 
-    // 識別子・キーワード (T-SQL の #temp / ##global も識別子)
+    // 識別子・キーワード (T-SQL の #temp / ##global も識別子。2 つ目の # も
+    // 名前の一部として読む)
     if (isWordStart(c) || (mssql && c === "#")) {
       let j = i + 1;
-      while (j < n && isWordPart(sql[j])) j++;
+      while (j < n && (isWordPart(sql[j]) || (mssql && sql[j] === "#"))) j++;
       tokens.push({ type: "word", text: sql.slice(i, j) });
       i = j;
       continue;
