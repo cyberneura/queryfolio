@@ -17,7 +17,7 @@
   import { syntaxTree, HighlightStyle, syntaxHighlighting } from "@codemirror/language";
   import { tags as t } from "@lezer/highlight";
   import { acceptCompletion, autocompletion, completionKeymap } from "@codemirror/autocomplete";
-  import { sql, MySQL, PostgreSQL, SQLite } from "@codemirror/lang-sql";
+  import { sql, MSSQL, MySQL, PostgreSQL, SQLite } from "@codemirror/lang-sql";
   import type { SQLNamespace } from "@codemirror/lang-sql";
   import { oneDark } from "@codemirror/theme-one-dark";
   import { formatSql } from "$lib/sqlFormat";
@@ -84,6 +84,9 @@
       case "sqlite":
       case "sqlite3":
         return SQLite;
+      case "mssql":
+      case "sqlserver":
+        return MSSQL;
       default:
         return PostgreSQL;
     }

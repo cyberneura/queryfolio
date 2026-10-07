@@ -83,15 +83,15 @@ servers:
 | Key | Required | Description |
 |-----|----------|-------------|
 | `name` | yes | Display name shown in the connections list. |
-| `engine` | yes | `postgres` (aliases: `postgresql`), `mysql` (aliases: `mariadb`), `sqlite` (aliases: `sqlite3`), `duckdb`, `redis` (aliases: `valkey`), `elasticsearch` (aliases: `es`, `opensearch`), or `dynamodb`. |
+| `engine` | yes | `postgres` (aliases: `postgresql`), `mysql` (aliases: `mariadb`), `sqlite` (aliases: `sqlite3`), `duckdb`, `mssql` (aliases: `sqlserver`), `redis` (aliases: `valkey`), `elasticsearch` (aliases: `es`, `opensearch`), or `dynamodb`. |
 | `description` | no | Free-text note shown in the UI. |
 | `host` | no | Database host. Defaults to `localhost` when omitted. Not needed for SQLite / DuckDB. For DynamoDB it is an **endpoint override** (dynamodb-local); omit it to use the standard AWS endpoint. When using an SSH tunnel, this is the DB host **as seen from the SSH endpoint** (often `localhost`). |
-| `port` | no | Database port. Defaults per engine when omitted: `5432` (PostgreSQL) / `3306` (MySQL) / `6379` (Redis) / `9200` (Elasticsearch) / `8000` (DynamoDB endpoint override). |
+| `port` | no | Database port. Defaults per engine when omitted: `5432` (PostgreSQL) / `3306` (MySQL) / `1433` (SQL Server) / `6379` (Redis) / `9200` (Elasticsearch) / `8000` (DynamoDB endpoint override). |
 | `schema` | depends | The database / schema to connect to. For SQLite / DuckDB, this is the **path to the database file** (queryfolio extension; `~` is expanded; if `schema` is omitted, `host` is used as the file path instead). For DynamoDB, this is the **AWS region** (required, e.g. `ap-northeast-1`). |
 | `user` | no | Database user. For DynamoDB, a static **access key ID** (paired with `password` as the secret access key). |
 | `password` | no | Database password. |
-| `tls` | no | For HTTP-based engines (Elasticsearch, and the DynamoDB endpoint override) use `https`. For SQL engines (MySQL / PostgreSQL) it makes the default `ssl_mode` `verify-full` — TLS is required and the certificate is verified. Default `false` (queryfolio extension). See [TLS for SQL engines](#tls-for-sql-engines). |
-| `ssl_mode` | no | MySQL / PostgreSQL only (queryfolio extension): `disable` / `prefer` / `require` / `verify-ca` / `verify-full`. Takes precedence over `tls`. See [TLS for SQL engines](#tls-for-sql-engines). |
+| `tls` | no | For HTTP-based engines (Elasticsearch, and the DynamoDB endpoint override) use `https`. For SQL engines (MySQL / PostgreSQL / SQL Server) it makes the default `ssl_mode` `verify-full` — TLS is required and the certificate is verified. Default `false` (queryfolio extension). See [TLS for SQL engines](#tls-for-sql-engines). |
+| `ssl_mode` | no | MySQL / PostgreSQL / SQL Server only (queryfolio extension): `disable` / `prefer` / `require` / `verify-ca` / `verify-full`. Takes precedence over `tls`. See [TLS for SQL engines](#tls-for-sql-engines). |
 | `ssl_root_cert` | no | MySQL / PostgreSQL only (queryfolio extension): path to a root CA certificate (PEM) used for verification (`~` is expanded). |
 | `aws_profile` | no | DynamoDB only (queryfolio extension): the AWS profile name (`~/.aws/config` / `credentials`) used for credentials. Ignored when `user` / `password` are set. SSO-based profiles (`sso_session` etc.) are not supported yet — use static keys or the default credential chain. |
 | `readonly` | no | See [Safety guards](#safety-guards). Default `false`. |
@@ -129,6 +129,40 @@ servers:
   - name: local-duckdb
     engine: duckdb
     schema: ~/data/example.duckdb
+  ```
+
+- **Microsoft SQL Server** — `engine: mssql` (alias: `sqlserver`; queryfolio
+  extension). T-SQL over the TDS protocol (the pure-Rust `tiberius` driver).
+  `schema` is the **database** to open (`master` when omitted); `user` /
+  `password` are **SQL Server authentication** and are required — Windows
+  integrated authentication, Azure AD and named instances (SQL Browser) are
+  not supported. The SQL editor, meta commands (`\l` `\dt` `\dv` `\dn` `\du`
+  `\d [table]`), `\c` / `USE` (reconnects to the database), Format, AI
+  features, the TABLES pane and SSH tunnels work as for the other SQL engines,
+  with two translations: auto LIMIT inserts `TOP (n)` after `SELECT` (not when
+  the statement already has `TOP` / `OFFSET` / `FETCH`, a set operator, `INTO`,
+  `FOR XML` / `FOR JSON` or starts with `WITH`), and `EXPLAIN <select>` runs
+  `SET SHOWPLAN_ALL ON` around the statement and returns the **estimated** plan
+  without executing it (the login needs `SHOWPLAN` permission). `tls` /
+  `ssl_mode` / `ssl_root_cert` work as described under
+  [TLS for SQL engines](#tls-for-sql-engines), except that `verify-ca` behaves
+  like `verify-full` (SQL Server's TLS cannot verify the chain without the host
+  name); through an SSH tunnel the certificate is checked against the
+  configured `host`. Cell editing in the results grid is not available. The AI
+  assistant's queries run on a connection of their own, inside
+  `BEGIN TRANSACTION ... ROLLBACK`, because SQL Server has no read-only
+  transaction — writes that slip past the statement guard are undone (and a
+  transaction you left open in the editor is not touched), but `NEXT VALUE FOR`
+  and identity values are consumed.
+
+  ```yaml
+  - name: dev-mssql
+    engine: mssql
+    host: localhost
+    schema: AdventureWorks
+    user: sa
+    password: your_password
+    # tls: true
   ```
 
 - **Redis** — `engine: redis` (alias: `valkey`; queryfolio extension). The
@@ -303,6 +337,14 @@ would be silently ignored, **setting `ssl_root_cert` together with `disable` /
 Use `ssl_root_cert` to point at a root CA certificate (PEM) when the server uses
 a private CA (for example the RDS bundle); it must be a readable file. On MySQL,
 `verify-full` maps to the driver's `VerifyIdentity`.
+
+SQL Server (`engine: mssql`) takes the same keys: `disable` sends no TLS,
+`prefer` encrypts when the server offers it and `require` insists on it (neither
+verifies the certificate), and `verify-ca` / `verify-full` both verify the
+chain **and** the host name (the driver has no chain-only mode). SQL Server
+installs commonly run with a self-signed certificate, which is why the default
+`prefer` does not verify — set `tls: true` and `ssl_root_cert` once the server
+has a certificate you trust.
 
 ```yaml
 - name: prod-postgres

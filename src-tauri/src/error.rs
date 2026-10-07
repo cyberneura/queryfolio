@@ -60,6 +60,9 @@ pub enum AppError {
 
     #[error("DynamoDB error: {0}")]
     DynamoDb(String),
+
+    #[error("SQL Server error: {0}")]
+    MsSql(String),
 }
 
 impl From<redis::RedisError> for AppError {
@@ -71,6 +74,14 @@ impl From<redis::RedisError> for AppError {
 impl From<duckdb::Error> for AppError {
     fn from(e: duckdb::Error) -> Self {
         AppError::DuckDb(e.to_string())
+    }
+}
+
+impl From<tiberius::error::Error> for AppError {
+    fn from(e: tiberius::error::Error) -> Self {
+        // tiberius の Server エラーは Display でメッセージ本文 (コード・状態・
+        // 行番号付き) になる。接続文字列や認証情報は含まれない
+        AppError::MsSql(e.to_string())
     }
 }
 

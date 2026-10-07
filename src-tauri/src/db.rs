@@ -44,6 +44,9 @@ pub enum DbPool {
     /// DynamoDB は sqlx を使わず AWS SDK で PartiQL (ExecuteStatement) を
     /// 実行する (engines::dynamodb)。DynamoClient は SDK クライアントのみ持つ。
     DynamoDb(crate::engines::dynamodb::DynamoClient),
+    /// SQL Server は sqlx を使わず tiberius で結線する (engines::mssql)。
+    /// SQL エンジンだがコネクションは 1 本を Mutex で維持する。
+    MsSql(crate::engines::mssql::MsSqlHandle),
 }
 
 #[derive(Debug, Serialize)]
@@ -243,6 +246,7 @@ pub(crate) enum Engine {
     Elasticsearch,
     DuckDb,
     DynamoDb,
+    MsSql,
 }
 
 /// プールから実行専用に確保した 1 本のコネクション。
@@ -265,7 +269,8 @@ impl DbConnection {
             DbPool::Redis(_)
             | DbPool::Elasticsearch(_)
             | DbPool::DuckDb(_)
-            | DbPool::DynamoDb(_) => {
+            | DbPool::DynamoDb(_)
+            | DbPool::MsSql(_) => {
                 return Err(AppError::Config(
                     "This engine does not use SQL connections".into(),
                 ));
@@ -458,9 +463,10 @@ pub fn parse_engine(engine: &str) -> Result<Engine, AppError> {
         "elasticsearch" | "es" | "opensearch" => Ok(Engine::Elasticsearch),
         "duckdb" => Ok(Engine::DuckDb),
         "dynamodb" => Ok(Engine::DynamoDb),
+        "mssql" | "sqlserver" => Ok(Engine::MsSql),
         other => Err(AppError::Config(format!(
             "Unsupported engine: {other} \
-             (supported: mysql / postgres / sqlite / duckdb / redis / \
+             (supported: mysql / postgres / sqlite / duckdb / mssql / redis / \
              elasticsearch / dynamodb)"
         ))),
     }
@@ -474,6 +480,7 @@ fn default_port(engine: Engine) -> u16 {
         Engine::Sqlite | Engine::DuckDb | Engine::DynamoDb => 0,
         Engine::Redis => crate::engines::redis::DEFAULT_PORT,
         Engine::Elasticsearch => crate::engines::elasticsearch::DEFAULT_PORT,
+        Engine::MsSql => crate::engines::mssql::DEFAULT_PORT,
     }
 }
 
@@ -481,7 +488,7 @@ fn default_port(engine: Engine) -> u16 {
 /// 値の妥当性 (空文字・検証しないモードとの併記) は ServerConfig 側で検証し、
 /// ここではファイルとして開ける形かを見る
 /// (存在しないパスは接続時の分かりにくいエラーになる前に弾く)。
-fn ssl_root_cert_path(server: &ServerConfig) -> Result<Option<PathBuf>, AppError> {
+pub(crate) fn ssl_root_cert_path(server: &ServerConfig) -> Result<Option<PathBuf>, AppError> {
     let Some(raw) = server.sql_ssl_root_cert()? else {
         return Ok(None);
     };
@@ -609,6 +616,10 @@ async fn connect(
         Engine::DynamoDb => Ok(DbPool::DynamoDb(
             crate::engines::dynamodb::connect(server).await?,
         )),
+        // mssql は TCP なので SSH トンネルで差し替えた host / port をそのまま使う
+        Engine::MsSql => Ok(DbPool::MsSql(
+            crate::engines::mssql::connect(server, host, port).await?,
+        )),
     }
 }
 
@@ -704,6 +715,21 @@ pub async fn run_query_cancellable(
             connection_name,
             sql,
             max_rows,
+            readonly,
+            allow_dangerous,
+        )
+        .await;
+    }
+    // SQL Server も SQL エンジンだが sqlx 非対応のためモジュールへ委譲する
+    // (auto LIMIT は T-SQL の TOP としてモジュール側で適用する)
+    if let DbPool::MsSql(handle) = pool {
+        return crate::engines::mssql::run_query_cancellable(
+            handle,
+            registry,
+            connection_name,
+            sql,
+            max_rows,
+            auto_limit,
             readonly,
             allow_dangerous,
         )
@@ -831,14 +857,15 @@ pub async fn run_statements(
     if statements.is_empty() {
         return Err(AppError::Config("There are no changes to apply".into()));
     }
-    // DuckDb はセル編集の適用経路 (sqlx のトランザクション実行) を持たない
-    // ため、capabilities.supports_editable_cells = false と合わせて拒否する
+    // DuckDb / MsSql はセル編集の適用経路 (sqlx のトランザクション実行) を
+    // 持たないため、capabilities.supports_editable_cells = false と合わせて拒否する
     if matches!(
         pool,
         DbPool::Redis(_)
             | DbPool::Elasticsearch(_)
             | DbPool::DuckDb(_)
             | DbPool::DynamoDb(_)
+            | DbPool::MsSql(_)
     ) {
         return Err(AppError::Config(
             "Cell editing is not supported for this engine".into(),
@@ -1254,6 +1281,7 @@ pub async fn list_schemas(
         // Redis の「database」は番号 (CYBERNEURA-DEV-408)。
         // 数はサーバー設定なのでモジュール側で問い合わせる
         DbPool::Redis(client) => crate::engines::redis::list_databases(client).await,
+        DbPool::MsSql(handle) => crate::engines::mssql::list_databases(handle).await,
         // Elasticsearch / DynamoDB に database 一覧の概念は無い
         // (capabilities.supports_schemas = false でフロントは呼ばないが、
         // 直接呼ばれても壊れないよう空を返す)
@@ -1309,7 +1337,8 @@ pub(crate) fn strip_leading_comments(sql: &str) -> &str {
 /// 空白化して小文字化したもの)、body_end は自動 LIMIT の挿入位置
 /// (末尾のコメント・セミコロン・空白を除いた本体の終了位置)。
 pub(crate) struct SqlScan {
-    cleaned: String,
+    /// リテラル・コメントを空白化し小文字に揃えた本文 (単語境界の判定用)
+    pub(crate) cleaned: String,
     pub(crate) body_end: usize,
 }
 
@@ -1357,6 +1386,8 @@ pub(crate) fn scan_sql(sql: &str, engine: Engine) -> SqlScan {
     let executable_comments = matches!(engine, Engine::MySql);
     // DuckDB はドル引用に対応しており方言は Postgres 相当
     let dollar_quotes = matches!(engine, Engine::Postgres | Engine::DuckDb);
+    // T-SQL は角括弧 (`[name]`) で識別子を囲む。`]]` が閉じ括弧のエスケープ
+    let bracket_quotes = matches!(engine, Engine::MsSql);
     let chars: Vec<char> = sql.chars().collect();
     let mut cleaned = String::with_capacity(sql.len());
     let mut body_end = 0;
@@ -1380,6 +1411,21 @@ pub(crate) fn scan_sql(sql: &str, engine: Engine) -> SqlScan {
                 advance!();
                 if inner == c {
                     if i < chars.len() && chars[i] == c {
+                        advance!();
+                        continue;
+                    }
+                    break;
+                }
+            }
+            cleaned.push(' ');
+            body_end = byte_pos;
+        } else if bracket_quotes && c == '[' {
+            advance!();
+            while i < chars.len() {
+                let inner = chars[i];
+                advance!();
+                if inner == ']' {
+                    if i < chars.len() && chars[i] == ']' {
                         advance!();
                         continue;
                     }
@@ -1546,6 +1592,9 @@ pub fn build_explain_sql(engine: &str, sql: &str) -> Result<String, AppError> {
         Engine::Sqlite => "EXPLAIN QUERY PLAN",
         // DuckDB の EXPLAIN ANALYZE は対象文を実際に実行するため使わない
         Engine::DuckDb => "EXPLAIN",
+        // T-SQL に EXPLAIN は無い。engines/mssql.rs が queryfolio の疑似文として
+        // 受け取り、SET SHOWPLAN_ALL ON で推定実行計画の行に変える (実行はしない)
+        Engine::MsSql => "EXPLAIN",
         // Redis / Elasticsearch / DynamoDb は冒頭の早期 return で弾いている
         Engine::Redis | Engine::Elasticsearch | Engine::DynamoDb => unreachable!(),
     };

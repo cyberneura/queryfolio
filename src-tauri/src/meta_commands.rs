@@ -57,6 +57,7 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
         Engine::MySql => mysql_meta(command, arg)?,
         Engine::Sqlite => sqlite_meta(command, arg)?,
         Engine::DuckDb => duckdb_meta(command, arg)?,
+        Engine::MsSql => mssql_meta(command, arg)?,
         // 冒頭の早期 return で弾いている
         Engine::Redis | Engine::Elasticsearch | Engine::DynamoDb => unreachable!(),
     };
@@ -76,8 +77,11 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
 /// 打たれることが多いため同じく切り替えとして受け付ける。sqlite / duckdb は
 /// `\c` 自体が非対応 (schema が DB ファイルパス) なので対象にしない。
 /// DuckDB の `USE` はネイティブに動くため、そのまま実行させる。
+/// SQL Server の `USE` もセッション単位の変更なので MySQL と同じく切り替えにする
+/// (コネクションは 1 本だが、Database 欄・TABLES ペインを追従させるには
+/// schema override を通す必要がある)。
 fn translate_use(engine: Engine, input: &str) -> Result<Option<MetaCommand>, AppError> {
-    if !matches!(engine, Engine::MySql | Engine::Postgres) {
+    if !matches!(engine, Engine::MySql | Engine::Postgres | Engine::MsSql) {
         return Ok(None);
     }
     // 先頭キーワードの判定は leading_keyword と揃える (先頭のコメントは読み飛ばす)
@@ -124,10 +128,15 @@ fn translate_use(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
 }
 
 /// `USE` の引数に付いた識別子クォートを外す。MySQL は `` ` ``、PostgreSQL は
-/// `"` がクォート文字。`USE \`my-db\`` のように方言として正しい書き方を
-/// そのまま受け付けるため。外した中身は validate_database_name で検証する
-/// (クォート内のエスケープを使う名前は非対応)。
+/// `"`、SQL Server は `[...]` (`"` も可) がクォート文字。`USE \`my-db\`` のように
+/// 方言として正しい書き方をそのまま受け付けるため。外した中身は
+/// validate_database_name で検証する (クォート内のエスケープを使う名前は非対応)。
 fn unquote_database_name(engine: Engine, name: &str) -> &str {
+    if engine == Engine::MsSql {
+        if let Some(inner) = name.strip_prefix('[').and_then(|n| n.strip_suffix(']')) {
+            return inner;
+        }
+    }
     let quote = if engine == Engine::MySql { '`' } else { '"' };
     name.strip_prefix(quote)
         .and_then(|inner| inner.strip_suffix(quote))
@@ -369,6 +378,54 @@ fn duckdb_meta(command: &str, arg: Option<&str>) -> Result<String, AppError> {
     Ok(sql)
 }
 
+/// SQL Server は INFORMATION_SCHEMA (ANSI) と sys.* カタログの両方を持つ。
+/// 一覧系は INFORMATION_SCHEMA、database / schema / principal の一覧は sys.* を使う。
+/// \d <table> の名前は validate_relation_name を通した識別子だけなので、
+/// 文字列リテラルとして埋め込める (クォートや `;` は含まれない)。
+fn mssql_meta(command: &str, arg: Option<&str>) -> Result<String, AppError> {
+    let sql = match (command, arg) {
+        ("\\l" | "\\list", _) => "SELECT name, database_id, create_date, state_desc \
+             FROM sys.databases ORDER BY name"
+            .to_string(),
+        ("\\dt", _) => "SELECT TABLE_SCHEMA AS [schema], TABLE_NAME AS name, \
+             'table' AS type FROM INFORMATION_SCHEMA.TABLES \
+             WHERE TABLE_TYPE = 'BASE TABLE' ORDER BY 1, 2"
+            .to_string(),
+        ("\\dv", _) => "SELECT TABLE_SCHEMA AS [schema], TABLE_NAME AS name, \
+             'view' AS type FROM INFORMATION_SCHEMA.TABLES \
+             WHERE TABLE_TYPE = 'VIEW' ORDER BY 1, 2"
+            .to_string(),
+        ("\\dn", _) => "SELECT name FROM sys.schemas ORDER BY name".to_string(),
+        ("\\d", None) => "SELECT TABLE_SCHEMA AS [schema], TABLE_NAME AS name, \
+             LOWER(TABLE_TYPE) AS type FROM INFORMATION_SCHEMA.TABLES ORDER BY 1, 2"
+            .to_string(),
+        ("\\d", Some(name)) => {
+            let name = validate_relation_name(name)?;
+            let (schema, table) = crate::engines::mssql::split_qualified(name);
+            format!(
+                "SELECT COLUMN_NAME AS [column], DATA_TYPE AS [type], \
+                 CHARACTER_MAXIMUM_LENGTH AS [length], NUMERIC_PRECISION AS [precision], \
+                 NUMERIC_SCALE AS [scale], IS_NULLABLE AS [nullable], \
+                 COLUMN_DEFAULT AS [default] \
+                 FROM INFORMATION_SCHEMA.COLUMNS \
+                 WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{table}' \
+                 ORDER BY ORDINAL_POSITION"
+            )
+        }
+        ("\\du", _) => "SELECT name, type_desc, create_date \
+             FROM sys.database_principals \
+             WHERE type IN ('S', 'U', 'G') AND name NOT LIKE '##%' ORDER BY name"
+            .to_string(),
+        _ => {
+            return Err(unsupported(
+                command,
+                "\\l \\list \\dt \\dv \\dn \\du \\d [table] \\c <database>",
+            ));
+        }
+    };
+    Ok(sql)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +529,55 @@ mod tests {
         assert!(err.to_string().contains("not supported for DuckDB"));
         // 未対応コマンド
         assert!(translate(Engine::DuckDb, "\\du").is_err());
+    }
+
+    #[test]
+    fn test_mssql_meta() {
+        let sql = sql_of(Engine::MsSql, "\\l");
+        assert!(sql.contains("sys.databases"));
+        let sql = sql_of(Engine::MsSql, "\\dt");
+        assert!(sql.contains("INFORMATION_SCHEMA.TABLES"));
+        assert!(sql.contains("BASE TABLE"));
+        let sql = sql_of(Engine::MsSql, "\\dv");
+        assert!(sql.contains("'VIEW'"));
+        assert!(sql_of(Engine::MsSql, "\\dn").contains("sys.schemas"));
+        assert!(sql_of(Engine::MsSql, "\\du").contains("sys.database_principals"));
+        // 非修飾名は dbo、schema.table はそのスキーマで絞る
+        let sql = sql_of(Engine::MsSql, "\\d users");
+        assert!(
+            sql.contains("TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'users'"),
+            "{sql}"
+        );
+        // 列の別名は全部角括弧で囲む (PRECISION 等は T-SQL の予約語)
+        for alias in [
+            "[column]",
+            "[type]",
+            "[length]",
+            "[precision]",
+            "[scale]",
+            "[nullable]",
+            "[default]",
+        ] {
+            assert!(sql.contains(&format!(" AS {alias}")), "{alias}: {sql}");
+        }
+        let sql = sql_of(Engine::MsSql, "\\d sales.orders");
+        assert!(
+            sql.contains("TABLE_SCHEMA = 'sales' AND TABLE_NAME = 'orders'"),
+            "{sql}"
+        );
+        // インジェクションにつながる引数は拒否
+        assert!(translate(Engine::MsSql, "\\d users'; DROP TABLE x; --").is_err());
+        assert!(translate(Engine::MsSql, "\\d [users]").is_err());
+        // \c と USE は database の切り替え。角括弧のクォートも外す
+        assert!(matches!(
+            translate(Engine::MsSql, "\\c reporting").unwrap(),
+            Some(MetaCommand::Connect(ref db)) if db == "reporting"
+        ));
+        assert!(matches!(
+            translate(Engine::MsSql, "USE [reporting];").unwrap(),
+            Some(MetaCommand::Connect(ref db)) if db == "reporting"
+        ));
+        assert!(translate(Engine::MsSql, "USE db; SELECT 1").is_err());
     }
 
     #[test]

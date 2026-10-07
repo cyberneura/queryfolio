@@ -12,6 +12,7 @@
 pub mod duckdb;
 pub mod dynamodb;
 pub mod elasticsearch;
+pub mod mssql;
 pub mod redis;
 
 use serde::Serialize;
@@ -97,9 +98,18 @@ const DYNAMODB_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     ..SQL_CAPABILITIES
 };
 
+/// SQL Server は SQL エンジンだが、セル編集の適用経路 (run_statements) が
+/// sqlx 前提のため supports_editable_cells のみ false にする (DuckDB と同じ)。
+/// EXPLAIN は queryfolio の疑似文 (SET SHOWPLAN_ALL) として engines/mssql.rs が実装する。
+const MSSQL_CAPABILITIES: EngineCapabilities = EngineCapabilities {
+    supports_editable_cells: false,
+    ..SQL_CAPABILITIES
+};
+
 pub fn capabilities(engine: Engine) -> EngineCapabilities {
     match engine {
         Engine::MySql | Engine::Postgres | Engine::Sqlite => SQL_CAPABILITIES.clone(),
+        Engine::MsSql => MSSQL_CAPABILITIES.clone(),
         Engine::Redis => REDIS_CAPABILITIES.clone(),
         Engine::Elasticsearch => ELASTICSEARCH_CAPABILITIES.clone(),
         Engine::DuckDb => DUCKDB_CAPABILITIES.clone(),
@@ -176,6 +186,18 @@ mod tests {
         assert!(dynamodb.supports_format);
         assert!(!dynamodb.supports_editable_cells);
         assert!(!dynamodb.supports_ai);
+
+        // SQL Server は SQL 系だがセル編集のみ非対応。エイリアスも同じ capability
+        let mssql = capabilities_for_name("mssql");
+        assert_eq!(mssql.editor_language, "sql");
+        assert_eq!(mssql.file_extension, "sql");
+        assert!(mssql.supports_schemas);
+        assert!(mssql.supports_tables);
+        assert!(mssql.supports_explain);
+        assert!(mssql.supports_format);
+        assert!(!mssql.supports_editable_cells);
+        assert!(mssql.supports_ai);
+        assert!(!capabilities_for_name("sqlserver").supports_editable_cells);
 
         // 未知のエンジンは SQL 相当 (エラーは接続時に出す)
         let unknown = capabilities_for_name("oracle");

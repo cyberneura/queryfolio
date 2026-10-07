@@ -596,6 +596,7 @@ async fn switch_active_schema(
         let sql = match db::parse_engine(&server.engine)? {
             db::Engine::MySql => "SELECT DATABASE() AS `database`",
             db::Engine::Postgres => "SELECT current_database() AS database",
+            db::Engine::MsSql => "SELECT DB_NAME() AS [database]",
             // sqlite / duckdb / redis は meta_commands 側で弾いているのでここには来ない
             db::Engine::Sqlite => {
                 return Err(AppError::Config(

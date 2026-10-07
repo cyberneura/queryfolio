@@ -43,7 +43,7 @@ queryfolio --license        # licenses of the bundled third-party libraries
 dynamodb, because there that field is an AWS access key ID rather than a database user —
 `(hidden)` means "configured but not shown", which is not the same as `-` ("not set").
 
-`SSL` shows the effective mode for mysql / postgres / redis (`disable` / `prefer` /
+`SSL` shows the effective mode for mysql / postgres / mssql / redis (`disable` / `prefer` /
 `require` / `verify-ca` / `verify-full`) rather than yes/no, because the default `prefer`
 falls back to plaintext without verifying the certificate. Other engines show the `tls` flag
 as `on` / `off` — except a dynamodb connection with no `host` override, where the flag does
@@ -155,7 +155,7 @@ queryfolio open ~/.config/queryfolio/sqlfiles/db.example.com_postgres_prod_app/m
 
 ## File names and contents
 
-- The extension follows the engine: `.sql` for postgres / mysql / sqlite / duckdb / dynamodb,
+- The extension follows the engine: `.sql` for postgres / mysql / sqlite / duckdb / mssql / dynamodb,
   `.redis` for redis / valkey, `.es` for elasticsearch / opensearch. A file whose extension
   does not match the connection's engine simply does not appear in that connection's list.
 - Names containing `/` `\` `\0`, starting with `.`, or consisting only of whitespace are
