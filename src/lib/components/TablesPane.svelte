@@ -164,13 +164,10 @@
       return;
     }
     if (engine === "mssql" || engine === "sqlserver") {
-      // T-SQL に LIMIT 句は無い (TOP を使う)。カタログ由来の名前は空白や
-      // 予約語を含み得る (`Order Details`) ので角括弧で囲む (`]` は `]]`)
-      const bracket = (s: string) => `[${s.replace(/]/g, "]]")}]`;
-      const target = table.schema
-        ? `${bracket(table.schema)}.${bracket(table.name)}`
-        : bracket(table.name);
-      appStore.insertSqlSnippet(`SELECT TOP 100 * FROM ${target};`);
+      // T-SQL に LIMIT 句は無い (TOP を使う)。qualified_name はバックエンド
+      // (engines/mssql.rs の qualified_name) が空白やドットを含む名前を
+      // 角括弧で囲んで返すので、そのまま埋め込める
+      appStore.insertSqlSnippet(`SELECT TOP 100 * FROM ${table.qualified_name};`);
       return;
     }
     appStore.insertSqlSnippet(

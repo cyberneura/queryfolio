@@ -39,6 +39,13 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
     }
     // SQL の癖で末尾に ; を付けても動くよう、末尾のセミコロンは無視する
     let trimmed = trimmed.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
+    // SQL Server の角括弧付き database 名 (`\c [Sales Data]`) は空白を含み得るので、
+    // 空白で切る前に 1 つの識別子として読む
+    if engine == Engine::MsSql {
+        if let Some(connect) = translate_bracketed_connect(trimmed)? {
+            return Ok(Some(connect));
+        }
+    }
     let mut parts = trimmed.split_whitespace();
     let command = parts.next().unwrap_or("");
     let arg = parts.next();
@@ -110,6 +117,13 @@ fn translate_use(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
                 .into(),
         ));
     }
+    // SQL Server の `USE [Sales Data]`: 角括弧の中の空白は区切りではない
+    if engine == Engine::MsSql && after.trim_start().starts_with('[') {
+        return Ok(Some(MetaCommand::Connect(bracketed_database_name(
+            after.trim_start(),
+            "USE",
+        )?)));
+    }
     let mut parts = after.split_whitespace();
     let Some(name) = parts.next() else {
         return Err(AppError::Config(
@@ -125,6 +139,47 @@ fn translate_use(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
     Ok(Some(MetaCommand::Connect(
         validate_database_name(name)?.to_string(),
     )))
+}
+
+/// SQL Server の `\c [name]` / `\connect [name]`: 角括弧の中は空白やドットを
+/// 含めるので、空白で切る前に識別子として読む。角括弧で始まらなければ None
+/// (通常の経路で処理する)。
+fn translate_bracketed_connect(trimmed: &str) -> Result<Option<MetaCommand>, AppError> {
+    let Some((command, rest)) = trimmed.split_once(char::is_whitespace) else {
+        return Ok(None);
+    };
+    if !matches!(command, "\\c" | "\\connect") {
+        return Ok(None);
+    }
+    let rest = rest.trim_start();
+    if !rest.starts_with('[') {
+        return Ok(None);
+    }
+    Ok(Some(MetaCommand::Connect(bracketed_database_name(
+        rest, command,
+    )?)))
+}
+
+/// 角括弧付きの database 名を読んで検証する (SQL Server)。閉じ括弧の後ろに
+/// 何か残っていれば余分な引数として拒否する。中身は SQL には埋め込まれず
+/// 接続オプション (tiberius の `database`) に渡るだけなので、識別子の形は
+/// 問わない — 空でなく、制御文字を含まず、SQL Server の識別子長 (128) 以内
+/// であることだけを見る。
+fn bracketed_database_name(input: &str, command: &str) -> Result<String, AppError> {
+    let Some((name, tail)) = crate::engines::mssql::parse_bracketed(input) else {
+        return Err(AppError::Config(format!(
+            "Invalid database name: {input} (a bracketed name must be closed with ])"
+        )));
+    };
+    if !tail.trim().is_empty() {
+        return Err(AppError::Config(format!(
+            "{command} takes only a database name (usage: {command} <database>)"
+        )));
+    }
+    if name.is_empty() || name.chars().count() > 128 || name.chars().any(char::is_control) {
+        return Err(AppError::Config(format!("Invalid database name: [{name}]")));
+    }
+    Ok(name)
 }
 
 /// `USE` の引数に付いた識別子クォートを外す。MySQL は `` ` ``、PostgreSQL は
@@ -578,6 +633,32 @@ mod tests {
             Some(MetaCommand::Connect(ref db)) if db == "reporting"
         ));
         assert!(translate(Engine::MsSql, "USE db; SELECT 1").is_err());
+        // 角括弧の中の空白・ドットは区切りではない (Codex レビューの指摘)。
+        // `]]` は `]` に戻る
+        for input in [
+            "USE [Sales Data]",
+            "\\c [Sales Data]",
+            "\\connect  [Sales Data] ;",
+        ] {
+            assert!(
+                matches!(
+                    translate(Engine::MsSql, input).unwrap(),
+                    Some(MetaCommand::Connect(ref db)) if db == "Sales Data"
+                ),
+                "{input}"
+            );
+        }
+        assert!(matches!(
+            translate(Engine::MsSql, "USE [a.b]]c]").unwrap(),
+            Some(MetaCommand::Connect(ref db)) if db == "a.b]c"
+        ));
+        // 閉じていない・余分な引数・空は拒否
+        assert!(translate(Engine::MsSql, "USE [unclosed").is_err());
+        assert!(translate(Engine::MsSql, "USE [a] extra").is_err());
+        assert!(translate(Engine::MsSql, "\\c [a] [b]").is_err());
+        assert!(translate(Engine::MsSql, "USE []").is_err());
+        // 他のエンジンの角括弧は従来どおり識別子として不正
+        assert!(translate(Engine::MySql, "USE [x]").is_err());
     }
 
     #[test]

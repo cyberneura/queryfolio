@@ -761,18 +761,86 @@ fn integer(value: Option<&ColumnData<'static>>) -> Option<i64> {
     }
 }
 
-/// SQL に埋め込める修飾名を作る。既定スキーマ dbo は修飾しない。
-fn qualified_name(schema: &str, name: &str) -> String {
-    if schema == DEFAULT_SCHEMA {
-        name.to_string()
+/// 角括弧なしで SQL に書ける識別子か (英字 / `_` 始まりで英数字 / `_` / `$` のみ)。
+fn is_plain_identifier(part: &str) -> bool {
+    let mut chars = part.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+/// 識別子を角括弧で囲む (`]` は `]]` にエスケープ)。
+fn bracket(part: &str) -> String {
+    format!("[{}]", part.replace(']', "]]"))
+}
+
+/// SQL に埋め込める形の識別子。空白・記号・ドット・予約語になり得ない形
+/// (plain) 以外は角括弧で囲む。
+fn quote_identifier(part: &str) -> String {
+    if is_plain_identifier(part) {
+        part.to_string()
     } else {
-        format!("{schema}.{name}")
+        bracket(part)
     }
 }
 
-/// 修飾名 (schema.table または table) を (schema, table) に分解する。
-/// 非修飾名は既定スキーマ dbo とみなす。
+/// 先頭の角括弧付き識別子を 1 つ読む。`[` で始まらない、または閉じていない
+/// 入力は None。返すのは中身 (`]]` は `]` に戻す) と、閉じ括弧の後ろ。
+pub(crate) fn parse_bracketed(input: &str) -> Option<(String, &str)> {
+    let mut rest = input.strip_prefix('[')?;
+    let mut out = String::new();
+    loop {
+        let close = rest.find(']')?;
+        out.push_str(&rest[..close]);
+        let after = &rest[close + 1..];
+        match after.strip_prefix(']') {
+            Some(after) => {
+                out.push(']');
+                rest = after;
+            }
+            None => return Some((out, after)),
+        }
+    }
+}
+
+/// 修飾名の先頭の識別子を 1 つ読む。角括弧付きなら中身を、そうでなければ
+/// 最初の `.` の手前までを返し、残りも返す。
+fn read_identifier(input: &str) -> (String, &str) {
+    if let Some(parsed) = parse_bracketed(input) {
+        return parsed;
+    }
+    match input.find('.') {
+        Some(dot) => (input[..dot].to_string(), &input[dot..]),
+        None => (input.to_string(), ""),
+    }
+}
+
+/// SQL に埋め込める修飾名を作る。既定スキーマ dbo は修飾しない。
+/// カタログ由来の名前は空白やドット (`Order Details` / `a.b`) を含み得るので、
+/// plain でない部分は角括弧で囲む — 修飾名はフロントが SQL へ挿入し、
+/// `split_qualified` が (schema, table) へ戻すので、どちらにも曖昧さが残らない
+/// (素の `a.b` は「スキーマ a のテーブル b」としか読めない)。
+fn qualified_name(schema: &str, name: &str) -> String {
+    if schema == DEFAULT_SCHEMA {
+        quote_identifier(name)
+    } else {
+        format!("{}.{}", quote_identifier(schema), quote_identifier(name))
+    }
+}
+
+/// `qualified_name` が作った修飾名を (schema, table) に戻す。角括弧付きの部分は
+/// 中身に戻し、非修飾名は既定スキーマ dbo とみなす。読み切れない形 (閉じていない
+/// 括弧等) は最初のドットで割る従来の読み方に倒す。
 pub(crate) fn split_qualified(table: &str) -> (String, String) {
+    let (first, rest) = read_identifier(table);
+    if rest.is_empty() {
+        return (DEFAULT_SCHEMA.to_string(), first);
+    }
+    if let Some(rest) = rest.strip_prefix('.') {
+        let (second, tail) = read_identifier(rest);
+        if tail.is_empty() && !second.is_empty() {
+            return (first, second);
+        }
+    }
     match table.split_once('.') {
         Some((schema, name)) => (schema.to_string(), name.to_string()),
         None => (DEFAULT_SCHEMA.to_string(), table.to_string()),
@@ -1187,6 +1255,10 @@ mod tests {
     fn test_qualified_names() {
         assert_eq!(qualified_name("dbo", "users"), "users");
         assert_eq!(qualified_name("sales", "orders"), "sales.orders");
+        // 空白・ドット・`]` を含む名前は角括弧で囲む (SQL に埋め込める形)
+        assert_eq!(qualified_name("dbo", "Order Details"), "[Order Details]");
+        assert_eq!(qualified_name("dbo", "a.b"), "[a.b]");
+        assert_eq!(qualified_name("my schema", "t]x"), "[my schema].[t]]x]");
         assert_eq!(
             split_qualified("users"),
             ("dbo".to_string(), "users".to_string())
@@ -1195,6 +1267,32 @@ mod tests {
             split_qualified("sales.orders"),
             ("sales".to_string(), "orders".to_string())
         );
+        // 往復: カタログの名前がそのまま戻る (Codex レビューの指摘: 素の
+        // `a.b` では dbo のテーブル a.b とスキーマ a のテーブル b が区別できない)
+        for (schema, name) in [
+            ("dbo", "Order Details"),
+            ("dbo", "a.b"),
+            ("my schema", "t]x"),
+            ("sales", "orders"),
+            ("a.b", "c"),
+        ] {
+            assert_eq!(
+                split_qualified(&qualified_name(schema, name)),
+                (schema.to_string(), name.to_string()),
+                "{schema} / {name}"
+            );
+        }
+        // 閉じていない括弧は従来の読み方に倒す (落とさない)
+        assert_eq!(
+            split_qualified("[broken"),
+            ("dbo".to_string(), "[broken".to_string())
+        );
+        assert_eq!(
+            parse_bracketed("[a]]b].rest"),
+            Some(("a]b".to_string(), ".rest"))
+        );
+        assert_eq!(parse_bracketed("plain"), None);
+        assert_eq!(parse_bracketed("[unclosed"), None);
     }
 
     #[test]
