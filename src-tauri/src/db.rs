@@ -1524,6 +1524,13 @@ pub(crate) fn scan_sql(sql: &str, engine: Engine) -> SqlScan {
 /// 付与しない (保守的側に倒す。スキップしてもクライアント側の max_rows
 /// 打ち切りが安全網になる)。
 pub(crate) fn should_auto_limit(sql: &str, engine: Engine) -> bool {
+    // T-SQL は LIMIT でなく TOP を差し込む。付くかどうかの判定は差し込む側
+    // (engines::mssql::apply_auto_top) と同じにしないと、lib.rs が「LIMIT が付く」
+    // と見て max_rows を既定値にしたまま、実際には TOP が付かず default_limit が
+    // 効かない文 (UNION / WITH / 既に TOP がある文) ができる
+    if engine == Engine::MsSql {
+        return crate::engines::mssql::apply_auto_top(sql, 1).is_some();
+    }
     // VALUES (SQLite では LIMIT 不可) や TABLE は対象にせず、
     // SELECT / WITH のみに限定する。DuckDB は FROM-first 構文
     // (`FROM t`) も SELECT と同じ問い合わせ形なので対象にする

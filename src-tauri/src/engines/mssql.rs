@@ -1031,6 +1031,28 @@ mod tests {
         );
     }
 
+    /// lib.rs は should_auto_limit で「LIMIT が付くか」を先読みして max_rows を
+    /// 決める。T-SQL では TOP を差し込む側と同じ判定でないと、TOP の付かない文で
+    /// default_limit が効かなくなる (Codex レビューの指摘)
+    #[test]
+    fn test_should_auto_limit_matches_apply_auto_top() {
+        for sql in [
+            "SELECT * FROM t",
+            "select distinct a from t",
+            "SELECT TOP 10 * FROM t",
+            "SELECT a FROM t UNION SELECT a FROM u",
+            "WITH c AS (SELECT 1 AS n) SELECT n FROM c",
+            "SELECT * FROM t ORDER BY id OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY",
+            "INSERT INTO t VALUES (1)",
+        ] {
+            assert_eq!(
+                crate::db::should_auto_limit(sql, Engine::MsSql),
+                apply_auto_top(sql, 10).is_some(),
+                "{sql}"
+            );
+        }
+    }
+
     #[test]
     fn test_explain_target() {
         assert_eq!(explain_target("EXPLAIN SELECT 1"), Some("SELECT 1"));

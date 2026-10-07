@@ -150,15 +150,17 @@ pub async fn fetch_columns(pool: &DbPool, table: &str) -> Result<Vec<ColumnInfo>
     if let DbPool::DynamoDb(client) = pool {
         return crate::engines::dynamodb::fetch_columns(client, table).await;
     }
+    // SQL Server のテーブル名は空白や記号を含み得る (`Order Details`) ので、
+    // SQL 識別子の規則 (validate_relation_name) は通さない。モジュール側が
+    // INFORMATION_SCHEMA に @P1 / @P2 でバインドして照会し、SQL には埋め込まない
+    if let DbPool::MsSql(handle) = pool {
+        return crate::engines::mssql::fetch_columns(handle, table).await;
+    }
     let table = validate_relation_name(table)?;
     // DuckDB はテーブル名をバインドして information_schema を照会する
     // (識別子検証は SQL 系と同じ規則を通す)
     if let DbPool::DuckDb(handle) = pool {
         return crate::engines::duckdb::fetch_columns(handle, table).await;
-    }
-    // SQL Server も同じ識別子規則で検証し、INFORMATION_SCHEMA にバインドして照会する
-    if let DbPool::MsSql(handle) = pool {
-        return crate::engines::mssql::fetch_columns(handle, table).await;
     }
     let columns: Vec<ColumnInfo> = match pool {
         DbPool::Postgres(p) => {
@@ -257,12 +259,13 @@ pub async fn fetch_primary_keys(pool: &DbPool, table: &str) -> Result<Vec<String
     if let DbPool::DynamoDb(client) = pool {
         return crate::engines::dynamodb::fetch_primary_keys(client, table).await;
     }
+    // SQL Server はバインドで照会するので識別子検証を通さない (fetch_columns と同じ)
+    if let DbPool::MsSql(handle) = pool {
+        return crate::engines::mssql::fetch_primary_keys(handle, table).await;
+    }
     let table = validate_relation_name(table)?;
     if let DbPool::DuckDb(handle) = pool {
         return crate::engines::duckdb::fetch_primary_keys(handle, table).await;
-    }
-    if let DbPool::MsSql(handle) = pool {
-        return crate::engines::mssql::fetch_primary_keys(handle, table).await;
     }
     let keys: Vec<String> = match pool {
         DbPool::Postgres(p) => {
