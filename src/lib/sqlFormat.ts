@@ -31,6 +31,7 @@ interface Token {
  *   一部で、`[order-id]` を `[order - id]` にすると別のオブジェクトになる)
  * - `#temp` / `##global` の一時テーブル名を識別子として読む (他の方言では
  *   `#` は MySQL 風の行コメントの始まり)
+ * - `N'...'` の Unicode 文字列定数を接頭辞ごと 1 トークンとして保つ
  */
 export type SqlDialect = "mssql";
 
@@ -224,6 +225,25 @@ function tokenize(sql: string, dialect?: SqlDialect): Token[] {
     if (isWordStart(c) || (mssql && c === "#")) {
       let j = i + 1;
       while (j < n && (isWordPart(sql[j]) || (mssql && sql[j] === "#"))) j++;
+      // T-SQL の Unicode 文字列 N'...' は接頭辞と文字列で 1 つの定数。
+      // 別トークンにすると N と '...' の間に空白が入り、別の式に変わる
+      if (mssql && j === i + 1 && (c === "N" || c === "n") && sql[j] === "'") {
+        let k = j + 1;
+        while (k < n) {
+          if (sql[k] === "'") {
+            if (sql[k + 1] === "'") {
+              k += 2;
+              continue;
+            }
+            k += 1;
+            break;
+          }
+          k += 1;
+        }
+        tokens.push({ type: "string", text: sql.slice(i, k) });
+        i = k;
+        continue;
+      }
       tokens.push({ type: "word", text: sql.slice(i, j) });
       i = j;
       continue;

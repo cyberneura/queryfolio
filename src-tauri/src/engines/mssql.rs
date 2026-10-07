@@ -294,9 +294,12 @@ pub async fn run_query_cancellable(
             return Err(AppError::Readonly(reason));
         }
     }
-    // 複文は 1 文目しか見ないガードをすり抜けるため、ガードが有効なら拒否する
+    // 複文は 1 文目しか見ないガードをすり抜けるため、ガードが有効なら拒否する。
+    // T-SQL はセミコロンが省略できるので、`;` の有無に加えて 2 文目になり得る
+    // キーワードが後ろにあるかも見る (contains_trailing_statement)
     if (readonly != ReadonlyGuard::Off || !allow_dangerous)
-        && crate::db::contains_multiple_statements(sql, Engine::MsSql)
+        && (crate::db::contains_multiple_statements(sql, Engine::MsSql)
+            || contains_trailing_statement(sql))
     {
         return Err(crate::db::multi_statement_block_error());
     }
@@ -403,6 +406,32 @@ pub async fn run_query_cancellable(
             Err(failure.error)
         }
     }
+}
+
+/// 先頭以外に現れたら「2 文目が始まっている」とみなす語。T-SQL は文の区切りの
+/// `;` を省略できるので、`SELECT 1\nDROP TABLE t` は contains_multiple_statements
+/// (`;` を数える) をすり抜けて先頭の SELECT だけで readonly / dangerous ガードを
+/// 通り、バッチ全体が実行される (Codex レビューの指摘)。書き込み・制御・実行の
+/// キーワードが後続にあればガードが有効な接続では拒否する。
+/// `select` / `with` は入れない: サブクエリと `WITH (NOLOCK)` ヒントが 1 文の中に
+/// 普通に現れるため (後続の DML は `WITH ... DELETE` でも delete の語で捕まる)。
+/// 列名が `update` のような文を素で書くと誤って拒否される側に倒れる
+/// (角括弧で書けば通る。Writable ON + allow_dangerous_statements で外せる)。
+const TRAILING_STATEMENT_KEYWORDS: &[&str] = &[
+    "insert", "update", "delete", "merge", "create", "alter", "drop", "truncate", "grant",
+    "revoke", "deny", "exec", "execute", "declare", "set", "use", "begin", "commit", "rollback",
+    "save", "backup", "restore", "bulk", "kill", "go", "dbcc", "shutdown",
+];
+
+/// 先頭の文の後ろに別の文が始まっている形か (セミコロンの無い複文)。
+/// 判定はリテラル・コメント・角括弧を空白化した cleaned に対する単語境界で行う。
+fn contains_trailing_statement(sql: &str) -> bool {
+    let cleaned = scan_sql(sql, Engine::MsSql).cleaned;
+    cleaned
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '#')
+        .filter(|w| !w.is_empty())
+        .skip(1)
+        .any(|word| TRAILING_STATEMENT_KEYWORDS.contains(&word))
 }
 
 /// `EXPLAIN <sql>` なら対象の SQL を返す (先頭のコメントは残さない)。
@@ -1142,6 +1171,38 @@ mod tests {
                 apply_auto_top(sql, 10).is_some(),
                 "{sql}"
             );
+        }
+    }
+
+    /// T-SQL はセミコロン無しで文を並べられるので、ガードが有効な接続では
+    /// 後続の文の始まりも複文として拒否する (Codex レビューの指摘)
+    #[test]
+    fn test_contains_trailing_statement() {
+        for sql in [
+            "SELECT 1\nDROP TABLE dbo.t",
+            "SELECT 1 DELETE FROM t",
+            "SELECT 1\nCOMMIT TRANSACTION",
+            "SELECT 1 EXEC sp_who",
+            "select 1 go",
+            "SELECT 1\nDECLARE @x INT",
+            "SELECT 1\nSET NOCOUNT ON",
+        ] {
+            assert!(contains_trailing_statement(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT 1",
+            "SELECT * FROM t WITH (NOLOCK) WHERE id = 1",
+            "SELECT a FROM t WHERE b IN (SELECT b FROM u)",
+            // リテラル・コメント・角括弧の中の語は文ではない
+            "SELECT 'drop table t' FROM t",
+            "SELECT 1 -- drop table t",
+            "SELECT [drop] FROM [update]",
+            "SELECT created, updated_at FROM t",
+            // 先頭の語自身は数えない
+            "DELETE FROM t WHERE id = 1",
+            "UPDATE t SET x = 1 WHERE id = 1",
+        ] {
+            assert!(!contains_trailing_statement(sql), "{sql}");
         }
     }
 
