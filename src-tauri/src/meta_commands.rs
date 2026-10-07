@@ -39,6 +39,13 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
     }
     // SQL の癖で末尾に ; を付けても動くよう、末尾のセミコロンは無視する
     let trimmed = trimmed.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
+    // SQL Server の角括弧付き database 名 (`\c [Sales Data]`) は空白を含み得るので、
+    // 空白で切る前に 1 つの識別子として読む
+    if engine == Engine::MsSql {
+        if let Some(connect) = translate_bracketed_connect(trimmed)? {
+            return Ok(Some(connect));
+        }
+    }
     let mut parts = trimmed.split_whitespace();
     let command = parts.next().unwrap_or("");
     let arg = parts.next();
@@ -57,6 +64,7 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
         Engine::MySql => mysql_meta(command, arg)?,
         Engine::Sqlite => sqlite_meta(command, arg)?,
         Engine::DuckDb => duckdb_meta(command, arg)?,
+        Engine::MsSql => mssql_meta(command, arg)?,
         // 冒頭の早期 return で弾いている
         Engine::Redis | Engine::Elasticsearch | Engine::DynamoDb => unreachable!(),
     };
@@ -76,8 +84,11 @@ pub fn translate(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
 /// 打たれることが多いため同じく切り替えとして受け付ける。sqlite / duckdb は
 /// `\c` 自体が非対応 (schema が DB ファイルパス) なので対象にしない。
 /// DuckDB の `USE` はネイティブに動くため、そのまま実行させる。
+/// SQL Server の `USE` もセッション単位の変更なので MySQL と同じく切り替えにする
+/// (コネクションは 1 本だが、Database 欄・TABLES ペインを追従させるには
+/// schema override を通す必要がある)。
 fn translate_use(engine: Engine, input: &str) -> Result<Option<MetaCommand>, AppError> {
-    if !matches!(engine, Engine::MySql | Engine::Postgres) {
+    if !matches!(engine, Engine::MySql | Engine::Postgres | Engine::MsSql) {
         return Ok(None);
     }
     // 先頭キーワードの判定は leading_keyword と揃える (先頭のコメントは読み飛ばす)
@@ -106,6 +117,13 @@ fn translate_use(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
                 .into(),
         ));
     }
+    // SQL Server の `USE [Sales Data]`: 角括弧の中の空白は区切りではない
+    if engine == Engine::MsSql && after.trim_start().starts_with('[') {
+        return Ok(Some(MetaCommand::Connect(bracketed_database_name(
+            after.trim_start(),
+            "USE",
+        )?)));
+    }
     let mut parts = after.split_whitespace();
     let Some(name) = parts.next() else {
         return Err(AppError::Config(
@@ -123,11 +141,57 @@ fn translate_use(engine: Engine, input: &str) -> Result<Option<MetaCommand>, App
     )))
 }
 
+/// SQL Server の `\c [name]` / `\connect [name]`: 角括弧の中は空白やドットを
+/// 含めるので、空白で切る前に識別子として読む。角括弧で始まらなければ None
+/// (通常の経路で処理する)。
+fn translate_bracketed_connect(trimmed: &str) -> Result<Option<MetaCommand>, AppError> {
+    let Some((command, rest)) = trimmed.split_once(char::is_whitespace) else {
+        return Ok(None);
+    };
+    if !matches!(command, "\\c" | "\\connect") {
+        return Ok(None);
+    }
+    let rest = rest.trim_start();
+    if !rest.starts_with('[') {
+        return Ok(None);
+    }
+    Ok(Some(MetaCommand::Connect(bracketed_database_name(
+        rest, command,
+    )?)))
+}
+
+/// 角括弧付きの database 名を読んで検証する (SQL Server)。閉じ括弧の後ろに
+/// 何か残っていれば余分な引数として拒否する。中身は SQL には埋め込まれず
+/// 接続オプション (tiberius の `database`) に渡るだけなので、識別子の形は
+/// 問わない — 空でなく、制御文字を含まず、SQL Server の識別子長 (128) 以内
+/// であることだけを見る。
+fn bracketed_database_name(input: &str, command: &str) -> Result<String, AppError> {
+    let Some((name, tail)) = crate::engines::mssql::parse_bracketed(input) else {
+        return Err(AppError::Config(format!(
+            "Invalid database name: {input} (a bracketed name must be closed with ])"
+        )));
+    };
+    if !tail.trim().is_empty() {
+        return Err(AppError::Config(format!(
+            "{command} takes only a database name (usage: {command} <database>)"
+        )));
+    }
+    if name.is_empty() || name.chars().count() > 128 || name.chars().any(char::is_control) {
+        return Err(AppError::Config(format!("Invalid database name: [{name}]")));
+    }
+    Ok(name)
+}
+
 /// `USE` の引数に付いた識別子クォートを外す。MySQL は `` ` ``、PostgreSQL は
-/// `"` がクォート文字。`USE \`my-db\`` のように方言として正しい書き方を
-/// そのまま受け付けるため。外した中身は validate_database_name で検証する
-/// (クォート内のエスケープを使う名前は非対応)。
+/// `"`、SQL Server は `[...]` (`"` も可) がクォート文字。`USE \`my-db\`` のように
+/// 方言として正しい書き方をそのまま受け付けるため。外した中身は
+/// validate_database_name で検証する (クォート内のエスケープを使う名前は非対応)。
 fn unquote_database_name(engine: Engine, name: &str) -> &str {
+    if engine == Engine::MsSql {
+        if let Some(inner) = name.strip_prefix('[').and_then(|n| n.strip_suffix(']')) {
+            return inner;
+        }
+    }
     let quote = if engine == Engine::MySql { '`' } else { '"' };
     name.strip_prefix(quote)
         .and_then(|inner| inner.strip_suffix(quote))
@@ -369,6 +433,54 @@ fn duckdb_meta(command: &str, arg: Option<&str>) -> Result<String, AppError> {
     Ok(sql)
 }
 
+/// SQL Server は INFORMATION_SCHEMA (ANSI) と sys.* カタログの両方を持つ。
+/// 一覧系は INFORMATION_SCHEMA、database / schema / principal の一覧は sys.* を使う。
+/// \d <table> の名前は validate_relation_name を通した識別子だけなので、
+/// 文字列リテラルとして埋め込める (クォートや `;` は含まれない)。
+fn mssql_meta(command: &str, arg: Option<&str>) -> Result<String, AppError> {
+    let sql = match (command, arg) {
+        ("\\l" | "\\list", _) => "SELECT name, database_id, create_date, state_desc \
+             FROM sys.databases ORDER BY name"
+            .to_string(),
+        ("\\dt", _) => "SELECT TABLE_SCHEMA AS [schema], TABLE_NAME AS name, \
+             'table' AS type FROM INFORMATION_SCHEMA.TABLES \
+             WHERE TABLE_TYPE = 'BASE TABLE' ORDER BY 1, 2"
+            .to_string(),
+        ("\\dv", _) => "SELECT TABLE_SCHEMA AS [schema], TABLE_NAME AS name, \
+             'view' AS type FROM INFORMATION_SCHEMA.TABLES \
+             WHERE TABLE_TYPE = 'VIEW' ORDER BY 1, 2"
+            .to_string(),
+        ("\\dn", _) => "SELECT name FROM sys.schemas ORDER BY name".to_string(),
+        ("\\d", None) => "SELECT TABLE_SCHEMA AS [schema], TABLE_NAME AS name, \
+             LOWER(TABLE_TYPE) AS type FROM INFORMATION_SCHEMA.TABLES ORDER BY 1, 2"
+            .to_string(),
+        ("\\d", Some(name)) => {
+            let name = validate_relation_name(name)?;
+            let (schema, table) = crate::engines::mssql::split_qualified(name);
+            format!(
+                "SELECT COLUMN_NAME AS [column], DATA_TYPE AS [type], \
+                 CHARACTER_MAXIMUM_LENGTH AS [length], NUMERIC_PRECISION AS [precision], \
+                 NUMERIC_SCALE AS [scale], IS_NULLABLE AS [nullable], \
+                 COLUMN_DEFAULT AS [default] \
+                 FROM INFORMATION_SCHEMA.COLUMNS \
+                 WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{table}' \
+                 ORDER BY ORDINAL_POSITION"
+            )
+        }
+        ("\\du", _) => "SELECT name, type_desc, create_date \
+             FROM sys.database_principals \
+             WHERE type IN ('S', 'U', 'G') AND name NOT LIKE '##%' ORDER BY name"
+            .to_string(),
+        _ => {
+            return Err(unsupported(
+                command,
+                "\\l \\list \\dt \\dv \\dn \\du \\d [table] \\c <database>",
+            ));
+        }
+    };
+    Ok(sql)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +584,81 @@ mod tests {
         assert!(err.to_string().contains("not supported for DuckDB"));
         // 未対応コマンド
         assert!(translate(Engine::DuckDb, "\\du").is_err());
+    }
+
+    #[test]
+    fn test_mssql_meta() {
+        let sql = sql_of(Engine::MsSql, "\\l");
+        assert!(sql.contains("sys.databases"));
+        let sql = sql_of(Engine::MsSql, "\\dt");
+        assert!(sql.contains("INFORMATION_SCHEMA.TABLES"));
+        assert!(sql.contains("BASE TABLE"));
+        let sql = sql_of(Engine::MsSql, "\\dv");
+        assert!(sql.contains("'VIEW'"));
+        assert!(sql_of(Engine::MsSql, "\\dn").contains("sys.schemas"));
+        assert!(sql_of(Engine::MsSql, "\\du").contains("sys.database_principals"));
+        // 非修飾名は dbo、schema.table はそのスキーマで絞る
+        let sql = sql_of(Engine::MsSql, "\\d users");
+        assert!(
+            sql.contains("TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'users'"),
+            "{sql}"
+        );
+        // 列の別名は全部角括弧で囲む (PRECISION 等は T-SQL の予約語)
+        for alias in [
+            "[column]",
+            "[type]",
+            "[length]",
+            "[precision]",
+            "[scale]",
+            "[nullable]",
+            "[default]",
+        ] {
+            assert!(sql.contains(&format!(" AS {alias}")), "{alias}: {sql}");
+        }
+        let sql = sql_of(Engine::MsSql, "\\d sales.orders");
+        assert!(
+            sql.contains("TABLE_SCHEMA = 'sales' AND TABLE_NAME = 'orders'"),
+            "{sql}"
+        );
+        // インジェクションにつながる引数は拒否
+        assert!(translate(Engine::MsSql, "\\d users'; DROP TABLE x; --").is_err());
+        assert!(translate(Engine::MsSql, "\\d [users]").is_err());
+        // \c と USE は database の切り替え。角括弧のクォートも外す
+        assert!(matches!(
+            translate(Engine::MsSql, "\\c reporting").unwrap(),
+            Some(MetaCommand::Connect(ref db)) if db == "reporting"
+        ));
+        assert!(matches!(
+            translate(Engine::MsSql, "USE [reporting];").unwrap(),
+            Some(MetaCommand::Connect(ref db)) if db == "reporting"
+        ));
+        assert!(translate(Engine::MsSql, "USE db; SELECT 1").is_err());
+        // 角括弧の中の空白・ドットは区切りではない (Codex レビューの指摘)。
+        // `]]` は `]` に戻る
+        for input in [
+            "USE [Sales Data]",
+            "\\c [Sales Data]",
+            "\\connect  [Sales Data] ;",
+        ] {
+            assert!(
+                matches!(
+                    translate(Engine::MsSql, input).unwrap(),
+                    Some(MetaCommand::Connect(ref db)) if db == "Sales Data"
+                ),
+                "{input}"
+            );
+        }
+        assert!(matches!(
+            translate(Engine::MsSql, "USE [a.b]]c]").unwrap(),
+            Some(MetaCommand::Connect(ref db)) if db == "a.b]c"
+        ));
+        // 閉じていない・余分な引数・空は拒否
+        assert!(translate(Engine::MsSql, "USE [unclosed").is_err());
+        assert!(translate(Engine::MsSql, "USE [a] extra").is_err());
+        assert!(translate(Engine::MsSql, "\\c [a] [b]").is_err());
+        assert!(translate(Engine::MsSql, "USE []").is_err());
+        // 他のエンジンの角括弧は従来どおり識別子として不正
+        assert!(translate(Engine::MySql, "USE [x]").is_err());
     }
 
     #[test]

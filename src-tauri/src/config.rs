@@ -264,14 +264,16 @@ pub struct ServerConfig {
     /// queryfolio 独自拡張: true の場合、HTTP 系エンジン (elasticsearch) の
     /// 接続に https を使う。省略時 false。
     /// dynamodb ではエンドポイント上書き (host 指定) 時のスキームに使う。
-    /// SQL 系エンジン (mysql / postgres) では「TLS を必須にし証明書も検証する」
+    /// SQL 系エンジン (mysql / postgres / mssql) では「TLS を必須にし証明書も検証する」
     /// 指定として扱う (ssl_mode 省略時の既定が verify-full になる)。
     /// redis では TLS 接続 (`rediss://` 相当) にする。証明書は必ず検証する
     /// (engines/redis.rs の connection_addr)。
     #[serde(default)]
     pub tls: bool,
-    /// queryfolio 独自拡張: SQL 系エンジン (mysql / postgres) の TLS モード。
+    /// queryfolio 独自拡張: SQL 系エンジン (mysql / postgres / mssql) の TLS モード。
     /// disable / prefer / require / verify-ca / verify-full。
+    /// mssql は verify-ca を verify-full と同じに扱う (SQL Server の TLS に
+    /// 「チェーンだけ検証してホスト名を見ない」設定は無い。engines/mssql.rs)。
     /// 省略時は tls: true なら verify-full、そうでなければ prefer
     /// (sqlx の既定。TLS を試み、張れなければ平文に降格し証明書も検証しない)。
     /// SSH トンネル経由の接続では接続先が 127.0.0.1 になるため、
@@ -543,7 +545,7 @@ pub struct ConnectionInfo {
     /// 接続一覧での表示グループ名 (グループ未所属なら null)
     pub group_name: Option<String>,
     /// 実効 TLS モード (SqlSslMode の文字列表現)。
-    /// mysql / postgres は ssl_mode / tls から解決した値、redis は tls: true なら
+    /// mysql / postgres / mssql は ssl_mode / tls から解決した値、redis は tls: true なら
     /// verify-full (証明書もホスト名も検証する)、false なら disable。
     /// 他のエンジン、および ssl_mode の値が不正な場合は null。
     /// フロントは「暗号化されない可能性がある直接接続」の表示に使う。
@@ -573,7 +575,9 @@ impl From<&ServerConfig> for ConnectionInfo {
             // エンジン名や ssl_mode の値が不正な設定は接続時にエラーになるので、
             // ここでは表示を諦めて null にする
             sql_ssl_mode: match crate::db::parse_engine(&server.engine) {
-                Ok(crate::db::Engine::MySql) | Ok(crate::db::Engine::Postgres) => server
+                Ok(crate::db::Engine::MySql)
+                | Ok(crate::db::Engine::Postgres)
+                | Ok(crate::db::Engine::MsSql) => server
                     .sql_ssl_mode()
                     .ok()
                     .map(|mode| mode.as_str().to_string()),

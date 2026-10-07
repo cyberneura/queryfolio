@@ -74,6 +74,22 @@ servers:
     engine: duckdb
     schema: ~/data/example.duckdb
 
+  # queryfolio 拡張: mssql (エイリアス: sqlserver)。Microsoft SQL Server に
+  # TDS (tiberius) で繋ぐ。schema は database 名 (省略時 master)、認証は
+  # user / password の SQL Server 認証のみ。ssl_mode / tls / ssl_root_cert は
+  # mysql / postgres と同じ (verify-ca は verify-full と同じ扱い)。
+  # SQL エンジンとして SELECT / メタコマンド / EXPLAIN (SHOWPLAN) / auto LIMIT (TOP)
+  # が使える。セル編集のみ非対応。
+  - name: dev-mssql
+    description: "開発用 SQL Server"
+    engine: mssql
+    host: localhost
+    port: 1433
+    schema: AdventureWorks
+    user: sa
+    password: your_password
+    # tls: true
+
   # queryfolio 拡張: redis (エイリアス: valkey)。
   # エディタは 1 行 = 1 コマンド (GET my-key / MGET a b c ...)。
   # schema は database 番号 (省略時 0)。user / password は ACL / AUTH に使う。

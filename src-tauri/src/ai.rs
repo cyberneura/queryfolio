@@ -136,6 +136,7 @@ fn dialect_name(engine: &str) -> String {
         "mysql" | "mariadb" => "MySQL".to_string(),
         "sqlite" | "sqlite3" => "SQLite".to_string(),
         "duckdb" => "DuckDB".to_string(),
+        "mssql" | "sqlserver" => "Microsoft SQL Server (T-SQL)".to_string(),
         // supports_ai = false のため通常は使われないが、直接呼ばれた時の
         // プロンプトが意味を成すよう方言名だけ持っておく
         "dynamodb" => "DynamoDB PartiQL".to_string(),

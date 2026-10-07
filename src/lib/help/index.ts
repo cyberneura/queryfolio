@@ -10,6 +10,7 @@ import redisHelp from "./redis.md?raw";
 import elasticsearchHelp from "./elasticsearch.md?raw";
 import dynamodbHelp from "./dynamodb.md?raw";
 import duckdbHelp from "./duckdb.md?raw";
+import mssqlHelp from "./mssql.md?raw";
 import sqlHelp from "./sql.md?raw";
 
 /**
@@ -33,6 +34,8 @@ const HELP_BY_ENGINE: Record<string, string> = {
   sqlite: sqlHelp,
   sqlite3: sqlHelp,
   duckdb: duckdbHelp,
+  mssql: mssqlHelp,
+  sqlserver: mssqlHelp,
 };
 
 /**
@@ -42,7 +45,10 @@ const HELP_BY_ENGINE: Record<string, string> = {
  * トークンを使うばかりで精度に効かない (CYBERNEURA-DEV-407 の指示)。
  * 載せるのは方言が独特で、モデルが取り違えやすいものだけ。
  *
- * **今この経路が実際に効くのは duckdb だけ**。redis / elasticsearch / dynamodb は
+ * mssql は T-SQL 自体は書けるが、`EXPLAIN` が queryfolio の疑似文 (SHOWPLAN) で
+ * `LIMIT` が無い (TOP) ことをモデルに伝えるために載せる。
+ *
+ * **今この経路が実際に効くのは duckdb と mssql だけ**。redis / elasticsearch / dynamodb は
  * `EngineCapabilities.supports_ai` が false で AI チャット自体が使えないため
  * (`engines/mod.rs`)、ここに載せても現状は届かない。将来それらが AI 対応した時に
  * 何もしなくても効くよう、意図として残してある。
@@ -55,6 +61,8 @@ const AI_CONTEXT_ENGINES = new Set([
   "opensearch",
   "dynamodb",
   "duckdb",
+  "mssql",
+  "sqlserver",
 ]);
 
 /**

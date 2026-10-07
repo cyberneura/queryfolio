@@ -279,7 +279,7 @@ fn scheme_summary(endpoint: &str) -> &'static str {
 /// 決められない時は `invalid` と出して隠さない。
 ///
 /// **逆に、`invalid` を出す範囲は「その値で実際に接続が失敗するエンジン」に限る。**
-/// `ssl_mode` を読むのは `db::connect` の mysql / postgres の分岐だけで、
+/// `ssl_mode` を読むのは `db::connect` の mysql / postgres / mssql の分岐だけで、
 /// elasticsearch / sqlite / duckdb / dynamodb の接続経路は見ない。共有テンプレート等で
 /// 不正な `ssl_mode` が紛れ込んでいても**それらは普通に繋がる**ので、`invalid` と
 /// 出すと使える接続を壊れているように見せることになる。`invalid` の意味は
@@ -302,7 +302,7 @@ fn ssl_summary(server: &ServerConfig, info: &ConnectionInfo, aws_endpoint: Optio
     // (未設定なら tls から既定値を返す) なので、未設定の接続を誤って invalid にはしない。
     // sql_ssl_root_cert() は ssl_root_cert が未設定なら mode を見ないので、
     // 2 つとも呼ぶ必要がある (前者は値の解決、後者は組み合わせの検証)
-    if matches!(engine, Engine::MySql | Engine::Postgres)
+    if matches!(engine, Engine::MySql | Engine::Postgres | Engine::MsSql)
         && (server.sql_ssl_mode().is_err() || server.sql_ssl_root_cert().is_err())
     {
         return INVALID.to_string();

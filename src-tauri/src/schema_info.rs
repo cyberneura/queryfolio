@@ -131,6 +131,7 @@ pub async fn fetch_tables(pool: &DbPool) -> Result<Vec<TableInfo>, AppError> {
         DbPool::DuckDb(handle) => crate::engines::duckdb::fetch_tables(handle).await,
         // DynamoDB はテーブル一覧 (ListTables) を返す
         DbPool::DynamoDb(client) => crate::engines::dynamodb::fetch_tables(client).await,
+        DbPool::MsSql(handle) => crate::engines::mssql::fetch_tables(handle).await,
     }
 }
 
@@ -148,6 +149,12 @@ pub async fn fetch_columns(pool: &DbPool, table: &str) -> Result<Vec<ColumnInfo>
     // ため、モジュール側の検証 (DynamoDB の命名規則) で DescribeTable する
     if let DbPool::DynamoDb(client) = pool {
         return crate::engines::dynamodb::fetch_columns(client, table).await;
+    }
+    // SQL Server のテーブル名は空白や記号を含み得る (`Order Details`) ので、
+    // SQL 識別子の規則 (validate_relation_name) は通さない。モジュール側が
+    // INFORMATION_SCHEMA に @P1 / @P2 でバインドして照会し、SQL には埋め込まない
+    if let DbPool::MsSql(handle) = pool {
+        return crate::engines::mssql::fetch_columns(handle, table).await;
     }
     let table = validate_relation_name(table)?;
     // DuckDB はテーブル名をバインドして information_schema を照会する
@@ -224,7 +231,7 @@ pub async fn fetch_columns(pool: &DbPool, table: &str) -> Result<Vec<ColumnInfo>
             ));
         }
         // 冒頭の早期 return で処理済み
-        DbPool::Elasticsearch(_) | DbPool::DuckDb(_) | DbPool::DynamoDb(_) => {
+        DbPool::Elasticsearch(_) | DbPool::DuckDb(_) | DbPool::DynamoDb(_) | DbPool::MsSql(_) => {
             unreachable!()
         }
     };
@@ -251,6 +258,10 @@ pub async fn fetch_primary_keys(pool: &DbPool, table: &str) -> Result<Vec<String
     // ため、検証前にモジュール側 (DynamoDB の命名規則で検証) へ委譲する
     if let DbPool::DynamoDb(client) = pool {
         return crate::engines::dynamodb::fetch_primary_keys(client, table).await;
+    }
+    // SQL Server はバインドで照会するので識別子検証を通さない (fetch_columns と同じ)
+    if let DbPool::MsSql(handle) = pool {
+        return crate::engines::mssql::fetch_primary_keys(handle, table).await;
     }
     let table = validate_relation_name(table)?;
     if let DbPool::DuckDb(handle) = pool {
@@ -317,7 +328,7 @@ pub async fn fetch_primary_keys(pool: &DbPool, table: &str) -> Result<Vec<String
         }
         DbPool::Redis(_) => vec![],
         // 冒頭の早期 return で処理済み
-        DbPool::Elasticsearch(_) | DbPool::DuckDb(_) | DbPool::DynamoDb(_) => {
+        DbPool::Elasticsearch(_) | DbPool::DuckDb(_) | DbPool::DynamoDb(_) | DbPool::MsSql(_) => {
             unreachable!()
         }
     };
@@ -402,6 +413,9 @@ pub async fn fetch_all_columns(
         // エンジン (Elasticsearch / DynamoDB。DynamoDB はスキーマレスで
         // 全カラム集合を確定できない) は空のまま返す
         DbPool::Redis(_) | DbPool::Elasticsearch(_) | DbPool::DynamoDb(_) => {}
+        DbPool::MsSql(handle) => {
+            return crate::engines::mssql::fetch_all_columns(handle).await;
+        }
         DbPool::DuckDb(handle) => {
             return crate::engines::duckdb::fetch_all_columns(handle).await;
         }

@@ -139,7 +139,8 @@
 
   /// ダブルクリック: クエリスニペットをエディタに挿入する (実行はしない)。
   /// スニペットはエディタ言語・エンジンに合わせる (es は検索リクエスト
-  /// ブロック、dynamodb は LIMIT 句の無い PartiQL、それ以外は SELECT 文)
+  /// ブロック、dynamodb は LIMIT 句の無い PartiQL、mssql は TOP、それ以外は
+  /// LIMIT 付きの SELECT 文)
   const onTableDblClick = (table: TableInfo) => {
     if (clickTimer) {
       clearTimeout(clickTimer);
@@ -160,6 +161,13 @@
       // PartiQL に LIMIT 句は無い (行数はバックエンドの max_rows で抑える)。
       // テーブル名はハイフン等を含み得るためダブルクォートで括る
       appStore.insertSqlSnippet(`SELECT * FROM "${table.qualified_name}";`);
+      return;
+    }
+    if (engine === "mssql" || engine === "sqlserver") {
+      // T-SQL に LIMIT 句は無い (TOP を使う)。qualified_name はバックエンド
+      // (engines/mssql.rs の qualified_name) が空白やドットを含む名前を
+      // 角括弧で囲んで返すので、そのまま埋め込める
+      appStore.insertSqlSnippet(`SELECT TOP 100 * FROM ${table.qualified_name};`);
       return;
     }
     appStore.insertSqlSnippet(

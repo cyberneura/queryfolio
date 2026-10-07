@@ -2,7 +2,7 @@
 
 SQL client desktop app. A lightweight, multi-purpose SQL GUI client.
 
-One app for several database engines: **MySQL / PostgreSQL / SQLite / DuckDB** on the SQL side,
+One app for several database engines: **MySQL / PostgreSQL / SQLite / DuckDB / Microsoft SQL Server** on the SQL side,
 plus **Redis / Elasticsearch / DynamoDB**. The editor language and the unit of execution switch
 per engine, and each engine declares what it supports, so features it lacks are hidden from the
 UI rather than left as dead buttons.
@@ -18,6 +18,7 @@ https://github.com/user-attachments/assets/90439816-49c8-4ebd-a068-b102cfe9c7aa
 - Elasticsearch support (`engine: elasticsearch`): Kibana-Console-style request blocks (`GET /index/_search` + JSON body, NDJSON `_bulk`), hits rendered as a table, an index browser with mapping fields, and guards for destructive requests (index deletion, `_delete_by_query` etc.)
 - DuckDB support (`engine: duckdb`): a local-file SQL engine (like the SQLite support) with the full SQL feature set (meta commands, EXPLAIN, auto LIMIT incl. `FROM`-first queries)
 - DynamoDB support (`engine: dynamodb`): PartiQL statements in the SQL editor, a table browser with key attributes, AWS credentials via static keys / `aws_profile` / the default chain, and the same read-only / dangerous guards
+- Microsoft SQL Server support (`engine: mssql`, via tiberius): T-SQL with the same meta commands, schema browser and guards; auto LIMIT becomes `TOP (n)`, `EXPLAIN` becomes the estimated plan (`SET SHOWPLAN_ALL`), `ssl_mode` / `tls` / `ssl_root_cert` work as for MySQL / PostgreSQL
 - SSH tunnel with known_hosts verification
 - Connection config in YAML, compatible with the sql-agent-mcp-server format
   - Secrets can stay in 1Password: the config YAML is fetched lazily via a getter command like `op read "op://..."`
