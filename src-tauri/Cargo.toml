@@ -86,15 +86,20 @@ aws-smithy-http-client = { version = "=1.2.0", default-features = false, feature
 ] }
 # Microsoft SQL Server エンジン用クライアント (TDS プロトコルの pure Rust 実装。
 # sqlx に MSSQL ドライバが無いため独自結線する。engines/mssql.rs)。
-# default-features = false: 既定の rustls バックエンドは tokio-rustls を既定
-# feature (aws_lc_rs) で引き、aws-lc-sys のネイティブビルド (cmake / NASM) を
-# CI に増やすため使わない。TLS は native-tls (macOS は Security.framework、
-# Windows は SChannel。Linux の開発ビルドだけ ssh2 と同じ vendored OpenSSL) にする。
+# default-features = false で TLS バックエンドを選ぶ:
+# - 既定の native-tls は使えない。tiberius の README が「macOS の Security
+#   Framework は SQL Server の TLS 設定と動かない」と明記しており、配布物の
+#   主なターゲットが macOS。
+# - rustls は tokio-rustls を既定 feature (aws_lc_rs) で引き、aws-lc-sys の
+#   ネイティブビルド (cmake / NASM) を CI に増やすため使わない (dynamodb が
+#   ring を明示して避けているもの)。
+# - vendored-openssl (opentls): OpenSSL を静的リンクする。ssh2 の vendored-openssl
+#   と同じ openssl-src なので、ネイティブビルドは増えない。
 # tds73 で date / time / datetime2 / datetimeoffset を扱い、chrono / rust_decimal
 # で既存の値変換 (db.rs) と同じ型へ落とす。
 tiberius = { version = "0.13", default-features = false, features = [
   "tds73",
-  "native-tls",
+  "vendored-openssl",
   "chrono",
   "rust_decimal",
 ] }

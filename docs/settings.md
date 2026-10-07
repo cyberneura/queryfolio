@@ -338,13 +338,17 @@ Use `ssl_root_cert` to point at a root CA certificate (PEM) when the server uses
 a private CA (for example the RDS bundle); it must be a readable file. On MySQL,
 `verify-full` maps to the driver's `VerifyIdentity`.
 
-SQL Server (`engine: mssql`) takes the same keys: `disable` sends no TLS,
-`prefer` encrypts when the server offers it and `require` insists on it (neither
-verifies the certificate), and `verify-ca` / `verify-full` both verify the
-chain **and** the host name (the driver has no chain-only mode). SQL Server
+SQL Server (`engine: mssql`) takes the same keys, mapped onto the TDS
+encryption negotiation: `disable` offers no TLS (the server can still insist),
+`prefer` always encrypts the login packet and encrypts the rest only when the
+server offers it, `require` insists on full encryption (neither `prefer` nor
+`require` verifies the certificate), and `verify-ca` / `verify-full` both verify
+the chain **and** the host name (the driver has no chain-only mode). SQL Server
 installs commonly run with a self-signed certificate, which is why the default
 `prefer` does not verify — set `tls: true` and `ssl_root_cert` once the server
-has a certificate you trust.
+has a certificate you trust. TLS is done with a statically linked OpenSSL
+(`vendored-openssl`), the same one the SSH tunnel uses; the system TLS library
+is not used because macOS's Security Framework does not work with SQL Server.
 
 ```yaml
 - name: prod-postgres

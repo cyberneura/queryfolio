@@ -31,17 +31,23 @@
 //!   接続を閉じればサーバーがセッションごと片付ける。
 //! - **接続は `user` / `password` の SQL Server 認証のみ**。Windows 統合認証・
 //!   Azure AD・名前付きインスタンス (SQL Browser) は非対応。
-//! - **TLS は `ssl_mode` / `tls` を tiberius の EncryptionLevel へ写す**:
-//!   disable = 暗号化しない、prefer = 可能なら暗号化 (証明書は検証しない)、
-//!   require = 必須 (検証しない)、verify-ca / verify-full = 必須 + 検証
-//!   (`ssl_root_cert` があれば追加 CA として信頼)。SQL Server の TLS は
-//!   チェーンだけ検証してホスト名を見ない設定を持たないため、verify-ca は
-//!   verify-full と同じ (厳しい側に倒す)。SSH トンネル経由では接続先が
-//!   127.0.0.1 になるので、証明書のホスト名検証には設定の `host` を使う
+//! - **TLS は `ssl_mode` / `tls` を tiberius の EncryptionLevel へ写す**。TDS の
+//!   暗号化はクライアントとサーバーの提示の組み合わせで決まる (tiberius の
+//!   `negotiated_encryption`): disable = NotSupported (サーバーが要求すれば
+//!   それでも暗号化される)、prefer = Off (ログインパケットは常に暗号化し、残りは
+//!   サーバーが On / Required を提示した時だけ暗号化する。証明書は検証しない。
+//!   `On` を提示すると Off / NotSupported のサーバーでプロトコルエラーになり、
+//!   平文への降格ができない)、require = Required (検証しない)、verify-ca /
+//!   verify-full = Required + 検証 (`ssl_root_cert` があれば追加 CA として信頼)。
+//!   SQL Server の TLS はチェーンだけ検証してホスト名を見ない設定を持たないため、
+//!   verify-ca は verify-full と同じ (厳しい側に倒す)。SSH トンネル経由では接続先
+//!   が 127.0.0.1 になるので、証明書のホスト名検証には設定の `host` を使う
 //!   (`hostname_in_certificate`)。
-//! - **TLS バックエンドは native-tls** (macOS は Security.framework、Windows は
-//!   SChannel)。tiberius の rustls feature は tokio-rustls の既定 feature
-//!   (aws_lc_rs) を引き、CI に aws-lc-sys のネイティブビルドを増やすため使わない。
+//! - **TLS バックエンドは vendored OpenSSL** (tiberius の `vendored-openssl` =
+//!   opentls)。既定の native-tls は macOS の Security Framework が SQL Server の
+//!   TLS と動かない (tiberius の README に明記)。rustls は tokio-rustls の既定
+//!   feature (aws_lc_rs) で aws-lc-sys のネイティブビルドを CI に持ち込む。
+//!   OpenSSL は ssh2 が既に静的リンクしている openssl-src と同じもの。
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -142,8 +148,11 @@ fn build_config(server: &ServerConfig, host: &str, port: u16) -> Result<Config, 
 
     match server.sql_ssl_mode()? {
         SqlSslMode::Disable => config.encryption(EncryptionLevel::NotSupported),
+        // Off = 「ログインパケットだけは暗号化し、残りはサーバーの提示に従う」。
+        // On だと Off / NotSupported を返すサーバーでプロトコルエラーになり、
+        // prefer の約束 (張れなければ降格) が守れない (Codex レビューの指摘)
         SqlSslMode::Prefer => {
-            config.encryption(EncryptionLevel::On);
+            config.encryption(EncryptionLevel::Off);
             config.trust_cert();
         }
         SqlSslMode::Require => {
@@ -455,20 +464,62 @@ async fn execute(
     }
 }
 
-/// 行を返す文か。共通の is_fetch_statement に加えて、EXEC (ストアド
-/// プロシージャ) は結果セットを返し得るのでバッチとして流して行を拾う
-/// (readonly ガードは EXEC を書き込み扱いで止めるので、ここへ来るのは
-/// Writable な接続だけ)。
+/// 先頭キーワードがこれなら行を返さない文として sp_executesql (execute) で
+/// 流し、影響行数を取る。それ以外 (SELECT 系はもちろん、EXEC や
+/// `IF EXISTS (...) SELECT ...` のような制御フロー、DECLARE から始まる
+/// スクリプトも) はバッチとして流して結果セットがあれば表にする —
+/// 制御フローの中身は先頭キーワードでは分からないので、行を取りこぼす側
+/// ではなく影響行数を取りこぼす側 (affected_rows = None) に倒す。
+const NO_ROWS_KEYWORDS: &[&str] = &[
+    "insert",
+    "update",
+    "delete",
+    "merge",
+    "create",
+    "alter",
+    "drop",
+    "truncate",
+    "grant",
+    "revoke",
+    "deny",
+    "set",
+    "use",
+    "commit",
+    "rollback",
+    "save",
+    "backup",
+    "restore",
+    "kill",
+    "checkpoint",
+    "bulk",
+    "raiserror",
+    "throw",
+    "waitfor",
+];
+
+/// 行を返し得る文か (バッチとして流すか)。readonly ガードは別で、ここへ
+/// 来るのは Writable な接続か読み取り文だけ。
 fn is_mssql_fetch(sql: &str) -> bool {
     if is_fetch_statement(sql) {
         return true;
     }
-    if matches!(leading_keyword(sql).as_str(), "exec" | "execute") {
+    let cleaned = scan_sql(sql, Engine::MsSql).cleaned;
+    let mut words = cleaned
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty());
+    let Some(first) = words.next() else {
+        return false;
+    };
+    // BEGIN TRAN / BEGIN TRANSACTION / BEGIN DISTRIBUTED TRAN は行を返さない。
+    // 素の BEGIN ... END ブロックは中に SELECT を持ち得る
+    if first == "begin" {
+        return !matches!(words.next(), Some("tran" | "transaction" | "distributed"));
+    }
+    if !NO_ROWS_KEYWORDS.contains(&first) {
         return true;
     }
     // INSERT / UPDATE / DELETE / MERGE ... OUTPUT は行を返す
-    scan_sql(sql, Engine::MsSql)
-        .cleaned
+    cleaned
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .any(|word| word == "output")
 }
@@ -761,26 +812,17 @@ fn integer(value: Option<&ColumnData<'static>>) -> Option<i64> {
     }
 }
 
-/// 角括弧なしで SQL に書ける識別子か (英字 / `_` 始まりで英数字 / `_` / `$` のみ)。
-fn is_plain_identifier(part: &str) -> bool {
-    let mut chars = part.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-}
-
 /// 識別子を角括弧で囲む (`]` は `]]` にエスケープ)。
 fn bracket(part: &str) -> String {
     format!("[{}]", part.replace(']', "]]"))
 }
 
-/// SQL に埋め込める形の識別子。空白・記号・ドット・予約語になり得ない形
-/// (plain) 以外は角括弧で囲む。
+/// SQL に埋め込める形の識別子。**常に角括弧で囲む**: 文字種だけ見ても
+/// `Order` のような予約語は見分けられず、素で埋め込むとスニペットが構文エラー
+/// になる (Codex レビューの指摘)。角括弧付きなら予約語も空白もドットも
+/// そのまま使え、`split_qualified` が同じ規則で戻す。
 fn quote_identifier(part: &str) -> String {
-    if is_plain_identifier(part) {
-        part.to_string()
-    } else {
-        bracket(part)
-    }
+    bracket(part)
 }
 
 /// 先頭の角括弧付き識別子を 1 つ読む。`[` で始まらない、または閉じていない
@@ -815,10 +857,9 @@ fn read_identifier(input: &str) -> (String, &str) {
 }
 
 /// SQL に埋め込める修飾名を作る。既定スキーマ dbo は修飾しない。
-/// カタログ由来の名前は空白やドット (`Order Details` / `a.b`) を含み得るので、
-/// plain でない部分は角括弧で囲む — 修飾名はフロントが SQL へ挿入し、
-/// `split_qualified` が (schema, table) へ戻すので、どちらにも曖昧さが残らない
-/// (素の `a.b` は「スキーマ a のテーブル b」としか読めない)。
+/// 各部分は角括弧で囲む (`[users]` / `[sales].[orders]`) — 修飾名はフロントが
+/// SQL へ挿入し、`split_qualified` が (schema, table) へ戻すので、空白・ドット・
+/// 予約語を含む名前でもどちらにも曖昧さが残らない。
 fn qualified_name(schema: &str, name: &str) -> String {
     if schema == DEFAULT_SCHEMA {
         quote_identifier(name)
@@ -1140,8 +1181,21 @@ mod tests {
         assert!(is_mssql_fetch(
             "INSERT INTO t OUTPUT inserted.id VALUES (1)"
         ));
+        // 制御フロー・スクリプトは中に SELECT を持ち得るのでバッチで流す
+        // (Codex レビューの指摘)
+        assert!(is_mssql_fetch(
+            "IF EXISTS (SELECT 1 FROM t) SELECT * FROM t"
+        ));
+        assert!(is_mssql_fetch("DECLARE @n INT = 1; SELECT @n"));
+        assert!(is_mssql_fetch("BEGIN SELECT 1 END"));
+        assert!(is_mssql_fetch("PRINT 'x'"));
+        // 行を返さない文は影響行数の経路
         assert!(!is_mssql_fetch("INSERT INTO t VALUES (1)"));
         assert!(!is_mssql_fetch("UPDATE t SET x = 'output' WHERE id = 1"));
+        assert!(!is_mssql_fetch("BEGIN TRANSACTION"));
+        assert!(!is_mssql_fetch("BEGIN TRAN t1"));
+        assert!(!is_mssql_fetch("-- note\nCREATE TABLE t (id INT)"));
+        assert!(!is_mssql_fetch("SET NOCOUNT ON"));
     }
 
     #[test]
@@ -1253,9 +1307,10 @@ mod tests {
 
     #[test]
     fn test_qualified_names() {
-        assert_eq!(qualified_name("dbo", "users"), "users");
-        assert_eq!(qualified_name("sales", "orders"), "sales.orders");
-        // 空白・ドット・`]` を含む名前は角括弧で囲む (SQL に埋め込める形)
+        // 常に角括弧: 予約語 (`Order`) も空白・ドット・`]` も同じ形で SQL に埋め込める
+        assert_eq!(qualified_name("dbo", "users"), "[users]");
+        assert_eq!(qualified_name("dbo", "Order"), "[Order]");
+        assert_eq!(qualified_name("sales", "orders"), "[sales].[orders]");
         assert_eq!(qualified_name("dbo", "Order Details"), "[Order Details]");
         assert_eq!(qualified_name("dbo", "a.b"), "[a.b]");
         assert_eq!(qualified_name("my schema", "t]x"), "[my schema].[t]]x]");
@@ -1271,6 +1326,7 @@ mod tests {
         // `a.b` では dbo のテーブル a.b とスキーマ a のテーブル b が区別できない)
         for (schema, name) in [
             ("dbo", "Order Details"),
+            ("dbo", "Order"),
             ("dbo", "a.b"),
             ("my schema", "t]x"),
             ("sales", "orders"),
