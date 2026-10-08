@@ -55,3 +55,12 @@ export const readFileDragPayload = (
   }
   return null;
 };
+
+/// OS (Finder / エクスプローラー) からのファイルのドラッグかどうか。
+///
+/// `tauri.conf.json` で `dragDropEnabled: false` にしているため、外部ファイルの
+/// ドロップも WebView の既定動作に流れる。既定動作は「そのファイルへ遷移する」で、
+/// SPA が丸ごと置き換わり編集中の状態を失う。アプリはファイルのドロップを
+/// 受け付けないので、`+layout.svelte` がこれで判定して握りつぶす。
+export const isExternalFileDrag = (dataTransfer: DataTransfer | null): boolean =>
+  !!dataTransfer && Array.from(dataTransfer.types).includes("Files");
