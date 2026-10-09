@@ -60,11 +60,17 @@
       }
       if (!appStore.connections.some((c) => c.name === added.name)) {
         // config_override_command が servers を丸ごと置き換えている等で、
-        // ローカルの config.yml に足した接続が一覧に出てこない
-        toast.warning(`Added "${added.name}" to config.yml, but it is not in the list`, {
-          description:
-            "config_override_command may be replacing servers. Check the config file.",
-        });
+        // ローカルの config.yml にある接続が一覧に出てこない。追記したのか
+        // 元からあったのかは added で言い分ける
+        toast.warning(
+          added.added
+            ? `Added "${added.name}" to config.yml, but it is not in the list`
+            : `"${added.name}" is already in config.yml, but it is not in the list`,
+          {
+            description:
+              "config_override_command may be replacing servers. Check the config file.",
+          },
+        );
         return;
       }
       await appStore.selectConnection(added.name);
