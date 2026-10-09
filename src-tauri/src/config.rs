@@ -979,19 +979,25 @@ fn add_file_connection_in(dir: &std::path::Path, path: &str) -> Result<FileConne
     let existing = parse_server_entries(&servers, &templates, "config")?;
 
     // 同じファイルを同じエンジンで登録済みなら、二重に足さずその接続を返す。
-    // engine の別名 (sqlite3) は db.rs の parse_engine と同じく sqlite とみなす
+    // engine の別名 (sqlite3) は db.rs の parse_engine と同じく sqlite とみなす。
+    // パスは `..` やシンボリックリンクを解決した実体で比べる (同じファイルを別の
+    // 書き方で選んでも重複させない)。解決できない (既存の設定が指すファイルが
+    // 無い等) ものは字句のまま比べる
     let same_engine = |e: &str| {
         let e = e.to_ascii_lowercase();
         e == engine || (engine == "sqlite" && e == "sqlite3")
     };
+    let canonical =
+        |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let target = canonical(file);
     if let Some(server) = existing.iter().find(|s| {
         same_engine(&s.engine)
             && s.schema
                 .as_deref()
                 .or(s.host.as_deref())
-                .map(expand_tilde)
-                .as_deref()
-                == Some(file)
+                .map(|p| canonical(&expand_tilde(p)))
+                .as_ref()
+                == Some(&target)
     }) {
         return Ok(FileConnection {
             name: server.name.clone(),
@@ -2536,6 +2542,40 @@ servers:
         assert_eq!(
             std::fs::read_to_string(dir.join("config.yml")).unwrap(),
             yaml
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `..` を含む書き方やシンボリックリンク経由で同じファイルを選んでも重複させない。
+    #[cfg(unix)]
+    #[test]
+    fn test_add_file_connection_in_compares_canonical_paths() {
+        let dir = add_file_test_dir("canonical");
+        let db = dir.join("data").join("c.db");
+        std::fs::write(&db, b"").unwrap();
+        let first = add_file_connection_in(&dir, &db.display().to_string()).unwrap();
+        assert!(first.added);
+
+        let dotted = dir.join("data").join("..").join("data").join("c.db");
+        let again = add_file_connection_in(&dir, &dotted.display().to_string()).unwrap();
+        assert_eq!(
+            again,
+            FileConnection {
+                name: "c.db".into(),
+                added: false
+            }
+        );
+
+        let link = dir.join("link.db");
+        std::os::unix::fs::symlink(&db, &link).unwrap();
+        let via_link = add_file_connection_in(&dir, &link.display().to_string()).unwrap();
+        assert_eq!(
+            via_link,
+            FileConnection {
+                name: "c.db".into(),
+                added: false
+            }
         );
 
         let _ = std::fs::remove_dir_all(&dir);
