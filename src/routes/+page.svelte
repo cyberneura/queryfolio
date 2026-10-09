@@ -438,6 +438,10 @@
         if (createdPath) {
           toast.info("Created a config file", {
             description: `Edit ${createdPath} to add your connections`,
+            action: {
+              label: "Edit config.yml",
+              onClick: () => openConfigEditor("config"),
+            },
           });
         }
       } catch (e) {
@@ -520,7 +524,7 @@
        もう片方が auto に計算されるため、明示的に hidden を置く) -->
   <div class="flex min-h-0 flex-1 overflow-x-auto overflow-y-hidden">
     <div class="shrink-0" style="width: {connectionsWidth}px">
-      <ConnectionsPane />
+      <ConnectionsPane onEditConfig={() => openConfigEditor("config")} />
     </div>
     <PaneDivider
       direction="vertical"
