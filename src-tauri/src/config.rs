@@ -962,14 +962,39 @@ fn add_file_connection_in(dir: &std::path::Path, path: &str) -> Result<FileConne
 
     let text = read_config_file_in(dir)?;
     let doc = parse_mapping(&text, "the config")?;
-    let existing = local_server_entries(&doc);
+    // 重複判定はテンプレートを展開し、グループもフラット化した実効の設定で行う
+    // (template から engine / schema を継承した接続や、schema の代わりに host に
+    // パスを書いた接続も同じファイルとして拾うため)。servers がリストでない設定は
+    // 空として扱い、追記の側 (append_server_entry) でエラーにする
+    let servers = doc
+        .get("servers")
+        .and_then(|v| v.as_sequence())
+        .cloned()
+        .unwrap_or_default();
+    let templates = doc
+        .get("server_templates")
+        .and_then(|v| v.as_sequence())
+        .cloned()
+        .unwrap_or_default();
+    let existing = parse_server_entries(&servers, &templates, "config")?;
 
-    // 同じファイルを同じエンジンで登録済みなら、二重に足さずその接続を返す
-    if let Some((name, _, _)) = existing.iter().find(|(_, e, schema)| {
-        e.as_deref() == Some(engine) && schema.as_deref().map(expand_tilde).as_deref() == Some(file)
+    // 同じファイルを同じエンジンで登録済みなら、二重に足さずその接続を返す。
+    // engine の別名 (sqlite3) は db.rs の parse_engine と同じく sqlite とみなす
+    let same_engine = |e: &str| {
+        let e = e.to_ascii_lowercase();
+        e == engine || (engine == "sqlite" && e == "sqlite3")
+    };
+    if let Some(server) = existing.iter().find(|s| {
+        same_engine(&s.engine)
+            && s.schema
+                .as_deref()
+                .or(s.host.as_deref())
+                .map(expand_tilde)
+                .as_deref()
+                == Some(file)
     }) {
         return Ok(FileConnection {
-            name: name.clone(),
+            name: server.name.clone(),
             added: false,
         });
     }
@@ -978,41 +1003,12 @@ fn add_file_connection_in(dir: &std::path::Path, path: &str) -> Result<FileConne
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string());
-    let names: std::collections::HashSet<&str> =
-        existing.iter().map(|(name, _, _)| name.as_str()).collect();
+    let names: std::collections::HashSet<&str> = existing.iter().map(|s| s.name.as_str()).collect();
     let name = unique_connection_name(&base_name, &names);
 
     let updated = append_server_entry(&text, &name, engine, path)?;
     write_config_file_in(dir, &updated)?;
     Ok(FileConnection { name, added: true })
-}
-
-/// ローカル設定の servers に書かれた各接続の (name, engine, schema)。
-/// グループエントリの中も含める。テンプレートは展開しない (重複判定に使うだけなので、
-/// 生の値で一致するものだけを拾えば足りる)。
-fn local_server_entries(
-    doc: &serde_yaml::Mapping,
-) -> Vec<(String, Option<String>, Option<String>)> {
-    let field = |m: &serde_yaml::Mapping, key: &str| {
-        m.get(key).and_then(|v| v.as_str()).map(str::to_string)
-    };
-    let mut result = Vec::new();
-    let Some(servers) = doc.get("servers").and_then(|v| v.as_sequence()) else {
-        return result;
-    };
-    for entry in servers.iter().filter_map(|v| v.as_mapping()) {
-        let nested = entry.get("servers").and_then(|v| v.as_sequence());
-        let items: Vec<&serde_yaml::Mapping> = match nested {
-            Some(list) => list.iter().filter_map(|v| v.as_mapping()).collect(),
-            None => vec![entry],
-        };
-        for item in items {
-            if let Some(name) = field(item, "name") {
-                result.push((name, field(item, "engine"), field(item, "schema")));
-            }
-        }
-    }
-    result
 }
 
 /// base が既存の名前と重なれば `base (2)`, `base (3)`, ... の空いている最初のものを返す。
@@ -2499,6 +2495,46 @@ servers:
         let servers = resolved_servers(&text);
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[1].1, "duckdb");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// template から engine / schema を継承した接続や、host にパスを書いた接続も
+    /// 同じファイルとして扱い、二重に足さない。
+    #[test]
+    fn test_add_file_connection_in_detects_resolved_duplicates() {
+        let dir = add_file_test_dir("resolved");
+        let a = dir.join("data").join("a.db");
+        let b = dir.join("data").join("b.sqlite3");
+        std::fs::write(&a, b"").unwrap();
+        std::fs::write(&b, b"").unwrap();
+        let yaml = format!(
+            "server_templates:\n  - name: t\n    engine: sqlite3\n    schema: \"{}\"\nservers:\n  - name: via-template\n    template: t\n  - name: via-host\n    engine: sqlite\n    host: \"{}\"\n",
+            a.display(),
+            b.display()
+        );
+        std::fs::write(dir.join("config.yml"), &yaml).unwrap();
+
+        let found = add_file_connection_in(&dir, &a.display().to_string()).unwrap();
+        assert_eq!(
+            found,
+            FileConnection {
+                name: "via-template".into(),
+                added: false
+            }
+        );
+        let found = add_file_connection_in(&dir, &b.display().to_string()).unwrap();
+        assert_eq!(
+            found,
+            FileConnection {
+                name: "via-host".into(),
+                added: false
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.yml")).unwrap(),
+            yaml
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
