@@ -2508,10 +2508,12 @@ servers:
         let b = dir.join("data").join("b.sqlite3");
         std::fs::write(&a, b"").unwrap();
         std::fs::write(&b, b"").unwrap();
+        // Windows のパスは `\` を含むので、JSON 文字列 (= YAML の二重引用符) で書く
+        let quote = |p: &PathBuf| serde_json::to_string(&p.display().to_string()).unwrap();
         let yaml = format!(
-            "server_templates:\n  - name: t\n    engine: sqlite3\n    schema: \"{}\"\nservers:\n  - name: via-template\n    template: t\n  - name: via-host\n    engine: sqlite\n    host: \"{}\"\n",
-            a.display(),
-            b.display()
+            "server_templates:\n  - name: t\n    engine: sqlite3\n    schema: {}\nservers:\n  - name: via-template\n    template: t\n  - name: via-host\n    engine: sqlite\n    host: {}\n",
+            quote(&a),
+            quote(&b)
         );
         std::fs::write(dir.join("config.yml"), &yaml).unwrap();
 
