@@ -1607,6 +1607,14 @@ fn write_config_file(content: String) -> Result<String, AppError> {
     config::write_config_file(&content)
 }
 
+/// 接続 0 件の画面から、ファイル選択ダイアログで選んだ SQLite / DuckDB ファイルの
+/// 接続を config.yml の servers へ追記する (コメントを保ったテキスト追記。config.rs)。
+/// 追記後の再読み込みと接続の選択はフロントが行う。
+#[tauri::command]
+fn add_file_connection(path: String) -> Result<config::FileConnection, AppError> {
+    config::add_file_connection(&path)
+}
+
 /// config_override_command を実行して取得した生の YAML を返す
 /// (コピー用ビュー用。表示先では編集できるが保存はしない)。
 #[tauri::command]
@@ -2287,6 +2295,7 @@ pub fn run() {
             ensure_config_file,
             read_config_file,
             write_config_file,
+            add_file_connection,
             read_override_config_yaml,
             write_export_file,
             frontend_ready,

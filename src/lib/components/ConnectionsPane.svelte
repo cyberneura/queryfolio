@@ -1,8 +1,96 @@
 <script lang="ts">
   import { toast } from "svelte-sonner";
+  import { open } from "@tauri-apps/plugin-dialog";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import appStore from "$lib/stores/app.svelte";
-  import type { ConnectionInfo } from "$lib/api";
+  import { addFileConnection, type ConnectionInfo } from "$lib/api";
   import { hasFileDragPayload, readFileDragPayload } from "$lib/fileDrag";
+
+  type Props = {
+    /// 設定エディタ (ConfigEditorModal) を開く。メニューの Edit config.yml と同じ
+    onEditConfig: () => void;
+  };
+
+  let { onEditConfig }: Props = $props();
+
+  const SETTINGS_DOC_URL =
+    "https://github.com/cyberneura/queryfolio/blob/main/docs/settings.md";
+
+  /// ファイル選択 → config.yml へ追記 → 再読み込み → 選択、の途中か (二重押し防止)
+  let addingFile = $state(false);
+
+  /// 接続 0 件の画面の「Open SQLite / DuckDB file…」。選んだファイルの接続を
+  /// config.yml の servers に 1 件足し (バックエンドがコメントを保ったまま追記する)、
+  /// 設定を読み直してその接続を選ぶ。
+  const openDatabaseFile = async () => {
+    if (addingFile) return;
+    addingFile = true;
+    try {
+      let selected;
+      try {
+        selected = await open({
+          multiple: false,
+          directory: false,
+          title: "Open a SQLite / DuckDB file",
+          filters: [
+            {
+              name: "SQLite / DuckDB",
+              extensions: ["sqlite", "sqlite3", "db", "duckdb"],
+            },
+          ],
+        });
+      } catch (e) {
+        toast.error("Failed to open the file dialog", { description: String(e) });
+        return;
+      }
+      // null = キャンセル
+      if (typeof selected !== "string") return;
+      let added;
+      try {
+        added = await addFileConnection(selected);
+      } catch (e) {
+        toast.error("Failed to add the connection", { description: String(e) });
+        return;
+      }
+      if (!(await appStore.reloadConnections())) {
+        toast.error("Failed to reload the config", {
+          description: appStore.errorMessage ?? undefined,
+        });
+        return;
+      }
+      if (!appStore.connections.some((c) => c.name === added.name)) {
+        // config_override_command が servers を丸ごと置き換えている等で、
+        // ローカルの config.yml にある接続が一覧に出てこない。追記したのか
+        // 元からあったのかは added で言い分ける
+        toast.warning(
+          added.added
+            ? `Added "${added.name}" to config.yml, but it is not in the list`
+            : `"${added.name}" is already in config.yml, but it is not in the list`,
+          {
+            description:
+              "config_override_command may be replacing servers. Check the config file.",
+          },
+        );
+        return;
+      }
+      await appStore.selectConnection(added.name);
+      toast.success(
+        added.added
+          ? `Added "${added.name}" to config.yml`
+          : `"${added.name}" is already in config.yml`,
+      );
+    } finally {
+      addingFile = false;
+    }
+  };
+
+  const openSettingsDoc = () => {
+    openUrl(SETTINGS_DOC_URL).catch((e) => {
+      toast.error("Failed to open the settings reference", {
+        description: String(e),
+      });
+    });
+  };
 
   const engineLabel = (engine: string): string => {
     switch (engine.toLowerCase()) {
@@ -198,9 +286,39 @@
     {#if appStore.loadingConnections}
       <p class="px-3 py-2 text-xs text-zinc-500">Loading...</p>
     {:else if appStore.connections.length === 0}
-      <p class="px-3 py-2 text-xs text-zinc-500">
-        No connections. Review your config file.
-      </p>
+      <div class="flex flex-col gap-2 px-3 py-3 text-xs text-zinc-400">
+        <p>No connections yet.</p>
+        <p class="text-zinc-500">
+          Open a SQLite / DuckDB file to try it right away, or add servers to
+          config.yml.
+        </p>
+        <button
+          class="flex items-center gap-1.5 rounded bg-blue-600 px-2 py-1.5 text-left text-xs text-white hover:bg-blue-500 disabled:opacity-50"
+          data-annotate="button-empty-open-db-file"
+          disabled={addingFile}
+          onclick={() => void openDatabaseFile()}
+        >
+          <i class="bi bi-folder2-open" aria-hidden="true"></i>
+          Open SQLite / DuckDB file…
+        </button>
+        <button
+          class="flex items-center gap-1.5 rounded bg-zinc-700 px-2 py-1.5 text-left text-xs text-zinc-200 hover:bg-zinc-600"
+          data-annotate="button-empty-edit-config"
+          onclick={onEditConfig}
+        >
+          <i class="bi bi-pencil-square" aria-hidden="true"></i>
+          Edit config.yml
+        </button>
+        <p class="text-zinc-500">
+          See
+          <button
+            class="text-blue-400 underline hover:text-blue-300"
+            data-annotate="link-empty-settings-doc"
+            onclick={openSettingsDoc}>docs/settings.md</button
+          >
+          for the config format (MySQL, PostgreSQL, SSH tunnels, and more).
+        </p>
+      </div>
     {:else}
       {#each sections as section, sectionIndex (sectionIndex)}
         {#if section.group !== null}

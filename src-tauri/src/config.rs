@@ -912,6 +912,263 @@ fn write_config_file_in(dir: &std::path::Path, content: &str) -> Result<String, 
     Ok(path.display().to_string())
 }
 
+/// ファイルを選ぶだけで繋がるエンジン (sqlite / duckdb) を拡張子から決める。
+/// 対象外の拡張子は None。
+fn file_connection_engine(path: &std::path::Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "sqlite" | "sqlite3" | "db" => Some("sqlite"),
+        "duckdb" => Some("duckdb"),
+        _ => None,
+    }
+}
+
+/// `add_file_connection` の結果。
+#[derive(Debug, Serialize, PartialEq)]
+pub struct FileConnection {
+    /// 追加した (または既に登録されていた) 接続の名前
+    pub name: String,
+    /// config.yml に追記したか。同じファイルの接続が既にあれば false (何も書かない)
+    pub added: bool,
+}
+
+/// 接続 0 件の画面の「Open SQLite / DuckDB file…」から、選んだ DB ファイルの接続を
+/// config.yml の servers へ 1 件追記する。
+///
+/// YAML をパースし直して書き出すとコメントとキーの順序が失われるため、テキストとして
+/// 追記する (`append_server_entry`)。書き込みは設定エディタと同じ `write_config_file_in`
+/// (YAML の検証 + 600 + 一時ファイルからの rename) を通す。
+pub fn add_file_connection(path: &str) -> Result<FileConnection, AppError> {
+    if config_env_override() {
+        return Err(AppError::Config(
+            "The config is overridden by QUERYFOLIO_CONFIG_YAML, so it cannot be saved".into(),
+        ));
+    }
+    add_file_connection_in(&app_config_dir()?, path)
+}
+
+fn add_file_connection_in(dir: &std::path::Path, path: &str) -> Result<FileConnection, AppError> {
+    let file = std::path::Path::new(path);
+    let engine = file_connection_engine(file).ok_or_else(|| {
+        AppError::Config(format!(
+            "{path} is not a SQLite / DuckDB file (expected .sqlite, .sqlite3, .db or .duckdb)"
+        ))
+    })?;
+    // ダイアログは実在のファイルしか返さないが、相対パスや消えたファイルを
+    // 設定へ書くと「繋がらない接続」が残るだけなので、ここで弾く
+    if !file.is_absolute() || !file.is_file() {
+        return Err(AppError::Config(format!("{path} is not an existing file")));
+    }
+
+    let text = read_config_file_in(dir)?;
+    let doc = parse_mapping(&text, "the config")?;
+    // 重複判定はテンプレートを展開し、グループもフラット化した実効の設定で行う
+    // (template から engine / schema を継承した接続や、schema の代わりに host に
+    // パスを書いた接続も同じファイルとして拾うため)。servers がリストでない設定は
+    // 空として扱い、追記の側 (append_server_entry) でエラーにする
+    let servers = doc
+        .get("servers")
+        .and_then(|v| v.as_sequence())
+        .cloned()
+        .unwrap_or_default();
+    let templates = doc
+        .get("server_templates")
+        .and_then(|v| v.as_sequence())
+        .cloned()
+        .unwrap_or_default();
+    let existing = parse_server_entries(&servers, &templates, "config")?;
+
+    // 同じファイルを同じエンジンで登録済みなら、二重に足さずその接続を返す。
+    // engine の別名 (sqlite3) は db.rs の parse_engine と同じく sqlite とみなす。
+    // パスは `..` やシンボリックリンクを解決した実体で比べる (同じファイルを別の
+    // 書き方で選んでも重複させない)。解決できない (既存の設定が指すファイルが
+    // 無い等) ものは字句のまま比べる
+    let same_engine = |e: &str| {
+        let e = e.to_ascii_lowercase();
+        e == engine || (engine == "sqlite" && e == "sqlite3")
+    };
+    let canonical =
+        |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let target = canonical(file);
+    if let Some(server) = existing.iter().find(|s| {
+        same_engine(&s.engine)
+            && s.schema
+                .as_deref()
+                .or(s.host.as_deref())
+                .map(|p| canonical(&expand_tilde(p)))
+                .as_ref()
+                == Some(&target)
+    }) {
+        return Ok(FileConnection {
+            name: server.name.clone(),
+            added: false,
+        });
+    }
+
+    let base_name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    let names: std::collections::HashSet<&str> = existing.iter().map(|s| s.name.as_str()).collect();
+    let name = unique_connection_name(&base_name, &names);
+
+    let updated = append_server_entry(&text, &name, engine, path)?;
+    write_config_file_in(dir, &updated)?;
+    Ok(FileConnection { name, added: true })
+}
+
+/// base が既存の名前と重なれば `base (2)`, `base (3)`, ... の空いている最初のものを返す。
+fn unique_connection_name(base: &str, existing: &std::collections::HashSet<&str>) -> String {
+    if !existing.contains(base) {
+        return base.to_string();
+    }
+    (2..)
+        .map(|n| format!("{base} ({n})"))
+        .find(|candidate| !existing.contains(candidate.as_str()))
+        .expect("an unused name always exists")
+}
+
+/// config.yml のテキストの servers リスト末尾に 1 件追記したテキストを返す。
+///
+/// コメント・キーの順序・他の項目の書き方を保つため、YAML を作り直さずに行単位で
+/// 書き足す。扱う形は次の 3 つ:
+/// - `servers: []` (初回起動のテンプレート) — その行をブロック形式の `servers:` に置き換える
+/// - `servers:` + ブロック形式のリスト — リストの最後の項目の直後に足す。項目の
+///   インデント (`- ` の位置) は既存の最初の項目に合わせる
+/// - servers キーが無い — ファイル末尾に `servers:` ごと足す
+///
+/// それ以外 (中身のあるフロー形式 `[...]`、アンカー等) は推測で書き換えず、エラーにして
+/// 手での編集を促す。最後に、書き足した結果をパースし直して「servers の末尾に 1 件
+/// 増えただけで、他は何も変わっていない」ことを確かめる (行単位の判定を誤った場合に、
+/// 壊れた設定や意図しない位置への追記を保存しないため)。
+fn append_server_entry(
+    text: &str,
+    name: &str,
+    engine: &str,
+    schema: &str,
+) -> Result<String, AppError> {
+    let unsupported = || {
+        AppError::Config(
+            "Could not add the connection automatically because of how servers is written \
+             in config.yml. Add it with Edit config.yml instead."
+                .into(),
+        )
+    };
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    // 値は常に二重引用符で書く。JSON の文字列は YAML の二重引用符スカラーとしても
+    // 正しく、ファイル名に `: ` や `#`、改行、Windows の `\` が含まれていても壊れない
+    let quote = |s: &str| serde_json::to_string(s).expect("a string always serializes");
+    let entry = |indent: &str| {
+        format!(
+            "{indent}- name: {name}{newline}{indent}  engine: {engine}{newline}{indent}  schema: {schema}{newline}",
+            name = quote(name),
+            schema = quote(schema),
+        )
+    };
+
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let content = |line: &str| line.trim_end_matches(['\r', '\n']).to_string();
+    let servers_line = lines.iter().position(|line| {
+        content(line)
+            .strip_prefix("servers:")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+    });
+
+    let mut out = String::with_capacity(text.len() + 128);
+    match servers_line {
+        None => {
+            out.push_str(text);
+            if !text.is_empty() && !text.ends_with('\n') {
+                out.push_str(newline);
+            }
+            out.push_str("servers:");
+            out.push_str(newline);
+            out.push_str(&entry("  "));
+        }
+        Some(index) => {
+            let value = content(lines[index])["servers:".len()..].trim().to_string();
+            let (value, comment) = match value.find('#') {
+                Some(pos) => (
+                    value[..pos].trim().to_string(),
+                    Some(value[pos..].to_string()),
+                ),
+                None => (value, None),
+            };
+            let is_empty_flow = value
+                .strip_prefix('[')
+                .and_then(|v| v.strip_suffix(']'))
+                .is_some_and(|inner| inner.trim().is_empty());
+            if is_empty_flow {
+                // `servers: []` をブロック形式に置き換える (行末のコメントは残す)
+                out.extend(lines[..index].iter().copied());
+                out.push_str("servers:");
+                if let Some(comment) = comment {
+                    out.push(' ');
+                    out.push_str(&comment);
+                }
+                out.push_str(newline);
+                out.push_str(&entry("  "));
+                out.extend(lines[index + 1..].iter().copied());
+            } else if value.is_empty() {
+                // ブロック形式。リストの範囲 = インデントされた行と、行頭の `-`
+                // (インデント 0 のシーケンス)。空行とコメント行はインデントの有無に
+                // かかわらず範囲を広げない (テンプレートのように、次のキーの説明
+                // コメントが続くことがあるため)。ブロックスカラーの中の `#` 行を
+                // 読み違えた場合は、最後の検証で値の違いとして弾かれる
+                let mut last = index;
+                let mut indent: Option<String> = None;
+                for (offset, line) in lines[index + 1..].iter().enumerate() {
+                    let line = content(line);
+                    let trimmed = line.trim_start();
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        continue;
+                    }
+                    let indented = line.starts_with([' ', '\t']);
+                    let is_item = trimmed == "-" || trimmed.starts_with("- ");
+                    if !indented && !is_item {
+                        break;
+                    }
+                    last = index + 1 + offset;
+                    if indent.is_none() && is_item {
+                        indent = Some(line[..line.len() - trimmed.len()].to_string());
+                    }
+                }
+                out.extend(lines[..=last].iter().copied());
+                if !out.ends_with('\n') {
+                    out.push_str(newline);
+                }
+                out.push_str(&entry(indent.as_deref().unwrap_or("  ")));
+                out.extend(lines[last + 1..].iter().copied());
+            } else {
+                return Err(unsupported());
+            }
+        }
+    }
+
+    // 追記の結果を検証する: servers の末尾に 1 件増えただけで、他は変わっていないこと
+    let before = parse_mapping(text, "the config")?;
+    let after = parse_mapping(&out, "the updated config").map_err(|_| unsupported())?;
+    let servers_of = |doc: &serde_yaml::Mapping| match doc.get("servers") {
+        None | Some(serde_yaml::Value::Null) => Some(Vec::new()),
+        Some(serde_yaml::Value::Sequence(list)) => Some(list.clone()),
+        Some(_) => None,
+    };
+    let mut expected = servers_of(&before).ok_or_else(unsupported)?;
+    let mut new_entry = serde_yaml::Mapping::new();
+    new_entry.insert("name".into(), name.into());
+    new_entry.insert("engine".into(), engine.into());
+    new_entry.insert("schema".into(), schema.into());
+    expected.push(serde_yaml::Value::Mapping(new_entry));
+    let mut rest_before = before.clone();
+    rest_before.remove("servers");
+    let mut rest_after = after.clone();
+    rest_after.remove("servers");
+    if servers_of(&after) != Some(expected) || rest_before != rest_after {
+        return Err(unsupported());
+    }
+    Ok(out)
+}
+
 /// config_override_command が設定されているか。
 /// メニュー項目の出し分けに使う。設定が読めない場合は false。
 pub fn has_config_override_command() -> bool {
@@ -1953,6 +2210,391 @@ servers:
             std::fs::read_to_string(dir.join("config.yaml")).unwrap(),
             edited
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 追記後のテキストを解決して (name, engine, schema, group_name) の一覧にする。
+    fn resolved_servers(yaml: &str) -> Vec<(String, String, Option<String>, Option<String>)> {
+        config_from_yaml(yaml)
+            .resolve_servers()
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.name, s.engine, s.schema, s.group_name))
+            .collect()
+    }
+
+    /// 初回起動のテンプレート (`servers: []`) へ追記すると、その行がブロック形式に
+    /// 置き換わり、前後のコメントはすべて残る。
+    #[test]
+    fn test_append_server_entry_replaces_empty_servers() {
+        let updated =
+            append_server_entry(CONFIG_TEMPLATE, "a.sqlite3", "sqlite", "/data/a.sqlite3").unwrap();
+        assert!(updated.contains(
+            "servers:\n  - name: \"a.sqlite3\"\n    engine: sqlite\n    schema: \"/data/a.sqlite3\"\n"
+        ));
+        assert!(!updated.contains("servers: []"));
+        // コメント行は 1 行も失われない
+        for line in CONFIG_TEMPLATE.lines().filter(|l| l.starts_with('#')) {
+            assert!(updated.contains(line), "lost comment: {line}");
+        }
+        assert_eq!(
+            resolved_servers(&updated),
+            vec![(
+                "a.sqlite3".to_string(),
+                "sqlite".to_string(),
+                Some("/data/a.sqlite3".to_string()),
+                None
+            )]
+        );
+    }
+
+    /// 行末コメント付きの `servers: []` もコメントを残して置き換える。
+    #[test]
+    fn test_append_server_entry_keeps_trailing_comment_of_empty_servers() {
+        let text = "default_limit: 100\nservers: [ ]  # none yet\nsqlfiles_dir: ~/q\n";
+        let updated = append_server_entry(text, "x.duckdb", "duckdb", "/x.duckdb").unwrap();
+        assert_eq!(
+            updated,
+            "default_limit: 100\nservers: # none yet\n  - name: \"x.duckdb\"\n    engine: duckdb\n    schema: \"/x.duckdb\"\nsqlfiles_dir: ~/q\n"
+        );
+    }
+
+    /// 既に servers がある場合は最後の項目の直後に足す。既存項目のインデントに
+    /// 合わせ、後ろに続くキーや説明コメントの位置は変えない。
+    #[test]
+    fn test_append_server_entry_after_existing_servers() {
+        let text = "# head\nservers:\n    - name: pg  # main db\n      engine: postgres\n      host: localhost\n\n    # - name: old\n    - name: local\n      engine: sqlite\n      schema: ~/a.db\n\n# about ai\nai:\n  provider: openai\n";
+        let updated = append_server_entry(text, "b.db", "sqlite", "/b.db").unwrap();
+        assert_eq!(
+            updated,
+            "# head\nservers:\n    - name: pg  # main db\n      engine: postgres\n      host: localhost\n\n    # - name: old\n    - name: local\n      engine: sqlite\n      schema: ~/a.db\n    - name: \"b.db\"\n      engine: sqlite\n      schema: \"/b.db\"\n\n# about ai\nai:\n  provider: openai\n"
+        );
+        let names: Vec<String> = resolved_servers(&updated)
+            .into_iter()
+            .map(|s| s.0)
+            .collect();
+        assert_eq!(names, vec!["pg", "local", "b.db"]);
+    }
+
+    /// リストの後ろのインデント付きコメントは次のキーの説明とみなし、その前に足す。
+    /// ブロックスカラーの中の `#` 行で範囲を読み違えた場合は書かずにエラーにする。
+    #[test]
+    fn test_append_server_entry_indented_comment_before_next_key() {
+        let text = "servers:\n  - name: a\n    engine: sqlite\n    schema: /a.db\n  # AI settings\nai:\n  provider: openai\n";
+        let updated = append_server_entry(text, "b.db", "sqlite", "/b.db").unwrap();
+        assert_eq!(
+            updated,
+            "servers:\n  - name: a\n    engine: sqlite\n    schema: /a.db\n  - name: \"b.db\"\n    engine: sqlite\n    schema: \"/b.db\"\n  # AI settings\nai:\n  provider: openai\n"
+        );
+
+        let block = "servers:\n  - name: a\n    engine: sqlite\n    description: |\n      foo\n      # bar\n";
+        let err = append_server_entry(block, "b.db", "sqlite", "/b.db")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Edit config.yml"), "{err}");
+    }
+
+    /// `- ` がキーと同じ列にあるリスト (インデント 0 のシーケンス) にも足せる。
+    #[test]
+    fn test_append_server_entry_zero_indent_sequence() {
+        let text = "servers:\n- name: pg\n  engine: postgres\n  host: h\ndefault_limit: 10\n";
+        let updated = append_server_entry(text, "c.db", "sqlite", "/c.db").unwrap();
+        assert_eq!(
+            updated,
+            "servers:\n- name: pg\n  engine: postgres\n  host: h\n- name: \"c.db\"\n  engine: sqlite\n  schema: \"/c.db\"\ndefault_limit: 10\n"
+        );
+    }
+
+    /// グループ形式の servers では、グループの中ではなくトップレベルの末尾に足す
+    /// (グループ外の接続として一覧の最後に出る)。
+    #[test]
+    fn test_append_server_entry_with_groups() {
+        let text = "servers:\n  - group_name: prod\n    servers:\n      - name: p1\n        engine: postgres\n        host: h\n  - group_name: dev\n    servers:\n      - name: d1\n        engine: sqlite\n        schema: ~/d.db\n";
+        let updated = append_server_entry(text, "e.duckdb", "duckdb", "/e.duckdb").unwrap();
+        assert!(updated.ends_with(
+            "        schema: ~/d.db\n  - name: \"e.duckdb\"\n    engine: duckdb\n    schema: \"/e.duckdb\"\n"
+        ));
+        assert_eq!(
+            resolved_servers(&updated),
+            vec![
+                ("p1".into(), "postgres".into(), None, Some("prod".into())),
+                (
+                    "d1".into(),
+                    "sqlite".into(),
+                    Some("~/d.db".into()),
+                    Some("dev".into())
+                ),
+                (
+                    "e.duckdb".into(),
+                    "duckdb".into(),
+                    Some("/e.duckdb".into()),
+                    None
+                ),
+            ]
+        );
+    }
+
+    /// servers キーが無ければ末尾に足す。末尾に改行が無くても壊れない。
+    #[test]
+    fn test_append_server_entry_without_servers_key() {
+        let updated = append_server_entry("default_limit: 5", "f.db", "sqlite", "/f.db").unwrap();
+        assert_eq!(
+            updated,
+            "default_limit: 5\nservers:\n  - name: \"f.db\"\n    engine: sqlite\n    schema: \"/f.db\"\n"
+        );
+    }
+
+    /// 最後の項目の行に改行が無い (ファイル末尾) 場合も、行をつなげずに足す。
+    #[test]
+    fn test_append_server_entry_without_trailing_newline() {
+        let text = "servers:\n  - name: pg\n    engine: postgres";
+        let updated = append_server_entry(text, "g.db", "sqlite", "/g.db").unwrap();
+        assert_eq!(
+            updated,
+            "servers:\n  - name: pg\n    engine: postgres\n  - name: \"g.db\"\n    engine: sqlite\n    schema: \"/g.db\"\n"
+        );
+    }
+
+    /// CRLF のファイルには CRLF で足す。
+    #[test]
+    fn test_append_server_entry_keeps_crlf() {
+        let text = "# c\r\nservers: []\r\n";
+        let updated = append_server_entry(text, "h.db", "sqlite", "/h.db").unwrap();
+        assert_eq!(
+            updated,
+            "# c\r\nservers:\r\n  - name: \"h.db\"\r\n    engine: sqlite\r\n    schema: \"/h.db\"\r\n"
+        );
+    }
+
+    /// YAML として特別な文字を含む名前・パスも、そのままの値として読める。
+    #[test]
+    fn test_append_server_entry_quotes_special_characters() {
+        let name = "a: b # c \"d\" 'e'.db";
+        let path = "C:\\Users\\me\\#data: x.db";
+        let updated = append_server_entry("servers: []\n", name, "sqlite", path).unwrap();
+        assert_eq!(
+            resolved_servers(&updated),
+            vec![(
+                name.to_string(),
+                "sqlite".to_string(),
+                Some(path.to_string()),
+                None
+            )]
+        );
+    }
+
+    /// 中身のあるフロー形式やアンカーなど、行単位で安全に書き足せない形は
+    /// 書き換えずにエラーにする。
+    #[test]
+    fn test_append_server_entry_rejects_unsupported_forms() {
+        for text in [
+            "servers: [{name: a, engine: sqlite, schema: /a.db}]\n",
+            "servers: &s\n  - name: a\n    engine: sqlite\n",
+            "servers:\n  [\n    {name: a, engine: sqlite}\n  ]\n",
+        ] {
+            let err = append_server_entry(text, "z.db", "sqlite", "/z.db")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Edit config.yml"), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_unique_connection_name() {
+        let existing: std::collections::HashSet<&str> =
+            ["a.db", "a.db (2)", "b.db"].into_iter().collect();
+        assert_eq!(unique_connection_name("c.db", &existing), "c.db");
+        assert_eq!(unique_connection_name("b.db", &existing), "b.db (2)");
+        assert_eq!(unique_connection_name("a.db", &existing), "a.db (3)");
+    }
+
+    #[test]
+    fn test_file_connection_engine() {
+        let engine = |p: &str| file_connection_engine(std::path::Path::new(p));
+        assert_eq!(engine("/a/x.sqlite"), Some("sqlite"));
+        assert_eq!(engine("/a/x.SQLITE3"), Some("sqlite"));
+        assert_eq!(engine("/a/x.db"), Some("sqlite"));
+        assert_eq!(engine("/a/x.duckdb"), Some("duckdb"));
+        assert_eq!(engine("/a/x.csv"), None);
+        assert_eq!(engine("/a/noext"), None);
+    }
+
+    fn add_file_test_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "queryfolio-add-file-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        dir
+    }
+
+    /// 設定ファイルが無い状態から追加すると、テンプレートを作ってから追記する。
+    /// 同名の接続 (グループ内を含む) があれば連番を付け、同じファイルなら追記しない。
+    #[test]
+    fn test_add_file_connection_in() {
+        let dir = add_file_test_dir("flow");
+        let db = dir.join("data").join("sales.sqlite3");
+        std::fs::write(&db, b"").unwrap();
+        let db_path = db.display().to_string();
+
+        let first = add_file_connection_in(&dir, &db_path).unwrap();
+        assert_eq!(
+            first,
+            FileConnection {
+                name: "sales.sqlite3".into(),
+                added: true
+            }
+        );
+        let text = std::fs::read_to_string(dir.join("config.yml")).unwrap();
+        assert!(text.starts_with("# Queryfolio config file"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("config.yml"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        // 同じファイルをもう一度選んでも二重に足さない
+        let again = add_file_connection_in(&dir, &db_path).unwrap();
+        assert_eq!(
+            again,
+            FileConnection {
+                name: "sales.sqlite3".into(),
+                added: false
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.yml")).unwrap(),
+            text
+        );
+
+        // 別ディレクトリの同名ファイルは連番付きで足す
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        let other = dir.join("other").join("sales.sqlite3");
+        std::fs::write(&other, b"").unwrap();
+        let second = add_file_connection_in(&dir, &other.display().to_string()).unwrap();
+        assert_eq!(second.name, "sales.sqlite3 (2)");
+        assert!(second.added);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// グループ内に同名の接続がある場合も重複とみなす。
+    #[test]
+    fn test_add_file_connection_in_avoids_names_in_groups() {
+        let dir = add_file_test_dir("group");
+        std::fs::write(
+            dir.join("config.yml"),
+            "servers:\n  - group_name: g\n    servers:\n      - name: w.duckdb\n        engine: postgres\n        host: h\n",
+        )
+        .unwrap();
+        let db = dir.join("data").join("w.duckdb");
+        std::fs::write(&db, b"").unwrap();
+        let added = add_file_connection_in(&dir, &db.display().to_string()).unwrap();
+        assert_eq!(added.name, "w.duckdb (2)");
+        let text = std::fs::read_to_string(dir.join("config.yml")).unwrap();
+        let servers = resolved_servers(&text);
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[1].1, "duckdb");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// template から engine / schema を継承した接続や、host にパスを書いた接続も
+    /// 同じファイルとして扱い、二重に足さない。
+    #[test]
+    fn test_add_file_connection_in_detects_resolved_duplicates() {
+        let dir = add_file_test_dir("resolved");
+        let a = dir.join("data").join("a.db");
+        let b = dir.join("data").join("b.sqlite3");
+        std::fs::write(&a, b"").unwrap();
+        std::fs::write(&b, b"").unwrap();
+        // Windows のパスは `\` を含むので、JSON 文字列 (= YAML の二重引用符) で書く
+        let quote = |p: &PathBuf| serde_json::to_string(&p.display().to_string()).unwrap();
+        let yaml = format!(
+            "server_templates:\n  - name: t\n    engine: sqlite3\n    schema: {}\nservers:\n  - name: via-template\n    template: t\n  - name: via-host\n    engine: sqlite\n    host: {}\n",
+            quote(&a),
+            quote(&b)
+        );
+        std::fs::write(dir.join("config.yml"), &yaml).unwrap();
+
+        let found = add_file_connection_in(&dir, &a.display().to_string()).unwrap();
+        assert_eq!(
+            found,
+            FileConnection {
+                name: "via-template".into(),
+                added: false
+            }
+        );
+        let found = add_file_connection_in(&dir, &b.display().to_string()).unwrap();
+        assert_eq!(
+            found,
+            FileConnection {
+                name: "via-host".into(),
+                added: false
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.yml")).unwrap(),
+            yaml
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `..` を含む書き方やシンボリックリンク経由で同じファイルを選んでも重複させない。
+    #[cfg(unix)]
+    #[test]
+    fn test_add_file_connection_in_compares_canonical_paths() {
+        let dir = add_file_test_dir("canonical");
+        let db = dir.join("data").join("c.db");
+        std::fs::write(&db, b"").unwrap();
+        let first = add_file_connection_in(&dir, &db.display().to_string()).unwrap();
+        assert!(first.added);
+
+        let dotted = dir.join("data").join("..").join("data").join("c.db");
+        let again = add_file_connection_in(&dir, &dotted.display().to_string()).unwrap();
+        assert_eq!(
+            again,
+            FileConnection {
+                name: "c.db".into(),
+                added: false
+            }
+        );
+
+        let link = dir.join("link.db");
+        std::os::unix::fs::symlink(&db, &link).unwrap();
+        let via_link = add_file_connection_in(&dir, &link.display().to_string()).unwrap();
+        assert_eq!(
+            via_link,
+            FileConnection {
+                name: "c.db".into(),
+                added: false
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 対応外の拡張子・存在しないファイル・相対パスは設定に書かない。
+    #[test]
+    fn test_add_file_connection_in_rejects_bad_paths() {
+        let dir = add_file_test_dir("reject");
+        let csv = dir.join("data").join("x.csv");
+        std::fs::write(&csv, b"").unwrap();
+        for path in [
+            csv.display().to_string(),
+            dir.join("data").join("missing.db").display().to_string(),
+            "relative.db".to_string(),
+        ] {
+            assert!(add_file_connection_in(&dir, &path).is_err(), "{path}");
+        }
+        assert!(!dir.join("config.yml").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

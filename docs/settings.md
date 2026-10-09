@@ -47,7 +47,10 @@ save. (On Windows, the platform's default file permissions apply.)
 You can edit the file with any text editor, or from inside the app:
 
 - Menu bar **Config → Edit config.yml** opens a built-in editor (with YAML
-  syntax highlighting and lint errors shown inline).
+  syntax highlighting and lint errors shown inline). While there are no
+  connections, the same editor is also one click away from the **Edit
+  config.yml** button in the CONNECTIONS pane and from the "Created a config
+  file" notification shown on first launch.
 - Inside that editor, **Cmd/Ctrl+F** opens a find bar (Cmd/Ctrl+G or F3 jumps to
   the next match, Escape closes the find bar).
 - Saving from the in-app editor validates that the content still parses as a YAML
@@ -55,6 +58,31 @@ You can edit the file with any text editor, or from inside the app:
 
 After editing the file directly, reload connections (reopen the app or use the
 menu) to pick up the changes.
+
+### Adding a SQLite / DuckDB file without writing YAML
+
+While there are no connections, the CONNECTIONS pane shows **Open SQLite /
+DuckDB file…**. Pick a `.sqlite`, `.sqlite3`, `.db` or `.duckdb` file and
+Queryfolio appends one entry to `servers` and selects it:
+
+```yaml
+servers:
+  - name: "example.sqlite3"
+    engine: sqlite
+    schema: "/Users/you/data/example.sqlite3"
+```
+
+- The entry is appended as text, so existing comments and key order are kept.
+  A starter `servers: []` is turned into a block list; otherwise the entry goes
+  after the last item of the top-level `servers` list (outside any group).
+- `name` is the file name. If a connection with that name already exists, a
+  number is added (`example.sqlite3 (2)`). Picking a file that is already
+  registered with the same engine just selects the existing connection.
+- If `servers` is written in a form that cannot be extended safely as text
+  (a non-empty `[...]` flow list, an anchor, ...), nothing is written and you
+  are asked to use **Edit config.yml** instead.
+- If `config_override_command` replaces `servers`, the appended entry is saved
+  but does not show up in the list.
 
 ## Connections (`servers`)
 

@@ -400,6 +400,15 @@ export const readConfigFile = () => invoke<string>("read_config_file");
 export const writeConfigFile = (content: string) =>
   invoke<string>("write_config_file", { content });
 
+/// add_file_connection の結果。added = false は「同じファイルの接続が既にあった」
+/// (config.yml は書き換えていない)。
+export type FileConnection = { name: string; added: boolean };
+
+/// 選んだ SQLite / DuckDB ファイルの接続を config.yml の servers へ追記する
+/// (既存のコメントと順序は保つ)。再読み込みは呼び出し側で行う。
+export const addFileConnection = (path: string) =>
+  invoke<FileConnection>("add_file_connection", { path });
+
 /// config_override_command を実行して取得した生の YAML を返す
 /// (コピー用ビュー用。表示先では編集できるが保存はしない)。
 export const readOverrideConfigYaml = () =>
