@@ -1975,19 +1975,37 @@ fn pg_binary_array_to_json(
 
     let mut buf = buf;
     let ndim = usize::try_from(take_i32(&mut buf)?).ok()?;
-    // has-null フラグと要素型 OID は使わない (要素型は列の型情報から分かる)
-    take(&mut buf, 8)?;
+    // has-null フラグは 0 / 1 以外なら壊れた入力 (array_recv と同じ判定)。
+    // 要素型 OID は使わない (要素型は列の型情報から分かる)
+    if !matches!(take_i32(&mut buf)?, 0 | 1) {
+        return None;
+    }
+    take(&mut buf, 4)?;
     if ndim == 0 {
-        return Some(serde_json::Value::Array(Vec::new()));
+        return buf.is_empty().then(|| serde_json::Value::Array(Vec::new()));
     }
     if ndim > MAX_DIMS {
         return None;
     }
     let mut dims = Vec::with_capacity(ndim);
     for _ in 0..ndim {
-        dims.push(usize::try_from(take_i32(&mut buf)?).ok()?);
+        let len = usize::try_from(take_i32(&mut buf)?).ok()?;
+        // Postgres は空配列を ndim = 0 に正規化するので、長さ 0 の次元は届かない
+        // (例外の int2vector / oidvector はここ = enum 配列の経路を通らない)。
+        // 届いたら壊れた入力として弾く (内側の次元が 0 だと入力を 1 バイトも
+        // 読まずに外側のループが回り続け、要素数の検査をすり抜ける)
+        if len == 0 {
+            return None;
+        }
+        dims.push(len);
         // 添字の下限
         take(&mut buf, 4)?;
+    }
+    // 要素は 1 つにつき最低 4 バイト (長さ) あるので、総要素数が残りの
+    // バイト数で賄えない入力は確保もループもする前に弾く
+    let total = dims.iter().try_fold(1usize, |acc, &d| acc.checked_mul(d))?;
+    if total > buf.len() / 4 {
+        return None;
     }
 
     // 要素は行優先で並んでいるので、次元ごとに再帰して入れ子にする
@@ -1997,16 +2015,16 @@ fn pg_binary_array_to_json(
         decode_element: &dyn Fn(&[u8]) -> serde_json::Value,
     ) -> Option<serde_json::Value> {
         let (&len, inner) = dims.split_first()?;
-        // 長さは巨大でも要素ごとに最低 4 バイト読むので、壊れた入力は
-        // 確保の前にバッファ不足で止まる
-        let mut items = Vec::with_capacity(len.min(buf.len() / 4));
+        let mut items = Vec::with_capacity(len);
         for _ in 0..len {
             if inner.is_empty() {
                 let elem_len = take_i32(buf)?;
-                if elem_len < 0 {
+                // NULL は -1 だけ。それ以外の負の長さは壊れた入力
+                if elem_len == -1 {
                     items.push(serde_json::Value::Null);
                 } else {
-                    items.push(decode_element(take(buf, elem_len as usize)?));
+                    let elem_len = usize::try_from(elem_len).ok()?;
+                    items.push(decode_element(take(buf, elem_len)?));
                 }
             } else {
                 items.push(build(inner, buf, decode_element)?);
@@ -2014,7 +2032,9 @@ fn pg_binary_array_to_json(
         }
         Some(serde_json::Value::Array(items))
     }
-    build(&dims, &mut buf, &decode_element)
+    let value = build(&dims, &mut buf, &decode_element)?;
+    // 宣言した要素数を読み終えても余りがあれば、ヘッダと中身が食い違っている
+    buf.is_empty().then_some(value)
 }
 
 fn pg_value_to_json(row: &PgRow, i: usize) -> serde_json::Value {
@@ -3886,6 +3906,30 @@ mod tests {
         // MAXDIM (6) を超える次元数
         let too_deep = pg_array_bytes(&[1; 7], &[Some("a")]);
         assert_eq!(pg_binary_array_to_json(&too_deep, label), None);
+        // 長さ 0 の次元 (内側が 0 だと入力を読まずに外側が 2^31 回まわる)
+        for dims in [[i32::MAX, 0], [0, i32::MAX], [2, 0]] {
+            let zero_dim = pg_array_bytes(&dims, &[]);
+            assert_eq!(pg_binary_array_to_json(&zero_dim, label), None, "{dims:?}");
+        }
+        // 次元の積がオーバーフローする / 残りのバイト数で賄えない
+        let overflow = pg_array_bytes(&[i32::MAX, i32::MAX, i32::MAX], &[Some("a")]);
+        assert_eq!(pg_binary_array_to_json(&overflow, label), None);
+        // NULL は -1 だけ
+        let mut bad_null = pg_array_bytes(&[1], &[None]);
+        let at = bad_null.len() - 4;
+        bad_null[at..].copy_from_slice(&(-2i32).to_be_bytes());
+        assert_eq!(pg_binary_array_to_json(&bad_null, label), None);
+        // 宣言した要素の後ろに余りがある
+        let mut trailing = pg_array_bytes(&[1], &[Some("a")]);
+        trailing.push(0);
+        assert_eq!(pg_binary_array_to_json(&trailing, label), None);
+        let mut trailing_empty = pg_array_bytes(&[], &[]);
+        trailing_empty.push(0);
+        assert_eq!(pg_binary_array_to_json(&trailing_empty, label), None);
+        // has-null フラグは 0 / 1 だけ
+        let mut bad_flag = pg_array_bytes(&[1], &[Some("a")]);
+        bad_flag[4..8].copy_from_slice(&2i32.to_be_bytes());
+        assert_eq!(pg_binary_array_to_json(&bad_flag, label), None);
     }
 
     /// エージェント経路でも文レベルのガードは効き続ける
