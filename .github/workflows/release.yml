@@ -263,9 +263,9 @@ jobs:
       matrix:
         include:
           # Distribute a universal binary that supports both Intel / Apple Silicon as a dmg.
-          # Signing is Developer ID + notarization in the steps below. Local builds are ad-hoc via
-          # signingIdentity "-" in tauri.conf.json, and in CI APPLE_SIGNING_IDENTITY overrides it
-          # (tauri-cli precedence: env > config).
+          # Signing is Developer ID + notarization (both the .app and the dmg) in the steps below.
+          # Local builds are ad-hoc via signingIdentity "-" in tauri.conf.json, and in CI
+          # APPLE_SIGNING_IDENTITY overrides it (tauri-cli precedence: env > config).
           - platform: macos-latest
             rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
             args: --target universal-apple-darwin --bundles dmg
@@ -280,8 +280,8 @@ jobs:
       # persist-credentials: false — so that checkout does not leave the write-capable GITHUB_TOKEN in
       # `.git/config`, so that later steps (pnpm install's install scripts and third-party actions)
       # cannot pick it up.
-      # This job handles Apple certificates, so pin every `uses:` to a commit SHA (pinning only
-      # tauri-action is not enough — the same happens if an action in an earlier step is tampered with).
+      # This job handles Apple certificates, so pin every `uses:` to a commit SHA (a tampered action
+      # could reach the Secrets and the keychain used by later steps).
       # When updating, look up the new SHA using the trailing `# v4` style comment and replace it.
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -317,7 +317,7 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # If even one signing / notarization Secret is missing, tauri-action just gets an empty string
+      # If even one signing / notarization Secret is missing, the tauri CLI just gets an empty string
       # and the build still passes (producing ad-hoc signed or non-notarized artifacts). The publish job
       # only looks at success or failure, so it would publish as if it were "signed + notarized". Fail
       # explicitly here to prevent an undistributable dmg from being published.
@@ -345,8 +345,9 @@ jobs:
           echo "All signing and notarization secrets are present."
 
       # macOS only: import the Developer ID certificate into a temporary keychain.
-      # tauri-action itself does not import certificates, so prepare it in this step before the build.
-      # The keychain password is disposable, so generate it instead of making it a Secret.
+      # The tauri CLI would also import one itself if given APPLE_CERTIFICATE, but the Build step only
+      # gets APPLE_SIGNING_IDENTITY and the keychain is prepared here (doing both would put the same
+      # certificate into two keychains). The keychain password is disposable, so generate it instead of making it a Secret.
       - name: Import Apple Developer certificate (macOS)
         if: matrix.platform == 'macos-latest'
         env:
@@ -377,23 +378,18 @@ jobs:
           }
           rm "$RUNNER_TEMP/certificate.p12"
 
-      # Upload the build artifacts to the draft Release (releaseId) prepared by the draft job.
+      # Windows: upload the build artifacts to the draft Release (releaseId) prepared by the draft job.
       # So that one side of the parallel matrix does not make it public by itself, publish it in the
       # publish job after all platforms succeed. When releaseId is passed, tauri-action neither looks
       # for nor creates a Release, so do not pass tagName / releaseName / releaseDraft
       # (the Release name and tag are decided by the draft job).
-      # Passing macOS's APPLE_* makes tauri-action automatically do Developer ID signing +
-      # notarization + staple. Since it receives Apple credentials, pin it to a commit SHA rather than
-      # the mutable tag @v0 (to prevent a supply-chain attack that swaps the tag and steals secrets).
-      - name: Build and upload to GitHub Release (draft)
+      # macOS has to notarize the dmg before uploading it, and tauri-action builds and uploads in one
+      # step, so macOS uses the three steps below instead.
+      - name: Build and upload to GitHub Release (draft, Windows)
+        if: matrix.platform == 'windows-latest'
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Apple credentials are passed only to the macOS job (empty strings on Windows so they are not exposed).
-          APPLE_SIGNING_IDENTITY: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_SIGNING_IDENTITY || '' }}
-          APPLE_ID: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_ID || '' }}
-          APPLE_PASSWORD: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_PASSWORD || '' }}
-          APPLE_TEAM_ID: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_TEAM_ID || '' }}
         with:
           # Call the tauri CLI directly, bypassing the "tauri" script in package.json.
           # That one hard-codes APPLE_SIGNING_IDENTITY as an env prefix for local signing,
@@ -401,6 +397,84 @@ jobs:
           tauriScript: pnpm exec tauri
           releaseId: ${{ needs.draft.outputs.release_id }}
           args: ${{ matrix.args }}
+
+      # `pnpm exec` bypasses the "tauri" script in package.json. That script sets
+      # APPLE_SIGNING_IDENTITY inline for local signing, and an inline assignment beats the inherited
+      # env, so the Secret passed here would be silently ignored.
+      # With APPLE_* the tauri CLI signs, notarizes and staples the .app, and signs the dmg. It does not
+      # notarize the dmg; the next step does.
+      - name: Build (macOS, sign and notarize the app)
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: pnpm exec tauri build ${{ matrix.args }}
+
+      # Without this, Gatekeeper rejects the downloaded dmg (spctl --type open says
+      # "Unnotarized Developer ID"), even though the .app inside is notarized.
+      - name: Notarize the dmg (macOS)
+        if: matrix.platform == 'macos-latest'
+        id: dmg
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          # target/ is restored by rust-cache, so a dmg of an earlier version may still be there.
+          # Narrow by version and require exactly one.
+          shopt -s nullglob
+          dmgs=(src-tauri/target/universal-apple-darwin/release/bundle/dmg/*_"${VERSION}"_universal.dmg)
+          if [ ${#dmgs[@]} -ne 1 ]; then
+            echo "::error::expected exactly one dmg for ${VERSION}, found ${#dmgs[@]}: ${dmgs[*]}"
+            exit 1
+          fi
+          DMG="${dmgs[0]}"
+          # Check both the exit code and the status. Do not let a non-zero submit end the step right
+          # away: print its output and the notarization log (why it was Invalid) first.
+          rc=0
+          result=$(xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            --wait --output-format json) || rc=$?
+          echo "$result"
+          status=$(echo "$result" | jq -r '.status // empty' 2>/dev/null || true)
+          if [ "$rc" -ne 0 ] || [ "$status" != "Accepted" ]; then
+            id=$(echo "$result" | jq -r '.id // empty' 2>/dev/null || true)
+            if [ -n "$id" ]; then
+              xcrun notarytool log "$id" \
+                --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" || true
+            fi
+            echo "::error::notarization of the dmg failed (exit ${rc}, status '${status:-none}')"
+            exit 1
+          fi
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+          spctl --assess --type open --context context:primary-signature -vv "$DMG"
+          echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
+
+      # Upload to the draft Release prepared by the draft job by its id, not by tag (like releaseId
+      # on Windows). The publish job makes it public after all platforms succeed.
+      - name: Upload the dmg to the draft release (macOS)
+        if: matrix.platform == 'macos-latest'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ needs.draft.outputs.release_id }}
+          DMG: ${{ steps.dmg.outputs.dmg }}
+        run: |
+          NAME=$(basename "$DMG")
+          export NAME
+          # On a re-run the asset uploaded by the earlier run is still there, and the same name
+          # cannot be uploaded twice.
+          for id in $(gh api "repos/${GH_REPO}/releases/${RELEASE_ID}/assets?per_page=100" \
+            --jq '.[] | select(.name == env.NAME) | .id'); do
+            gh api -X DELETE "repos/${GH_REPO}/releases/assets/${id}"
+            echo "Deleted the previous asset ${id} (${NAME})."
+          done
+          gh api -X POST "https://uploads.github.com/repos/${GH_REPO}/releases/${RELEASE_ID}/assets?name=${NAME}" \
+            -H "Content-Type: application/x-apple-diskimage" --input "$DMG" --jq '.browser_download_url'
 
   # Publish the draft only when the build and upload of all platforms succeeded.
   # If any fails, it stays a draft (an incomplete Release is never published).
