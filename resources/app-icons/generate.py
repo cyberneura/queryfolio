@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Queryfolio のアプリアイコンを各サイズで描き出す (標準ライブラリだけ)。"""
+"""Draws the Queryfolio app icon at each size (standard library only)."""
 from __future__ import annotations
 
 import math
@@ -13,20 +13,20 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 NAVY = (30, 41, 59)
 WHITE = (255, 255, 255)
 
-# --- 1024px キャンバスでの採寸値 (既存 icon.icns の ic10 から) ---------------
+# --- Measurements on the 1024px canvas (from ic10 of the existing icon.icns) ---
 REF = 1024.0
 SQ_INSET = 103.0
 SQ_SIDE = 819.0
 SQ_RADIUS = 178.4
 CYL_CX = 511.5
-CYL_RX = 182.5          # 線の中心を通る半径
+CYL_RX = 182.5          # radius through the center of the stroke
 CYL_RY = 83.0
 STROKE = 32.0
-BAND_CY = (379.0, 479.0, 579.0, 679.0)   # 上の楕円 + 帯 3 本
+BAND_CY = (379.0, 479.0, 579.0, 679.0)   # top ellipse + 3 bands
 
-# 小さいサイズは比例配分のままだと線が消えるので下限を置く。
+# At small sizes the strokes would vanish if scaled proportionally, so set a lower bound.
 MIN_STROKE = {16: 2.0, 32: 3.0, 64: 3.6}
-# 16px では帯が 4 本とも入らない。段数を減らして輪郭を残す。
+# At 16px all 4 bands do not fit. Reduce the number of levels to keep the outline.
 BAND_COUNT = {16: 2, 32: 3}
 
 SIZES = (16, 32, 64, 128, 256, 512, 1024)
@@ -37,7 +37,7 @@ def stroke_width(size: int) -> float:
 
 
 def band_centers(size: int) -> list[float]:
-    """そのサイズで描く楕円の中心 y (1024px 基準)。"""
+    """Center y of the ellipses drawn at that size (1024px basis)."""
     count = BAND_COUNT.get(size, len(BAND_CY))
     if count >= len(BAND_CY):
         return list(BAND_CY)
@@ -86,7 +86,7 @@ def render(size: int, supersample: int = 4) -> list[bytearray]:
                     covered += 1
 
                     hit = False
-                    # 円柱の縦の側面
+                    # vertical sides of the cylinder
                     if body_top <= y <= body_bottom:
                         for sxp in side_x:
                             if abs(x - sxp) <= half:
@@ -94,7 +94,7 @@ def render(size: int, supersample: int = 4) -> list[bytearray]:
                                 break
                     if not hit:
                         for i, cy in enumerate(centers):
-                            # 先頭は全周、以降は下半分だけ (帯)
+                            # the first is the full circumference, the rest only the lower half (bands)
                             if i > 0 and y < cy:
                                 continue
                             dx, dy = x - cx, y - cy

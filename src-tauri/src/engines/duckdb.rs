@@ -1,21 +1,21 @@
-//! DuckDB エンジン。
+//! DuckDB engine.
 //!
-//! DuckDB は SQL エンジンだが sqlx にドライバが無いため、`duckdb` crate
-//! (duckdb-rs、bundled) で独自に結線する。SQL 系の共通ガード
-//! (readonly / dangerous / auto LIMIT / メタコマンド / EXPLAIN) は db.rs の
-//! 既存ロジックをそのまま再利用する (scan_sql の方言は Postgres 相当)。
+//! DuckDB is a SQL engine, but sqlx has no driver for it, so it is wired up directly with the
+//! `duckdb` crate (duckdb-rs, bundled). The common SQL guards (readonly / dangerous / auto LIMIT /
+//! meta commands / EXPLAIN) reuse the existing logic in db.rs as is (scan_sql uses the Postgres
+//! dialect).
 //!
-//! - 接続は sqlite と同型: `schema` (無ければ `host`) を DB ファイルパスとして
-//!   開く。ファイルが存在しなければエラー (黙って新規作成しない)。
-//!   SSH トンネルは不可 (ファイルベース)。
-//! - duckdb-rs は同期 API のため、実行は `spawn_blocking` で包む。
-//!   コネクションは 1 本を `Arc<Mutex<Connection>>` で維持する
-//!   (duckdb::Connection は Send だが Sync でない)。
-//! - キャンセルはサーバー (エンジン) 側の interrupt が必須:
-//!   spawn_blocking は future の drop では止まらないため、
-//!   `InterruptHandle::interrupt()` で実行中の文を中断させる
-//!   (`CancelTarget::DuckDb`)。interrupt は実行中の文にしか効かないので、
-//!   実行開始前に届いたキャンセルは blocking 側のフラグ確認で拾う。
+//! - The connection mirrors sqlite: `schema` (or `host` if absent) is opened as the DB file path.
+//!   An error is returned if the file does not exist (we never silently create a new one).
+//!   SSH tunnels are not supported (file-based).
+//! - duckdb-rs has a synchronous API, so execution is wrapped in `spawn_blocking`.
+//!   A single connection is kept as `Arc<Mutex<Connection>>`
+//!   (duckdb::Connection is Send but not Sync).
+//! - Cancellation requires an interrupt on the server (engine) side:
+//!   spawn_blocking is not stopped by dropping the future, so the running statement is aborted
+//!   with `InterruptHandle::interrupt()` (`CancelTarget::DuckDb`). An interrupt only affects a
+//!   statement that is currently running, so a cancel that arrives before execution starts is
+//!   caught by a flag check on the blocking side.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,31 +34,31 @@ use crate::db::{
 use crate::error::AppError;
 use crate::schema_info::{ColumnInfo, TableInfo};
 
-/// 1 セルに入れるコレクション (LIST / STRUCT / MAP) の要素数上限。
-/// 超過分は打ち切り、QueryResult.truncated で通知する
-/// (非有界のネスト値を webview へ送らない)。
+/// Upper bound on the number of elements of a collection (LIST / STRUCT / MAP) in one cell.
+/// Anything beyond it is cut off and reported via QueryResult.truncated
+/// (so unbounded nested values are never sent to the webview).
 const MAX_COLLECTION_ELEMENTS: usize = 1000;
 
-/// 1 セルに入れる文字列 (TEXT / BLOB) の文字数上限。超過分は打ち切って
-/// truncated を立てる。
-/// 既知の限界: duckdb-rs の row.get は値を丸ごと実体化してから返すため、
-/// この上限は「webview へ送るサイズ」の保護であって、Rust 側の一時メモリは
-/// 実体化した値のぶん消費する (巨大な 1 セルは実行側で size を絞ること)。
+/// Upper bound on the number of characters of a string (TEXT / BLOB) in one cell. Anything beyond
+/// it is cut off and `truncated` is set.
+/// Known limitation: duckdb-rs's row.get fully materializes the value before returning it, so this
+/// limit protects the size sent to the webview, while temporary memory on the Rust side is still
+/// consumed for the materialized value (limit the size on the query side for a huge single cell).
 const MAX_TEXT_CHARS: usize = 10_000;
 
-/// ネスト値 (LIST / STRUCT / MAP / UNION) を JSON 化する再帰の深さ上限。
-/// read_json_auto 等でデータ由来の任意深度のネストが返り得るため、
-/// スタックオーバーフローを防ぐ (超えたらプレースホルダ + truncated)。
+/// Upper bound on the recursion depth when converting nested values (LIST / STRUCT / MAP / UNION)
+/// to JSON. read_json_auto and the like can return nesting of arbitrary depth derived from the
+/// data, so this prevents stack overflow (beyond it: placeholder + truncated).
 const MAX_NESTING_DEPTH: usize = 32;
 
-/// DuckDB 接続のハンドル。DbPool::DuckDb として保持される。
-/// interrupt は Mutex を取らずに実行中の文を中断できる (キャンセル用)。
-/// exec はクエリ実行 (run_query_cancellable) を接続単位で直列化する
-/// async ロック: キャンセル登録 (CancelRegistry) は接続名ごとに 1 件で、
-/// 同一接続の 2 本目が並行実行されると登録が上書きされ、共有の
-/// InterruptHandle が実行中の 1 本目を巻き込む (キャンセルの混線)。
-/// 実行をこのロックで直列化し、登録が常に「実際に実行中の文」と一致する
-/// ことを保証する (フロントの並列抑止に依存しない)。
+/// Handle of a DuckDB connection. Held as DbPool::DuckDb.
+/// interrupt can abort the running statement without taking the Mutex (used for cancellation).
+/// exec is an async lock that serializes query execution (run_query_cancellable) per connection:
+/// the cancel registration (CancelRegistry) holds one entry per connection name, so if a second
+/// query ran concurrently on the same connection the registration would be overwritten and the
+/// shared InterruptHandle would take down the first, running one (cancellation crosstalk).
+/// Serializing execution with this lock guarantees the registration always matches the statement
+/// that is actually running (without relying on the frontend preventing parallel runs).
 #[derive(Clone)]
 pub struct DuckDbHandle {
     conn: Arc<Mutex<Connection>>,
@@ -66,14 +66,14 @@ pub struct DuckDbHandle {
     exec: Arc<tokio::sync::Mutex<()>>,
 }
 
-// Connection が Debug を実装しないため手書きする (テストの unwrap_err 用)
+// Written by hand because Connection does not implement Debug (needed for unwrap_err in tests)
 impl std::fmt::Debug for DuckDbHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("DuckDbHandle")
     }
 }
 
-/// 設定から DB ファイルパスを解決する (sqlite と同じく schema 優先)。
+/// Resolves the DB file path from the settings (schema takes priority, as with sqlite).
 fn database_path(server: &ServerConfig) -> Result<std::path::PathBuf, AppError> {
     let path = server
         .schema
@@ -85,8 +85,8 @@ fn database_path(server: &ServerConfig) -> Result<std::path::PathBuf, AppError> 
     Ok(expand_tilde(path))
 }
 
-/// 接続を確立する。ファイルが存在しなければエラー
-/// (Connection::open は無いファイルを黙って新規作成するため、先に確認する)。
+/// Establishes the connection. Returns an error if the file does not exist
+/// (Connection::open silently creates a new file when it is missing, so check first).
 pub async fn connect(server: &ServerConfig) -> Result<DuckDbHandle, AppError> {
     let file_path = database_path(server)?;
     if !file_path.exists() {
@@ -95,8 +95,8 @@ pub async fn connect(server: &ServerConfig) -> Result<DuckDbHandle, AppError> {
             file_path.display()
         )));
     }
-    // ファイルオープンはローカル I/O のみだが、WAL リプレイ等で
-    // 時間がかかり得るため blocking スレッドで行う
+    // Opening the file is local I/O only, but WAL replay and the like can take
+    // a while, so do it on a blocking thread
     let conn = tokio::task::spawn_blocking(move || Connection::open(&file_path))
         .await
         .map_err(|e| AppError::DuckDb(format!("DuckDB open task failed: {e}")))??;
@@ -108,10 +108,10 @@ pub async fn connect(server: &ServerConfig) -> Result<DuckDbHandle, AppError> {
     })
 }
 
-/// SQL を実行して結果を返す (キャンセル対応版)。
-/// db::run_query_cancellable から DbPool::DuckDb の場合に委譲される。
-/// SQL エンジンなのでメタコマンド・readonly / dangerous ガード・auto LIMIT は
-/// db.rs の SQL 系と同じ流れで適用する。
+/// Executes SQL and returns the result (cancellable version).
+/// db::run_query_cancellable delegates here for DbPool::DuckDb.
+/// Since this is a SQL engine, meta commands, readonly / dangerous guards and auto LIMIT are
+/// applied in the same flow as the SQL engines in db.rs.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_query_cancellable(
     handle: &DuckDbHandle,
@@ -123,8 +123,8 @@ pub async fn run_query_cancellable(
     readonly: ReadonlyGuard,
     allow_dangerous: bool,
 ) -> Result<QueryResult, AppError> {
-    // psql 風メタコマンドはカタログ照会 SQL に変換する。
-    // \c は meta_commands 側で DuckDB を拒否するため Connect は来ない
+    // psql-style meta commands are converted into catalog queries.
+    // \c is rejected for DuckDB in meta_commands, so Connect never arrives here
     let translated = match crate::meta_commands::translate(Engine::DuckDb, sql)? {
         Some(crate::meta_commands::MetaCommand::Sql(sql)) => Some(sql),
         Some(crate::meta_commands::MetaCommand::Connect(_)) => {
@@ -140,8 +140,8 @@ pub async fn run_query_cancellable(
         return Err(AppError::Config("The SQL statement is empty".into()));
     }
 
-    // エージェント経路は狭いホワイトリスト (db.rs の run_query_on と同じ理由。
-    // 呼び出し側でなく ReadonlyGuard::Agent 自体がポリシーを持つ)
+    // The agent path uses a narrow whitelist (same reason as run_query_on in db.rs;
+    // ReadonlyGuard::Agent itself holds the policy, not the caller)
     if readonly == ReadonlyGuard::Agent {
         if let Some(reason) =
             crate::db::agent_rejection_reason(sql, Engine::DuckDb)
@@ -150,16 +150,16 @@ pub async fn run_query_cancellable(
         }
     }
 
-    // 複文はガードをすり抜ける (1 文目しか見ないため)。db.rs の run_query_on と
-    // 同じく、ガードが有効な接続では複文自体を拒否する。
+    // Multi-statement input slips past the guard (only the first statement is inspected). As in
+    // run_query_on in db.rs, multi-statement input is rejected when the guard is active.
     if (readonly != ReadonlyGuard::Off || !allow_dangerous)
         && crate::db::contains_multiple_statements(sql, Engine::DuckDb)
     {
         return Err(crate::db::multi_statement_block_error());
     }
 
-    // メタコマンド変換後の SQL にもガードを適用する (すり抜け防止。
-    // 変換結果は読み取り系のみなので常に通るが、順序として明示する)
+    // Apply the guard to the SQL after meta command conversion as well (to prevent bypass.
+    // The converted SQL is read-only so it always passes, but make the order explicit)
     if readonly != ReadonlyGuard::Off
         && !is_readonly_allowed(sql, Engine::DuckDb)
         && !is_duckdb_readonly_statement(sql)
@@ -172,8 +172,8 @@ pub async fn run_query_cancellable(
         }
     }
 
-    // LIMIT 未指定の SELECT にはデフォルトの LIMIT を付与する
-    // (メタコマンド変換後の SQL には適用しない。db.rs の run_query_on と同じ)
+    // Add the default LIMIT to a SELECT without one
+    // (not applied to SQL after meta command conversion; same as run_query_on in db.rs)
     let mut applied_limit = None;
     let limited_sql;
     let sql = match auto_limit {
@@ -190,8 +190,8 @@ pub async fn run_query_cancellable(
         _ => sql,
     };
 
-    // 実行を接続単位で直列化してからキャンセル対象を登録する
-    // (登録と実行中の文の対応がズレるキャンセル混線の防止)
+    // Serialize execution per connection, then register the cancel target
+    // (prevents cancellation crosstalk where the registration and the running statement diverge)
     let _exec = handle.exec.lock().await;
     let cancelled = Arc::new(AtomicBool::new(false));
     let guard = registry.register(
@@ -208,10 +208,10 @@ pub async fn run_query_cancellable(
     let fetch = is_fetch_statement(sql)
         || is_duckdb_readonly_statement(sql)
         || contains_returning(sql);
-    // spawn_blocking は future の drop では止まらないが、キャンセル時は
-    // CancelRegistry が interrupt を発行して実行中の文をエラーで終わらせる
-    // ため、この await が無期限に残ることはない
-    // エージェント経路は読み取り専用トランザクションで包む (DB レベルの強制)
+    // spawn_blocking is not stopped by dropping the future, but on cancel the
+    // CancelRegistry issues an interrupt that ends the running statement with an error,
+    // so this await never stays pending indefinitely.
+    // The agent path is wrapped in a read-only transaction (enforced at the DB level)
     let readonly_tx = readonly == ReadonlyGuard::Agent;
     let result = tokio::task::spawn_blocking(move || {
         execute_blocking(&conn, &sql_owned, max_rows, fetch, readonly_tx, &cancelled)
@@ -222,8 +222,8 @@ pub async fn run_query_cancellable(
     let was_cancelled = guard.was_cancelled();
     drop(guard);
 
-    // キャンセル要求後のエラーは「キャンセルされた」として返す
-    // (キャンセルが間に合わず完了していた場合は成功結果を優先する)
+    // An error after a cancel request is returned as "cancelled"
+    // (if the query completed before the cancel took effect, the successful result wins)
     if was_cancelled && result.is_err() {
         return Err(AppError::Cancelled);
     }
@@ -233,11 +233,11 @@ pub async fn run_query_cancellable(
     Ok(result)
 }
 
-/// DuckDB 固有の行を返す読み取り文か。共通の is_fetch_statement は
-/// SQL 標準の先頭キーワードしか知らないため、DuckDB の FROM-first 構文
-/// (`FROM t`) / SUMMARIZE / PIVOT / UNPIVOT をここで補完する。
-/// いずれも読み取り専用の問い合わせ形で書き込みは表現できない
-/// (DuckDB に SELECT INTO は無い) ため、readonly 判定にも使う。
+/// Whether this is a read statement returning rows that is specific to DuckDB. The common
+/// is_fetch_statement only knows the standard leading SQL keywords, so DuckDB's FROM-first syntax
+/// (`FROM t`) / SUMMARIZE / PIVOT / UNPIVOT are covered here.
+/// All of them are read-only query forms that cannot express writes
+/// (DuckDB has no SELECT INTO), so this is also used for the readonly check.
 fn is_duckdb_readonly_statement(sql: &str) -> bool {
     matches!(
         leading_keyword(sql).as_str(),
@@ -245,14 +245,14 @@ fn is_duckdb_readonly_statement(sql: &str) -> bool {
     )
 }
 
-/// blocking スレッドで 1 文を実行する。
-/// fetch = 行を返す文 (SELECT 系 / RETURNING 付き)。それ以外は execute で
-/// 影響行数のみ取得する。
-/// readonly_tx = 読み取り専用トランザクションで包む (エージェント経路)。
-/// DuckDB の `BEGIN TRANSACTION READ ONLY` は `SELECT nextval(...)` を含む
-/// 全ての書き込みを拒否する。接続を Mutex で押さえたまま同期実行するため、
-/// ROLLBACK まで必ずこの関数の中で完了する (キャンセルで中断された場合も、
-/// 中断されるのは実行中の文で、この関数自体は最後まで走る)。
+/// Executes one statement on a blocking thread.
+/// fetch = a statement that returns rows (SELECT family / with RETURNING). Anything else uses
+/// execute and only gets the affected row count.
+/// readonly_tx = wrap in a read-only transaction (agent path).
+/// DuckDB's `BEGIN TRANSACTION READ ONLY` rejects all writes, including `SELECT nextval(...)`.
+/// Because it runs synchronously while holding the connection Mutex, everything up to ROLLBACK
+/// always completes inside this function (even when interrupted by a cancel, what gets aborted
+/// is the running statement; this function itself runs to the end).
 fn execute_blocking(
     conn: &Mutex<Connection>,
     sql: &str,
@@ -264,8 +264,8 @@ fn execute_blocking(
     let conn = conn.lock().map_err(|_| {
         AppError::DuckDb("The DuckDB connection is poisoned".into())
     })?;
-    // interrupt は実行中の文にしか効かないため、実行開始前に届いた
-    // キャンセルはここで拾う
+    // interrupt only affects a running statement, so a cancel that arrived
+    // before execution started is caught here
     if cancelled.load(Ordering::SeqCst) {
         return Err(AppError::Cancelled);
     }
@@ -273,16 +273,16 @@ fn execute_blocking(
     if readonly_tx {
         conn.execute_batch("BEGIN TRANSACTION READ ONLY")?;
         let result = execute_statement_blocking(&conn, sql, max_rows, fetch);
-        // 読み取りしかしていないので COMMIT は不要。中断でトランザクションが
-        // aborted になっていても ROLLBACK は受け付けられる
-        // (失敗しても元のエラー・結果を優先して返す)
+        // Only reads were done, so COMMIT is unnecessary. ROLLBACK is accepted even if the
+        // transaction was aborted by an interrupt
+        // (on failure, prefer returning the original error / result)
         let _ = conn.execute_batch("ROLLBACK");
         return result;
     }
     execute_statement_blocking(&conn, sql, max_rows, fetch)
 }
 
-/// execute_blocking の本体 (トランザクションの内外で共有する)。
+/// Body of execute_blocking (shared between inside and outside a transaction).
 fn execute_statement_blocking(
     conn: &Connection,
     sql: &str,
@@ -305,7 +305,7 @@ fn execute_statement_blocking(
 
     let mut stmt = conn.prepare(sql)?;
     let mut rows = stmt.query([])?;
-    // query は結果を実体化するため、この時点で列情報が確定している
+    // query materializes the result, so the column info is already settled at this point
     let columns: Vec<String> = rows
         .as_ref()
         .map(|s| s.column_names())
@@ -339,7 +339,7 @@ fn execute_statement_blocking(
     })
 }
 
-/// i128 (HUGEINT) を JSON へ。JS の安全整数範囲なら数値、超えたら文字列。
+/// i128 (HUGEINT) to JSON. A number if within the JS safe integer range, otherwise a string.
 fn json_i128(v: i128) -> serde_json::Value {
     match i64::try_from(v) {
         Ok(v) => json_i64(v),
@@ -353,8 +353,8 @@ fn json_f64(v: f64) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::Value::String(v.to_string()))
 }
 
-/// TIMESTAMP (エポックからの経過時間) を "%Y-%m-%d %H:%M:%S%.f" 文字列へ。
-/// 範囲外はマイクロ秒の生値を文字列で返す。
+/// TIMESTAMP (elapsed time since the epoch) to a "%Y-%m-%d %H:%M:%S%.f" string.
+/// Out-of-range values are returned as the raw microsecond value in a string.
 fn timestamp_to_json(unit: duckdb::types::TimeUnit, v: i64) -> serde_json::Value {
     let micros = unit.to_micros(v);
     match chrono::DateTime::from_timestamp_micros(micros) {
@@ -365,7 +365,7 @@ fn timestamp_to_json(unit: duckdb::types::TimeUnit, v: i64) -> serde_json::Value
     }
 }
 
-/// DATE (エポックからの日数) を "%Y-%m-%d" 文字列へ。
+/// DATE (days since the epoch) to a "%Y-%m-%d" string.
 fn date_to_json(days: i32) -> serde_json::Value {
     let base = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
     let date = if days >= 0 {
@@ -379,7 +379,7 @@ fn date_to_json(days: i32) -> serde_json::Value {
     }
 }
 
-/// TIME (深夜 0 時からの経過時間) を "%H:%M:%S%.f" 文字列へ。
+/// TIME (elapsed time since midnight) to a "%H:%M:%S%.f" string.
 fn time_to_json(unit: duckdb::types::TimeUnit, v: i64) -> serde_json::Value {
     let micros = unit.to_micros(v);
     let secs = (micros / 1_000_000) as u32;
@@ -390,19 +390,19 @@ fn time_to_json(unit: duckdb::types::TimeUnit, v: i64) -> serde_json::Value {
     }
 }
 
-/// duckdb の値を JSON へ変換する。
-/// - 64bit 超の整数 (BIGINT の安全範囲外 / HUGEINT / UBIGINT) と DECIMAL は
-///   精度を保つため文字列
-/// - LIST / STRUCT / MAP / ARRAY は JSON 化するが、要素数を
-///   MAX_COLLECTION_ELEMENTS で打ち切り、打ち切ったら truncated を立てる
+/// Converts a duckdb value to JSON.
+/// - Integers beyond 64 bits (outside BIGINT's safe range / HUGEINT / UBIGINT) and DECIMAL are
+///   strings to preserve precision
+/// - LIST / STRUCT / MAP / ARRAY are converted to JSON, but the element count is cut off at
+///   MAX_COLLECTION_ELEMENTS and `truncated` is set when that happens
 fn value_to_json_limited(value: Value, truncated: &mut bool) -> serde_json::Value {
-    // 要素数の上限はセル全体で共有する予算にする: 階層ごとの独立上限だと
-    // 1,000 要素 × 1,000 要素のネストで 100 万値を直列化してしまう
+    // The element limit is a budget shared across the whole cell: with an independent limit per
+    // level, a 1,000 x 1,000 nesting would serialize 1 million values
     let mut budget = MAX_COLLECTION_ELEMENTS;
     value_to_json_at_depth(value, truncated, 0, &mut budget)
 }
 
-/// 文字列を文字数上限で打ち切る (超えたら truncated を立てて省略記号を付ける)。
+/// Cuts a string off at the character limit (if exceeded, sets truncated and appends an ellipsis).
 fn text_to_json_limited(v: String, truncated: &mut bool) -> serde_json::Value {
     if v.chars().count() <= MAX_TEXT_CHARS {
         return serde_json::Value::String(v);
@@ -418,7 +418,7 @@ fn value_to_json_at_depth(
     depth: usize,
     budget: &mut usize,
 ) -> serde_json::Value {
-    // データ由来 (read_json_auto 等) の任意深度ネストでスタックを溢れさせない
+    // Do not overflow the stack on nesting of arbitrary depth derived from data (read_json_auto etc.)
     if depth >= MAX_NESTING_DEPTH
         && matches!(
             value,
@@ -446,8 +446,8 @@ fn value_to_json_at_depth(
         Value::Timestamp(unit, v) => timestamp_to_json(unit, v),
         Value::Text(v) => text_to_json_limited(v, truncated),
         Value::Blob(v) => {
-            // BLOB は先頭だけ変換して上限を掛ける (bytes_to_json は UTF-8 なら
-            // 文字列、そうでなければ base64 にする)
+            // For BLOB, convert only the head and apply the limit (bytes_to_json yields a
+            // string if it is UTF-8, otherwise base64)
             if v.len() > MAX_TEXT_CHARS {
                 *truncated = true;
                 let head = bytes_to_json(v[..MAX_TEXT_CHARS].to_vec());
@@ -518,8 +518,8 @@ fn value_to_json_at_depth(
     }
 }
 
-/// MAP のキーを JSON オブジェクトのキー文字列へ変換する。
-/// 文字列キーはそのまま、それ以外は JSON 表現の文字列にする。
+/// Converts a MAP key into a JSON object key string.
+/// String keys are used as is; anything else becomes the string of its JSON representation.
 fn map_key_to_string(key: &Value) -> String {
     let mut ignored = false;
     match value_to_json_limited(key.clone(), &mut ignored) {
@@ -528,16 +528,16 @@ fn map_key_to_string(key: &Value) -> String {
     }
 }
 
-/// パラメータバインド付きの SELECT を blocking スレッドで実行し、
-/// 全行を Value のまま返す (schema_info 用の小さなカタログ照会専用)。
+/// Runs a SELECT with parameter binding on a blocking thread and
+/// returns all rows as Value (only for the small catalog queries used by schema_info).
 async fn query_rows(
     handle: &DuckDbHandle,
     sql: &'static str,
     params: Vec<String>,
 ) -> Result<Vec<Vec<Value>>, AppError> {
-    // クエリ実行と同じ直列化に参加する: これが無いと、カタログ照会が
-    // conn を握っている間にユーザークエリが exec を取って登録し、
-    // そのキャンセル (interrupt) が実行中のカタログ文を巻き込む
+    // Take part in the same serialization as query execution: without this, while a catalog query
+    // holds conn a user query could take exec and register, and that query's
+    // cancel (interrupt) would take down the running catalog statement
     let _exec = handle.exec.lock().await;
     let conn = handle.conn.clone();
     tokio::task::spawn_blocking(move || {
@@ -569,8 +569,8 @@ fn value_text(value: Option<&Value>) -> String {
     }
 }
 
-/// SQL に埋め込める修飾名を作る。DuckDB のデフォルトスキーマ main は
-/// 修飾しない (schema_info::build_qualified_name の public と同じ扱い)。
+/// Builds a qualified name that can be embedded in SQL. The DuckDB default schema, main, is not
+/// qualified (same treatment as public in schema_info::build_qualified_name).
 fn qualified_name(schema: &str, name: &str) -> String {
     if schema == "main" {
         name.to_string()
@@ -579,8 +579,8 @@ fn qualified_name(schema: &str, name: &str) -> String {
     }
 }
 
-/// 修飾名 (schema.table または table) を (schema, table) に分解する。
-/// 非修飾名はデフォルトスキーマ main とみなす。
+/// Splits a qualified name (schema.table or table) into (schema, table).
+/// An unqualified name is treated as being in the default schema, main.
 fn split_qualified(table: &str) -> (String, String) {
     match table.split_once('.') {
         Some((schema, name)) => (schema.to_string(), name.to_string()),
@@ -588,7 +588,7 @@ fn split_qualified(table: &str) -> (String, String) {
     }
 }
 
-/// テーブル / ビューの一覧 (スキーマブラウザの TABLES ペイン用)。
+/// List of tables / views (for the TABLES pane of the schema browser).
 pub async fn fetch_tables(handle: &DuckDbHandle) -> Result<Vec<TableInfo>, AppError> {
     let rows = query_rows(
         handle,
@@ -619,7 +619,7 @@ pub async fn fetch_tables(handle: &DuckDbHandle) -> Result<Vec<TableInfo>, AppEr
         .collect())
 }
 
-/// テーブルのカラム一覧。テーブル名はバインドするので SQL には埋め込まない。
+/// List of columns of a table. The table name is bound, so it is not embedded in the SQL.
 pub async fn fetch_columns(
     handle: &DuckDbHandle,
     table: &str,
@@ -642,17 +642,17 @@ pub async fn fetch_columns(
             nullable: value_text(row.get(2)).eq_ignore_ascii_case("YES"),
         })
         .collect();
-    // 存在しないテーブルは空になるため明示的にエラーにする
-    // (schema_info の MySQL / SQLite と同じ扱い)
+    // A nonexistent table yields an empty result, so make it an explicit error
+    // (same treatment as MySQL / SQLite in schema_info)
     if columns.is_empty() {
         return Err(AppError::Config(format!("Table not found: {table}")));
     }
     Ok(columns)
 }
 
-/// テーブルの主キーを構成するカラム名。
-/// セル編集は非対応 (supports_editable_cells = false) のため実利用は無いが、
-/// duckdb_constraints() から取れる範囲で返す。
+/// Column names that make up a table's primary key.
+/// Cell editing is not supported (supports_editable_cells = false), so this has no real use,
+/// but it returns what can be obtained from duckdb_constraints().
 pub async fn fetch_primary_keys(
     handle: &DuckDbHandle,
     table: &str,
@@ -670,7 +670,7 @@ pub async fn fetch_primary_keys(
     Ok(rows.iter().map(|row| value_text(row.first())).collect())
 }
 
-/// 全テーブルの全カラム (SQL 補完のスキーママップ用)。
+/// All columns of all tables (for the schema map used by SQL completion).
 pub async fn fetch_all_columns(
     handle: &DuckDbHandle,
 ) -> Result<std::collections::BTreeMap<String, Vec<ColumnInfo>>, AppError> {
@@ -702,8 +702,8 @@ pub async fn fetch_all_columns(
 mod tests {
     use super::*;
 
-    /// テスト用の DuckDB ファイルを作り、接続ハンドルを返す。
-    /// (_dir は drop でファイルが消えるため呼び出し側で保持する)
+    /// Creates a DuckDB file for tests and returns a connection handle.
+    /// (_dir deletes the file on drop, so the caller must keep it alive)
     async fn test_handle() -> (tempfile::TempDir, DuckDbHandle) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.duckdb");
@@ -761,9 +761,9 @@ mod tests {
         .await
     }
 
-    /// エージェント経路 (ReadonlyGuard::Agent) は読み取り専用トランザクション
-    /// で実行する。文レベルのガードを素通りする副作用付き SELECT
-    /// (`SELECT nextval(...)`) を DB 自身に拒否させることが目的。
+    /// The agent path (ReadonlyGuard::Agent) runs in a read-only transaction.
+    /// The purpose is to have the DB itself reject side-effecting SELECTs
+    /// (`SELECT nextval(...)`) that slip through the statement-level guard.
     #[tokio::test]
     async fn test_agent_guard_blocks_side_effecting_select() {
         let (_dir, handle) = test_handle().await;
@@ -771,14 +771,14 @@ mod tests {
             .await
             .unwrap();
 
-        // 文レベルのガードは SELECT を通す (先頭キーワードしか見ない)
+        // The statement-level guard lets SELECT through (it only looks at the leading keyword)
         assert!(crate::db::agent_rejection_reason(
             "SELECT nextval('s')",
             Engine::DuckDb
         )
         .is_none());
 
-        // DB レベルの読み取り専用が書き込みを拒否する
+        // The DB-level read-only mode rejects the write
         let err = run(
             &handle,
             "SELECT nextval('s')",
@@ -792,13 +792,13 @@ mod tests {
         .to_string();
         assert!(err.contains("read-only"), "unexpected error: {err}");
 
-        // 通常の読み取りは通り、ロールバック後も接続は健全なまま
+        // Normal reads pass, and the connection stays healthy after the rollback
         let result = run(&handle, "SELECT 1", 10, None, ReadonlyGuard::Agent, false)
             .await
             .unwrap();
         assert_eq!(result.row_count, 1);
-        // Writable な経路は従来どおり実行できる (トランザクションが
-        // 開いたまま残っていないことの確認も兼ねる)
+        // The Writable path executes as before (this also confirms that no transaction
+        // is left open)
         let result = run(
             &handle,
             "SELECT nextval('s')",
@@ -821,7 +821,7 @@ mod tests {
         let err = connect(&server).await.unwrap_err();
         assert!(err.to_string().contains("not found"), "{err}");
 
-        // パス未指定もエラー
+        // A missing path is also an error
         let server = test_server_config();
         let err = connect(&server).await.unwrap_err();
         assert!(err.to_string().contains("set schema"), "{err}");
@@ -854,7 +854,7 @@ mod tests {
             result.rows[0][4],
             serde_json::json!("2026-01-02 03:04:05")
         );
-        // NULL は JSON null
+        // NULL becomes JSON null
         assert_eq!(result.rows[1][2], serde_json::Value::Null);
         assert_eq!(result.rows[1][4], serde_json::Value::Null);
     }
@@ -882,7 +882,7 @@ mod tests {
         .await
         .unwrap();
         let row = &result.rows[0];
-        // 2^53 を超える整数は文字列化 (invoke 境界の丸め対策)
+        // Integers above 2^53 are stringified (guards against rounding at the invoke boundary)
         assert_eq!(
             row[0],
             serde_json::json!("170141183460469231731687303715884105727")
@@ -893,7 +893,7 @@ mod tests {
         assert_eq!(row[4], serde_json::json!("1.50"));
         assert_eq!(row[5], serde_json::json!("2026-07-25"));
         assert_eq!(row[6], serde_json::json!("12:34:56.789"));
-        // 不正な UTF-8 の BLOB は base64 化される
+        // A BLOB with invalid UTF-8 is converted to base64
         assert!(row[7].as_str().unwrap().starts_with("base64:"));
         assert_eq!(row[8], serde_json::json!({"a": 1, "b": "x"}));
         assert_eq!(row[9], serde_json::json!({"k": 42}));
@@ -926,7 +926,7 @@ mod tests {
         .unwrap();
         assert_eq!(result.affected_rows, Some(1));
 
-        // RETURNING は行として返る
+        // RETURNING comes back as rows
         let result = run(
             &handle,
             "DELETE FROM users WHERE id = 4 RETURNING name",
@@ -966,7 +966,7 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, AppError::Readonly(_)), "{sql}: {err}");
         }
-        // 読み取りは通る
+        // Reads pass
         assert!(run(&handle, "SELECT 1", 10, None, ReadonlyGuard::Switch, false)
             .await
             .is_ok());
@@ -986,7 +986,7 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, AppError::Dangerous(_)), "{sql}: {err}");
         }
-        // WHERE ありは通る (行は消えるが危険判定ではない)
+        // With WHERE it passes (rows get deleted, but it is not judged dangerous)
         assert!(run(
             &handle,
             "DELETE FROM users WHERE id = 999",
@@ -1002,7 +1002,7 @@ mod tests {
     #[tokio::test]
     async fn test_auto_limit_and_truncation() {
         let (_dir, handle) = test_handle().await;
-        // auto LIMIT が付与される
+        // auto LIMIT is added
         let result = run(
             &handle,
             "SELECT * FROM range(100)",
@@ -1016,7 +1016,7 @@ mod tests {
         assert_eq!(result.applied_limit, Some(2));
         assert_eq!(result.row_count, 2);
 
-        // LIMIT 指定済みなら付与しない
+        // Not added when LIMIT is already specified
         let result = run(
             &handle,
             "SELECT * FROM range(100) LIMIT 5",
@@ -1030,7 +1030,7 @@ mod tests {
         assert_eq!(result.applied_limit, None);
         assert_eq!(result.row_count, 5);
 
-        // max_rows 超過は打ち切って truncated
+        // Exceeding max_rows is cut off and truncated is set
         let result = run(
             &handle,
             "SELECT * FROM range(100)",
@@ -1044,7 +1044,7 @@ mod tests {
         assert_eq!(result.row_count, 10);
         assert!(result.truncated);
 
-        // FROM-first 構文 (DuckDB 固有) にも auto LIMIT が付与される
+        // auto LIMIT is also added to FROM-first syntax (DuckDB-specific)
         let result = run(
             &handle,
             "FROM range(100)",
@@ -1058,7 +1058,7 @@ mod tests {
         assert_eq!(result.applied_limit, Some(3));
         assert_eq!(result.row_count, 3);
 
-        // FROM-first でも LIMIT 指定済みなら付与しない
+        // Not added to FROM-first either when LIMIT is already specified
         let result = run(
             &handle,
             "FROM range(100) LIMIT 4",
@@ -1076,7 +1076,7 @@ mod tests {
     #[tokio::test]
     async fn test_collection_truncation() {
         let (_dir, handle) = test_handle().await;
-        // 1 セル内の LIST も要素数上限で打ち切られ truncated が立つ
+        // A LIST within one cell is also cut off at the element limit and truncated is set
         let result = run(
             &handle,
             "SELECT range(3000) AS xs",
@@ -1096,22 +1096,22 @@ mod tests {
 
     #[test]
     fn test_text_and_blob_truncation() {
-        // TEXT は文字数上限で打ち切り + truncated
+        // TEXT is cut off at the character limit + truncated
         let mut truncated = false;
         let long = "x".repeat(MAX_TEXT_CHARS + 5);
         let v = value_to_json_limited(Value::Text(long), &mut truncated);
         assert!(truncated);
         let s = v.as_str().unwrap();
-        assert_eq!(s.chars().count(), MAX_TEXT_CHARS + 1); // +1 は省略記号
+        assert_eq!(s.chars().count(), MAX_TEXT_CHARS + 1); // +1 is the ellipsis
         assert!(s.ends_with('…'));
 
-        // 上限以内はそのまま
+        // Within the limit it is kept as is
         let mut truncated = false;
         let v = value_to_json_limited(Value::Text("hello".into()), &mut truncated);
         assert_eq!(v, serde_json::json!("hello"));
         assert!(!truncated);
 
-        // BLOB も上限で打ち切り
+        // BLOB is also cut off at the limit
         let mut truncated = false;
         let v = value_to_json_limited(
             Value::Blob(vec![b'a'; MAX_TEXT_CHARS + 10]),
@@ -1123,7 +1123,7 @@ mod tests {
 
     #[test]
     fn test_collection_budget_is_shared_across_nesting() {
-        // 1,000 × 2 のネストでも総量 (予算) で打ち切られる
+        // Even a 1,000 x 2 nesting is cut off by the total (budget)
         let inner: Vec<Value> = (0..600).map(Value::Int).collect();
         let value = Value::List(vec![
             Value::List(inner.clone()),
@@ -1132,7 +1132,7 @@ mod tests {
         let mut truncated = false;
         let v = value_to_json_limited(value, &mut truncated);
         assert!(truncated);
-        // 直列化される値の総数が予算 (1,000) を大きく超えない
+        // The total number of serialized values does not greatly exceed the budget (1,000)
         fn count(v: &serde_json::Value) -> usize {
             match v {
                 serde_json::Value::Array(items) => {
@@ -1161,8 +1161,8 @@ mod tests {
 
     #[test]
     fn test_nesting_depth_cap() {
-        // MAX_NESTING_DEPTH を超えるネストはプレースホルダに置き換わり、
-        // スタックオーバーフローしない
+        // Nesting beyond MAX_NESTING_DEPTH is replaced by a placeholder,
+        // without overflowing the stack
         let mut value = Value::Int(1);
         for _ in 0..(MAX_NESTING_DEPTH + 10) {
             value = Value::List(vec![value]);
@@ -1170,7 +1170,7 @@ mod tests {
         let mut truncated = false;
         let v = value_to_json_limited(value, &mut truncated);
         assert!(truncated);
-        // 打ち切りプレースホルダがどこかの深さに現れる
+        // The truncation placeholder appears at some depth
         let text = v.to_string();
         assert!(text.contains("nesting too deep"));
     }
@@ -1178,7 +1178,7 @@ mod tests {
     #[tokio::test]
     async fn test_meta_commands() {
         let (_dir, handle) = test_handle().await;
-        // \dt: ベーステーブルのみ
+        // \dt: base tables only
         let result = run(&handle, "\\dt", 100, None, ReadonlyGuard::Switch, false)
             .await
             .unwrap();
@@ -1190,7 +1190,7 @@ mod tests {
         assert!(names.contains(&"users"));
         assert!(!names.contains(&"user_names"));
 
-        // \dv: ビューのみ
+        // \dv: views only
         let result = run(&handle, "\\dv", 100, None, ReadonlyGuard::Switch, false)
             .await
             .unwrap();
@@ -1202,7 +1202,7 @@ mod tests {
         assert!(names.contains(&"user_names"));
         assert!(!names.contains(&"users"));
 
-        // \d <table>: カラム定義
+        // \d <table>: column definitions
         let result = run(&handle, "\\d users", 100, None, ReadonlyGuard::Switch, false)
             .await
             .unwrap();
@@ -1213,7 +1213,7 @@ mod tests {
             .collect();
         assert_eq!(columns, vec!["id", "name", "score", "tags", "created_at"]);
 
-        // \c はエラー
+        // \c is an error
         let err = run(&handle, "\\c other", 100, None, ReadonlyGuard::Switch, false)
             .await
             .unwrap_err();
@@ -1226,14 +1226,14 @@ mod tests {
         let registry = Arc::new(CancelRegistry::default());
         let handle2 = handle.clone();
         let registry2 = registry.clone();
-        // 数十秒かかる集計をバックグラウンドで開始する
+        // Start an aggregate that takes tens of seconds in the background
         let task = tokio::spawn(async move {
             run_query_cancellable(
                 &handle2,
                 &registry2,
                 "duck-test",
-                // count(*) は optimizer が cardinality 計算へ短絡し得るため、
-                // 実際の演算を伴う集計にする (キャンセルテストの flaky 防止)
+                // count(*) can be short-circuited by the optimizer into a cardinality computation,
+                // so use an aggregate that does real work (prevents flakiness in the cancel test)
                 "SELECT sum(a.range * b.range) FROM range(200000000) a, range(1000) b",
                 10,
                 None,
@@ -1242,7 +1242,7 @@ mod tests {
             )
             .await
         });
-        // 実行が登録されるのを待ってからキャンセルする
+        // Wait for the execution to be registered, then cancel
         let mut cancelled = false;
         for _ in 0..200 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1258,17 +1258,17 @@ mod tests {
             .unwrap();
         assert!(matches!(result, Err(AppError::Cancelled)), "{result:?}");
 
-        // キャンセル後も同じ接続で次のクエリを実行できる
+        // The next query can run on the same connection after the cancel
         let result = run(&handle, "SELECT 1", 10, None, ReadonlyGuard::Switch, false)
             .await
             .unwrap();
         assert_eq!(result.rows[0][0], serde_json::json!(1));
     }
 
-    /// GUI E2E の代替となる統合テスト。フロントの Tauri コマンドと同じ
-    /// db.rs の公開経路 (DbManager::get_pool → db::run_query_cancellable の
-    /// 委譲 → list_schemas / build_explain_sql) を、実データ入りの DB ファイル
-    /// (tempfile に Rust 側で生成する自己完結フィクスチャ) で通しで検証する。
+    /// An integration test standing in for GUI E2E. It runs the public db.rs path that the frontend's
+    /// Tauri commands use (DbManager::get_pool -> delegation of db::run_query_cancellable ->
+    /// list_schemas / build_explain_sql) end to end against a DB file with real data
+    /// (a self-contained fixture generated on the Rust side in a tempfile).
     #[tokio::test]
     async fn test_integration_via_db_manager() {
         let dir = tempfile::tempdir().unwrap();
@@ -1302,7 +1302,7 @@ mod tests {
         let registry = CancelRegistry::default();
         let pool = manager.get_pool(&server).await.unwrap();
 
-        // (a) SELECT: 行取得と型変換 (INTEGER / TEXT / DOUBLE / LIST / DATE)
+        // (a) SELECT: row fetching and type conversion (INTEGER / TEXT / DOUBLE / LIST / DATE)
         let result = crate::db::run_query_cancellable(
             &pool,
             &registry,
@@ -1329,10 +1329,10 @@ mod tests {
                 serde_json::json!("1965-08-01"),
             ]
         );
-        // LIMIT 未指定なのでデフォルト LIMIT が付与されている
+        // No LIMIT was specified, so the default LIMIT has been added
         assert_eq!(result.applied_limit, Some(500));
 
-        // (b) auto LIMIT: 600 行のテーブルに default 500 → 500 行で止まる
+        // (b) auto LIMIT: default 500 on a 600-row table -> stops at 500 rows
         let result = crate::db::run_query_cancellable(
             &pool,
             &registry,
@@ -1349,7 +1349,7 @@ mod tests {
         assert_eq!(result.row_count, 500);
         assert!(!result.truncated);
 
-        // (c) readonly ガード: Writable OFF (Switch) では INSERT を拒否する
+        // (c) readonly guard: INSERT is rejected with Writable OFF (Switch)
         let err = crate::db::run_query_cancellable(
             &pool,
             &registry,
@@ -1365,7 +1365,7 @@ mod tests {
         assert!(matches!(err, AppError::Readonly(_)), "{err}");
         assert!(err.to_string().contains("Writable"), "{err}");
 
-        // 危険な文ガードも同じ経路で効く
+        // The dangerous-statement guard also works on the same path
         let err = crate::db::run_query_cancellable(
             &pool,
             &registry,
@@ -1380,7 +1380,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, AppError::Dangerous(_)), "{err}");
 
-        // (d) メタコマンド: \dt (テーブル一覧) / \d books (カラム定義)
+        // (d) meta commands: \dt (table list) / \d books (column definitions)
         let result = crate::db::run_query_cancellable(
             &pool,
             &registry,
@@ -1399,7 +1399,7 @@ mod tests {
             .map(|r| r[1].as_str().unwrap())
             .collect();
         assert_eq!(names, vec!["books", "sales"]);
-        // メタコマンド変換後の SQL には auto LIMIT を付与しない
+        // auto LIMIT is not added to SQL after meta command conversion
         assert_eq!(result.applied_limit, None);
 
         let result = crate::db::run_query_cancellable(
@@ -1424,7 +1424,7 @@ mod tests {
             vec!["id", "title", "rating", "tags", "published_on"]
         );
 
-        // (e) max_rows 打ち切り + truncated
+        // (e) max_rows cut-off + truncated
         let result = crate::db::run_query_cancellable(
             &pool,
             &registry,
@@ -1440,7 +1440,7 @@ mod tests {
         assert_eq!(result.row_count, 100);
         assert!(result.truncated);
 
-        // EXPLAIN: prefix は EXPLAIN (ANALYZE ではない) で、実行して行が返る
+        // EXPLAIN: the prefix is EXPLAIN (not ANALYZE), and it runs and returns rows
         let explain_sql =
             crate::db::build_explain_sql("duckdb", "SELECT * FROM books").unwrap();
         assert!(explain_sql.starts_with("EXPLAIN\n"), "{explain_sql}");
@@ -1458,7 +1458,7 @@ mod tests {
         .unwrap();
         assert!(result.row_count > 0);
 
-        // list_schemas は設定のファイルパスを 1 件返す (Database 表示用)
+        // list_schemas returns the configured file path as one entry (for the Database display)
         let schemas = crate::db::list_schemas(&pool, &server).await.unwrap();
         assert_eq!(schemas, vec![path.to_string_lossy().into_owned()]);
 
@@ -1475,7 +1475,7 @@ mod tests {
             .collect();
         assert!(names.contains(&("users", "table")));
         assert!(names.contains(&("user_names", "view")));
-        // main スキーマは修飾しない
+        // The main schema is not qualified
         assert!(tables.iter().all(|t| !t.qualified_name.contains('.')));
 
         let columns = fetch_columns(&handle, "users").await.unwrap();
@@ -1494,7 +1494,7 @@ mod tests {
             ]
         );
 
-        // 存在しないテーブルはエラー
+        // A nonexistent table is an error
         let err = fetch_columns(&handle, "missing_table").await.unwrap_err();
         assert!(err.to_string().contains("Table not found"), "{err}");
 

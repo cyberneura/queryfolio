@@ -20,73 +20,73 @@ use config::{AppConfig, ConfigInfo, ConnectionInfo, ServerConfig};
 use db::{CancelRegistry, DbManager, DbPool, QueryResult, DEFAULT_MAX_ROWS};
 use error::AppError;
 
-/// 実行中に届いた「開く対象」のフロントへの受け渡し状態。
-/// フロントの listener は onMount (webview 準備後) に登録されるため、それより前に
-/// deep link / CLI が届くと `open-query-file` イベントを取りこぼす。ready になるまでは
-/// キューに積み、frontend_ready でまとめて渡す (単一 Mutex で ready 判定と push/drain を
-/// 直列化し、取りこぼし・二重配送を防ぐ)。
+/// State for handing "targets to open" that arrive while running over to the frontend.
+/// The frontend listener is registered in onMount (after the webview is ready), so a
+/// deep link / CLI that arrives earlier would miss the `open-query-file` event. Until
+/// ready, targets are queued and handed over together by frontend_ready (a single Mutex
+/// serializes the ready check and push/drain, preventing misses and double delivery).
 #[derive(Default)]
 struct LiveDelivery {
-    /// フロントの listener が用意できたか (frontend_ready で true になる)。
+    /// Whether the frontend listener is ready (becomes true in frontend_ready).
     ready: bool,
-    /// ready 前に届いた開く対象 (frontend_ready で drain して渡す)。
+    /// Targets to open that arrived before ready (drained and handed over by frontend_ready).
     pending: Vec<router::OpenTarget>,
-    /// ready 前に届いた解決失敗のメッセージ (frontend_ready で drain して渡す)。
-    /// 成功対象と同様、listener 準備前は emit しても取りこぼすためキューする。
+    /// Resolution-failure messages that arrived before ready (drained and handed over by frontend_ready).
+    /// Like successful targets, emitting before the listener is ready would be missed, so they are queued.
     pending_errors: Vec<String>,
 }
 
-/// アプリ全体の共有状態。
+/// Shared state of the whole app.
 #[derive(Default)]
 struct AppState {
-    /// マージ済み設定 (config_override_command 適用後) のセッションキャッシュ。
-    /// 取得コマンドは外部プロセス実行を伴うため、毎回走らせない
-    /// (reset_connections でクリアして再取得する)。
+    /// Session cache of the merged config (after config_override_command is applied).
+    /// The fetch command runs an external process, so it is not run every time
+    /// (cleared by reset_connections and fetched again).
     config: tokio::sync::Mutex<Option<Arc<AppConfig>>>,
-    /// 接続設定のキャッシュ。get_connections で更新される。
-    /// パスワード等の機密を含むためフロントエンドには渡さない。
+    /// Cache of connection configs. Updated by get_connections.
+    /// It contains secrets such as passwords, so it is not passed to the frontend.
     servers: tokio::sync::Mutex<Option<Vec<ServerConfig>>>,
     db: DbManager,
-    /// 実行中クエリのキャンセルレジストリ (接続名単位)。
+    /// Cancel registry for running queries (per connection name).
     query_cancels: CancelRegistry,
-    /// クエリ実行履歴の記録 (接続ごとの行数キャッシュを保持)。
+    /// Query execution history recording (holds a per-connection line count cache).
     history: history::HistoryManager,
-    /// スキーマ情報 (テーブル・カラム) のキャッシュ。
-    /// スキーマブラウザと SQL 補完 (get_schema_map) で共有する。
+    /// Cache of schema information (tables and columns).
+    /// Shared by the schema browser and SQL completion (get_schema_map).
     schema_cache: schema_info::SchemaCache,
-    /// AI 設定のセッションキャッシュ (reset_connections でクリア)。
-    /// 外側の None は未解決を表す。api_key を含むためフロントには渡さず、
-    /// get_ai_info で configured / model のみを返す。
+    /// Session cache of the AI config (cleared by reset_connections).
+    /// The outer None means unresolved. It contains the api_key, so it is not passed to the
+    /// frontend; get_ai_info returns only configured / model.
     ai: tokio::sync::Mutex<Option<Option<ai::AiConfig>>>,
-    /// 起動時に `queryfolio://` deep link / CLI サブコマンドで指定された
-    /// 開くべきルート (無ければ None)。フロントが起動後に frontend_ready で
-    /// 1 度だけ取り出す (取り出すと消える)。実行中に開かれたルートは live 経由
-    /// (イベント / キュー) でフロントへ届けるため、ここには積まない。
+    /// The route to open that was specified at startup via a `queryfolio://` deep link / CLI
+    /// subcommand (None if none). The frontend takes it out exactly once after startup via
+    /// frontend_ready (it disappears once taken). Routes opened while running are delivered
+    /// to the frontend via live (event / queue), so they are not stored here.
     launch_route: std::sync::Mutex<Option<router::Route>>,
-    /// 実行中に届いた開く対象の受け渡し (listener 準備前の取りこぼし対策)。
+    /// Handing over targets to open that arrive while running (guards against misses before the listener is ready).
     live: std::sync::Mutex<LiveDelivery>,
-    /// AI チャットの中断要求 (接続名単位)。
+    /// AI chat abort requests (per connection name).
     chat_cancels: ChatCancels,
 }
 
-/// 中断要求を覚えておく ID の上限 (開始しなかった要求の取りこぼし対策で
-/// 残るため、古いものから捨てて無制限に増えないようにする)。
+/// Upper limit of IDs for which abort requests are remembered (they are kept to guard against
+/// missed requests that never started, so old ones are dropped to keep it from growing without bound).
 const CHAT_CANCEL_HISTORY_MAX: usize = 256;
 
-/// エージェントのクエリ実行中に中断要求を見に行く間隔 (ms)。
-/// run_query_cancellable がキャンセルレジストリへ登録するまでの間に
-/// 届いた中断はレジストリ経由では効かないため、自前で監視する。
+/// Interval (ms) at which an agent's query execution checks for an abort request.
+/// An abort that arrives before run_query_cancellable registers with the cancel registry
+/// does not take effect via the registry, so it is watched for separately.
 const CHAT_CANCEL_POLL_INTERVAL_MS: u64 = 200;
 
-/// AI チャット (エージェント) の中断要求を**リクエスト単位**で保持する。
+/// Holds AI chat (agent) abort requests **per request**.
 ///
-/// クエリのキャンセル (CancelRegistry) は「実行中の 1 本」を止めるだけで、
-/// モデルの応答待ちや次のツール往復は止められないため、往復そのものを
-/// 止める仕組みが要る。接続単位のカウンタにすると (1) 同じ接続で 2 本が
-/// 同時に走る時にどちらを止めるか区別できず、(2) 開始直後に届いた中断が
-/// 「開始時の基準値」に吸収されてしまうため、フロントが採番した
-/// リクエスト ID をそのまま使う。ID を控えておけば、コマンドが走り出す
-/// 前に届いた中断も入口の判定で拾える。
+/// Query cancellation (CancelRegistry) only stops "the one that is running"; it cannot stop
+/// waiting for the model's response or the next tool round trip, so a mechanism to stop
+/// the round trips themselves is needed. With a per-connection counter, (1) when two
+/// requests run at once on the same connection, you cannot tell which to stop, and (2) an
+/// abort that arrives right after starting is absorbed into the "baseline value at start",
+/// so the request ID numbered by the frontend is used as is. If the ID is remembered, an
+/// abort that arrived before the command started running is also caught by the entry check.
 #[derive(Default)]
 struct ChatCancels {
     inner: tokio::sync::Mutex<ChatCancelState>,
@@ -95,12 +95,12 @@ struct ChatCancels {
 #[derive(Default)]
 struct ChatCancelState {
     cancelled: std::collections::HashSet<String>,
-    /// 挿入順 (上限超過時に古いものから捨てる)
+    /// Insertion order (old ones are dropped first when the limit is exceeded)
     order: std::collections::VecDeque<String>,
 }
 
 impl ChatCancels {
-    /// リクエストの中断を要求する (まだ開始していなくても記録を残す)。
+    /// Requests an abort of the request (records it even if it has not started yet).
     async fn request(&self, request_id: &str) {
         let mut state = self.inner.lock().await;
         if state.cancelled.insert(request_id.to_string()) {
@@ -113,12 +113,12 @@ impl ChatCancels {
         }
     }
 
-    /// このリクエストに中断が要求されているか。
+    /// Whether an abort has been requested for this request.
     async fn is_cancelled(&self, request_id: &str) -> bool {
         self.inner.lock().await.cancelled.contains(request_id)
     }
 
-    /// 終了したリクエストの記録を捨てる。
+    /// Discards the record of finished requests.
     async fn finish(&self, request_id: &str) {
         let mut state = self.inner.lock().await;
         if state.cancelled.remove(request_id) {
@@ -127,26 +127,26 @@ impl ChatCancels {
     }
 }
 
-/// AI チャットのツール実行を登録するキャンセルレジストリのキー。
-/// ユーザーのクエリ (接続名がキー) と衝突せず、かつ同じ接続で複数の
-/// 往復が走っても互いのエントリを上書きしないようリクエスト ID を含める
-/// (CancelRegistry は同じキーの登録を置き換えるため)。
+/// Key for the cancel registry in which AI chat tool executions are registered.
+/// It includes the request ID so that it does not collide with user queries (keyed by
+/// connection name) and so that, even when multiple round trips run on the same
+/// connection, they do not overwrite each other's entries (CancelRegistry replaces a registration with the same key).
 fn chat_cancel_key(connection: &str, request_id: &str) -> String {
     format!("{connection}\u{1}ai-chat\u{1}{request_id}")
 }
 
 impl AppState {
-    /// マージ済み設定を解決する (セッションキャッシュあり)。
-    /// config_override_command は 1Password 等の外部コマンドで数秒かかり
-    /// Touch ID を要求することもあるため、クエリ実行のたびに走らせない。
-    /// reset_connections でクリアされる。
-    /// 起動前の CLI 書き出し (`apply_cli_write_route`) で既にマージ済み設定を
-    /// 解決している場合、それをキャッシュに載せた状態で作る。
+    /// Resolves the merged config (with a session cache).
+    /// config_override_command is an external command such as 1Password that takes several
+    /// seconds and may demand Touch ID, so it is not run on every query execution.
+    /// Cleared by reset_connections.
+    /// Builds the state with the merged config cached, when the pre-startup CLI write
+    /// (`apply_cli_write_route`) has already resolved it.
     ///
-    /// `config_override_command` は 1Password 等の外部プロセスを起こすため、
-    /// 1 回の CLI 起動で 2 度実行させない: 遅い / Touch ID が 2 回出るだけでなく、
-    /// 取得結果が変わると**書き込みと読み出しで別のスナップショット**を使うことになり、
-    /// 書いたファイルを開けなくなる (sqlfiles_dir や接続一覧が食い違う)。
+    /// `config_override_command` spawns an external process such as 1Password, so it must not
+    /// run twice in one CLI launch: besides being slow / showing Touch ID twice, if the fetched
+    /// result changes, **the write and the read would use different snapshots**, and the file
+    /// that was written could not be opened (sqlfiles_dir and the connection list would disagree).
     fn with_config(config: Option<Arc<AppConfig>>) -> Self {
         Self {
             config: tokio::sync::Mutex::new(config),
@@ -168,18 +168,18 @@ impl AppState {
         Ok(self.resolve_config().await?.default_limit())
     }
 
-    /// クエリファイル保存ディレクトリを解決する。
-    /// config.yml は手編集されるため、開いているファイルの保存中に
-    /// sqlfiles_dir が変わると未保存内容が新ディレクトリへ書かれてしまう。
-    /// マージ済み設定のキャッシュが再読込 (reset_connections) まで固定される
-    /// ため、dirty ファイルの保存先も読み込み時のディレクトリに固定される。
+    /// Resolves the query file storage directory.
+    /// config.yml is edited by hand, so if sqlfiles_dir changes while saving an open file,
+    /// unsaved content would be written to the new directory. The merged config cache is fixed
+    /// until reload (reset_connections), so the save destination of dirty files is also
+    /// fixed to the directory at load time.
     async fn resolve_sqlfiles_dir(&self) -> Result<PathBuf, AppError> {
         self.resolve_config().await?.resolve_sqlfiles_dir()
     }
 
-    /// クエリファイルの保存フォルダ名 → 接続名の対応表を作る (設定順)。
-    /// `queryfolio://open/<path>` / CLI で指定されたパスから、そのファイルが
-    /// どの接続のものかを解決するために使う (router::resolve_open_target)。
+    /// Builds the table of query file storage folder name -> connection name (in config order).
+    /// Used to resolve which connection a file belongs to from a path specified via
+    /// `queryfolio://open/<path>` / CLI (router::resolve_open_target).
     async fn folder_connection_map(&self) -> Result<Vec<(String, String)>, AppError> {
         let servers = self.resolve_config().await?.resolve_servers()?;
         Ok(servers
@@ -188,16 +188,17 @@ impl AppState {
             .collect())
     }
 
-    /// ルート (deep link / CLI) を、開く対象のクエリファイル (接続 + ファイル名) へ
-    /// 解決する。保存ディレクトリ配下の接続フォルダにある、接続エンジンの拡張子の
-    /// クエリファイルでなければエラー。
-    /// 既知の限界: ここでの検証と実際の読み込み (read_query_file) は別呼び出しで、
-    /// その間に設定リロードが挟まると folder / 拡張子の解決結果がズレ得る
-    /// (検証済み設定と読込時設定の狭い TOCTOU)。リロードはユーザーの明示操作で、
-    /// どちらの解決も設定由来の保存領域内に閉じるため許容する。
-    /// `cwd` は相対パスを解決する基準ディレクトリ。deep link / CLI を実行中
-    /// インスタンスが受け取った時は「起動元ディレクトリ」を渡す (single-instance の
-    /// callback cwd)。None の時はこのプロセスのカレントディレクトリを使う。
+    /// Resolves a route (deep link / CLI) to the query file to open (connection + file name).
+    /// It is an error unless it is a query file with the connection engine's extension in a
+    /// connection folder under the storage directory.
+    /// Known limitation: the validation here and the actual load (read_query_file) are
+    /// separate calls, and if a config reload happens in between, the folder / extension
+    /// resolution results can diverge (a narrow TOCTOU between the validated config and the
+    /// config at load time). Reload is an explicit user action, and both resolutions stay
+    /// inside the storage area derived from the config, so this is accepted.
+    /// `cwd` is the base directory for resolving relative paths. When a running instance
+    /// receives a deep link / CLI, pass the "launch origin directory" (the callback cwd of
+    /// single-instance). When None, the current directory of this process is used.
     async fn resolve_route_target(
         &self,
         route: &router::Route,
@@ -205,17 +206,17 @@ impl AppState {
     ) -> Result<router::OpenTarget, AppError> {
         match route {
             router::Route::OpenFile { path } => {
-                // resolve_sqlfiles_dir は相対設定を設定ディレクトリ基準で絶対化して
-                // 返すため、ここでの絶対化は本来 no-op。それでも残すのは、パス検証の
-                // base が相対のままだと strip_prefix の比較が実 I/O と食い違うためで、
-                // 「base は必ず絶対」という前提をこの場で担保しておく
-                // (std::path::absolute は FS に触れない字句的絶対化)。
+                // resolve_sqlfiles_dir returns a path made absolute against the config directory for
+                // relative settings, so making it absolute here is essentially a no-op. It is kept
+                // because if the base for path validation stayed relative, the strip_prefix comparison
+                // would disagree with the real I/O, so the premise "base is always absolute" is
+                // guaranteed right here (std::path::absolute is lexical absolutization that does not touch the FS).
                 let sqlfiles_dir = self.resolve_sqlfiles_dir().await?;
                 let sqlfiles_dir =
                     std::path::absolute(&sqlfiles_dir).unwrap_or(sqlfiles_dir);
                 let folders = self.folder_connection_map().await?;
                 let home = dirs::home_dir();
-                // 生の入力パスの相対解決だけは cwd (実行中インスタンスなら起動元) 基準。
+                // Only the relative resolution of the raw input path is against cwd (the launch origin for a running instance).
                 let raw_cwd = cwd.or_else(|| std::env::current_dir().ok());
                 let target = router::resolve_open_target(
                     &sqlfiles_dir,
@@ -226,11 +227,11 @@ impl AppState {
                 )
                 .map_err(|e| AppError::QueryFile(e.to_string()))?;
                 let server = self.find_server(&target.connection).await?;
-                // 拡張子が接続エンジンのものと一致することを検証する。
-                // 一致しないと「router / verify_within_dir が検証したパス」と
-                // 「query_files が拡張子を付け直して実際に開くパス」がズレて、
-                // symlink 防御が実 I/O 対象に効かなくなる (例: SQL 接続に
-                // foo.redis を渡すと検証は foo.redis、実 I/O は foo.redis.sql)。
+                // Verify that the extension matches the connection engine's. If it does not, "the path
+                // validated by router / verify_within_dir" and "the path query_files actually opens after
+                // re-attaching the extension" diverge, and the symlink defense no longer applies to the
+                // real I/O target (e.g. passing foo.redis to a SQL connection is validated as foo.redis,
+                // but the real I/O is foo.redis.sql).
                 let ext = engines::capabilities_for_name(&server.engine).file_extension;
                 if !target
                     .file_name
@@ -243,20 +244,20 @@ impl AppState {
                         target.file_name
                     )));
                 }
-                // 多重防御: 字句検証 (router) を通っても、接続フォルダやファイルが
-                // シンボリックリンクで保存領域外の実体を指していることがある。
-                // 実際に開くパス (sqlfiles_dir/<folder>/<file>) を canonicalize して、
-                // リンク解決後も保存ディレクトリ配下に留まることを確かめる
-                // (「queryfolio のデータ保存パスのみ対象」の要件を実体レベルで担保)。
+                // Defense in depth: even after passing the lexical validation (router), the connection
+                // folder or file may be a symbolic link pointing to something outside the storage area.
+                // Canonicalize the path that is actually opened (sqlfiles_dir/<folder>/<file>) and confirm
+                // it still stays under the storage directory after resolving links (guaranteeing the
+                // requirement "only queryfolio's data storage path is a target" at the entity level).
                 let folder = server.sqlfiles_folder_name();
                 let concrete = sqlfiles_dir.join(&folder).join(&target.file_name);
                 query_files::verify_within_dir(&sqlfiles_dir, &concrete)?;
                 Ok(target)
             }
-            // 接続名 + ファイル名の指定 (CLI の `write`)。**ここでは書き込まない** —
-            // 書き出しは起動側プロセスが Tauri の起動前に済ませている
-            // (router::Route::WriteFile のドキュメント参照)。ここは
-            // 「その接続のそのファイルを開く」の解決だけを行う。
+            // Specified by connection name + file name (CLI `write`). **Nothing is written here** —
+            // the launching process finished the write before starting Tauri
+            // (see the documentation of router::Route::WriteFile). This only performs the
+            // resolution of "open that file of that connection".
             router::Route::WriteFile {
                 connection,
                 file_name,
@@ -264,9 +265,9 @@ impl AppState {
             } => {
                 let server = self.find_server(connection).await?;
                 let ext = engines::capabilities_for_name(&server.engine).file_extension;
-                // 起動側の書き出しと同じ正規化を通す (拡張子の補完・名前の検証)。
-                // 同じ関数を使うことで「検証した名前」と「実際に書いた名前」が
-                // 必ず一致する。
+                // Go through the same normalization as the launching side's write (extension completion /
+                // name validation). Using the same function guarantees that "the validated name" and
+                // "the name actually written" always match.
                 let file_name = query_files::normalize_file_name(file_name, ext)?;
                 let sqlfiles_dir = self.resolve_sqlfiles_dir().await?;
                 let sqlfiles_dir =
@@ -274,16 +275,16 @@ impl AppState {
                 let concrete = sqlfiles_dir
                     .join(server.sqlfiles_folder_name())
                     .join(&file_name);
-                // 書き出しに失敗している (存在しない) 場合は、canonicalize の
-                // 一般的な I/O エラーではなく分かりやすい文言で返す。
+                // If the write failed (the file does not exist), return an easy-to-understand message
+                // instead of the generic I/O error from canonicalize.
                 if !concrete.exists() {
                     return Err(AppError::QueryFile(format!(
                         "File not found: {}",
                         concrete.display()
                     )));
                 }
-                // OpenFile と同じ多重防御 (シンボリックリンクで保存領域外を
-                // 指していないか)。
+                // The same defense in depth as OpenFile (whether a symlink points
+                // outside the storage area).
                 query_files::verify_within_dir(&sqlfiles_dir, &concrete)?;
                 Ok(router::OpenTarget {
                     connection: server.name.clone(),
@@ -309,10 +310,10 @@ impl AppState {
             })
     }
 
-    /// クエリファイル操作に必要なコンテキストを解決する:
-    /// 保存ディレクトリ・接続フォルダ名・エンジン別のファイル拡張子。
-    /// フォルダ名は folder_name → <host>_<engine>_<schema>_<user> の順で決まる
-    /// (接続 name はフォルダ名には使わない)。
+    /// Resolves the context required for query file operations:
+    /// the storage directory, the connection folder name, and the per-engine file extension.
+    /// The folder name is decided in the order folder_name -> <host>_<engine>_<schema>_<user>
+    /// (the connection name is not used for the folder name).
     async fn resolve_files_ctx(
         &self,
         connection: &str,
@@ -325,9 +326,9 @@ impl AppState {
         ))
     }
 
-    /// 接続のクエリファイルフォルダに、接続を説明するメタファイルを書き出す。
-    /// フォルダが未作成なら何もしない (メタだけのために空フォルダを作らない)。
-    /// クエリファイルの作成・保存・一覧時のリフレッシュに使う。
+    /// Writes a meta file describing the connection into the connection's query file folder.
+    /// Does nothing if the folder has not been created (does not create an empty folder just for the meta).
+    /// Used when creating / saving query files and when refreshing on listing.
     async fn refresh_folder_meta(&self, server: &ServerConfig) -> Result<(), AppError> {
         let dir = query_files::connection_dir(
             &self.resolve_sqlfiles_dir().await?,
@@ -336,8 +337,8 @@ impl AppState {
         folder_meta::write_folder_meta(&dir, server)
     }
 
-    /// スキーマキャッシュのキーになるアクティブスキーマ名を返す
-    /// (オーバーライド > 設定のデフォルト > 空文字)。
+    /// Returns the active schema name that becomes the schema cache key
+    /// (override > config default > empty string).
     async fn active_schema_key(&self, server: &ServerConfig) -> String {
         match self.db.schema_override(&server.name).await {
             Some(schema) => schema,
@@ -345,11 +346,11 @@ impl AppState {
         }
     }
 
-    /// AI 設定を解決する (キャッシュあり)。未設定なら Ok(None)。
-    /// マージ済み設定のトップレベル `ai:` を見る (config_override_command で
-    /// 取得した YAML 側の ai がローカルより優先されるのはマージの結果)。
-    /// 解決エラー (不明 provider 等) はキャッシュせず毎回返す
-    /// (設定修正 + リロードで直せるように)。
+    /// Resolves the AI config (with cache). Ok(None) if not configured.
+    /// Looks at the top-level `ai:` of the merged config (the `ai` on the YAML side fetched
+    /// by config_override_command takes precedence over the local one as a result of the merge).
+    /// Resolution errors (unknown provider etc.) are not cached and are returned every time
+    /// (so they can be fixed by editing the config + reloading).
     async fn resolve_ai_config(&self) -> Result<Option<ai::AiConfig>, AppError> {
         let mut cached = self.ai.lock().await;
         if let Some(ai_config) = cached.as_ref() {
@@ -360,8 +361,8 @@ impl AppState {
         Ok(ai_config)
     }
 
-    /// テーブル → カラム名リストのマップを解決する (キャッシュあり)。
-    /// SQL 補完 (get_schema_map) と AI の SQL 生成コンテキストで共有する。
+    /// Resolves the table -> column name list map (with cache).
+    /// Shared by SQL completion (get_schema_map) and the AI SQL generation context.
     async fn resolve_schema_map(
         &self,
         server: &ServerConfig,
@@ -391,9 +392,9 @@ impl AppState {
         Ok(map)
     }
 
-    /// AI コマンド (SQL 生成 / エラー修正) 共通のコンテキストを解決する:
-    /// AI 設定・接続設定・プロンプト用アクティブスキーマ名・スキーママップ。
-    /// AI 未設定時は案内メッセージのエラーを返す。
+    /// Resolves the context common to AI commands (SQL generation / error fixing):
+    /// AI config, connection config, active schema name for the prompt, and the schema map.
+    /// Returns an error with a guidance message when AI is not configured.
     async fn resolve_ai_context(
         &self,
         connection: &str,
@@ -416,7 +417,7 @@ impl AppState {
         let server = self.find_server(connection).await?;
         let schema_key = self.active_schema_key(&server).await;
         let schema_map = self.resolve_schema_map(&server, &schema_key).await?;
-        // sqlite の schema はローカル DB ファイルパスなので、プロンプトには含めない
+        // The schema of sqlite is a local DB file path, so it is not included in the prompt
         let is_sqlite = matches!(
             server.engine.to_ascii_lowercase().as_str(),
             "sqlite" | "sqlite3"
@@ -434,8 +435,8 @@ async fn get_connections(
     let config = state.resolve_config().await?;
     let servers = config.resolve_servers()?;
     let infos = servers.iter().map(ConnectionInfo::from).collect();
-    // 同じマージ済み設定から AI 設定も解決してキャッシュする。解決エラーは
-    // ここでは接続一覧を壊さず、get_ai_info / ai_generate_sql 側の再解決で返す。
+    // Also resolve the AI config from the same merged config and cache it. A resolution error
+    // does not break the connection list here; it is returned by the re-resolution in get_ai_info / ai_generate_sql.
     match ai::resolve_ai_config(config.ai().as_ref()) {
         Ok(ai_config) => *state.ai.lock().await = Some(ai_config),
         Err(_) => *state.ai.lock().await = None,
@@ -444,8 +445,8 @@ async fn get_connections(
     Ok(infos)
 }
 
-/// 接続設定のキャッシュ・プール・SSH トンネルを破棄する。
-/// 設定を変更した後のリロード時に呼ぶ。
+/// Discards the connection config cache, pools and SSH tunnels.
+/// Called on reload after the config has been changed.
 #[tauri::command]
 async fn reset_connections(
     app: tauri::AppHandle,
@@ -456,8 +457,8 @@ async fn reset_connections(
     *state.ai.lock().await = None;
     state.db.reset().await;
     state.schema_cache.clear().await;
-    // 設定を編集して config_override_command の有無が変わることがあるため、
-    // コピー用ビュー (保存不可) のメニュー項目の要否を再判定する
+    // Editing the config can change whether config_override_command exists, so
+    // re-determine whether the menu item for the copy view (not saveable) is needed
     rebuild_menu(&app);
     Ok(())
 }
@@ -468,15 +469,15 @@ async fn run_query(
     connection: String,
     sql: String,
     max_rows: Option<usize>,
-    // ツールバーの Writable スイッチの状態。省略・false は読み取り専用
-    // (安全側の既定)。config の readonly: true はこれより優先される。
+    // State of the toolbar's Writable switch. Omitted / false means read-only
+    // (the safe default). The config's readonly: true takes precedence over this.
     writable: Option<bool>,
-    // 設定の default_limit を自動付与するか。省略時は付与する (従来どおり)。
-    // Copy / Export は結果テーブルの表示用ではなく全件を出したいので false で呼ぶ。
+    // Whether to auto-apply the config's default_limit. Applied when omitted (as before).
+    // Copy / Export want all rows rather than the display for the result table, so they call with false.
     apply_default_limit: Option<bool>,
 ) -> Result<QueryResult, AppError> {
     let server = state.find_server(&connection).await?;
-    // config の readonly が最優先のハードロック。次にスイッチ。
+    // The config's readonly is the highest-priority hard lock. Next is the switch.
     let readonly_guard = if server.readonly {
         db::ReadonlyGuard::Config
     } else if writable.unwrap_or(false) {
@@ -484,13 +485,13 @@ async fn run_query(
     } else {
         db::ReadonlyGuard::Switch
     };
-    // 履歴記録用に実行時点のアクティブスキーマを控えておく
+    // Note the active schema at execution time for history recording
     let schema = match state.db.schema_override(&connection).await {
         Some(schema) => Some(schema),
         None => server.schema.clone(),
     };
-    // 結果テーブルの表示用 (apply_default_limit) と、Copy / Export 用の
-    // 全件取得 (apply_default_limit = false) で行数の扱いを分ける。
+    // Row handling is separated between the display for the result table (apply_default_limit)
+    // and the fetch of all rows for Copy / Export (apply_default_limit = false)
     let apply_default_limit = apply_default_limit.unwrap_or(true);
     let default_limit = if apply_default_limit {
         state.resolve_default_limit().await?
@@ -501,17 +502,17 @@ async fn run_query(
         0 => None,
         limit => Some(limit),
     };
-    // 表示用の実行では、SQL 自身が LIMIT を持っていて auto_limit を付けられない
-    // 場合 (LIMIT 10000 等) でも、結果テーブルには default_limit 行までしか出さない
-    // (打ち切りは truncated で UI に出る)。
+    // For display execution, even when the SQL itself has a LIMIT and auto_limit cannot be
+    // applied (LIMIT 10000 etc.), the result table shows only up to default_limit rows
+    // (truncation is shown in the UI via truncated).
     //
-    // auto_limit が付く文 (LIMIT 無しの SELECT) はここで絞らない。絞ると
-    // 「LIMIT 500 で 500 行返ってきた」時に必ず truncated が立ち、
-    // 通常のクエリすべてに打ち切り表示が出てしまうため。
+    // Statements that get an auto_limit (a SELECT without LIMIT) are not trimmed here. If
+    // trimmed, truncated would always be set when "500 rows came back with LIMIT 500", and a
+    // truncation indicator would appear for every ordinary query.
     let max_rows = max_rows.unwrap_or(DEFAULT_MAX_ROWS);
-    // auto_limit で SQL 側が絞られる文はクライアント側の上限を触らない。
-    // engine 名が不正な場合はここでエラーにせず false に倒す (実行時に
-    // 下の async ブロックが同じエラーを返し、失敗として履歴に残るため)。
+    // For statements that auto_limit narrows on the SQL side, the client-side limit is not touched.
+    // If the engine name is invalid, this falls back to false instead of failing here (the
+    // async block below returns the same error at execution time and it is recorded in the history as a failure).
     let sql_gets_auto_limit = auto_limit.is_some()
         && db::parse_engine(&server.engine)
             .map(|engine| db::should_auto_limit(&sql, engine))
@@ -524,9 +525,9 @@ async fn run_query(
     let started = std::time::Instant::now();
 
     let result = async {
-        // \c <database> と USE <database> は SQL の実行ではなく接続状態の
-        // 変更なので、プールを取得する前にここで処理する。
-        // (メタコマンドの解釈エラーもここで出すことで、失敗として履歴に残る)
+        // `\c <database>` and `USE <database>` are not SQL execution but changes to the
+        // connection state, so they are handled here before acquiring the pool.
+        // (Reporting meta command parse errors here as well records them in the history as failures)
         let engine = db::parse_engine(&server.engine)?;
         if let Some(meta_commands::MetaCommand::Connect(schema)) =
             meta_commands::translate(engine, &sql)?
@@ -548,11 +549,11 @@ async fn run_query(
     }
     .await;
 
-    // 成功・失敗にかかわらず実行履歴を記録する。
-    // 記録の失敗でクエリ結果を損なわないよう、エラーはログに留める。
-    // (追記は小さな同期 I/O なので async コンテキストのまま行う。
-    //  ローテーション時のみ全読み・書き直しが走るが、上限 1 万行 =
-    //  高々数 MB のため許容する)
+    // Record the execution history regardless of success or failure.
+    // Recording failures only go to the log so that they do not spoil the query result.
+    // (The append is small synchronous I/O, so it is done as is in the async context.
+    //  Only on rotation does a full read and rewrite run, but with the 10,000-line limit =
+    //  at most a few MB, so this is accepted)
     let entry = history::HistoryEntry {
         time: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false),
         sql,
@@ -576,11 +577,11 @@ async fn run_query(
     result
 }
 
-/// `\c <database>` / `USE <database>` の実処理。アクティブスキーマを切り替え、切替後の接続で
-/// 確認用のクエリを実行して結果として返す (空の結果だと成功が分かりにくいため)。
+/// Actual processing of `\c <database>` / `USE <database>`. Switches the active schema and
+/// runs a confirmation query on the switched connection and returns it as the result (an empty result would make success hard to see).
 ///
-/// 切替に失敗した場合 (存在しない database 等) は元のスキーマへ戻す。
-/// 戻さないと、以降すべてのクエリが接続できない状態で残ってしまう。
+/// If the switch fails (a nonexistent database, etc.), return to the original schema.
+/// If not restored, all subsequent queries would be left in a state where they cannot connect.
 async fn switch_active_schema(
     state: &tauri::State<'_, AppState>,
     server: &ServerConfig,
@@ -590,14 +591,14 @@ async fn switch_active_schema(
     let previous = state.db.schema_override(&server.name).await;
     state.db.set_schema_override(&server.name, schema.clone()).await;
 
-    // 切替後の接続で実際に繋がることを確かめる。ここで失敗したら巻き戻す
+    // Confirm that it can actually connect with the switched connection. If it fails here, roll back
     let confirm = async {
         let pool: DbPool = state.db.get_pool(server).await?;
         let sql = match db::parse_engine(&server.engine)? {
             db::Engine::MySql => "SELECT DATABASE() AS `database`",
             db::Engine::Postgres => "SELECT current_database() AS database",
             db::Engine::MsSql => "SELECT DB_NAME() AS [database]",
-            // sqlite / duckdb / redis は meta_commands 側で弾いているのでここには来ない
+            // sqlite / duckdb / redis are rejected on the meta_commands side, so they never reach here
             db::Engine::Sqlite => {
                 return Err(AppError::Config(
                     "\\c is not supported for SQLite".into(),
@@ -621,7 +622,7 @@ async fn switch_active_schema(
             sql,
             DEFAULT_MAX_ROWS,
             None,
-            // 確認用の SELECT なので readonly 接続でも通る
+            // This is a confirmation SELECT, so it passes even on a readonly connection
             db::ReadonlyGuard::Config,
             false,
         )
@@ -631,14 +632,14 @@ async fn switch_active_schema(
 
     match confirm {
         Ok(mut result) => {
-            // 確認クエリの実行中にユーザーがスキーマ選択で別の database へ
-            // 変えていた場合、こちらの切替先をフロントへ報告すると
-            // 実際の接続先と表示が食い違うため報告しない
-            // (そちらの切替が自前でキャッシュ破棄と表示更新を済ませている)
+            // If, while the confirmation query was running, the user changed to another database via
+            // schema selection, reporting our switch destination to the frontend would make the
+            // display disagree with the actual connection target, so it is not reported
+            // (that switch has already discarded caches and updated the display by itself)
             let still_ours =
                 state.db.schema_override(&server.name).await.as_deref() == Some(schema.as_str());
             if still_ours {
-                // 切替後は古いスキーマのテーブル一覧・カラムを返さないようにする
+                // After switching, do not return the table list / columns of the old schema
                 state.schema_cache.invalidate_connection(&server.name).await;
                 result.switched_schema = Some(schema);
             }
@@ -646,14 +647,14 @@ async fn switch_active_schema(
             Ok(result)
         }
         Err(e) => {
-            // 切替中にユーザーがスキーマ選択で別の database へ変えていた場合は
-            // 巻き戻さない (そちらの選択を尊重する)
+            // If, during the switch, the user changed to another database via schema selection,
+            // do not roll back (respect that selection)
             state
                 .db
                 .rollback_schema_override(&server.name, &schema, previous)
                 .await;
-            // キャンセルはフロントが「Query cancelled」の完全一致で判定して
-            // 専用表示にするため、理由を包まずそのまま返す
+            // The frontend determines cancellation by an exact match on "Query cancelled" and
+            // shows a dedicated display, so the reason is returned as is without wrapping
             if matches!(e, AppError::Cancelled) {
                 return Err(e);
             }
@@ -664,10 +665,10 @@ async fn switch_active_schema(
     }
 }
 
-/// 接続で実行中のクエリにキャンセルを要求する。
-/// 実行中のクエリが無ければ何もせず false を返す。
-/// キャンセルされた実行は run_query 側が AppError::Cancelled
-/// ("Query cancelled") で返る。
+/// Requests cancellation of the query running on a connection.
+/// Does nothing and returns false if no query is running.
+/// The cancelled execution is returned by run_query as AppError::Cancelled
+/// ("Query cancelled").
 #[tauri::command]
 async fn cancel_query(
     state: tauri::State<'_, AppState>,
@@ -676,23 +677,23 @@ async fn cancel_query(
     state.query_cancels.cancel(&connection).await
 }
 
-/// AI チャットのエージェントの往復を中断する。
-/// request_ids はフロントが採番した実行中リクエストの ID
-/// (同じ接続で複数の往復が走りうるため、まとめて渡す)。
+/// Aborts the agent round trip of the AI chat.
+/// request_ids are the IDs of running requests numbered by the frontend
+/// (multiple round trips can run on the same connection, so they are passed together).
 ///
-/// 実行中のクエリを止める (CancelRegistry) だけでなく、ID を控えて
-/// 次のモデル呼び出し・ツール実行も行わせない。まだ ai_chat が走り
-/// 出していないリクエストの ID も控えられるので、送信直後の中断も効く。
-/// 戻り値は「実行中のクエリを実際に止めたか」。
+/// Besides stopping the running query (CancelRegistry), it remembers the IDs so that the
+/// next model call and tool execution are not performed either. IDs of requests for which
+/// ai_chat has not started running yet are also remembered, so aborting right after sending works.
+/// The return value is "whether a running query was actually stopped".
 #[tauri::command]
 async fn cancel_ai_chat(
     state: tauri::State<'_, AppState>,
     connection: String,
     request_ids: Vec<String>,
 ) -> Result<bool, AppError> {
-    // 先に**全ての ID を記録する**。クエリのキャンセルは DB へ問い合わせる
-    // ため失敗しうるが、そこで打ち切ると残りの往復が中断されないまま
-    // 切替後のバックエンドで動き続けてしまう
+    // First **record all the IDs**. Cancelling a query asks the DB and can fail, but if we
+    // stopped there, the remaining round trips would not be aborted and would keep running
+    // against the backend after the switch
     for request_id in &request_ids {
         state.chat_cancels.request(request_id).await;
     }
@@ -706,8 +707,8 @@ async fn cancel_ai_chat(
         {
             Ok(true) => cancelled_query = true,
             Ok(false) => {}
-            // 1 本の失敗で残りのキャンセルを止めない (記録は済んでいるので
-            // 往復自体は次の判定で止まる)。エラーは最初の 1 件だけ返す
+            // A failure of one does not stop the cancellation of the rest (the record is already made, so
+            // the round trip itself stops at the next check). Only the first error is returned
             Err(e) => {
                 first_error.get_or_insert(e);
             }
@@ -719,8 +720,8 @@ async fn cancel_ai_chat(
     }
 }
 
-/// 接続のクエリ実行履歴を新しい順に返す。
-/// search を指定すると SQL の部分一致 (大文字小文字を区別しない) で絞り込む。
+/// Returns the connection's query execution history newest first.
+/// If search is given, filters by substring match on the SQL (case-insensitive).
 #[tauri::command]
 fn list_query_history(
     connection: String,
@@ -747,13 +748,13 @@ async fn list_query_files(
         &server.sqlfiles_folder_name(),
         ext,
     )?;
-    // フォルダを開いた時に接続の説明メタファイルを最新化する (ベストエフォート:
-    // メタ書き込みの失敗で一覧取得を壊さない)。フォルダ未作成時は何もしない。
+    // When a folder is opened, refresh the connection's description meta file (best effort:
+    // a failure to write the meta does not break listing). Does nothing if the folder has not been created.
     let _ = state.refresh_folder_meta(&server).await;
     Ok(files)
 }
 
-/// 接続のクエリファイルをファイル名・中身で検索する (大文字小文字を区別しない部分一致)。
+/// Searches a connection's query files by file name and content (case-insensitive substring match).
 #[tauri::command]
 async fn search_query_files(
     state: tauri::State<'_, AppState>,
@@ -774,7 +775,7 @@ async fn read_query_file(
     query_files::read_query_file(&dir, &folder, &file_name, ext)
 }
 
-/// クエリファイルの絶対パスを返す (FilesPane の「Copy full path」用)。
+/// Returns the absolute path of a query file (for "Copy full path" in FilesPane).
 #[tauri::command]
 async fn query_file_path(
     state: tauri::State<'_, AppState>,
@@ -801,16 +802,16 @@ async fn write_query_file(
         &content,
         ext,
     )?;
-    // 保存でフォルダが確実に存在するタイミングで説明メタファイルを最新化する
-    // (ベストエフォート: メタ書き込みの失敗で保存を壊さない)。
+    // At the timing when saving guarantees the folder exists, refresh the description meta file
+    // (best effort: a failure to write the meta does not break saving).
     let _ = state.refresh_folder_meta(&server).await;
     Ok(())
 }
 
-/// 楽観的排他つきの保存。expected_base とディスクの現在内容が一致する時だけ書き込む。
-/// 書けたら true、アプリ外で変更されていて書かなかったら false を返す
-/// (フロントはマージ/衝突処理へ回す)。暗黙の保存 (自動保存・閉じる前保存) で使い、
-/// 外部変更を黙って上書きしないための atomic 寄りの CAS。
+/// Save with optimistic locking. Writes only when expected_base matches the current content on disk.
+/// Returns true if written, false if not written because it was changed outside the app
+/// (the frontend routes to merge / conflict handling). Used for implicit saves (autosave /
+/// save before closing), as an atomic-leaning CAS so that external changes are not silently overwritten.
 #[tauri::command]
 async fn write_query_file_if_unchanged(
     state: tauri::State<'_, AppState>,
@@ -849,8 +850,8 @@ async fn create_query_file(
         &file_name,
         ext,
     )?;
-    // フォルダ新規作成のタイミングで接続の説明メタファイルを書き出す
-    // (ベストエフォート: メタ書き込みの失敗で作成を壊さない)。
+    // At the timing when a folder is newly created, write the connection's description meta file
+    // (best effort: a failure to write the meta does not break creation).
     let _ = state.refresh_folder_meta(&server).await;
     Ok(normalized)
 }
@@ -876,8 +877,8 @@ async fn rename_query_file(
     query_files::rename_query_file(&dir, &folder, &old_name, &new_name, ext)
 }
 
-/// クエリファイルを別の接続のフォルダへ移動する (FILES から CONNECTIONS への
-/// ドラッグ & ドロップ)。正規化された移動後のファイル名を返す。
+/// Moves a query file to another connection's folder (drag & drop from FILES to
+/// CONNECTIONS). Returns the normalized file name after the move.
 #[tauri::command]
 async fn move_query_file(
     state: tauri::State<'_, AppState>,
@@ -889,19 +890,19 @@ async fn move_query_file(
     let to = state.find_server(&to_connection).await?;
     let from_ext = engines::capabilities_for_name(&from.engine).file_extension;
     let to_ext = engines::capabilities_for_name(&to.engine).file_extension;
-    // クエリファイルの拡張子はエンジンごとに違う (.sql / .redis / .es)。
-    // 拡張子が変わる移動は、移動先の一覧に出てこないファイルを作るだけなので
-    // 受け付けない (勝手に拡張子を付け替えると中身と食い違う)。
+    // The extension of query files differs per engine (.sql / .redis / .es).
+    // A move that changes the extension only creates a file that does not appear in the
+    // destination's list, so it is not accepted (changing the extension on our own would disagree with the content).
     if from_ext != to_ext {
         return Err(AppError::QueryFile(format!(
             "Cannot move a .{from_ext} file to \"{to_connection}\": it uses .{to_ext} files"
         )));
     }
-    // 別の接続でもクエリファイルの保存フォルダは同じことがある
-    // (folder_name の明示指定、または host/engine/schema/user が同じ場合)。
-    // 移動しても同じ場所なので、成功として返さずここで知らせる。成功にすると
-    // フロントがタブを閉じて "Moved" と出すのに、ファイルは移動元の一覧に
-    // 残ったままになる。
+    // Even different connections can have the same query file storage folder
+    // (an explicit folder_name, or the same host/engine/schema/user).
+    // The move would land in the same place, so we report that here instead of returning
+    // success. If it returned success, the frontend would close the tab and show "Moved",
+    // but the file would remain in the source's list.
     if from.sqlfiles_folder_name() == to.sqlfiles_folder_name() {
         return Err(AppError::QueryFile(format!(
             "\"{to_connection}\" shares the same query file folder as \"{from_connection}\": the file is already there"
@@ -914,13 +915,13 @@ async fn move_query_file(
         &file_name,
         from_ext,
     )?;
-    // 移動先フォルダが新規作成された場合があるので、接続の説明メタファイルを
-    // 書き出す (ベストエフォート: メタ書き込みの失敗で移動を壊さない)。
+    // The destination folder may have been newly created, so write the connection's
+    // description meta file (best effort: a failure to write the meta does not break the move).
     let _ = state.refresh_folder_meta(&to).await;
     Ok(moved)
 }
 
-/// 接続先サーバー上の database (スキーマ) 一覧を返す。
+/// Returns the list of databases (schemas) on the connection's server.
 #[tauri::command]
 async fn list_schemas(
     state: tauri::State<'_, AppState>,
@@ -931,8 +932,8 @@ async fn list_schemas(
     db::list_schemas(&pool, &server).await
 }
 
-/// 接続のアクティブスキーマ (database) を切り替える。
-/// プールが再構築され、次のクエリから新しい database に接続される。
+/// Switches the connection's active schema (database).
+/// The pool is rebuilt, and subsequent queries connect to the new database.
 #[tauri::command]
 async fn set_active_schema(
     state: tauri::State<'_, AppState>,
@@ -942,15 +943,15 @@ async fn set_active_schema(
     if schema.trim().is_empty() {
         return Err(AppError::Config("The schema name is empty".into()));
     }
-    // 接続名の実在確認 (存在しない接続へのオーバーライド蓄積を防ぐ)
+    // Confirm the connection name exists (prevents accumulating overrides for nonexistent connections)
     state.find_server(&connection).await?;
     state.db.set_schema_override(&connection, schema).await;
-    // 切替後に古いスキーマ情報を返さないよう、接続単位でキャッシュを破棄する
+    // Discard the cache per connection so that old schema information is not returned after the switch
     state.schema_cache.invalidate_connection(&connection).await;
     Ok(())
 }
 
-/// 接続のアクティブスキーマを返す (オーバーライトが無ければ設定のデフォルト)。
+/// Returns the connection's active schema (the config default if there is no override).
 #[tauri::command]
 async fn get_active_schema(
     state: tauri::State<'_, AppState>,
@@ -966,10 +967,10 @@ async fn get_active_schema(
     ))
 }
 
-/// 指定接続のプールと SSH トンネルを破棄する。
-/// この接続のエディタタブが全て閉じられた時にフロントから呼ぶ。
-/// 接続設定・アクティブスキーマの選択は残るため、次に必要になった時
-/// (ファイルを開く / スキーマブラウザを開く / クエリ実行) に自動で張り直される。
+/// Discards the pool and SSH tunnel of the specified connection.
+/// Called from the frontend when all editor tabs of this connection have been closed.
+/// The connection config and the active schema selection remain, so it is re-established
+/// automatically the next time it is needed (opening a file / opening the schema browser / running a query).
 #[tauri::command]
 async fn disconnect(
     state: tauri::State<'_, AppState>,
@@ -979,8 +980,8 @@ async fn disconnect(
     Ok(())
 }
 
-/// 接続先のテーブル / ビューの一覧を返す (キャッシュあり)。
-/// refresh = true でキャッシュを破棄して再取得する (リロードボタン用)。
+/// Returns the list of tables / views on the connection (with cache).
+/// With refresh = true, discards the cache and fetches again (for the reload button).
 #[tauri::command]
 async fn list_tables(
     state: tauri::State<'_, AppState>,
@@ -990,7 +991,7 @@ async fn list_tables(
     let server = state.find_server(&connection).await?;
     let schema_key = state.active_schema_key(&server).await;
     if refresh.unwrap_or(false) {
-        // カラムのキャッシュも古い可能性があるため、スキーマ単位で丸ごと破棄する
+        // The column cache may be stale too, so discard it wholesale per schema
         state
             .schema_cache
             .invalidate_schema(&connection, &schema_key)
@@ -1007,8 +1008,8 @@ async fn list_tables(
     Ok(tables)
 }
 
-/// テーブルのカラム一覧を返す (キャッシュあり。ツリー展開時の遅延ロード用)。
-/// table は list_tables が返す qualified_name を渡す。
+/// Returns the list of columns of a table (with cache. For lazy loading when expanding the tree).
+/// For table, pass the qualified_name returned by list_tables.
 #[tauri::command]
 async fn list_columns(
     state: tauri::State<'_, AppState>,
@@ -1033,8 +1034,8 @@ async fn list_columns(
     Ok(columns)
 }
 
-/// テーブル名 → カラム名リストのマップを返す (SQL 補完の強化用)。
-/// キャッシュに全テーブル分のカラムが無ければ一括取得してキャッシュする。
+/// Returns a map of table name -> column name list (to enhance SQL completion).
+/// If the cache lacks columns for all tables, fetches them in bulk and caches them.
 #[tauri::command]
 async fn get_schema_map(
     state: tauri::State<'_, AppState>,
@@ -1045,8 +1046,8 @@ async fn get_schema_map(
     state.resolve_schema_map(&server, &schema_key).await
 }
 
-/// テーブルの主キーを構成するカラム名を返す (結果グリッドのセル編集用)。
-/// 主キーが無いテーブルでは空を返す。
+/// Returns the column names that make up the table's primary key (for cell editing in the result grid).
+/// Returns empty for a table with no primary key.
 #[tauri::command]
 async fn get_primary_keys(
     state: tauri::State<'_, AppState>,
@@ -1058,9 +1059,9 @@ async fn get_primary_keys(
     schema_info::fetch_primary_keys(&pool, &table).await
 }
 
-/// 結果グリッドのセル編集を UPDATE 群として 1 トランザクションで適用する。
-/// writable の解決は run_query と同じ (config readonly が最優先、次にスイッチ)。
-/// 合計の影響行数を返す。
+/// Applies cell edits in the result grid as a group of UPDATEs in one transaction.
+/// The resolution of writable is the same as run_query (config readonly takes precedence, then the switch).
+/// Returns the total number of affected rows.
 #[tauri::command]
 async fn run_statements(
     state: tauri::State<'_, AppState>,
@@ -1086,9 +1087,9 @@ async fn run_statements(
     .await
 }
 
-/// AI 設定の情報 (configured / model) を返す。api_key は含めない。
-/// `ai:` セクションが無い場合はエラーではなく configured: false。
-/// セクションはあるが不正 (不明 provider 等) な場合はエラーを返す。
+/// Returns information on the AI config (configured / model). Does not include the api_key.
+/// If there is no `ai:` section, it is configured: false rather than an error.
+/// If the section exists but is invalid (unknown provider etc.), an error is returned.
 #[tauri::command]
 async fn get_ai_info(state: tauri::State<'_, AppState>) -> Result<ai::AiInfo, AppError> {
     Ok(match state.resolve_ai_config().await? {
@@ -1103,11 +1104,11 @@ async fn get_ai_info(state: tauri::State<'_, AppState>) -> Result<ai::AiInfo, Ap
     })
 }
 
-/// 自然言語の指示から SQL を生成して返す。実行はせず、エディタへの
-/// 挿入もフロント側に任せる (ユーザーが確認してから実行する)。
-/// LLM に送るのはスキーマ情報 (テーブル・カラム名)・エンジン方言・
-/// アクティブスキーマ名・ユーザーの指示のみ。クエリの結果データや
-/// 接続情報 (ホスト・認証情報) は送らない。
+/// Generates SQL from a natural language instruction and returns it. It does not execute
+/// it, and leaves inserting it into the editor to the frontend (the user confirms before running).
+/// What is sent to the LLM is only the schema information (table and column names), the
+/// engine dialect, the active schema name and the user's instruction. Query result data
+/// and connection information (host, credentials) are not sent.
 #[tauri::command]
 async fn ai_generate_sql(
     state: tauri::State<'_, AppState>,
@@ -1125,14 +1126,14 @@ async fn ai_generate_sql(
     Ok(ai::strip_sql_fences(&response))
 }
 
-/// 失敗した SQL と DB のエラーメッセージから修正案の SQL を生成して返す。
-/// 実行はせず、エディタへの反映もユーザーの確認 (Apply) に任せる。
-/// LLM に送るのは失敗した SQL・エラーメッセージ・スキーマ情報
-/// (テーブル・カラム名)・エンジン方言・アクティブスキーマ名のみ。
-/// クエリの結果データや接続情報 (ホスト・認証情報) は送らない。
-/// 注意: DB のエラーメッセージ自体が値を含むことがある (例: 一意制約違反の
-/// DETAIL に衝突したキー値が載る)。修正に必要な情報のため加工せず送る
-/// 設計とし、フロントのボタン tooltip で送信内容を明示している。
+/// Generates a suggested fix SQL from the failed SQL and the DB error message and returns it.
+/// It does not execute it, and leaves reflecting it in the editor to the user's confirmation (Apply).
+/// What is sent to the LLM is only the failed SQL, the error message, the schema information
+/// (table and column names), the engine dialect and the active schema name.
+/// Query result data and connection information (host, credentials) are not sent.
+/// Note: the DB error message itself may contain values (e.g. the conflicting key value is
+/// in the DETAIL of a unique constraint violation). Since it is information needed for the
+/// fix, it is designed to be sent without processing, and the frontend button tooltip states what is sent.
 #[tauri::command]
 async fn ai_fix_sql(
     state: tauri::State<'_, AppState>,
@@ -1155,10 +1156,10 @@ async fn ai_fix_sql(
     Ok(ai::strip_sql_fences(&response))
 }
 
-/// エンジン別の EXPLAIN プレフィックスを付けた SQL を組み立てて返す。
-/// 実行はしない (フロントが通常の run_query 経路で実行する)。
-/// 対象は SELECT / WITH のみ (Postgres の EXPLAIN ANALYZE は対象文を
-/// 実際に実行するため、DML への付与はエラーで拒否する)。
+/// Builds and returns SQL with the engine-specific EXPLAIN prefix.
+/// It does not execute it (the frontend runs it through the normal run_query path).
+/// Only SELECT / WITH are targeted (Postgres EXPLAIN ANALYZE actually executes the
+/// target statement, so adding it to DML is rejected with an error).
 #[tauri::command]
 async fn build_explain_sql(
     state: tauri::State<'_, AppState>,
@@ -1169,10 +1170,10 @@ async fn build_explain_sql(
     db::build_explain_sql(&server.engine, &sql)
 }
 
-/// 危険な文 (WHERE 無し UPDATE/DELETE、DROP/TRUNCATE) なら理由を返す。
-/// 実行はしない。allow_dangerous_statements が有効な接続で、フロントが
-/// 実行前に確認ダイアログを出すかどうかを判断するために使う
-/// (無効な接続では run_query 側が拒否するため、フロントは呼ぶ必要がない)。
+/// Returns the reason if the statement is dangerous (UPDATE/DELETE without WHERE, DROP/TRUNCATE).
+/// It does not execute it. Used by the frontend, on connections where allow_dangerous_statements
+/// is enabled, to decide whether to show a confirmation dialog before execution
+/// (on connections where it is disabled run_query rejects it, so the frontend need not call it).
 #[tauri::command]
 async fn check_dangerous_statement(
     state: tauri::State<'_, AppState>,
@@ -1183,12 +1184,12 @@ async fn check_dangerous_statement(
     db::dangerous_statement_reason(&server.engine, &sql)
 }
 
-/// Copy / Export で全件を取り直すために、その SQL をもう一度実行してよいかを返す。
+/// Returns whether that SQL may be executed again to re-fetch all rows for Copy / Export.
 ///
-/// 結果テーブルは default_limit で打ち切られるため、全件を出すには同じ SQL を
-/// 実行し直す必要がある。ただし書き込みを伴う文を二度実行してしまうと事故になる
-/// ので、AI エージェント経路と同じ厳しい読み取り専用判定 (複文・EXPLAIN ANALYZE・
-/// CALL / PRAGMA も拒否) を通ったものだけ許可する。
+/// The result table is truncated by default_limit, so showing all rows requires running
+/// the same SQL again. But running a statement that writes twice would be an accident,
+/// so only statements that pass the same strict read-only check as the AI agent path
+/// (which also rejects multiple statements, EXPLAIN ANALYZE and CALL / PRAGMA) are allowed.
 #[tauri::command]
 async fn can_rerun_for_output(
     state: tauri::State<'_, AppState>,
@@ -1200,11 +1201,11 @@ async fn can_rerun_for_output(
     Ok(db::is_safe_to_rerun(&sql, engine))
 }
 
-/// EXPLAIN の実行計画を AI に解説させ、ボトルネックの特定・インデックス
-/// 提案・書き直し案の Markdown を返す。LLM に送るのはスキーマ情報
-/// (テーブル・カラム名)・エンジン方言・アクティブスキーマ名・SQL・
-/// 実行計画テキストのみ (実行計画はクエリの結果データではなくプランナー
-/// 出力なので許容する)。接続情報 (ホスト・認証情報) は送らない。
+/// Has the AI explain an EXPLAIN execution plan, and returns Markdown identifying
+/// bottlenecks, suggesting indexes and proposing rewrites. What is sent to the LLM is only
+/// the schema information (table and column names), the engine dialect, the active schema
+/// name, the SQL and the plan text (the plan is planner output, not query result data, so
+/// it is accepted). Connection information (host, credentials) is not sent.
 #[tauri::command]
 async fn ai_explain_plan(
     state: tauri::State<'_, AppState>,
@@ -1228,7 +1229,7 @@ async fn ai_explain_plan(
     let server = state.find_server(&connection).await?;
     let schema_key = state.active_schema_key(&server).await;
     let schema_map = state.resolve_schema_map(&server, &schema_key).await?;
-    // sqlite の schema はローカル DB ファイルパスなので、プロンプトには含めない
+    // The schema of sqlite is a local DB file path, so it is not included in the prompt
     let is_sqlite = matches!(
         server.engine.to_ascii_lowercase().as_str(),
         "sqlite" | "sqlite3"
@@ -1242,10 +1243,10 @@ async fn ai_explain_plan(
     Ok(response.trim().to_string())
 }
 
-/// カーソル位置 (選択中) の SQL 文を AI に平易に解説させ、Markdown を返す。
-/// 実行はしない。LLM に送るのは SQL・スキーマ情報 (テーブル・カラム名)・
-/// エンジン方言・アクティブスキーマ名のみ。クエリの結果データや接続情報
-/// (ホスト・認証情報) は送らない。
+/// Has the AI explain the SQL statement at the cursor (selected) in plain terms, and returns Markdown.
+/// It does not execute it. What is sent to the LLM is only the SQL, the schema information
+/// (table and column names), the engine dialect and the active schema name. Query result
+/// data and connection information (host, credentials) are not sent.
 #[tauri::command]
 async fn ai_explain_sql(
     state: tauri::State<'_, AppState>,
@@ -1267,9 +1268,9 @@ async fn ai_explain_sql(
     Ok(response.trim().to_string())
 }
 
-/// エージェントの run_sql の結果を LLM 向けのテキストに整形する。
-/// 行数を明示し、列名 + 各行を 1 行の JSON にして渡す (トークン効率と
-/// パースのしやすさの両立)。
+/// Formats the result of the agent's run_sql into text for the LLM.
+/// States the row count explicitly and passes the column names + each row as one line of
+/// JSON (balancing token efficiency and ease of parsing).
 fn format_chat_tool_result(result: &QueryResult) -> String {
     let mut text = format!(
         "{} row(s){}",
@@ -1292,16 +1293,16 @@ fn format_chat_tool_result(result: &QueryResult) -> String {
     ai::truncate_tool_result(&text)
 }
 
-/// AI チャット (エージェント) の 1 往復を実行する。
-/// フロントは会話履歴を毎回そのまま渡し、バックエンドが system prompt の
-/// 組み立てとツール実行ループを担う。
+/// Runs one round trip of the AI chat (agent).
+/// The frontend passes the conversation history as is every time, and the backend is
+/// responsible for building the system prompt and the tool execution loop.
 ///
-/// ツールは読み取り専用の `run_sql` のみで、実行は**常に読み取り専用**
-/// (ツールバーの Writable スイッチが ON でも書き込みは許可しない)。
-/// エージェントが自分の判断で書き込む事故を構造的に防ぐため。
-/// LLM に送るのはスキーマ情報・方言・アクティブスキーマ名・会話履歴と、
-/// エージェント自身が実行した読み取りクエリの結果のみ。接続情報
-/// (ホスト・認証情報) は送らない。
+/// The only tool is the read-only `run_sql`, and execution is **always read-only**
+/// (writes are not permitted even if the toolbar's Writable switch is ON).
+/// This is to structurally prevent accidents where the agent writes on its own judgment.
+/// What is sent to the LLM is only the schema information, dialect, active schema name,
+/// conversation history, and the results of read queries the agent itself executed.
+/// Connection information (host, credentials) is not sent.
 #[tauri::command]
 async fn ai_chat(
     state: tauri::State<'_, AppState>,
@@ -1309,13 +1310,13 @@ async fn ai_chat(
     history: Vec<ai::ChatTurn>,
     request_id: String,
 ) -> Result<ai::ChatReply, AppError> {
-    // 実行したツール呼び出しは失敗時にも返す (途中まで実行したクエリを
-    // 隠さない。特に中断・タイムアウトはツール実行の後に起きやすい)
+    // Tool calls that were executed are returned on failure as well (do not hide queries that
+    // were executed partway; aborts and timeouts in particular tend to happen after tool execution)
     let mut tool_calls: Vec<ai::ChatToolCall> = Vec::new();
     let result =
         run_ai_chat(&state, &connection, &history, &request_id, &mut tool_calls).await;
-    // 中断記録は往復の終了時に掃除する (残っても上限で捨てられるが、
-    // 同じ ID が再利用されることはないので溜めておく意味が無い)
+    // Clean up the abort record at the end of the round trip (even if left it would be dropped
+    // by the limit, but the same ID is never reused, so there is no point in keeping it)
     state.chat_cancels.finish(&request_id).await;
     Ok(match result {
         Ok(content) => ai::ChatReply {
@@ -1331,8 +1332,8 @@ async fn ai_chat(
     })
 }
 
-/// ai_chat の本体。アシスタントの最終メッセージを返し、実行したツール
-/// 呼び出しは (失敗時も呼び出し側が拾えるよう) 引数の Vec へ積む。
+/// The body of ai_chat. Returns the assistant's final message, and pushes the tool calls
+/// that were executed into the argument Vec (so the caller can pick them up even on failure).
 async fn run_ai_chat(
     state: &AppState,
     connection: &str,
@@ -1345,10 +1346,10 @@ async fn run_ai_chat(
     if messages.is_empty() {
         return Err(AppError::Ai("The chat history is empty".into()));
     }
-    // 中断はリクエスト ID で判定する。接続単位のカウンタだと、同じ接続で
-    // 2 本走る時に区別できず、開始直後に届いた中断も「開始時の基準値」に
-    // 吸収されてしまう。ID なら、このコマンドが走り出す前に届いた中断も
-    // ここで拾える
+    // Abort is determined by request ID. With a per-connection counter, two requests running
+    // on the same connection cannot be distinguished, and an abort that arrives right after
+    // starting would be absorbed into the "baseline value at start". With an ID, an abort that
+    // arrived before this command started running is also caught here
     let cancelled = || async { state.chat_cancels.is_cancelled(&request_id).await };
     if cancelled().await {
         return Err(AppError::Cancelled);
@@ -1356,13 +1357,13 @@ async fn run_ai_chat(
 
     let (ai_config, server, active_schema, schema_map) =
         state.resolve_ai_context(&connection).await?;
-    // コンテキスト解決の間に中断されていたら、ここで打ち切る
-    // (この時点の schema_map / プロンプトは既に古い可能性がある)
+    // If aborted during context resolution, cut off here
+    // (the schema_map / prompt at this point may already be stale)
     if cancelled().await {
         return Err(AppError::Cancelled);
     }
-    // AI 非対応のエンジン (redis / elasticsearch / dynamodb) はフロントでも
-    // 入力を塞いでいるが、コマンド側でも拒否する (プロンプトが SQL 前提のため)
+    // Engines without AI support (redis / elasticsearch / dynamodb) have their input blocked
+    // in the frontend too, but the command rejects them as well (the prompt assumes SQL)
     if !engines::capabilities_for_name(&server.engine).supports_ai {
         return Err(AppError::Ai(format!(
             "The AI features are not available for the '{}' engine",
@@ -1376,31 +1377,31 @@ async fn run_ai_chat(
         serde_json::json!({ "role": "system", "content": system_prompt }),
     );
 
-    // エージェントの実行は Writable スイッチや config に関わらず Agent 固定。
-    // 文レベルのガードに加えて DB レベルの読み取り専用 (読み取り専用
-    // トランザクション / PRAGMA query_only) も強制される。
+    // Agent execution is fixed to Agent regardless of the Writable switch or config.
+    // In addition to the statement-level guard, DB-level read-only (read-only
+    // transaction / PRAGMA query_only) is also enforced.
     let readonly_guard = db::ReadonlyGuard::Agent;
-    // ユーザーのクエリのキャンセル (接続名がキー) と衝突せず、同じ接続の
-    // 別の往復とも衝突しないキーを使う
+    // Use a key that collides neither with the user's query cancellation (keyed by connection
+    // name) nor with another round trip on the same connection
     let cancel_key = chat_cancel_key(&connection, &request_id);
 
     let engine = db::parse_engine(&server.engine)?;
-    // ツール実行の累計。1 応答が複数の tool_calls を並べられるため、
-    // 往復回数 (ラウンド) とは別に累計でも上限を課す
+    // Cumulative count of tool executions. One response can list multiple tool_calls, so a
+    // cumulative limit is imposed separately from the number of round trips (rounds)
     let mut executed_calls = 0usize;
     for _ in 0..ai::CHAT_MAX_TOOL_ROUNDS {
-        // 累計上限に達したら、ツールを渡さず最後の回答を書かせる
-        // (上限超過をエラーにせず、そこまでに読めた内容で答えさせる)
+        // When the cumulative limit is reached, have it write the final answer without passing tools
+        // (do not make exceeding the limit an error; have it answer with what it could read so far)
         let allow_tools = executed_calls < ai::CHAT_MAX_TOOL_CALLS;
-        // 会話が破棄された (接続 / スキーマ切替・Clear・Stop) なら、
-        // 次のモデル呼び出しもツール実行も行わずに打ち切る
+        // If the conversation was discarded (connection / schema switch, Clear, Stop), cut off
+        // without making the next model call or running tools
         if cancelled().await {
             return Err(AppError::Cancelled);
         }
         let message = ai::chat_step(&ai_config, &messages, allow_tools, &cancelled).await?;
-        // モデルの応答を待つ間に中断された場合、その応答は採用しない
-        // (ツール無しの応答で終わる往復が最も多いため、ここを見落とすと
-        //  Stop を押しても普通の回答が返ってくる)
+        // If aborted while waiting for the model's response, that response is not adopted
+        // (a round trip ending with a response that has no tools is the most common, so if this
+        // is overlooked, an ordinary answer still comes back after pressing Stop)
         if cancelled().await {
             return Err(AppError::Cancelled);
         }
@@ -1414,13 +1415,13 @@ async fn run_ai_chat(
             }
             return Ok(content);
         }
-        // ツール呼び出しを含むアシスタントメッセージはそのまま履歴へ積む
-        // (tool メッセージは直前の tool_calls と対応していなければならない)
+        // An assistant message that contains tool calls is pushed to the history as is
+        // (tool messages must correspond to the preceding tool_calls)
         messages.push(message);
         for (id, name, arguments) in requested {
-            // 1 応答内で複数の tool_calls を並べられるため、累計でも打ち切る。
-            // 打ち切った分にも tool メッセージは返す (tool_calls と対応する
-            // tool メッセージが欠けると API がエラーになる)
+            // One response can list multiple tool_calls, so also cut off by the cumulative limit.
+            // A tool message is also returned for the cut-off ones (if the tool message corresponding
+            // to a tool_call is missing, the API returns an error)
             if executed_calls >= ai::CHAT_MAX_TOOL_CALLS {
                 messages.push(serde_json::json!({
                     "role": "tool",
@@ -1440,31 +1441,28 @@ async fn run_ai_chat(
             let (ok, argument, result_text) = if name == "run_sql" {
                 match ai::parse_run_sql_argument(&arguments) {
                     Ok(sql) => {
-                        // DB へ実際に投げたか (投げていない中断を「実行した」
-                        // と記録しないための目印)
+                        // Whether it was actually sent to the DB (a marker so that an abort
+                        // that did not send it is not recorded as "executed")
                         let mut started = false;
                         let outcome = async {
-                            // エージェント経路は通常の readonly ガードより狭い
-                            // ホワイトリストを課す (CALL / PRAGMA / 複文を落とす)
+                            // The agent path imposes a narrower whitelist than the usual
+                            // readonly guard (rejecting CALL / PRAGMA / multiple statements)
                             if let Some(reason) = db::agent_rejection_reason(&sql, engine) {
                                 return Err(AppError::Readonly(reason));
                             }
-                            // プール取得 (SSH トンネルの確立を含む) は待ちが
-                            // 長い。その間に届いた中断は CancelRegistry には
-                            // 届かない (run_query_cancellable がまだ登録して
-                            // いない) ので、実行の直前にもう一度確認する
+                            // Acquiring the pool (including establishing the SSH tunnel) can wait a long time. An
+                            // abort that arrives in the meantime does not reach the CancelRegistry
+                            // (run_query_cancellable has not registered yet), so check once more right before execution
                             let pool = state.db.get_pool(&server).await?;
                             if cancelled().await {
                                 return Err(AppError::Cancelled);
                             }
                             started = true;
-                            // run_query_cancellable は内部で登録するまでの間
-                            // (コネクション取得・セッション ID 照会) キャンセル
-                            // レジストリに現れないため、そこへ届いた中断は
-                            // 空振りする。ポーリングで自前に監視し、中断されたら
-                            // クエリの future を drop して待つのをやめる
-                            // (サーバー側は登録済みなら停止し、未登録なら
-                            //  クライアント側の打ち切りになる)
+                            // run_query_cancellable does not appear in the cancel registry until it registers
+                            // internally (connection acquisition, session ID lookup), so an abort that arrives then
+                            // has no effect. Watch for it ourselves by polling, and when aborted, drop the query's
+                            // future and stop waiting (the server side stops if it is registered, and if not it is
+                            // a client-side cutoff)
                             let query = db::run_query_cancellable(
                                 &pool,
                                 &state.query_cancels,
@@ -1473,7 +1471,7 @@ async fn run_ai_chat(
                                 ai::CHAT_TOOL_MAX_ROWS,
                                 None,
                                 readonly_guard,
-                                // エージェントには危険な文も許可しない
+                                // Do not permit dangerous statements for the agent either
                                 false,
                             );
                             tokio::pin!(query);
@@ -1487,13 +1485,10 @@ async fn run_ai_chat(
                                         ),
                                     ) => {
                                         if cancelled().await {
-                                            // future を drop するだけでは
-                                            // spawn_blocking で走るエンジン
-                                            // (DuckDB) は止まらない。この時点
-                                            // では登録が済んでいるはずなので、
-                                            // エンジン別のキャンセル
-                                            // (DuckDB の InterruptHandle 等) を
-                                            // 改めて要求してから待つのをやめる
+                                            // Merely dropping the future does not stop engines that run via spawn_blocking
+                                            // (DuckDB). At this point registration should be done, so request the
+                                            // engine-specific cancellation (DuckDB's InterruptHandle etc.)
+                                            // again and then stop waiting
                                             let _ = state
                                                 .query_cancels
                                                 .cancel(&cancel_key)
@@ -1505,24 +1500,22 @@ async fn run_ai_chat(
                             }
                         }
                         .await;
-                        // 中断で終える場合も、DB へ投げた SQL は記録に残す
-                        // (結果はモデルにもユーザーにも見せないが、「何を
-                        //  実行したか」を隠さない)。中断の狙いは「破棄した /
-                        // 切り替えた後のデータを AI プロバイダへ送らないこと」
-                        // なので、結果だけを捨てて往復ごと終える
+                        // Even when ending with an abort, SQL that was sent to the DB is kept in the record
+                        // (the result is not shown to the model or the user, but "what was executed" is not
+                        // hidden). The aim of the abort is "not to send data to the AI provider after the
+                        // conversation has been discarded or the connection / schema has been switched", so only
+                        // the result is discarded and the whole round trip ends
                         let cancelled_now = cancelled().await;
                         if cancelled_now || matches!(outcome, Err(AppError::Cancelled)) {
-                            // DB へ投げる前に中断した分は「実行した」と
-                            // 記録しない (実行していないクエリを一覧に
-                            // 出すと、監査としてかえって誤解を招く)
+                            // Do not record one aborted before being sent to the DB as "executed"
+                            // (listing a query that was not executed would be rather misleading as an audit)
                             if started {
                                 tool_calls.push(ai::ChatToolCall {
                                     name: name.clone(),
                                     argument: sql,
                                     ok: false,
-                                    // 実行に入ったことは分かるが、コネクション
-                                    // 取得の途中で止まった可能性もあるため
-                                    // 「実行した」と断定はしない
+                                    // It is known that execution was entered, but it may have stopped partway through
+                                    // connection acquisition, so do not assert that it was "executed"
                                     summary: "Cancelled (may not have run)".to_string(),
                                 });
                             }
@@ -1546,7 +1539,7 @@ async fn run_ai_chat(
                 name: name.clone(),
                 argument,
                 ok,
-                // 要約は 1 行に収める (フロントのツールチップ表示用)
+                // Keep the summary to one line (for the frontend's tooltip display)
                 summary: result_text.lines().next().unwrap_or("").to_string(),
             });
             messages.push(serde_json::json!({
@@ -1556,8 +1549,8 @@ async fn run_ai_chat(
             }));
         }
     }
-    // 往復の上限に達した場合も、ツールを渡さない最後の 1 回で回答を書かせる
-    // (ここまでのツール結果は履歴に載っているので、調べた内容を無駄にしない)
+    // Also when the round trip limit is reached, have it write the answer in one last call
+    // without passing tools (the tool results so far are in the history, so what was investigated is not wasted)
     if cancelled().await {
         return Err(AppError::Cancelled);
     }
@@ -1575,10 +1568,10 @@ async fn run_ai_chat(
     Ok(content)
 }
 
-/// 設定の解決結果を返す (情報表示用。機密を含まない)。
-/// マージ済み設定 (キャッシュ) から作るので、config_override_command で
-/// 上書きされた sqlfiles_dir 等も実際に使われている値が表示される。
-/// キャッシュ経由なので取得コマンドがモーダルを開くたびに走ることはない。
+/// Returns the resolved config (for information display; contains no secrets).
+/// It is built from the merged config (cache), so values actually in use, such as
+/// sqlfiles_dir overridden by config_override_command, are displayed.
+/// Because it goes through the cache, the fetch command does not run every time the modal is opened.
 #[tauri::command]
 async fn get_config_info(state: tauri::State<'_, AppState>) -> Result<ConfigInfo, AppError> {
     Ok(match state.resolve_config().await {
@@ -1589,58 +1582,57 @@ async fn get_config_info(state: tauri::State<'_, AppState>) -> Result<ConfigInfo
     })
 }
 
-/// config.yml が無ければテンプレートを作成する。作成した場合はそのパスを返す。
+/// Creates a template if config.yml does not exist. If created, returns its path.
 #[tauri::command]
 fn ensure_config_file() -> Result<Option<String>, AppError> {
     config::ensure_config_file()
 }
 
-/// 設定エディタ用に config.yml の中身を返す (無ければテンプレートを作成してから読む)。
+/// Returns the contents of config.yml for the config editor (creates the template first if it does not exist, then reads).
 #[tauri::command]
 fn read_config_file() -> Result<String, AppError> {
     config::read_config_file()
 }
 
-/// 設定エディタからの保存。書き込んだファイルのパスを返す。
+/// Save from the config editor. Returns the path of the file written.
 #[tauri::command]
 fn write_config_file(content: String) -> Result<String, AppError> {
     config::write_config_file(&content)
 }
 
-/// 接続 0 件の画面から、ファイル選択ダイアログで選んだ SQLite / DuckDB ファイルの
-/// 接続を config.yml の servers へ追記する (コメントを保ったテキスト追記。config.rs)。
-/// 追記後の再読み込みと接続の選択はフロントが行う。
+/// From the screen with 0 connections, appends the connection for the SQLite / DuckDB file
+/// chosen in the file selection dialog to the servers of config.yml (text append that preserves comments; config.rs).
+/// The frontend performs the reload after the append and the selection of the connection.
 #[tauri::command]
 fn add_file_connection(path: String) -> Result<config::FileConnection, AppError> {
     config::add_file_connection(&path)
 }
 
-/// config_override_command を実行して取得した生の YAML を返す
-/// (コピー用ビュー用。表示先では編集できるが保存はしない)。
+/// Returns the raw YAML fetched by running config_override_command
+/// (for the copy view. It can be edited at the display destination but is not saved).
 #[tauri::command]
 async fn read_override_config_yaml() -> Result<String, AppError> {
     config::fetch_override_config_yaml().await
 }
 
-/// 結果テーブルの Export で、ネイティブ保存ダイアログ (フロントの
-/// plugin-dialog save) でユーザーが選んだパスへテキストを書き出す。
-/// パスは実行時にダイアログでユーザーが選んだものが渡ってくる。
+/// In the result table's Export, writes text to the path the user chose in the native save
+/// dialog (the frontend's plugin-dialog save).
+/// The path passed in is the one the user chose in the dialog at runtime.
 ///
-/// バックエンドではパスを検証しない (任意パスへ書ける) 点に注意。これは
-/// このアプリの信頼モデルに沿う: フロントエンドは自前の同梱コードのみで
-/// リモートコンテンツを読み込まず、`run_query` で任意 SQL 実行・
-/// `write_config_file` で設定書き込みが既に可能なため、フロントが侵害された
-/// 場合の被害範囲は元々広い。ここで新たにファイル書き込みが増えることの
-/// 追加リスクは限定的と判断している。
-/// エクスポート時の文字コード。
+/// Note that the backend does not validate the path (it can write to any path). This
+/// follows this app's trust model: the frontend loads only its own bundled code and no
+/// remote content, and arbitrary SQL execution via `run_query` and config writes via
+/// `write_config_file` are already possible, so the damage if the frontend were
+/// compromised is already broad. The additional risk of adding a new file write here is judged to be limited.
+/// Character encoding used on export.
 ///
-/// 既定は UTF-8。Excel など UTF-8 を前提としないツール向けに CP932 / EUC-JP を選べる。
-/// 文字コード名はフロントから文字列で渡ってくる。
+/// The default is UTF-8. CP932 / EUC-JP can be chosen for tools such as Excel that do not assume UTF-8.
+/// The encoding name is passed from the frontend as a string.
 fn encode_export_contents(contents: &str, encoding: &str) -> Result<Vec<u8>, AppError> {
     let encoder = match encoding {
-        // 空文字・未指定は既定の UTF-8 として扱う
+        // Empty or unspecified is treated as the default UTF-8
         "" | "utf-8" | "utf8" => return Ok(contents.as_bytes().to_vec()),
-        // encoding_rs の SHIFT_JIS は Encoding Standard の定義により Windows-31J (CP932)
+        // By the Encoding Standard's definition, encoding_rs's SHIFT_JIS is Windows-31J (CP932)
         "cp932" | "shift_jis" | "sjis" => encoding_rs::SHIFT_JIS,
         "euc-jp" | "eucjp" => encoding_rs::EUC_JP,
         other => {
@@ -1652,8 +1644,8 @@ fn encode_export_contents(contents: &str, encoding: &str) -> Result<Vec<u8>, App
 
     let (encoded, _, had_unmappable) = encoder.encode(contents);
     if had_unmappable {
-        // 変換できない文字は encoding_rs が数値文字参照 (&#12345;) に置き換える。
-        // 黙って壊れた出力を書くとデータの取り違えにつながるため、失敗として返す。
+        // Characters that cannot be converted are replaced by encoding_rs with numeric character references (&#12345;).
+        // Silently writing broken output would lead to data mix-ups, so it is returned as a failure.
         return Err(AppError::Export(format!(
             "The result contains characters that cannot be represented in {encoding}. \
              Export as UTF-8 instead, or remove those characters."
@@ -1674,45 +1666,46 @@ async fn write_export_file(
     Ok(())
 }
 
-/// frontend_ready の戻り値。開く対象と、起動時指定の解決に失敗したエラーメッセージ。
-/// GUI 起動では stderr が見えないため、失敗はフロントへ返してトーストで知らせる。
+/// Return value of frontend_ready. The targets to open, and the error messages for failures to resolve the startup specification.
+/// Stderr is not visible when launched as a GUI, so failures are returned to the frontend and shown in a toast.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LaunchResult {
-    /// 開く対象 (起動時指定 + 起動中にキューされた分)。
+    /// Targets to open (the startup specification + those queued while starting).
     targets: Vec<router::OpenTarget>,
-    /// 起動時指定 (launch route) の解決に失敗した理由 (無ければ空)。
+    /// The reason the startup specification (launch route) failed to resolve (empty if none).
     errors: Vec<String>,
 }
 
-/// フロントの listener 登録が済んだことを知らせ、それまでに溜まった「開く対象」を
-/// まとめて受け取る。フロントは onMount で listener を登録した直後にこれを呼び、
-/// 返った各対象について接続を選択してファイルを開き、errors はトーストで知らせる。
-/// targets の内訳は次の 2 つ:
-/// (1) 起動時に deep link / CLI で指定された launch route (解決してから返す)、
-/// (2) 起動中 (ready 前) に届いてキューされた実行中ルートの解決済み対象。
-/// 呼び出し後は ready = true になり、以降の実行中ルートは `open-query-file` イベントで
-/// 直接届く (listener が既にあるため取りこぼさない)。
+/// Notifies that the frontend's listener registration is done, and receives together the
+/// "targets to open" accumulated until then. The frontend calls this right after
+/// registering the listener in onMount, selects the connection and opens the file for each
+/// returned target, and shows errors in a toast.
+/// The breakdown of targets is the following two:
+/// (1) the launch route specified by deep link / CLI at startup (resolved and then returned),
+/// (2) the resolved targets of running routes that arrived and were queued during startup (before ready).
+/// After the call, ready = true, and subsequent running routes arrive directly via the
+/// `open-query-file` event (the listener already exists, so nothing is missed).
 #[tauri::command]
 async fn frontend_ready(
     state: tauri::State<'_, AppState>,
 ) -> Result<LaunchResult, AppError> {
     let mut targets = Vec::new();
     let mut errors = Vec::new();
-    // (1) 起動時指定 (launch route)。このプロセスの cwd 基準で解決する (None)。
-    //     std Mutex は await をまたいで保持しない (take だけして即解放)。
+    // (1) The startup specification (launch route). Resolved against this process's cwd (None).
+    //     The std Mutex is not held across an await (just take and release immediately).
     let launch = state.launch_route.lock().unwrap().take();
     if let Some(route) = launch {
         match state.resolve_route_target(&route, None).await {
             Ok(target) => targets.push(target),
-            // 起動時指定が失敗したら、GUI 起動では stderr が見えないためフロントへ
-            // 返してトーストで知らせる (握り潰さない)。他の対象・起動は止めない。
+            // If the startup specification fails, stderr is not visible when launched as a GUI, so
+            // return it to the frontend and show it in a toast (do not swallow it). Other targets and startup are not stopped.
             Err(e) => errors.push(e.to_string()),
         }
     }
-    // (2) ready にして、それまでにキューされた対象を drain する。
-    //     ready 設定と drain を 1 つのロックで行い、dispatch_route の
-    //     「ready 判定 → push/emit」と直列化する (取りこぼし・二重配送を防ぐ)。
+    // (2) Set ready and drain the targets queued until then.
+    //     Doing the ready setting and drain under one lock serializes with dispatch_route's
+    //     "ready check -> push/emit" (preventing misses and double delivery).
     let (mut queued, mut queued_errors) = {
         let mut live = state.live.lock().unwrap();
         live.ready = true;
@@ -1726,10 +1719,10 @@ async fn frontend_ready(
     Ok(LaunchResult { targets, errors })
 }
 
-/// 実行中に受け取ったルート (deep link / CLI サブコマンド) を解決し、フロントへ
-/// イベントで届ける。解決は設定の読み取りを伴い async なので、別タスクで行う。
-/// 成功なら `open-query-file` に OpenTarget を、失敗なら `open-query-file-error` に
-/// エラーメッセージを載せる。
+/// Resolves a route received while running (deep link / CLI subcommand) and delivers it to
+/// the frontend by event. Resolution involves reading the config and is async, so it is done in a separate task.
+/// On success, puts the OpenTarget on `open-query-file`; on failure, puts the
+/// error message on `open-query-file-error`.
 fn dispatch_route(app: &tauri::AppHandle, route: router::Route, cwd: Option<PathBuf>) {
     use tauri::{Emitter, Manager};
     let app = app.clone();
@@ -1737,9 +1730,9 @@ fn dispatch_route(app: &tauri::AppHandle, route: router::Route, cwd: Option<Path
         let state = app.state::<AppState>();
         match state.resolve_route_target(&route, cwd).await {
             Ok(target) => {
-                // フロントの listener が未登録 (起動中) なら取りこぼすため、ready で
-                // なければキューに積む (frontend_ready が drain する)。ready 判定と
-                // push を 1 ロックで行い、frontend_ready の ready 設定 + drain と直列化。
+                // If the frontend listener is not registered yet (during startup), it would be missed, so
+                // if not ready, push to the queue (frontend_ready drains it). The ready check and the
+                // push are done under one lock, serialized with frontend_ready's ready setting + drain.
                 let emit_now = {
                     let mut live = state.live.lock().unwrap();
                     if live.ready {
@@ -1756,8 +1749,8 @@ fn dispatch_route(app: &tauri::AppHandle, route: router::Route, cwd: Option<Path
                 }
             }
             Err(e) => {
-                // 成功対象と同様、listener 未登録 (起動中) なら emit しても取りこぼす。
-                // ready でなければエラーもキューに積み、frontend_ready で drain させる。
+                // Like successful targets, if the listener is not registered (during startup), emitting would miss it.
+                // If not ready, errors are also queued and drained by frontend_ready.
                 let message = e.to_string();
                 let emit_now = {
                     let mut live = state.live.lock().unwrap();
@@ -1778,13 +1771,13 @@ fn dispatch_route(app: &tauri::AppHandle, route: router::Route, cwd: Option<Path
     });
 }
 
-/// 配布物に同梱している依存ライブラリのライセンス一覧 (Third-Party Licenses のモーダル)。
+/// List of licenses of dependency libraries bundled with the distribution (Third-Party Licenses modal).
 #[tauri::command]
 fn third_party_notices() -> &'static str {
     third_party_notices::NOTICES
 }
 
-/// About ダイアログに出すメタ情報 (tauri の Menu::default と同じ内容)。
+/// Meta information shown in the About dialog (same content as tauri's Menu::default).
 fn about_metadata(app: &tauri::AppHandle) -> tauri::menu::AboutMetadata<'_> {
     let package_info = app.package_info();
     let config = app.config();
@@ -1797,21 +1790,20 @@ fn about_metadata(app: &tauri::AppHandle) -> tauri::menu::AboutMetadata<'_> {
     }
 }
 
-/// アプリのメニューバーを組み立てる。
+/// Builds the app's menu bar.
 ///
-/// macOS のアプリメニュー (Queryfolio) は NSApplication がメインメニュー設置時の
-/// 内容で確定させるため、後から項目を insert しても反映されない。そのため
-/// tauri のデフォルトメニューを流用せず、アプリメニューを含めて丸ごと自前で組み、
-/// Builder::menu で最初の設置時から渡す。設定変更時はこの関数で組み直す。
+/// The macOS app menu (Queryfolio) is fixed by NSApplication with the content at the time
+/// the main menu is installed, so inserting items later has no effect. Therefore, tauri's
+/// default menu is not reused; the whole menu including the app menu is built ourselves and
+/// passed to Builder::menu from the first installation. On config change, it is rebuilt by this function.
 ///
-/// 「View override config yaml (Copy only)」は config_override_command が
-/// 設定されている時だけ出す。
+/// "View override config yaml (Copy only)" is shown only when config_override_command is set.
 ///
-/// 構成は tauri の `Menu::default` を踏襲する (アプリメニュー / View は macOS のみ、
-/// File の quit は macOS 以外のみ)。ただし Close Window は置かず、File に
-/// Close Tab (CmdOrCtrl+W) を置く (CYBERNEURA-DEV-773)。設定関連の項目は
-/// プラットフォームに関わらず Config サブメニューにまとめる
-/// (アプリメニューと Config に散らばっていると探しにくいため)。
+/// The structure follows tauri's `Menu::default` (the app menu / View are macOS only, and
+/// File's quit is non-macOS only). However, Close Window is not placed; Close Tab
+/// (CmdOrCtrl+W) is placed in File instead (CYBERNEURA-DEV-773). Config-related items are
+/// grouped in the Config submenu regardless of platform
+/// (they are hard to find when scattered between the app menu and Config).
 fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 
@@ -1823,7 +1815,7 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
     )
     .build(app)?;
     let show_source_item = config::has_config_override_command();
-    // About の直下に置く (macOS はアプリメニュー、他は Help メニュー)
+    // Place it right under About (the app menu on macOS, the Help menu elsewhere)
     let licenses_item =
         MenuItemBuilder::with_id("show_licenses", "Third-Party Licenses").build(app)?;
 
@@ -1849,12 +1841,12 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
             .build()?
     };
 
-    // CmdOrCtrl+W はウインドウではなくアクティブなエディタタブを閉じる。
-    // 定義済みの Close Window は macOS で Cmd+W を持ち、ウインドウが 1 枚のこのアプリでは
-    // 押すとアプリごと閉じてしまう。そのため File / Window のどちらにも置かない
-    // (メニューのキー割り当ては WebView より先に NSApp が処理するので、フロントの
-    // keydown で preventDefault しても止められない)。閉じる対象の判断は
-    // エディタタブと開いているモーダルを知っているフロントに任せる
+    // CmdOrCtrl+W closes the active editor tab, not the window.
+    // The predefined Close Window has Cmd+W on macOS, and in this app with a single window,
+    // pressing it would close the whole app. So it is placed in neither File nor Window
+    // (menu key bindings are processed by NSApp before the WebView, so they cannot be stopped
+    // by preventDefault in the frontend's keydown). The decision of what to close is left to
+    // the frontend, which knows the editor tabs and open modals
     let close_tab_item = MenuItemBuilder::with_id("close_editor_tab", "Close Tab")
         .accelerator("CmdOrCtrl+W")
         .build(app)?;
@@ -1875,15 +1867,15 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
         .build()?;
     #[cfg(target_os = "macos")]
     let view_menu = SubmenuBuilder::new(app, "View").fullscreen().build()?;
-    // Window / Help は tauri と同じ固定 ID で作る。macOS の init_app_menu は
-    // この ID でメニューを探して NSApp の windowsMenu / helpMenu に登録するため、
-    // ID が無いとウインドウ一覧やヘルプ検索が付かなくなる
+    // Window / Help are created with the same fixed IDs as tauri. macOS's init_app_menu looks
+    // up menus by these IDs and registers them to NSApp's windowsMenu / helpMenu, so without
+    // the IDs the window list and help search would not be attached
     let window_menu = SubmenuBuilder::with_id(app, tauri::menu::WINDOW_SUBMENU_ID, "Window")
         .minimize()
         .maximize()
         .build()?;
-    // tauri のデフォルトメニュー同様、macOS では中身を持たない
-    // (About はアプリメニュー側にあり、システムがヘルプ検索を足す)
+    // Like tauri's default menu, it has no contents on macOS
+    // (About is in the app menu, and the system adds help search)
     let help_menu = {
         let builder = SubmenuBuilder::with_id(app, tauri::menu::HELP_SUBMENU_ID, "Help");
         #[cfg(not(target_os = "macos"))]
@@ -1893,11 +1885,11 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
         builder.build()?
     };
 
-    // アクセラレータは付けない。以前は CmdOrCtrl+R を割り当てていたが、
-    // ブラウザのリロードと同じキーなのに実際に起きるのは reload_config_file =
-    // 全エディタタブの破棄・接続の張り直し・チャットの中断で、ページの再読込の
-    // つもりで押すとアプリ全体が初期状態へ戻る (CYBERNEURA-DEV-648)。
-    // 破壊的なうえ取り消せないので、Config メニューからの明示的な選択だけにする
+    // No accelerator is attached. It used to be assigned CmdOrCtrl+R, but although it is the
+    // same key as the browser's reload, what actually happens is reload_config_file = discarding
+    // all editor tabs, re-establishing connections and aborting chats, so pressing it intending
+    // a page reload would return the whole app to its initial state (CYBERNEURA-DEV-648).
+    // It is destructive and cannot be undone, so only an explicit selection from the Config menu is allowed
     let reload_item =
         MenuItemBuilder::with_id("reload_config_file", "Reload config file").build(app)?;
     let reveal_item =
@@ -1931,8 +1923,8 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
         .build()
 }
 
-/// 設定を読み直した後にメニューを組み直す。
-/// config_override_command の有無が変わるとコピー用ビューの項目の要否も変わるため。
+/// Rebuilds the menu after the config is re-read.
+/// This is because the need for the copy view item changes when the presence of config_override_command changes.
 fn rebuild_menu(app: &tauri::AppHandle) {
     match build_menu(app).and_then(|menu| app.set_menu(menu)) {
         Ok(_) => {}
@@ -1940,7 +1932,7 @@ fn rebuild_menu(app: &tauri::AppHandle) {
     }
 }
 
-/// config.yml (無ければ設定フォルダ) を Finder 等のファイルマネージャで表示する。
+/// Shows config.yml (or the config folder if absent) in a file manager such as Finder.
 fn reveal_config_folder() -> Result<(), AppError> {
     let target = match config::existing_config_path()? {
         Some(path) => path,
@@ -1950,24 +1942,24 @@ fn reveal_config_folder() -> Result<(), AppError> {
         .map_err(|e| AppError::Config(format!("Failed to reveal {}: {e}", target.display())))
 }
 
-/// CLI の `write` サブコマンドで標準入力から受け取る内容の上限 (バイト)。
-/// クエリファイルとしては十分に大きく、取り違えたパイプで巨大なファイルを
-/// 丸ごとメモリに載せることは防げる大きさ。超過は切り詰めずエラーにする
-/// (途中まで書くとクエリが壊れたまま保存される)。
+/// Upper limit (bytes) of the content received from stdin by the CLI `write` subcommand.
+/// Large enough for a query file, yet a size that prevents loading a huge file into memory
+/// whole through a wrongly connected pipe. Exceeding it is an error rather than being
+/// truncated (writing partway would save a broken query).
 const MAX_STDIN_CONTENT_BYTES: usize = 10 * 1024 * 1024;
 
-/// CLI の `write` サブコマンドの内容を決める。
+/// Decides the content of the CLI `write` subcommand.
 ///
-/// 引数で渡っていればそれを使い、無ければ標準入力から読む。次の場合は
-/// 「内容の指定なし」= `Ok(None)` として扱う (= 既存ファイルを潰さない):
+/// If given as an argument, use it; otherwise read from stdin. In the following cases it is
+/// treated as "no content specified" = `Ok(None)` (= the existing file is not clobbered):
 ///
-/// - 標準入力が端末 (対話シェルで内容を渡していない。読むと入力待ちで固まる)
-/// - 標準入力が空 (GUI 起動 `open -a Queryfolio --args write ...` の stdin は
-///   /dev/null で即 EOF になる。これを「空で書け」と解釈すると、既存のクエリ
-///   ファイルを黙って空にしてしまう)
+/// - stdin is a terminal (content was not passed in an interactive shell; reading would hang waiting for input)
+/// - stdin is empty (for a GUI launch `open -a Queryfolio --args write ...`, stdin is
+///   /dev/null and immediately hits EOF. Interpreting this as "write it empty" would
+///   silently empty an existing query file)
 ///
-/// 読み取りの失敗と上限超過は `Err` にする (内容が分からないまま / 途中までで
-/// 上書きしない。呼び出し側はここで打ち切って非ゼロ終了する)。
+/// A read failure and exceeding the limit are `Err` (do not overwrite with unknown content /
+/// a partial one. The caller aborts here and exits non-zero).
 fn resolve_write_content(arg_content: Option<String>) -> Result<Option<String>, AppError> {
     use std::io::{IsTerminal, Read};
 
@@ -1978,8 +1970,8 @@ fn resolve_write_content(arg_content: Option<String>) -> Result<Option<String>, 
     if stdin.is_terminal() {
         return Ok(None);
     }
-    // 上限 + 1 バイトまで読み、超えたら「上限超過」と判定する
-    // (ちょうど上限で切ると、切り詰めたのか元から上限ぴったりなのか分からない)。
+    // Read up to the limit + 1 byte, and judge "limit exceeded" if it goes over
+    // (cutting exactly at the limit would not tell whether it was truncated or was exactly the limit to begin with).
     let mut buf = String::new();
     stdin
         .take(MAX_STDIN_CONTENT_BYTES as u64 + 1)
@@ -1995,23 +1987,23 @@ fn resolve_write_content(arg_content: Option<String>) -> Result<Option<String>, 
     Ok(if buf.is_empty() { None } else { Some(buf) })
 }
 
-/// CLI の `write <connection> <file-name> [content]` を処理し、クエリファイルを
-/// 書き出す (内容の指定が無ければ空ファイルを作るだけ。既存は変更しない)。
+/// Handles the CLI `write <connection> <file-name> [content]` and writes the query file
+/// (if no content is specified, it only creates an empty file. An existing one is not changed).
 ///
-/// **Tauri を起動する前に、起動したプロセス自身が行う**。実行中インスタンスが
-/// いる場合、single-instance プラグインが転送するのは argv と cwd だけで
-/// 標準入力は渡らないため、書き出しを実行中インスタンス側に任せると
-/// パイプで渡した内容が失われる。書き出しを起動側で完結させ、実行中インスタンス
-/// (または自分自身) には「開く」だけを任せる。
+/// **The launching process itself does this, before starting Tauri.** When a running
+/// instance exists, the single-instance plugin forwards only argv and cwd, and stdin is not
+/// passed, so leaving the write to the running instance would lose the content passed via a
+/// pipe. The write is completed on the launching side, and the running instance
+/// (or itself) is left only with "open".
 ///
-/// 失敗した場合は `Err` を返す。呼び出し側 (run) は起動を続けず**非ゼロで終了する**:
-/// 続行して「開く」だけ行うと、書き込みに失敗しているのに古い内容がそのまま開き、
-/// 依頼したエージェントには成功したように見えてしまう (終了ステータスからも
-/// 失敗を判別できない)。
+/// On failure, returns `Err`. The caller (run) does not continue startup and **exits non-zero**:
+/// if it continued and just did "open", the old content would be opened as is even though
+/// the write failed, and it would look like a success to the agent that requested it
+/// (the failure could not be told from the exit status either).
 ///
-/// 解決したマージ済み設定を返す (書き出しを行わなかった場合は `None`)。
-/// 呼び出し側はこれを `AppState` のキャッシュに載せ、`config_override_command` を
-/// 1 回の起動で 2 度実行しないようにする (`AppState::with_config` 参照)。
+/// Returns the resolved merged config (`None` if no write was performed).
+/// The caller puts this into the `AppState` cache so that `config_override_command` is not
+/// run twice in one launch (see `AppState::with_config`).
 fn apply_cli_write_route(
     route: &router::Route,
 ) -> Result<Option<Arc<AppConfig>>, AppError> {
@@ -2039,7 +2031,7 @@ fn apply_cli_write_route(
         let folder = server.sqlfiles_folder_name();
         let ext = engines::capabilities_for_name(&server.engine).file_extension;
         match &content {
-            // 内容が指定された時だけ上書きする。
+            // Overwrite only when content is specified.
             Some(text) => {
                 let name = query_files::normalize_file_name(file_name, ext)?;
                 query_files::write_query_file(
@@ -2050,7 +2042,7 @@ fn apply_cli_write_route(
                     ext,
                 )?;
             }
-            // 指定が無ければ「無ければ作る」だけ (既存の内容は残す)。
+            // If not specified, only "create if absent" (leave existing content).
             None => {
                 query_files::ensure_query_file(
                     &sqlfiles_dir,
@@ -2060,22 +2052,22 @@ fn apply_cli_write_route(
                 )?;
             }
         }
-        // フォルダを新規作成した時に接続の説明メタファイルを置く
-        // (アプリ内の作成・保存と同じ扱い。ベストエフォート)。
+        // When a folder is newly created, place the connection's description meta file
+        // (same handling as create / save within the app. Best effort).
         let dir = query_files::connection_dir(&sqlfiles_dir, &folder)?;
         let _ = folder_meta::write_folder_meta(&dir, server);
         Ok::<Option<Arc<AppConfig>>, AppError>(Some(config))
     })
 }
 
-/// GUI を起動しない CLI オプションを処理し、プロセスの終了コードを返す。
+/// Handles CLI options that do not launch the GUI and returns the process exit code.
 ///
-/// 表示の組み立ては [`crate::cli`] の純粋な関数に任せ、ここは設定の読み込みと
-/// 出力だけを行う。`--list-servers` は設定を読むので失敗しうる。その場合は
-/// 標準エラーへ書いて 1 で終わる (呼び出したスクリプトが失敗を判別できるように)。
+/// Building the display is left to the pure functions of [`crate::cli`]; this only does
+/// reading the config and output. `--list-servers` reads the config, so it can fail. In that
+/// case it writes to stderr and ends with 1 (so the calling script can tell the failure).
 fn run_info_command(command: cli::InfoCommand) -> i32 {
-    // Windows の release ビルドはコンソールを持たないため、書く前に繋ぎ直す
-    // (詳細は cli::attach_parent_console)。他の OS では何もしない
+    // Windows release builds have no console, so reattach before writing
+    // (see cli::attach_parent_console for details). Does nothing on other OSes
     cli::attach_parent_console();
 
     match command {
@@ -2096,8 +2088,8 @@ fn run_info_command(command: cli::InfoCommand) -> i32 {
                 let config = AppConfig::load_merged().await?;
                 let servers = config.resolve_servers()?;
                 let sqlfiles_dir = config.resolve_sqlfiles_dir()?;
-                // エンドポイント上書きの環境変数はここで解決する
-                // (cli.rs の表の組み立てはプロセスの環境に依存しない純粋な関数に保つ)
+                // Environment variables that override endpoints are resolved here
+                // (keep the table building in cli.rs a pure function that does not depend on the process environment)
                 let aws_endpoint = cli::aws_endpoint_override_from_env();
                 Ok::<String, AppError>(cli::format_server_list(
                     &servers,
@@ -2123,18 +2115,18 @@ fn run_info_command(command: cli::InfoCommand) -> i32 {
 pub fn run() {
     use tauri::Emitter;
 
-    // CLI の `write` は、Tauri (single-instance プラグイン) を起動する前に
-    // このプロセスで書き出す (apply_cli_write_route のドキュメント参照)。
-    // 起動時引数だけを見る: 実行中インスタンスが転送されてくる argv を
-    // 処理する経路 (single-instance のコールバック) では、その argv は
-    // 別プロセスのものなので書き出しは既に済んでいる。
+    // The CLI `write` is written out by this process before starting Tauri
+    // (the single-instance plugin) (see the documentation of apply_cli_write_route).
+    // Only the startup arguments are looked at: on the path where a running instance
+    // processes the argv forwarded to it (the single-instance callback), that argv belongs to
+    // another process, so the write has already been done.
     //
-    // ここで解決したマージ済み設定は AppState のキャッシュに引き継ぐ
-    // (config_override_command を 1 起動で 2 度実行しない)。
+    // The merged config resolved here is carried over to the AppState cache
+    // (do not run config_override_command twice per launch).
     let preflight_config = {
         let argv: Vec<String> = std::env::args().skip(1).collect();
-        // --help / --version / --license / --list-servers は表示だけして終わる
-        // (GUI もウインドウも起動しない)。write の書き出しより前に見る。
+        // --help / --version / --license / --list-servers only display and exit
+        // (neither the GUI nor a window is launched). Look at them before the write.
         if let Some(command) = cli::info_command_from_args(&argv) {
             std::process::exit(run_info_command(command));
         }
@@ -2142,8 +2134,8 @@ pub fn run() {
             Some(route) => match apply_cli_write_route(&route) {
                 Ok(config) => config,
                 Err(e) => {
-                    // 書けていないものを開きに行かない。CLI から呼んだ側が
-                    // 終了ステータスで失敗を判別できるようにする。
+                    // Do not go to open something that could not be written. Make it possible for the
+                    // caller of the CLI to tell the failure from the exit status.
                     eprintln!("[cli] failed to write the query file: {e}");
                     std::process::exit(1);
                 }
@@ -2153,37 +2145,37 @@ pub fn run() {
     };
 
     tauri::Builder::default()
-        // single-instance は最初に登録する (プラグインは登録順に走る)。
-        // deep-link feature 有効: 2 個目の起動の argv に含まれる queryfolio:// URL は
-        // 実行中インスタンスの deep-link プラグインへ転送され on_open_url が発火する。
-        // ここでは追加で (1) ウインドウを前面化し (2) CLI サブコマンド
-        // (queryfolio open <path>) を処理する (URL 引数は上記で処理済みなので無視)。
+        // single-instance is registered first (plugins run in registration order).
+        // With the deep-link feature enabled: a queryfolio:// URL in the argv of a second launch
+        // is forwarded to the running instance's deep-link plugin and on_open_url fires.
+        // Here, additionally (1) bring the window to the front and (2) process the CLI subcommand
+        // (queryfolio open <path>) (URL arguments were already processed above, so they are ignored).
         .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             use tauri::Manager;
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_focus();
             }
-            // cwd は 2 個目の起動元ディレクトリ。CLI の相対パスをこの基準で解決する。
+            // cwd is the directory the second launch came from. Relative CLI paths are resolved against it.
             if let Some(route) = router::route_from_cli_args(&argv) {
                 dispatch_route(app, route, Some(PathBuf::from(cwd)));
             }
         }))
-        // queryfolio:// スキームの deep link。macOS はネイティブに URL を受け取り、
-        // Linux/Windows は上の single-instance (deep-link feature) 経由で受け取る。
+        // Deep link for the queryfolio:// scheme. macOS receives the URL natively;
+        // Linux/Windows receive it via the single-instance above (deep-link feature).
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        // 結果テーブルの Export でネイティブ保存ダイアログを開くのに使う
+        // Used to open the native save dialog in the result table's Export
         .plugin(tauri_plugin_dialog::init())
-        // 終了時のウインドウサイズ・位置を保存し、起動時に復元する
+        // Save the window size and position on exit and restore them at startup
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        // setup で set_menu すると、それより前に設置される tauri のデフォルト
-        // メニューで macOS のアプリメニューが確定してしまうため、ここで渡す
+        // If set_menu is done in setup, the macOS app menu gets fixed by tauri's default menu
+        // installed before that, so it is passed here
         .menu(build_menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "reload_config_file" => {
-                // 再読込はフロントの状態 (選択・未保存編集) と連動するため、
-                // イベントで通知してフロント側の reloadConnections に任せる
+                // Reload is tied to the frontend's state (selection / unsaved edits), so
+                // notify by event and leave it to the frontend's reloadConnections
                 if let Err(e) = app.emit("menu-reload-config", ()) {
                     eprintln!("[menu] failed to emit reload event: {e}");
                 }
@@ -2219,24 +2211,24 @@ pub fn run() {
         .setup(|app| {
             use tauri::Manager;
             use tauri_plugin_deep_link::DeepLinkExt;
-            // dev / Linux 実行向けにスキームを実行時登録する (macOS は bundle 時に
-            // Info.plist へ登録される)。ベストエフォート: 失敗しても起動は続ける。
+            // Register the scheme at runtime for dev / Linux runs (on macOS it is registered in
+            // Info.plist at bundle time). Best effort: startup continues even if it fails.
             if let Err(e) = app.deep_link().register_all() {
                 eprintln!("[router] failed to register deep link schemes: {e}");
             }
-            // 実行中に URL を開かれた時のハンドラ (macOS ネイティブ / Linux 転送)。
+            // Handler for when a URL is opened while running (macOS native / Linux forwarding).
             let handle = app.handle().clone();
             app.deep_link().on_open_url(move |event| {
                 for url in event.urls() {
                     match router::parse_uri(url.as_str()) {
-                        // deep link の URL は絶対パス想定なので cwd は不要 (None)
+                        // A deep link URL is assumed to be an absolute path, so cwd is not needed (None)
                         Ok(route) => dispatch_route(&handle, route, None),
                         Err(e) => eprintln!("[router] ignoring URL {url}: {e}"),
                     }
                 }
             });
-            // 起動時に指定されたルートを控える (フロントが frontend_ready で取り出す)。
-            // 優先度: deep link 起動 (macOS: get_current が URL を返す) → CLI サブコマンド。
+            // Note the route specified at startup (the frontend takes it out in frontend_ready).
+            // Priority: deep link launch (macOS: get_current returns the URL) -> CLI subcommand.
             let mut launch: Option<router::Route> = None;
             if let Ok(Some(urls)) = app.deep_link().get_current() {
                 for url in urls {
@@ -2322,7 +2314,7 @@ mod export_encoding_tests {
 
     #[test]
     fn encodes_cp932_and_euc_jp() {
-        // 「あ」は CP932 で 0x82 0xA0、EUC-JP で 0xA4 0xA2
+        // "あ" (hiragana "a") is 0x82 0xA0 in CP932 and 0xA4 0xA2 in EUC-JP
         assert_eq!(
             encode_export_contents("あa", "cp932").unwrap(),
             vec![0x82, 0xA0, 0x61]
@@ -2340,7 +2332,7 @@ mod export_encoding_tests {
 
     #[test]
     fn rejects_unmappable_characters() {
-        // 変換できない文字は数値文字参照に化けるため、黙って書かずエラーにする
+        // Characters that cannot be converted turn into numeric character references, so return an error instead of silently writing
         assert!(encode_export_contents("a🍣b", "cp932").is_err());
         assert!(encode_export_contents("🍣", "euc-jp").is_err());
     }

@@ -1,13 +1,13 @@
-//! エンジンごとの差分を差し替え可能にするプラガブル層。
+//! A pluggable layer that makes per-engine differences swappable.
 //!
-//! - `EngineCapabilities`: エンジンの能力宣言 (エディタ言語・クエリファイル
-//!   拡張子・スキーマ/テーブル閲覧・Explain 等の対応可否)。Rust 側を単一の
-//!   真実とし、`ConnectionInfo` に載せてフロントへ渡す。フロントはエンジン名
-//!   ではなく capability で UI を出し分ける。
-//! - `engines::redis` などエンジン別モジュール: sqlx を使わないエンジンの
-//!   接続・実行・ガードの実装。`db.rs` の enum match は各モジュールへの
-//!   1 行委譲に留め、エンジン追加時は「モジュールを足す + capability を
-//!   宣言する + enum に variant を足す」だけで済むようにする。
+//! - `EngineCapabilities`: declares what each engine supports (editor language, query file
+//!   extension, schema/table browsing, Explain, etc.). The Rust side is the single source of
+//!   truth; it is attached to `ConnectionInfo` and passed to the frontend. The frontend shows
+//!   or hides UI by capability, not by engine name.
+//! - Per-engine modules such as `engines::redis`: connection, execution and guard
+//!   implementations for engines that do not use sqlx. The enum match in `db.rs` is kept to a
+//!   one-line delegation to each module, so adding an engine only takes "add a module +
+//!   declare its capabilities + add a variant to the enum".
 
 pub mod duckdb;
 pub mod dynamodb;
@@ -19,29 +19,29 @@ use serde::Serialize;
 
 use crate::db::Engine;
 
-/// エンジンの能力宣言。フロントエンドの UI 出し分けの単一の真実。
-/// 新しいエンジンを追加する時はここに能力を宣言する。
+/// Declares what an engine supports. The single source of truth for how the frontend shows or
+/// hides UI. When adding a new engine, declare its capabilities here.
 #[derive(Debug, Clone, Serialize)]
 pub struct EngineCapabilities {
-    /// エディタのシンタックスハイライト言語 ("sql" | "redis")
+    /// Syntax highlighting language of the editor ("sql" | "redis")
     pub editor_language: &'static str,
-    /// クエリファイルの拡張子 (ドット無し)
+    /// Query file extension (without the dot)
     pub file_extension: &'static str,
-    /// スキーマ (database) の一覧・切替に対応するか
+    /// Whether listing and switching schemas (databases) is supported
     pub supports_schemas: bool,
-    /// スキーマブラウザ (TABLES ペイン) に対応するか
+    /// Whether the schema browser (TABLES pane) is supported
     pub supports_tables: bool,
-    /// EXPLAIN (実行計画) に対応するか
+    /// Whether EXPLAIN (execution plan) is supported
     pub supports_explain: bool,
-    /// エディタの Format (整形) に対応するか
+    /// Whether the editor's Format (pretty-print) is supported
     pub supports_format: bool,
-    /// 結果グリッドのセル編集 (UPDATE 生成) に対応するか
+    /// Whether cell editing in the result grid (UPDATE generation) is supported
     pub supports_editable_cells: bool,
-    /// AI 機能 (SQL 生成 / 解説) に対応するか
+    /// Whether AI features (SQL generation / explanation) are supported
     pub supports_ai: bool,
 }
 
-/// SQL 系エンジン (mysql / postgres / sqlite) の共通 capability。
+/// Common capabilities of the SQL engines (mysql / postgres / sqlite).
 const SQL_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     editor_language: "sql",
     file_extension: "sql",
@@ -56,8 +56,8 @@ const SQL_CAPABILITIES: EngineCapabilities = EngineCapabilities {
 const REDIS_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     editor_language: "redis",
     file_extension: "redis",
-    // Redis の「スキーマ」は database 番号 (CYBERNEURA-DEV-408)。
-    // SELECT で切り替える概念が接続にあるので、一覧と切替を提供する
+    // A Redis "schema" is the database number (CYBERNEURA-DEV-408).
+    // A connection has the concept of switching with SELECT, so listing and switching are provided
     supports_schemas: true,
     supports_tables: false,
     supports_explain: false,
@@ -66,8 +66,8 @@ const REDIS_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_ai: false,
 };
 
-/// Elasticsearch は Kibana Console 風のリクエストブロックをエディタで扱い、
-/// TABLES ペインにはインデックス一覧 + mapping のフィールドを出す。
+/// Elasticsearch works with Kibana Console-style request blocks in the editor, and the
+/// TABLES pane shows the index list plus the mapping fields.
 const ELASTICSEARCH_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     editor_language: "es",
     file_extension: "es",
@@ -79,17 +79,17 @@ const ELASTICSEARCH_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_ai: false,
 };
 
-/// DuckDB は SQL エンジンだが、セル編集の適用経路 (run_statements) が
-/// sqlx 前提のため supports_editable_cells のみ false にする。
+/// DuckDB is a SQL engine, but the path that applies cell edits (run_statements) assumes
+/// sqlx, so only supports_editable_cells is set to false.
 const DUCKDB_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_editable_cells: false,
     ..SQL_CAPABILITIES
 };
 
-/// DynamoDB は PartiQL (SQL 互換サブセット) をエディタで扱う。
-/// schema はリージョン (一覧・切替の対象外)、EXPLAIN は存在しない。
-/// セル編集 (run_statements) と AI (SQL 方言前提) も対象外。
-/// TABLES ペインにはテーブル一覧 + キースキーマ・属性定義を出す。
+/// DynamoDB works with PartiQL (a SQL-compatible subset) in the editor.
+/// The schema is the region (not subject to listing or switching), and EXPLAIN does not exist.
+/// Cell editing (run_statements) and AI (which assumes a SQL dialect) are also unsupported.
+/// The TABLES pane shows the table list plus key schema and attribute definitions.
 const DYNAMODB_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_schemas: false,
     supports_explain: false,
@@ -98,11 +98,12 @@ const DYNAMODB_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     ..SQL_CAPABILITIES
 };
 
-/// SQL Server は SQL エンジンだが、セル編集の適用経路 (run_statements) が
-/// sqlx 前提のため supports_editable_cells のみ false にする (DuckDB と同じ)。
-/// EXPLAIN は queryfolio の疑似文 (SET SHOWPLAN_ALL) として engines/mssql.rs が実装する。
-/// Format はフロントの sqlFormat.ts が mssql 方言 (角括弧識別子・`#temp`) を
-/// 知っているので使える (SqlEditor が engine から方言を渡す)。
+/// SQL Server is a SQL engine, but the path that applies cell edits (run_statements) assumes
+/// sqlx, so only supports_editable_cells is set to false (same as DuckDB).
+/// EXPLAIN is implemented by engines/mssql.rs as a queryfolio pseudo-statement
+/// (SET SHOWPLAN_ALL).
+/// Format is usable because the frontend's sqlFormat.ts knows the mssql dialect
+/// (bracket identifiers, `#temp`); SqlEditor passes the dialect based on the engine.
 const MSSQL_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_editable_cells: false,
     ..SQL_CAPABILITIES
@@ -119,9 +120,9 @@ pub fn capabilities(engine: Engine) -> EngineCapabilities {
     }
 }
 
-/// 設定の engine 文字列から capability を解決する。
-/// 未知のエンジンは SQL 相当を返す (設定エラー自体は接続時に
-/// `db::parse_engine` が返すため、ここでは一覧表示を壊さない)。
+/// Resolves capabilities from the engine string in the config.
+/// An unknown engine gets SQL-equivalent capabilities (the config error itself is returned by
+/// `db::parse_engine` at connect time, so this does not break the list display).
 pub fn capabilities_for_name(engine: &str) -> EngineCapabilities {
     match crate::db::parse_engine(engine) {
         Ok(engine) => capabilities(engine),
@@ -143,10 +144,10 @@ mod tests {
         let redis = capabilities_for_name("redis");
         assert_eq!(redis.editor_language, "redis");
         assert_eq!(redis.file_extension, "redis");
-        // Redis の「スキーマ」は database 番号。Database 欄で切り替えられる
+        // A Redis "schema" is the database number. It can be switched in the Database field
         // (CYBERNEURA-DEV-408)
         assert!(redis.supports_schemas);
-        // エイリアスも同じ capability
+        // Aliases get the same capabilities
         assert!(capabilities_for_name("valkey").supports_schemas);
         assert!(!redis.supports_tables);
         assert!(!redis.supports_explain);
@@ -163,11 +164,11 @@ mod tests {
         assert!(!es.supports_format);
         assert!(!es.supports_editable_cells);
         assert!(!es.supports_ai);
-        // エイリアスも同じ capability
+        // Aliases get the same capabilities
         assert_eq!(capabilities_for_name("es").editor_language, "es");
         assert_eq!(capabilities_for_name("opensearch").editor_language, "es");
 
-        // DuckDB は SQL 系だがセル編集のみ非対応
+        // DuckDB is SQL-based but only cell editing is unsupported
         let duckdb = capabilities_for_name("duckdb");
         assert_eq!(duckdb.editor_language, "sql");
         assert_eq!(duckdb.file_extension, "sql");
@@ -178,7 +179,7 @@ mod tests {
         assert!(!duckdb.supports_editable_cells);
         assert!(duckdb.supports_ai);
 
-        // DynamoDB は SQL エディタだが schema / EXPLAIN / セル編集 / AI 非対応
+        // DynamoDB uses the SQL editor but does not support schema / EXPLAIN / cell editing / AI
         let dynamodb = capabilities_for_name("dynamodb");
         assert_eq!(dynamodb.editor_language, "sql");
         assert_eq!(dynamodb.file_extension, "sql");
@@ -189,7 +190,7 @@ mod tests {
         assert!(!dynamodb.supports_editable_cells);
         assert!(!dynamodb.supports_ai);
 
-        // SQL Server は SQL 系だがセル編集のみ非対応。エイリアスも同じ capability
+        // SQL Server is SQL-based but only cell editing is unsupported. Aliases get the same capabilities
         let mssql = capabilities_for_name("mssql");
         assert_eq!(mssql.editor_language, "sql");
         assert_eq!(mssql.file_extension, "sql");
@@ -201,7 +202,7 @@ mod tests {
         assert!(mssql.supports_ai);
         assert!(!capabilities_for_name("sqlserver").supports_editable_cells);
 
-        // 未知のエンジンは SQL 相当 (エラーは接続時に出す)
+        // An unknown engine gets SQL-equivalent capabilities (the error is raised at connect time)
         let unknown = capabilities_for_name("oracle");
         assert_eq!(unknown.editor_language, "sql");
     }

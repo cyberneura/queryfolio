@@ -17,15 +17,15 @@
     `${tab.connection} / ${tab.file}${tab.dirty ? " (unsaved)" : ""}`;
 </script>
 
-<!-- 多段タブ: 開いているエディタが増えたら折り返して複数段で表示する -->
+<!-- Multi-row tabs: when more editors are open, tabs wrap and are shown in multiple rows -->
 <div
   class="flex shrink-0 flex-wrap items-end gap-1 border-b border-zinc-700 bg-zinc-950 px-2 pt-1"
   data-annotate="editor-tabs"
 >
   {#each appStore.editorTabs as tab (tab.id)}
     {@const active = tab.id === appStore.activeEditorTabId}
-    <!-- アクティブタブは下辺のボーダーをコンテンツ側に食い込ませて
-         「タブが本文とつながっている」見た目にする (-mb-px) -->
+    <!-- Let the active tab's bottom border sink into the content side so
+         the tab looks connected to the body (-mb-px) -->
     <div
       class="group flex shrink-0 items-center gap-1 rounded-t-md border border-b-0 px-2.5 py-1 text-xs {active
         ? '-mb-px border-zinc-600 bg-zinc-800 text-zinc-100 shadow-[inset_0_-2px_0_0_#3b82f6]'

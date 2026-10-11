@@ -5,21 +5,21 @@
 
   interface Props {
     engine: string | null;
-    /// エンジンの能力宣言 (UI の出し分けに使う)。null は SQL 相当
+    /// Engine capability declaration (used to decide which UI to show). null means SQL-equivalent
     capabilities: EngineCapabilities | null;
     readonly: boolean;
-    /// Explain ボタン押下時の処理 (+page.svelte がエディタの
-    /// カーソル位置の文を取り出して appStore.explainQuery に渡す)
+    /// Handler for pressing the Explain button (+page.svelte extracts the statement at the
+    /// editor cursor position and passes it to appStore.explainQuery)
     onExplain: () => void;
-    /// Explain SQL ボタン押下時の処理 (+page.svelte がエディタの
-    /// カーソル位置の文を取り出して appStore.explainSql に渡す)
+    /// Handler for pressing the Explain SQL button (+page.svelte extracts the statement at the
+    /// editor cursor position and passes it to appStore.explainSql)
     onExplainSql: () => void;
-    /// Format ボタン押下時の処理 (+page.svelte が
-    /// SqlEditor.formatCurrentStatement を呼ぶ)
+    /// Handler for pressing the Format button (+page.svelte calls
+    /// SqlEditor.formatCurrentStatement)
     onFormat: () => void;
-    /// 複数行選択中か。true のとき Replace Multiline ボタンを表示する
+    /// Whether multiple lines are selected. When true, the Replace Multiline button is shown
     showReplaceMultiline: boolean;
-    /// Replace Multiline ボタン押下時の処理 (+page.svelte がペインを開く)
+    /// Handler for pressing the Replace Multiline button (+page.svelte opens the pane)
     onReplaceMultiline: () => void;
   }
 
@@ -38,20 +38,20 @@
     ["sqlite", "sqlite3"].includes((engine ?? "").toLowerCase()),
   );
 
-  /// capability の出し分け (未取得 = null は SQL 相当として全部出す)
+  /// Decide which capabilities to show (not yet fetched = null is treated as SQL-equivalent and shows everything)
   const supportsSchemas = $derived(capabilities?.supports_schemas ?? true);
   const supportsExplain = $derived(capabilities?.supports_explain ?? true);
   const supportsFormat = $derived(capabilities?.supports_format ?? true);
   const supportsAi = $derived(capabilities?.supports_ai ?? true);
 
-  /// AI 生成のインライン入力欄の表示状態と入力内容
+  /// Visibility state and input content of the inline input field for AI generation
   let showAiInput = $state(false);
   let aiInstruction = $state("");
   let aiInputEl: HTMLInputElement | undefined = $state();
 
   const aiConfigured = $derived(appStore.aiInfo?.configured ?? false);
 
-  /// AI ボタンの title (未設定・エラー時は設定方法を案内する)
+  /// Title of the AI button (explains how to configure when unset or on error)
   const aiButtonTitle = $derived(
     aiConfigured
       ? `Generate SQL with AI (${appStore.aiInfo?.model})`
@@ -61,7 +61,7 @@
           "api_key: ...) to config.yml or the override YAML.",
   );
 
-  /// Explain SQL ボタンの title (未設定・エラー時は設定方法を案内する)
+  /// Title of the Explain SQL button (explains how to configure when unset or on error)
   const explainSqlButtonTitle = $derived(
     aiConfigured
       ? "Explain the SQL statement under the cursor with AI " +
@@ -73,7 +73,7 @@
           "api_key: ...) to config.yml or the override YAML.",
   );
 
-  // 入力欄を開いたらフォーカスする
+  // Focus the input field once it is opened
   $effect(() => {
     if (showAiInput) {
       aiInputEl?.focus();
@@ -97,7 +97,7 @@
     }
   };
 
-  /// 衝突タブの解消: 手元の編集でディスクを上書き保存する (force)
+  /// Resolve a conflicted tab: overwrite the disk with the local edits (force)
   const onOverwriteConflict = async () => {
     if (await appStore.overwriteActiveFileConflict()) {
       toast.success("Saved (overwrote the external change)");
@@ -108,7 +108,7 @@
     }
   };
 
-  /// 衝突タブの解消: 手元の編集を破棄してディスクの内容を読み直す
+  /// Resolve a conflicted tab: discard the local edits and reload the disk contents
   const onDiscardConflict = async () => {
     await appStore.discardActiveFileConflict();
   };
@@ -125,14 +125,14 @@
       toast.error("Failed to switch the database", {
         description: appStore.errorMessage ?? undefined,
       });
-      // 失敗したら表示を元に戻す
+      // If it fails, restore the display
       select.value = previous ?? "";
     }
   };
 </script>
 
-<!-- 狭いウインドウ (チャットペインを開いた時など) でボタン列がはみ出して
-     見えなくなるのを防ぐため、収まらない分は折り返す -->
+<!-- On a narrow window (e.g. when the chat pane is open), wrap the buttons that do not fit,
+     to prevent the button row from overflowing and becoming invisible -->
 <div
   class="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-zinc-700 bg-zinc-900 px-3 py-1"
 >
@@ -155,8 +155,8 @@
     </span>
   {/if}
 
-  <!-- 外部変更との衝突中は、常に到達可能な解消手段 (上書き / 破棄) を出す。
-       ファイル一覧の再クリックが Rename になり reopen 経路に届かないケースの逃げ道。 -->
+  <!-- While in conflict with an external change, always show the resolution actions that can be reached (overwrite / discard).
+         This is an escape hatch for the case where clicking the file list again becomes Rename and never reaches the reopen path. -->
   {#if appStore.activeFileConflicted}
     <span
       class="flex items-center gap-1 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] tracking-wide text-amber-400"
@@ -211,7 +211,7 @@
   <div
     class="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-x-2 gap-y-1"
   >
-    <!-- 複数行選択中のみ表示。行単位の一括置換ペインを開く -->
+    <!-- Shown only while multiple lines are selected. Opens the line-by-line bulk replace pane -->
     {#if showReplaceMultiline}
       <button
         type="button"
@@ -224,7 +224,7 @@
         <i class="bi bi-body-text" aria-hidden="true"></i> Replace Multiline
       </button>
     {/if}
-    <!-- カーソル位置の文を整形する (ファイルが開いているときのみ有効) -->
+    <!-- Format the statement at the cursor position (enabled only when a file is open) -->
     {#if supportsFormat}
       <button
         type="button"
@@ -238,7 +238,7 @@
         <i class="bi bi-braces" aria-hidden="true"></i> Format
       </button>
     {/if}
-    <!-- カーソル位置の文をエンジン別 EXPLAIN で実行する (AI 不要の単体機能) -->
+    <!-- Run the statement at the cursor position with the engine-specific EXPLAIN (standalone feature, no AI needed) -->
     {#if supportsExplain}
       <button
         type="button"
@@ -252,7 +252,7 @@
         <i class="bi bi-diagram-3" aria-hidden="true"></i> Explain
       </button>
     {/if}
-    <!-- カーソル位置の文を AI に平易に解説させる (AI 設定済みのときのみ有効) -->
+    <!-- Have the AI explain the statement at the cursor position in plain language (enabled only when AI is configured) -->
     {#if supportsAi}
       <button
         type="button"
@@ -263,7 +263,7 @@
         onclick={onExplainSql}
       >
         {#if appStore.aiExplaining}
-          <!-- 解説の生成中スピナー -->
+          <!-- Spinner while the explanation is being generated -->
           <span
             class="inline-block size-3 animate-spin rounded-full border-2 border-zinc-300 border-t-transparent"
             data-annotate="spinner-ai-explaining"
@@ -275,7 +275,7 @@
       </button>
     {/if}
     {#if !supportsAi}
-      <!-- AI 系 UI はこのエンジンでは出さない -->
+      <!-- The AI UI is not shown for this engine -->
     {:else if showAiInput}
       <form
         class="flex min-w-0 items-center gap-1"
@@ -297,7 +297,7 @@
           disabled={appStore.aiGenerating || !aiInstruction.trim()}
         >
           {#if appStore.aiGenerating}
-            <!-- 生成中スピナー -->
+            <!-- Spinner while generating -->
             <span
               class="inline-block size-3 animate-spin rounded-full border-2 border-blue-300 border-t-transparent"
               data-annotate="spinner-ai-generating"

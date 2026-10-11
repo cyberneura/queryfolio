@@ -11,14 +11,14 @@
 
   let query = $state("");
   let fileHits = $state<FileSearchHit[]>([]);
-  /// キーボードで選択中の候補 (items のフラットな添字)
+  /// The candidate selected with the keyboard (a flat index into items)
   let activeIndex = $state(0);
   let inputEl: HTMLInputElement | undefined = $state();
-  /// 非同期検索の世代番号。古い応答が新しい結果を上書きしないために使う
+  /// Generation number of the async search. Used so an old response does not overwrite newer results
   let searchGeneration = 0;
 
-  /// 接続の絞り込み。名前・説明の部分一致 (大小無視)。空クエリなら全件を出し、
-  /// 接続の切り替え (ジャンプ) に使えるようにする。
+  /// Connection filtering. Partial match on name and description (case-insensitive). An empty query shows all
+  /// entries so it can be used to switch connections (jump).
   const connMatches = $derived.by(() => {
     const q = query.trim().toLowerCase();
     const list = appStore.connections;
@@ -32,8 +32,8 @@
     );
   });
 
-  /// キーボード操作用のフラットな候補リスト (接続 → ファイルの順)。
-  /// 表示のグループ分けと添字はこの順序に対応する。
+  /// Flat candidate list for keyboard navigation (connections, then files).
+  /// The display grouping and indices correspond to this order.
   type Item =
     | { kind: "connection"; name: string; description: string | null }
     | { kind: "file"; hit: FileSearchHit };
@@ -46,17 +46,17 @@
     ...fileHits.map((hit) => ({ kind: "file" as const, hit })),
   ]);
 
-  /// query 変更でファイル検索をデバウンス実行する。ファイルは選択中の接続の
-  /// ものだけを対象にする (接続をまたぐファイルは接続の切り替えで辿る)。
+  /// Run the file search debounced on query change. Files are searched only for the selected
+  /// connection (to reach files in other connections, switch connections).
   $effect(() => {
     const q = query.trim();
     const connection = appStore.selectedConnection;
     const gen = ++searchGeneration;
-    // クエリ変更のたびに選択位置を先頭へ戻す
+    // Reset the selection to the top on every query change
     activeIndex = 0;
-    // 検索語・接続が変わった瞬間に古いファイル結果を消す。debounce + invoke
-    // 待ちの間、現在の検索語と一致しない stale なファイルを表示・選択 (Enter/
-    // クリック) できないようにする。接続の候補は同期的に絞り込むので残してよい。
+    // The moment the search term or connection changes, clear the old file results. While waiting for
+    // debounce + invoke, this prevents showing or selecting (Enter/click) stale files that do not
+    // match the current search term. Connection candidates are filtered synchronously, so they can stay.
     fileHits = [];
     if (!q || !connection) {
       return;
@@ -68,7 +68,7 @@
           fileHits = hits;
         }
       } catch {
-        // 検索失敗時は結果を空にする (モーダルは開いたまま)
+        // On search failure, empty the results (the modal stays open)
         if (gen === searchGeneration) {
           fileHits = [];
         }
@@ -77,7 +77,7 @@
     return () => clearTimeout(timer);
   });
 
-  // マウント時に入力へフォーカスする
+  // Focus the input on mount
   $effect(() => {
     inputEl?.focus();
   });

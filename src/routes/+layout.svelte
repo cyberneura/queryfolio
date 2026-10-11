@@ -7,12 +7,12 @@
 
   let { children } = $props();
 
-  /// リロードのショートカットを無効化する (CYBERNEURA-DEV-648)。
+  /// Disable the reload shortcuts (CYBERNEURA-DEV-648).
   ///
-  /// capture フェーズで window に付ける。バブルフェーズの
-  /// `<svelte:window onkeydown>` (+page.svelte のアプリ内ショートカット) と違い、
-  /// 途中のコンポーネントが stopPropagation しても必ず先に通るため、
-  /// モーダルや CodeMirror にフォーカスがある時も取りこぼさない。
+  /// Attach to window in the capture phase. Unlike the bubble-phase
+  /// `<svelte:window onkeydown>` (+page.svelte's in-app shortcuts), this always runs first
+  /// even if an intermediate component calls stopPropagation, so it is not missed
+  /// when a modal or CodeMirror has focus.
   onMount(() => {
     const suppressReload = (e: KeyboardEvent) => {
       if (isReloadShortcut(e)) {
@@ -25,14 +25,14 @@
     };
   });
 
-  /// OS から持ち込まれたファイルのドロップを無効化する (CYBERNEURA-DEV-977)。
+  /// Disable dropping of files brought in from the OS (CYBERNEURA-DEV-977).
   ///
-  /// FILES → CONNECTIONS のドラッグ & ドロップを動かすため、tauri.conf.json で
-  /// `dragDropEnabled: false` にしている (true のままだと Tauri のネイティブ
-  /// ハンドラがドロップを奪い、macOS では HTML の drop イベントが発火しない)。
-  /// その代わり外部ファイルのドロップは WebView の既定動作 (そのファイルへの
-  /// 遷移) に流れるので、ここで止める。capture フェーズで止めて、CodeMirror が
-  /// ファイルの中身を挿入する経路にも渡さない (以前と同じく「何も起きない」)。
+  /// To make FILES -> CONNECTIONS drag & drop work, tauri.conf.json sets
+  /// `dragDropEnabled: false` (if left true, Tauri's native handler steals the drop and
+  /// HTML drop events do not fire on macOS).
+  /// As a result, dropping an external file falls through to the WebView's default behavior
+  /// (navigating to that file), so we stop it here. Stopping it in the capture phase also keeps
+  /// it from reaching the path where CodeMirror inserts the file contents (as before, "nothing happens").
   onMount(() => {
     const blockExternalFileDrop = (e: DragEvent) => {
       if (!isExternalFileDrag(e.dataTransfer)) {

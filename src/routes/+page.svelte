@@ -35,18 +35,18 @@
 
   let showSettings = $state(false);
   let showSearch = $state(false);
-  /// メニューの Third-Party Licenses から開くライセンス一覧
+  /// License list opened from the Third-Party Licenses menu item
   let showLicenses = $state(false);
-  /// 設定エディタ。null = 閉じている
+  /// Settings editor. null = closed
   let configEditorMode = $state<"config" | "source" | null>(null);
-  /// 設定エディタに未保存の変更があるか (モード切替で巻き添え破棄しないため)
+  /// Whether the settings editor has unsaved changes (so a mode switch does not discard them)
   let configEditorDirty = $state(false);
 
-  /// メニューから設定エディタを開く。表示中のエディタに未保存の変更がある状態で
-  /// 別のモードへ切り替えると #key による作り直しで編集が消えるため、それを断る。
+  /// Open the settings editor from the menu. Switching to a different mode while the visible editor has unsaved changes
+  /// would lose the edits because the #key rebuilds it, so refuse that.
   function openConfigEditor(mode: "config" | "source") {
     if (configEditorMode !== null && configEditorMode !== mode && configEditorDirty) {
-      // source モードには Save が無いため、できない操作を案内しないよう文言を分ける
+      // source mode has no Save, so the wording is split to avoid suggesting an action that cannot be done
       toast.warning(
         configEditorMode === "config"
           ? "Save or discard your changes first"
@@ -57,9 +57,9 @@
     configEditorMode = mode;
   }
 
-  /// モーダルを 1 つでも開いているか (キーボードはモーダルのものとみなす)。
-  /// aiAnalysis (EXPLAIN の AI 解説) はこのファイルではなく ResultsPane が
-  /// 描画するが、画面を覆うのは同じなのでここで見る。
+  /// Whether any modal is open (the keyboard is considered to belong to the modal).
+  /// aiAnalysis (the AI explanation of EXPLAIN) is rendered by ResultsPane rather than this file,
+  /// but it covers the screen the same way, so it is checked here.
   const isModalOpen = () =>
     showSearch ||
     showSettings ||
@@ -70,50 +70,50 @@
     appStore.dangerousConfirmReason !== null ||
     runLogConfirm !== null;
 
-  /// グローバルショートカット。
-  /// - Cmd+K (mac) / Ctrl+K で検索モーダルを開閉する
-  /// - Ctrl+Tab / Ctrl+Shift+Tab でエディタタブを履歴順に切り替える
+  /// Global shortcuts.
+  /// - Cmd+K (mac) / Ctrl+K toggles the search modal
+  /// - Ctrl+Tab / Ctrl+Shift+Tab switches editor tabs in history order
   function handleGlobalKeydown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
       e.preventDefault();
       showSearch = !showSearch;
       return;
     }
-    // Ctrl+Tab は Ctrl 単独の時だけ拾う (Cmd+Tab は OS のアプリ切替、
-    // Alt+Tab は Windows のウインドウ切替なので、修飾が増えたら手を出さない)。
-    // preventDefault が要る: 既定はフォーカス移動で、押すたびにフォーカスが
-    // エディタから外れてしまう。
-    // モーダルが開いている間は無視する (見えない裏でタブが移り、閉じたら別の
-    // ファイルになっている、という状態を作らない)。
+    // Ctrl+Tab is handled only when Ctrl is the sole modifier (Cmd+Tab is the OS app switcher and
+    // Alt+Tab is the Windows window switcher, so do not interfere once more modifiers are held).
+    // preventDefault is needed: the default is to move focus, so each press would take the focus
+    // away from the editor.
+    // Ignore it while a modal is open (so we never end up with the tab having moved unseen behind
+    // it and a different file showing once it closes).
     if (e.key === "Tab" && e.ctrlKey && !e.metaKey && !e.altKey && !isModalOpen()) {
       e.preventDefault();
       void appStore.cycleEditorTab(e.shiftKey ? -1 : 1);
     }
   }
 
-  /// Ctrl を離したら巡回を終える (そこで初めて、選んだタブが履歴の先頭になる)。
+  /// End the cycling when Ctrl is released (only then does the chosen tab become the head of the history).
   function handleGlobalKeyup(e: KeyboardEvent) {
     if (e.key === "Control") {
       void appStore.endEditorTabCycle();
     }
   }
 
-  /// ウインドウがフォーカスを失うと Ctrl の keyup は届かない (Cmd+Tab で
-  /// アプリを切り替えた時など)。巡回状態を持ち越すと、次に Ctrl+Tab を押した時に
-  /// 古い巡回の続きから進んでしまうので、ここでも終わらせる。
+  /// When the window loses focus, the Ctrl keyup never arrives (e.g. when switching apps with
+  /// Cmd+Tab). Carrying the cycling state over would make the next Ctrl+Tab continue from the old
+  /// cycle, so end it here as well.
   function handleWindowBlur() {
     void appStore.endEditorTabCycle();
   }
   let editor: SqlEditor | undefined = $state();
 
-  /// 大量の行をエディタへ書き戻す前の確認ダイアログ。null = 出していない
+  /// Confirmation dialog before writing a large number of rows back into the editor. null = not shown
   let runLogConfirm = $state<{
     rows: number;
     resolve: (choice: RunLogChoice) => void;
   } | null>(null);
 
-  /// 書き戻してよいかを尋ね、選択を待つ。
-  /// 未応答のものが残っていれば却下してから差し替える (危険文の確認と同じ)
+  /// Ask whether to write back and wait for the choice.
+  /// If an unanswered one remains, reject it before replacing it (same as the dangerous-statement confirmation)
   const confirmRunLog = (rows: number): Promise<RunLogChoice> =>
     new Promise((resolve) => {
       runLogConfirm?.resolve("cancel");
@@ -126,31 +126,32 @@
     pending?.resolve(choice);
   }
 
-  /// エディタからの実行。`-- 📝 <label>` が付いた文は、実行後にその下へ
-  /// 結果を TSV のブロックコメント (Run and Log) として書き戻す。
-  /// 結果テーブルへの表示は書き戻しの有無に関わらず通常どおり行われる。
+  /// Run from the editor. For a statement carrying `-- 📝 <label>`, after execution the result is
+  /// written back below it as a TSV block comment (Run and Log).
+  /// Display in the results table happens as usual regardless of whether anything is written back.
   async function runStatement(target: RunTarget) {
-    // 実行を開始したエディタタブを控える。SqlEditor は
-    // {#key appStore.activeEditorTabId} でタブ切替のたびに作り直されるため、
-    // editor 参照は常に「今開いているファイル」を指す。target の範囲照合だけ
-    // では、たまたま同じ位置に同じ SQL がある別ファイルへ書いてしまう
+    // Remember the editor tab where the run started. SqlEditor is rebuilt on every tab switch by
+    // {#key appStore.activeEditorTabId}, so the editor reference always points at "the file open now".
+    // Matching only the target's range could write into a different file that happens to have the
+    // same SQL at the same position
     const tabId = appStore.activeEditorTabId;
-    // アクティブスキーマ (database) も控える。実行中に Database 欄を
-    // 切り替えられると、タブも SQL も変わらないまま切替前のスキーマの結果が
-    // ファイルに残り、後から読んだ人には現在のスキーマの結果に見える
+    // Also remember the active schema (database). If the Database field is switched during
+    // execution, the result for the pre-switch schema would stay in the file while neither the tab
+    // nor the SQL changed, and a later reader would take it for a result of the current schema
     const schema = appStore.activeSchema;
-    // 実行先の接続も控える (非アクティブになったタブへ書く時に、タブが別接続へ
-    // 移っていないかを照合する)
+    // Also remember the connection used for the run (when writing to a tab that has become
+    // inactive, check that the tab has not moved to a different connection)
     const connection = appStore.selectedConnection;
     const result = await appStore.runQuery(target.sql);
     if (!result || target.logLabel === null) {
       return;
     }
-    // 見出しに入れるのは実行が終わった時刻。下の確認ダイアログを開いたまま
-    // にされると承認した時刻になってしまうので、待つ前に採る
+    // The heading uses the time when the execution finished. If the confirmation dialog below were
+    // left open, it would become the approval time, so take it before waiting
     const executedAt = formatRunLogTimestamp(new Date());
-    // 大量の行はエディタを埋めてしまうので、書き戻す前に「全部書く / 先頭だけ書く /
-    // 書かない」を選ばせる。ちょうど上限の結果は全部書いても同じ量なので訊かない
+    // A large number of rows would fill the editor, so before writing back let the user choose
+    // "write all / write only the head / do not write". A result exactly at the limit is the same
+    // amount even if written in full, so do not ask
     let maxRows: number | undefined;
     if (result.rows.length > RUN_LOG_CONFIRM_ROWS) {
       const choice = await confirmRunLog(result.rows.length);
@@ -159,15 +160,15 @@
       }
       maxRows = choice === "limited" ? RUN_LOG_CONFIRM_ROWS : undefined;
     }
-    // ラベルは書き戻す直前に本文から取り直したものを使う (SqlEditor が渡す)
+    // Use a label re-read from the body right before writing back (passed by SqlEditor)
     const buildBlock = (label: string) =>
       formatRunLogBlock(label, executedAt, runLogBody(result, maxRows));
-    // `\c` / `USE` は実行そのものが切替なので、その文が切り替えた先は
-    // 「変わっていない」とみなす (この結果は切替後のスキーマのもの)
+    // `\c` / `USE` is itself a switch by execution, so the schema that statement switched to
+    // is considered "unchanged" (this result belongs to the post-switch schema)
     const expectedSchema = result.switched_schema ?? schema;
-    // 実行中に別のタブへ移っていたら、そのタブの本文へ直接書く
-    // (CYBERNEURA-DEV-858)。照合の条件はエディタ経路と同じで、
-    // 待つ間にタブへ戻ってきたら "active" が返るのでエディタ経路で書く
+    // If the user moved to another tab during execution, write directly into that tab's body
+    // (CYBERNEURA-DEV-858). The matching conditions are the same as the editor path, and if the
+    // user returns to the tab while waiting, "active" is returned and it is written via the editor path
     let outcome: RunLogOutcome | "active" = "active";
     if (tabId !== null && connection !== null && appStore.activeEditorTabId !== tabId) {
       outcome = await appStore.writeRunLogToInactiveTab(
@@ -187,14 +188,14 @@
     }
     switch (outcome) {
       case "stale":
-        // 実行中に編集・タブのクローズ・スキーマ切替が起きて対象がズレた場合。
-        // 無関係な位置へ書き込むより、書かずに知らせる方が安全
+        // The target drifted because of an edit, a tab close, or a schema switch during execution.
+        // Notifying without writing is safer than writing to an unrelated position
         toast.warning(
           "The editor changed while the query was running — the log was not written.",
         );
         break;
       case "unmarked":
-        // 実行中にマーカーを消した = 書き戻しの取り消しなので黙って従う
+        // Removing the marker during execution = cancelling the write-back, so silently comply
         break;
       case "broken":
         toast.warning(
@@ -209,14 +210,14 @@
     }
   }
 
-  // Replace Multiline: エディタの複数行選択状態と、右側の置換ペインの表示。
-  // ペインを開いた時点の選択範囲を snapshot し、差し込み時に範囲がズレて
-  // いないか照合してから置換する (ファイル切替・編集での誤挿入を防ぐ)
+  // Replace Multiline: the editor's multi-line selection state and the display of the replace pane on the right.
+  // Snapshot the selection when the pane is opened, and on insertion check that the range has not drifted
+  // before replacing (prevents wrong insertion after a file switch or edit)
   let hasMultilineSelection = $state(false);
   let showReplacePane = $state(false);
   let replaceInitialLines = $state("");
   let replaceSnapshot: { from: number; to: number; text: string } | null = null;
-  // ペインを開き直すたびに増やし、#key で再マウントして Lines を作り直す
+  // Incremented every time the pane is reopened; remounts via #key to rebuild Lines
   let replaceOpenToken = $state(0);
 
   function openReplacePane() {
@@ -244,31 +245,31 @@
     if (ok) {
       showReplacePane = false;
     } else {
-      // 選択範囲がズレた (ファイル切替や編集) 場合は破壊せずに知らせる
+      // If the selection range has drifted (file switch or edit), notify without destroying anything
       toast.error("The editor selection changed — nothing was replaced.", {
         description: "Use Copy to grab the result instead.",
       });
     }
   }
 
-  // タブ切替・クローズで選択追跡状態と置換ペインをリセットする。
-  // 依存はアクティブタブ ID にする: 同名ファイルを別接続で開いている場合、
-  // selectedFile (ファイル名) は変わらないままタブだけ切り替わり得るため、
-  // selectedFile 依存だと stale なスナップショットが残り新タブへ誤適用される
+  // Reset the selection tracking state and the replace pane on tab switch / close.
+  // Depend on the active tab ID: when a same-named file is opened under a different connection,
+  // only the tab can switch while selectedFile (the file name) stays the same, so depending on
+  // selectedFile would leave a stale snapshot that gets wrongly applied to the new tab
   $effect(() => {
     void appStore.activeEditorTabId;
     hasMultilineSelection = false;
     showReplacePane = false;
     replaceSnapshot = null;
   });
-  /// 左ペイン 2 列目のタブ (クエリファイル一覧 / クエリ履歴 / テーブル一覧)
+  /// Tabs of the 2nd column of the left pane (query file list / query history / table list)
   let leftPaneTab = $state<"files" | "history" | "tables">("files");
 
-  // ペインのレイアウト。区切り線のドラッグで変更し localStorage に保存する
+  // Pane layout. Changed by dragging the dividers and saved to localStorage
   const LAYOUT_PREFIX = "queryfolio.layout.";
   const SIDEBAR_MIN = 140;
   const SIDEBAR_MAX = 500;
-  /// AI チャットペインは本文が長いので、サイドバーより広い範囲を許す
+  /// The AI chat pane has long content, so allow a wider range than the sidebar
   const CHAT_MIN = 240;
   const CHAT_MAX = 720;
   const HELP_MIN = 260;
@@ -291,7 +292,7 @@
     try {
       localStorage.setItem(LAYOUT_PREFIX + key, String(value));
     } catch {
-      // localStorage が使えなくてもレイアウト変更自体は機能させる
+      // Keep the layout change itself working even when localStorage is unavailable
     }
   }
 
@@ -299,36 +300,36 @@
     return Math.min(max, Math.max(min, value));
   }
 
-  /// 接続一覧ペインの幅 (px)。デフォルトは従来の w-56 = 224px
+  /// Width of the connection list pane (px). The default is the previous w-56 = 224px
   let connectionsWidth = $state(
     clamp(loadLayoutValue("connectionsWidth", 224), SIDEBAR_MIN, SIDEBAR_MAX),
   );
-  /// 2 列目 (Files / History / Tables) ペインの幅 (px)
+  /// Width of the 2nd column (Files / History / Tables) pane (px)
   let sidebarWidth = $state(
     clamp(loadLayoutValue("sidebarWidth", 224), SIDEBAR_MIN, SIDEBAR_MAX),
   );
-  /// エディタが占める縦の割合。デフォルトは従来の flex 3:2 = 0.6
+  /// Vertical fraction occupied by the editor. The default is the previous flex 3:2 = 0.6
   let editorFrac = $state(
     clamp(loadLayoutValue("editorFrac", 0.6), EDITOR_FRAC_MIN, EDITOR_FRAC_MAX),
   );
-  // editorFrac の px 換算用。列全体 (ツールバー込み) ではなく
-  // 分割対象 2 ペインの実高さの合計を使うと、ドラッグがカーソルに正確に追従する
+  // For converting editorFrac to px. Using the sum of the actual heights of the 2 panes being split,
+  // not the whole column (including the toolbar), makes the drag follow the cursor exactly
   let editorPaneEl: HTMLDivElement | undefined = $state();
   let resultsPaneEl: HTMLDivElement | undefined = $state();
 
-  /// AI チャットペイン (右) の幅 (px)
+  /// Width of the AI chat pane (right) (px)
   let chatWidth = $state(
     clamp(loadLayoutValue("chatWidth", 360), CHAT_MIN, CHAT_MAX),
   );
-  /// AI チャットペインを開いているか (表示状態も次回起動へ引き継ぐ)
+  /// Whether the AI chat pane is open (the visibility is also carried over to the next launch)
   let showChat = $state(loadLayoutValue("chatOpen", 0) === 1);
   let helpWidth = $state(
     clamp(loadLayoutValue("helpWidth", 380), HELP_MIN, HELP_MAX),
   );
   let showHelp = $state(loadLayoutValue("helpOpen", 0) === 1);
 
-  // ドラッグ開始時の基準サイズ。PaneDivider は開始位置からの累積 delta を
-  // 渡すので、基準 + delta で計算するとクランプ飽和後もポインタと同期する
+  // Base sizes at drag start. PaneDivider passes the cumulative delta from the start position, so
+  // computing base + delta keeps in sync with the pointer even after clamp saturation
   let dragBaseConnections = 0;
   let dragBaseSidebar = 0;
   let dragBaseEditorFrac = 0;
@@ -344,8 +345,8 @@
     selectedConnectionInfo?.capabilities ?? null,
   );
 
-  // TABLES ペインを開いたままテーブル非対応エンジン (redis 等) の接続へ
-  // 切り替えた場合は FILES へ戻す (TablesPane が listTables を呼ばないように)
+  // If the connection is switched to an engine without table support (redis, etc.) while the TABLES pane
+  // is open, go back to FILES (so TablesPane does not call listTables)
   $effect(() => {
     if (
       leftPaneTab === "tables" &&
@@ -357,10 +358,10 @@
   });
 
   onMount(() => {
-    // 開いているクエリファイルが外部で変更されたら自動リロード / マージする
+    // Auto-reload / merge when an open query file is changed externally
     appStore.startFileWatcher();
 
-    // メニューの Reload config file からの通知を受けて再読込する
+    // Reload on notification from the Reload config file menu item
     const unlistenPromise = listen("menu-reload-config", async () => {
       if (await appStore.reloadConnections()) {
         toast.success("Config reloaded");
@@ -371,24 +372,24 @@
       }
     });
 
-    // メニューの Edit config.yml / View override config yaml からの通知
+    // Notifications from the Edit config.yml / View override config yaml menu items
     const unlistenEditPromise = listen("menu-edit-config", () => {
       openConfigEditor("config");
     });
     const unlistenEditSourcePromise = listen("menu-view-override-config", () => {
       openConfigEditor("source");
     });
-    // メニューの Third-Party Licenses (macOS はアプリメニュー、他は Help の About の直下)
+    // Third-Party Licenses menu item (app menu on macOS, directly under About in Help elsewhere)
     const unlistenLicensesPromise = listen("menu-show-licenses", () => {
       showLicenses = true;
     });
 
-    // メニューの Close Tab (Cmd+W / Ctrl+W)。ウインドウは閉じず、アクティブな
-    // エディタタブだけを閉じる。タブが無ければ何もしない。モーダルが開いている間も
-    // 何もしない (見えない裏でタブが閉じる状態を作らない。Ctrl+Tab と同じ扱い)。
-    // isModalOpen はこのページが状態を持つモーダルしか知らないので、各コンポーネントが
-    // 自前で開くモーダル (ResultsPane のセル編集プレビュー等) は、モーダルの
-    // ルート要素に付けた data-modal で拾う
+    // Close Tab menu item (Cmd+W / Ctrl+W). Does not close the window; closes only the active
+    // editor tab. Does nothing if there is no tab. Also does nothing while a modal is open (so a tab
+    // never closes unseen behind it; same treatment as Ctrl+Tab).
+    // isModalOpen only knows modals whose state this page holds, so modals that individual components
+    // open themselves (e.g. the cell edit preview of ResultsPane) are detected by the data-modal
+    // attribute on the modal's root element
     const unlistenCloseTabPromise = listen("menu-close-editor-tab", () => {
       const id = appStore.activeEditorTabId;
       if (id === null || isModalOpen() || document.querySelector("[data-modal]")) {
@@ -397,11 +398,11 @@
       appStore.closeEditorTab(id);
     });
 
-    // 開く指定を直列で処理するキュー。openFileByTarget は selectConnection を呼び、
-    // ストアの世代ガードが後発の接続切替で先行分をキャンセルするため、複数を並行で
-    // 走らせると別接続のファイルが黙って飛ばされ得る。Promise チェーンで 1 件ずつ
-    // 順に開く (1 件の失敗でチェーンが止まらないよう catch する。個別の失敗は
-    // openFileByTarget が errorMessage で表示する)。
+    // A queue that processes open requests serially. openFileByTarget calls selectConnection, and the
+    // store's generation guard cancels the earlier one when a later connection switch arrives, so
+    // running several concurrently could silently drop a file of another connection. Open them one at
+    // a time in order via a Promise chain (catch so one failure does not stop the chain; individual
+    // failures are shown by openFileByTarget through errorMessage).
     let openQueue: Promise<void> = Promise.resolve();
     const enqueueOpen = (connection: string, fileName: string) => {
       openQueue = openQueue
@@ -409,9 +410,9 @@
         .catch(() => {});
     };
 
-    // 実行中に queryfolio:// deep link / CLI で開くよう要求された時の通知。
-    // バックエンドが保存領域配下かを検証済みの接続 / ファイル名を届ける。
-    // 1 イベントに複数 URL・近接した複数回起動でも直列に開く。
+    // Notification when a request to open arrives via a queryfolio:// deep link / CLI while running.
+    // Delivers the connection / file name whose location under the storage area the backend has
+    // already verified. Even with multiple URLs in one event or several launches in quick succession, open them serially.
     const unlistenOpenFilePromise = listen<OpenTarget>(
       "open-query-file",
       (event) => {
@@ -428,9 +429,9 @@
     );
 
     void (async () => {
-      // frontend_ready を呼ぶと backend が ready=true にしてイベント直送に切り替わる。
-      // その前に open-query-file / -error の listener が実際に installed される
-      // (listen の Promise が解決する) のを待たないと、間に届いた指定を取りこぼす。
+      // Calling frontend_ready makes the backend set ready=true and switch to sending events directly.
+      // Before that, wait until the open-query-file / -error listeners are actually installed (the
+      // listen Promise resolves); otherwise a request arriving in between would be dropped.
       await unlistenOpenFilePromise;
       await unlistenOpenFileErrPromise;
       try {
@@ -450,18 +451,18 @@
         });
       }
       await appStore.loadConnections();
-      // listener が installed 済みになったので frontend_ready を呼んで「準備完了」を
-      // 知らせ、起動時指定 + 起動中に溜まった開く対象をまとめて受け取って開く。
-      // 以降の指定は open-query-file イベントで直接届く (取りこぼさない)。
+      // Now that the listeners are installed, call frontend_ready to signal "ready", and receive and open
+      // the launch-time targets plus those accumulated during startup all at once.
+      // Later requests arrive directly via the open-query-file event (nothing is dropped).
       try {
         const { targets, errors } = await frontendReady();
-        // ライブイベントと同じキューに載せて直列に開く (ready 直後に届くライブ
-        // イベントとの並行実行を避ける)。
+        // Put them on the same queue as live events and open them serially (avoids running concurrently
+        // with live events that arrive right after ready).
         for (const target of targets) {
           enqueueOpen(target.connection, target.fileName);
         }
-        // 起動時指定の解決に失敗した分はトーストで知らせる (GUI 起動では
-        // stderr が見えず、握り潰すとユーザーの明示的な指定が無反応になる)。
+        // Notify failures to resolve launch-time targets with a toast (in a GUI launch stderr is
+        // invisible, and swallowing them would leave the user's explicit request with no response).
         for (const message of errors) {
           toast.error("Failed to open the requested file", {
             description: message,
@@ -493,8 +494,8 @@
   onblur={handleWindowBlur}
 />
 
-<!-- overflow-hidden: 内側のペインがはみ出しても、アプリの枠から外へ広げない
-     (html/body 側の overflow: hidden と対で効かせる。CYBERNEURA-DEV-421) -->
+<!-- overflow-hidden: even if an inner pane overflows, do not let it extend beyond the app frame
+     (works as a pair with overflow: hidden on html/body. CYBERNEURA-DEV-421) -->
 <div class="flex h-screen flex-col overflow-hidden bg-zinc-950 text-zinc-200">
   <Toolbar
     onRunCurrent={() => editor?.runCurrentStatement()}
@@ -516,12 +517,13 @@
     }}
   />
 
-  <!-- overflow-x-auto: 接続一覧 / サイドバー / チャットは shrink-0 の固定幅なので、
-       ウインドウを狭めると中央のエディタが 0 幅まで潰れた先で右端がはみ出す。
-       ドキュメントをスクロールさせない代わりに、この行の中で横スクロールできるように
-       しておかないと右側のペインへ到達できなくなる (CYBERNEURA-DEV-421)。
-       縦は各ペインが内側にスクロール領域を持つので抑止する (片方だけ指定すると
-       もう片方が auto に計算されるため、明示的に hidden を置く) -->
+  <!-- overflow-x-auto: the connection list / sidebar / chat are fixed-width with shrink-0, so
+       when the window is narrowed, the right edge overflows after the central editor has been
+       squashed to 0 width. Since the document is not made to scroll, this row must scroll
+       horizontally by itself, otherwise the right-hand panes become unreachable
+       (CYBERNEURA-DEV-421).
+       Vertical overflow is suppressed because each pane has its own inner scroll area (specifying
+       only one axis makes the other compute to auto, so hidden is set explicitly) -->
   <div class="flex min-h-0 flex-1 overflow-x-auto overflow-y-hidden">
     <div class="shrink-0" style="width: {connectionsWidth}px">
       <ConnectionsPane onEditConfig={() => openConfigEditor("config")} />
@@ -609,11 +611,11 @@
         {/if}
         <div class="min-h-0 flex-1">
           {#if appStore.selectedFile}
-            <!-- エディタと Replace Multiline ペインを横並びにする -->
+            <!-- Lay out the editor and the Replace Multiline pane side by side -->
             <div class="flex h-full min-h-0">
               <div class="min-w-0 flex-1">
-                <!-- タブ切替でエディタを作り直し、タブ間で undo 履歴・
-                     カーソルが混ざらないようにする -->
+                <!-- Rebuild the editor on tab switch so the undo history and
+                     cursor are not mixed between tabs -->
                 {#key appStore.activeEditorTabId}
                   <SqlEditor
                     bind:this={editor}
@@ -680,7 +682,7 @@
       </div>
     </div>
 
-    <!-- AI チャットペイン。エディタ / 結果の右側に縦いっぱいで並ぶ -->
+    <!-- AI chat pane. Sits to the right of the editor / results, spanning the full height -->
     {#if showChat}
       <PaneDivider
         direction="vertical"
@@ -689,7 +691,7 @@
           dragBaseChat = chatWidth;
         }}
         onDrag={(delta) => {
-          // 右端のペインなので、ドラッグ方向と幅の増減は逆になる
+          // The pane is at the right edge, so the drag direction and the width change are inverted
           chatWidth = clamp(dragBaseChat - delta, CHAT_MIN, CHAT_MAX);
         }}
         onDragEnd={() => saveLayoutValue("chatWidth", chatWidth)}
@@ -706,7 +708,7 @@
       </div>
     {/if}
 
-    <!-- ヘルプペイン。チャットペインのさらに右 (最も右) に並ぶ -->
+    <!-- Help pane. Sits further right of the chat pane (rightmost) -->
     {#if showHelp}
       <PaneDivider
         direction="vertical"
@@ -715,7 +717,7 @@
           dragBaseHelp = helpWidth;
         }}
         onDrag={(delta) => {
-          // 右端のペインなので、ドラッグ方向と幅の増減は逆になる
+          // The pane is at the right edge, so the drag direction and the width change are inverted
           helpWidth = clamp(dragBaseHelp - delta, HELP_MIN, HELP_MAX);
         }}
         onDragEnd={() => saveLayoutValue("helpWidth", helpWidth)}
@@ -750,10 +752,10 @@
   />
 {/if}
 
-<!-- 設定ファイルのエディタ (メニューから開く)。mode で保存できる config と、
-     編集はできるが保存できない source を切り替える。
-     モーダル表示中でもネイティブメニューは操作できるため、mode が切り替わったら
-     #key で作り直す (読み込み直しがマウント時に確定するため) -->
+<!-- Editor for the config file (opened from the menu). mode switches between config, which can
+     be saved, and source, which can be edited but not saved.
+     The native menu can be used even while a modal is shown, so rebuild with #key when mode
+     changes (because the reload is settled at mount time) -->
 {#if configEditorMode !== null}
   {#key configEditorMode}
     <ConfigEditorModal
@@ -769,7 +771,7 @@
   {/key}
 {/if}
 
-<!-- AI による選択 SQL 解説のモーダル (EXPLAIN 解説モーダルを見出し違いで再利用) -->
+<!-- Modal for the AI explanation of the selected SQL (reuses the EXPLAIN explanation modal with a different heading) -->
 {#if appStore.aiExplanation !== null}
   <AiAnalysisModal
     title="AI SQL Explanation"
@@ -778,7 +780,7 @@
   />
 {/if}
 
-<!-- 危険な文 (allow_dangerous_statements 有効な接続) の実行前確認モーダル -->
+<!-- Pre-execution confirmation modal for dangerous statements (connections with allow_dangerous_statements enabled) -->
 {#if appStore.dangerousConfirmReason !== null}
   <DangerousConfirmModal
     reason={appStore.dangerousConfirmReason}
@@ -787,7 +789,7 @@
   />
 {/if}
 
-<!-- 📝 マーカー付きの文で、行数の多い結果をエディタへ書き戻す前の確認 -->
+<!-- Confirmation, for a statement with the 📝 marker, before writing a result with many rows back into the editor -->
 {#if runLogConfirm !== null}
   <RunLogConfirmModal
     rows={runLogConfirm.rows}
@@ -796,8 +798,8 @@
   />
 {/if}
 
-<!-- Third-Party Licenses (メニューから開く)。ネイティブメニューはモーダル表示中でも
-     選べるので、他のモーダルより後ろに置いて一番上に出す (LicensesModal の z-index も参照) -->
+<!-- Third-Party Licenses (opened from the menu). The native menu can be chosen even while a modal
+     is shown, so place it after the other modals to put it on top (see also LicensesModal's z-index) -->
 {#if showLicenses}
   <LicensesModal
     onClose={() => {

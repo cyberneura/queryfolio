@@ -12,5 +12,5 @@ vite.config.ts.timestamp-*
 .pnpm-cache
 .claude/worktrees/
 
-# アイコン生成の副産物
+# Byproducts of icon generation
 __pycache__/

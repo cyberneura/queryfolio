@@ -1,30 +1,30 @@
 import { invoke } from "@tauri-apps/api/core";
 
-/// SSH トンネル情報 (機密を除く。バックエンドの config::SshTunnelInfo に対応)
+/// SSH tunnel info (secrets excluded. Corresponds to config::SshTunnelInfo in the backend)
 export interface SshTunnelInfo {
   host: string;
   port: number;
   user: string;
-  /// ~/.ssh/config の Host エイリアス (system ssh 委譲モード時)。libssh2 モードでは null
+  /// Host alias in ~/.ssh/config (in system ssh delegation mode). null in libssh2 mode
   ssh_config: string | null;
 }
 
-/// エンジンの能力宣言 (バックエンドの engines::EngineCapabilities に対応)。
-/// UI の出し分けはエンジン名ではなくこのフラグで行う。
+/// Engine capability declaration (corresponds to engines::EngineCapabilities in the backend).
+/// The UI decides what to show by these flags, not by engine name.
 export interface EngineCapabilities {
-  /// エディタのシンタックスハイライト言語
+  /// Syntax highlighting language of the editor
   editor_language: "sql" | "redis" | "es";
-  /// クエリファイルの拡張子 (ドット無し)
+  /// Extension of query files (without the dot)
   file_extension: string;
-  /// スキーマ (database) の一覧・切替に対応するか
+  /// Whether listing / switching schemas (databases) is supported
   supports_schemas: boolean;
-  /// スキーマブラウザ (TABLES ペイン) に対応するか
+  /// Whether the schema browser (TABLES pane) is supported
   supports_tables: boolean;
   supports_explain: boolean;
   supports_format: boolean;
-  /// 結果グリッドのセル編集 (UPDATE 生成) に対応するか
+  /// Whether cell editing in the result grid (UPDATE generation) is supported
   supports_editable_cells: boolean;
-  /// AI 機能 (SQL 生成 / 解説) に対応するか
+  /// Whether AI features (SQL generation / explanation) are supported
   supports_ai: boolean;
 }
 
@@ -33,26 +33,26 @@ export interface ConnectionInfo {
   description: string | null;
   engine: string;
   has_ssh_tunnel: boolean;
-  /// 接続先ホスト (未設定なら null)
+  /// Host to connect to (null if not set)
   host: string | null;
-  /// 接続先ポート (未設定なら null)
+  /// Port to connect to (null if not set)
   port: number | null;
-  /// 接続ユーザー (未設定なら null)
+  /// User to connect as (null if not set)
   user: string | null;
   schema: string | null;
-  /// SSH トンネル情報 (機密を除く)。トンネル未使用なら null
+  /// SSH tunnel info (secrets excluded). null if no tunnel is used
   ssh_tunnel: SshTunnelInfo | null;
   readonly: boolean;
-  /// 危険な文 (WHERE 無し UPDATE/DELETE、DROP/TRUNCATE) の実行を許可する接続。
-  /// true でも実行前に確認を求める
+  /// A connection that is allowed to run dangerous statements (UPDATE/DELETE without WHERE, DROP/TRUNCATE).
+  /// Even when true, confirmation is requested before running
   allow_dangerous_statements: boolean;
-  /// 接続一覧での表示グループ名 (グループ未所属なら null)
+  /// Display group name in the connection list (null if not in a group)
   group_name: string | null;
-  /// SQL 系エンジン (mysql / postgres) の実効 TLS モード。
-  /// disable / prefer は平文へ降格しうる (prefer は sqlx の既定)。
-  /// 他のエンジンでは null
+  /// Effective TLS mode of SQL engines (mysql / postgres).
+  /// disable / prefer may downgrade to plaintext (prefer is sqlx's default).
+  /// null for other engines
   sql_ssl_mode: string | null;
-  /// エンジンの能力宣言 (UI の出し分けに使う)
+  /// Engine capability declaration (used to decide what the UI shows)
   capabilities: EngineCapabilities;
 }
 
@@ -64,47 +64,47 @@ export interface QueryResult {
   truncated: boolean;
   applied_limit: number | null;
   elapsed_ms: number;
-  /// `\c` でアクティブスキーマを切り替えた場合の切替先 (それ以外は null)
+  /// The switch target when the active schema was switched with `\c` (null otherwise)
   switched_schema: string | null;
 }
 
-/// クエリ実行履歴の 1 件分 (バックエンドの history::HistoryEntry に対応)
+/// One entry of the query execution history (corresponds to history::HistoryEntry in the backend)
 export interface QueryHistoryEntry {
-  /// 実行時刻 (ISO 8601)
+  /// Execution time (ISO 8601)
   time: string;
   sql: string;
-  /// 実行時のアクティブスキーマ (database)
+  /// Active schema (database) at execution time
   schema: string | null;
-  /// 取得行数または影響行数 (失敗時は null)
+  /// Number of rows fetched or affected (null on failure)
   row_count: number | null;
   elapsed_ms: number;
   success: boolean;
 }
 
-/// テーブル / ビューの情報 (バックエンドの schema_info::TableInfo に対応)
+/// Table / view info (corresponds to schema_info::TableInfo in the backend)
 export interface TableInfo {
-  /// テーブル名 (スキーマ修飾なし)
+  /// Table name (without schema qualification)
   name: string;
-  /// 所属スキーマ名 (PostgreSQL のみ。MySQL / SQLite は null)
+  /// Owning schema name (PostgreSQL only. null for MySQL / SQLite)
   schema: string | null;
-  /// "table" または "view"
+  /// "table" or "view"
   kind: string;
-  /// SQL に埋め込める修飾名。listColumns の table 引数やエディタへの
-  /// 挿入にはこの値を使う
+  /// Qualified name that can be embedded in SQL. Use this value for the table argument of
+  /// listColumns and for insertion into the editor
   qualified_name: string;
 }
 
-/// カラムの情報 (バックエンドの schema_info::ColumnInfo に対応)
+/// Column info (corresponds to schema_info::ColumnInfo in the backend)
 export interface ColumnInfo {
   name: string;
   data_type: string;
   nullable: boolean;
 }
 
-/// AI 設定の情報 (バックエンドの ai::AiInfo に対応)。api_key は含まれない
+/// AI settings info (corresponds to ai::AiInfo in the backend). api_key is not included
 export interface AiInfo {
   configured: boolean;
-  /// 使用モデル名 (未設定時は空文字)
+  /// Model name in use (empty string if not set)
   model: string;
 }
 
@@ -120,10 +120,10 @@ export const getConnections = () =>
 
 export const resetConnections = () => invoke<void>("reset_connections");
 
-/// writable は Writable スイッチの状態 (未指定・false は読み取り専用の安全側)。
-/// config の readonly: true 接続では、writable に関わらず書き込みは拒否される。
-/// applyDefaultLimit を false にすると、設定の default_limit を自動付与しない
-/// (Copy / Export で全件を出すため)。省略時は従来どおり付与する。
+/// writable is the state of the Writable switch (unspecified / false means read-only, the safe side).
+/// For a config connection with readonly: true, writes are rejected regardless of writable.
+/// If applyDefaultLimit is false, the default_limit from the config is not added automatically
+/// (to get all rows for Copy / Export). When omitted, it is added as before.
 export const runQuery = (
   connection: string,
   sql: string,
@@ -139,64 +139,64 @@ export const runQuery = (
     applyDefaultLimit,
   });
 
-/// 接続で実行中のクエリにキャンセルを要求する。実行中でなければ false。
-/// キャンセルされた run_query は CANCELLED_ERROR_MESSAGE のエラーで返る。
+/// Request cancellation of the query running on a connection. false if nothing is running.
+/// The cancelled run_query returns with an error of CANCELLED_ERROR_MESSAGE.
 export const cancelQuery = (connection: string) =>
   invoke<boolean>("cancel_query", { connection });
 
-/// バックエンドの AppError::Cancelled が返す文字列 (キャンセル判定用)
+/// The string returned by the backend's AppError::Cancelled (for detecting cancellation)
 export const CANCELLED_ERROR_MESSAGE = "Query cancelled";
 
-/// 危険な文 (WHERE 無し UPDATE/DELETE、DROP/TRUNCATE) なら理由を、そうでなければ
-/// null を返す。allow_dangerous_statements が有効な接続で、実行前の確認要否を
-/// 判断するために使う (無効な接続では runQuery 側が拒否する)。
+/// Returns the reason if it is a dangerous statement (UPDATE/DELETE without WHERE, DROP/TRUNCATE),
+/// otherwise null. Used on a connection with allow_dangerous_statements enabled to decide whether
+/// confirmation is needed before running (on a connection without it, runQuery rejects it).
 export const checkDangerousStatement = (connection: string, sql: string) =>
   invoke<string | null>("check_dangerous_statement", { connection, sql });
 
-/// Copy / Export で全件を取り直すために、その SQL をもう一度実行してよいかを返す。
-/// 書き込みを伴う文を二度実行しないよう、読み取り専用と判定できたものだけ true。
+/// Returns whether it is OK to run the SQL again to re-fetch all rows for Copy / Export.
+/// Only statements judged read-only return true, so a statement with writes is never run twice.
 export const canRerunForOutput = (connection: string, sql: string) =>
   invoke<boolean>("can_rerun_for_output", { connection, sql });
 
-/// クエリ実行履歴を新しい順に返す。search は SQL の部分一致 (大小無視)。
+/// Returns the query execution history, newest first. search is a substring match on SQL (case-insensitive).
 export const listQueryHistory = (
   connection: string,
   search?: string,
   limit?: number,
 ) => invoke<QueryHistoryEntry[]>("list_query_history", { connection, search, limit });
 
-/// FILES ペインの 1 行 (バックエンドの query_files::QueryFileEntry に対応)
+/// One row of the FILES pane (corresponds to query_files::QueryFileEntry in the backend)
 export interface QueryFileEntry {
-  /// ファイル名 (拡張子付き)
+  /// File name (with extension)
   file_name: string;
-  /// 最終更新日時 (UNIX エポックからのミリ秒)。取れなければ null
+  /// Last modified time (milliseconds since the UNIX epoch). null if unavailable
   modified_ms: number | null;
-  /// ファイルサイズ (バイト)
+  /// File size (bytes)
   size: number;
 }
 
-/// 接続のクエリファイル一覧 (更新日時の降順 = 最近編集したものが先頭)
+/// List of a connection's query files (descending by modified time = most recently edited first)
 export const listQueryFiles = (connection: string) =>
   invoke<QueryFileEntry[]>("list_query_files", { connection });
 
-/// クエリファイル検索の 1 ヒット (バックエンドの query_files::FileSearchHit に対応)
+/// One hit of the query file search (corresponds to query_files::FileSearchHit in the backend)
 export interface FileSearchHit {
-  /// ヒットしたファイル名 (拡張子付き。.sql / .redis)
+  /// File name of the hit (with extension. .sql / .redis)
   file_name: string;
-  /// ファイル名が query に一致したか
+  /// Whether the file name matched the query
   name_match: boolean;
-  /// 中身が一致した最初の行 (プレビュー用。名前のみ一致なら null)
+  /// The first line whose contents matched (for preview. null if only the name matched)
   content_preview: string | null;
 }
 
-/// 接続のクエリファイルをファイル名・中身で検索する (大文字小文字を区別しない部分一致)。
+/// Search a connection's query files by file name and contents (case-insensitive substring match).
 export const searchQueryFiles = (connection: string, query: string) =>
   invoke<FileSearchHit[]>("search_query_files", { connection, query });
 
 export const readQueryFile = (connection: string, fileName: string) =>
   invoke<string>("read_query_file", { connection, fileName });
 
-/// クエリファイルの絶対パスを返す (FilesPane の「Copy full path」用)。
+/// Returns the absolute path of a query file (for "Copy full path" in FilesPane).
 export const queryFilePath = (connection: string, fileName: string) =>
   invoke<string>("query_file_path", { connection, fileName });
 
@@ -206,8 +206,8 @@ export const writeQueryFile = (
   content: string,
 ) => invoke<void>("write_query_file", { connection, fileName, content });
 
-/// 楽観的排他つきの書き込み。expectedBase とディスクの現在内容が一致する時だけ書き込む。
-/// 書けたら true、アプリ外で変更されていて書かなかったら false を返す。
+/// Write with optimistic locking. Writes only when expectedBase matches the current contents on disk.
+/// Returns true if written, false if nothing was written because it was changed outside the app.
 export const writeQueryFileIfUnchanged = (
   connection: string,
   fileName: string,
@@ -233,9 +233,9 @@ export const renameQueryFile = (
   newName: string,
 ) => invoke<string>("rename_query_file", { connection, oldName, newName });
 
-/// クエリファイルを別の接続のフォルダへ移動する (FILES から CONNECTIONS への
-/// ドラッグ & ドロップ)。移動後のファイル名を返す。
-/// クエリファイルの拡張子が違うエンジン同士の移動はバックエンドが拒否する。
+/// Move a query file to another connection's folder (drag & drop from FILES to
+/// CONNECTIONS). Returns the file name after the move.
+/// The backend rejects a move between engines whose query file extensions differ.
 export const moveQueryFile = (
   fromConnection: string,
   toConnection: string,
@@ -252,174 +252,174 @@ export const setActiveSchema = (connection: string, schema: string) =>
 export const getActiveSchema = (connection: string) =>
   invoke<string | null>("get_active_schema", { connection });
 
-/// 指定接続のプール / SSH トンネルを破棄する (エディタタブを全て閉じた時に呼ぶ)。
-/// 接続設定は残り、次に必要になった時 (ファイルを開く / スキーマブラウザ / クエリ)
-/// に自動で張り直される。
+/// Discard the pool / SSH tunnel of the given connection (called when all editor tabs are closed).
+/// The connection settings remain, and it is re-established automatically the next time it is needed
+/// (opening a file / schema browser / query).
 export const disconnect = (connection: string) =>
   invoke<void>("disconnect", { connection });
 
-/// テーブル / ビューの一覧を返す。refresh = true でキャッシュを破棄して再取得。
+/// Returns the list of tables / views. refresh = true discards the cache and re-fetches.
 export const listTables = (connection: string, refresh?: boolean) =>
   invoke<TableInfo[]>("list_tables", { connection, refresh });
 
-/// テーブルのカラム一覧を返す。table には TableInfo.qualified_name を渡す。
+/// Returns the column list of a table. Pass TableInfo.qualified_name as table.
 export const listColumns = (connection: string, table: string) =>
   invoke<ColumnInfo[]>("list_columns", { connection, table });
 
-/// テーブル名 → カラム名リストのマップを返す (SQL 補完用)。
+/// Returns a map of table name -> column name list (for SQL completion).
 export const getSchemaMap = (connection: string) =>
   invoke<Record<string, string[]>>("get_schema_map", { connection });
 
-/// テーブルの主キーを構成するカラム名を返す (結果グリッドのセル編集用)。
-/// 主キーが無いテーブルでは空配列。
+/// Returns the column names that make up the table's primary key (for cell editing in the result grid).
+/// An empty array for a table with no primary key.
 export const getPrimaryKeys = (connection: string, table: string) =>
   invoke<string[]>("get_primary_keys", { connection, table });
 
-/// 結果グリッドのセル編集を UPDATE 群として 1 トランザクションで適用する。
-/// writable の意味は runQuery と同じ (未指定・false は読み取り専用)。
-/// 合計の影響行数を返す。
+/// Apply the result-grid cell edits as a group of UPDATEs in a single transaction.
+/// writable means the same as in runQuery (unspecified / false is read-only).
+/// Returns the total number of affected rows.
 export const runStatements = (
   connection: string,
   statements: string[],
   writable?: boolean,
 ) => invoke<number>("run_statements", { connection, statements, writable });
 
-/// AI 設定の情報を返す。`ai:` セクションが無い場合は configured: false。
-/// セクションはあるが不正 (不明 provider 等) な場合は reject される。
+/// Returns the AI settings info. configured: false if there is no `ai:` section.
+/// Rejects if the section exists but is invalid (unknown provider, etc.).
 export const getAiInfo = () => invoke<AiInfo>("get_ai_info");
 
-/// 自然言語の指示から SQL を生成して返す (実行はしない)。
+/// Generate SQL from a natural-language instruction and return it (does not run it).
 export const aiGenerateSql = (connection: string, instruction: string) =>
   invoke<string>("ai_generate_sql", { connection, instruction });
 
-/// 失敗した SQL とエラーメッセージから修正案の SQL を返す (実行はしない)。
+/// Return a suggested fixed SQL from the failed SQL and the error message (does not run it).
 export const aiFixSql = (
   connection: string,
   sql: string,
   errorMessage: string,
 ) => invoke<string>("ai_fix_sql", { connection, sql, errorMessage });
 
-/// エンジン別の EXPLAIN プレフィックスを付けた SQL を組み立てて返す
-/// (実行はしない)。SELECT / WITH 以外の文は reject される。
+/// Build and return SQL with the engine-specific EXPLAIN prefix
+/// (does not run it). Statements other than SELECT / WITH are rejected.
 export const buildExplainSql = (connection: string, sql: string) =>
   invoke<string>("build_explain_sql", { connection, sql });
 
-/// EXPLAIN の実行計画を AI に解説させ、Markdown テキストを返す。
+/// Have the AI explain the EXPLAIN execution plan and return Markdown text.
 export const aiExplainPlan = (
   connection: string,
   sql: string,
   planText: string,
 ) => invoke<string>("ai_explain_plan", { connection, sql, planText });
 
-/// カーソル位置の SQL 文を AI に平易に解説させ、Markdown テキストを返す
-/// (実行はしない)。
+/// Have the AI explain the SQL statement at the cursor in plain terms and return Markdown text
+/// (does not run it).
 export const aiExplainSql = (connection: string, sql: string) =>
   invoke<string>("ai_explain_sql", { connection, sql });
 
-/// AI チャットの 1 ターン (バックエンドの ai::ChatTurn に対応)。
-/// role は "user" / "assistant" のみ (system はバックエンドが組み立てる)。
+/// One turn of the AI chat (corresponds to ai::ChatTurn in the backend).
+/// role is only "user" / "assistant" (the backend builds system).
 export interface ChatTurn {
   role: "user" | "assistant";
   content: string;
 }
 
-/// AI エージェントが実行したツール呼び出しの記録
-/// (バックエンドの ai::ChatToolCall に対応)。
+/// Record of a tool call executed by the AI agent
+/// (corresponds to ai::ChatToolCall in the backend).
 export interface ChatToolCall {
   name: string;
-  /// 実行した SQL (引数のパースに失敗した場合は生の引数)
+  /// The SQL that was run (the raw arguments if parsing the arguments failed)
   argument: string;
   ok: boolean;
-  /// 結果の要約 (行数 / エラーメッセージの 1 行目)
+  /// Summary of the result (row count / first line of the error message)
   summary: string;
 }
 
-/// AI チャット 1 往復の応答 (バックエンドの ai::ChatReply に対応)。
-/// 失敗した往復も reject ではなくこの形で返る (途中まで実行したクエリを
-/// 隠さないため)。error が非 null なら失敗で、content は空。
+/// Response of one AI chat round trip (corresponds to ai::ChatReply in the backend).
+/// A failed round trip also returns in this shape instead of rejecting (so that queries
+/// executed partway are not hidden). If error is non-null it failed, and content is empty.
 export interface ChatReply {
   content: string;
   tool_calls: ChatToolCall[];
   error: string | null;
 }
 
-/// AI チャット (エージェント) の 1 往復を実行する。会話履歴は毎回そのまま
-/// 送り、system prompt の組み立てとツール実行ループはバックエンドが行う。
-/// エージェントが実行できるのは読み取り専用の SQL のみ。
-/// requestId はフロントが採番する往復の識別子 (中断はこの ID を指定する。
-/// 同じ接続で複数の往復が走りうるため接続名だけでは区別できない)。
+/// Run one round trip of the AI chat (agent). The conversation history is sent as is every time,
+/// and the backend builds the system prompt and runs the tool-execution loop.
+/// The agent can run only read-only SQL.
+/// requestId is the round-trip identifier numbered by the frontend (abort specifies this ID;
+/// several round trips can run on the same connection, so the connection name alone cannot distinguish them).
 export const aiChat = (
   connection: string,
   history: ChatTurn[],
   requestId: string,
 ) => invoke<ChatReply>("ai_chat", { connection, history, requestId });
 
-/// AI チャットのエージェントの往復を中断する (実行中のクエリを止め、
-/// 次のモデル呼び出し・ツール往復も行わせない)。まだ ai_chat が走り出す
-/// 前の ID も指定でき、その場合は開始時に中断される。
-/// 実行中のクエリを実際に止めたら true。
+/// Abort an AI chat agent round trip (stops the running query and does not let it
+/// make the next model call or tool round trip). An ID can also be specified before ai_chat has
+/// started running, in which case it is aborted at start.
+/// Returns true if a running query was actually stopped.
 export const cancelAiChat = (connection: string, requestIds: string[]) =>
   invoke<boolean>("cancel_ai_chat", { connection, requestIds });
 
-/// `queryfolio://open/<path>` deep link / CLI で指定された「開く対象」
-/// (バックエンドの router::OpenTarget に対応)。
+/// The "open target" specified by a `queryfolio://open/<path>` deep link / CLI
+/// (corresponds to router::OpenTarget in the backend).
 export interface OpenTarget {
-  /// 対象ファイルが属する接続名
+  /// Name of the connection the target file belongs to
   connection: string;
-  /// 開くファイル名 (拡張子付き。.sql / .redis)
+  /// File name to open (with extension. .sql / .redis)
   fileName: string;
 }
 
-/// frontend_ready の戻り値 (バックエンドの LaunchResult に対応)。
+/// Return value of frontend_ready (corresponds to LaunchResult in the backend).
 export interface LaunchResult {
-  /// 開く対象 (起動時指定 + 起動中に届いた分)
+  /// Targets to open (those specified at launch + those that arrived while running)
   targets: OpenTarget[];
-  /// 起動時指定の解決に失敗した理由 (トーストで表示する)
+  /// Reason why resolving the launch-time target failed (shown in a toast)
   errors: string[];
 }
 
-/// フロントの listener 登録完了を知らせ、それまでに溜まった開く対象
-/// (起動時の deep link / CLI 指定 + 起動中に届いた分) と、起動時指定の解決に
-/// 失敗した理由をまとめて受け取る。呼び出し後は以降の指定が open-query-file
-/// イベントで直接届く。onMount で listener を登録した直後に 1 度だけ呼ぶ。
+/// Notifies that the frontend's listener registration is complete, and receives together the open
+/// targets accumulated until then (launch-time deep link / CLI specification + those that arrived
+/// while running) and the reason resolving the launch-time target failed. After the call, later
+/// specifications arrive directly via the open-query-file event. Call it only once, right after registering the listener in onMount.
 export const frontendReady = () => invoke<LaunchResult>("frontend_ready");
 
 export const getConfigInfo = () => invoke<ConfigInfo>("get_config_info");
 
-/// 配布物に同梱している依存ライブラリのライセンス一覧 (THIRD-PARTY-NOTICES.txt の本文)。
+/// List of licenses of the dependency libraries bundled with the distribution (the body of THIRD-PARTY-NOTICES.txt).
 export const getThirdPartyNotices = () => invoke<string>("third_party_notices");
 
-/// config.yml が無ければテンプレートを作成する。作成した場合はそのパスを返す。
+/// Create a template if config.yml does not exist. If created, returns its path.
 export const ensureConfigFile = () =>
   invoke<string | null>("ensure_config_file");
 
-/// 設定エディタ用に config.yml の中身を読む (無ければテンプレートを作成してから読む)。
+/// Read the contents of config.yml for the config editor (creating the template first if it does not exist).
 export const readConfigFile = () => invoke<string>("read_config_file");
 
-/// 設定エディタからの保存。書き込んだファイルのパスを返す。
+/// Save from the config editor. Returns the path of the written file.
 export const writeConfigFile = (content: string) =>
   invoke<string>("write_config_file", { content });
 
-/// add_file_connection の結果。added = false は「同じファイルの接続が既にあった」
-/// (config.yml は書き換えていない)。
+/// Result of add_file_connection. added = false means "a connection for the same file already existed"
+/// (config.yml was not rewritten).
 export type FileConnection = { name: string; added: boolean };
 
-/// 選んだ SQLite / DuckDB ファイルの接続を config.yml の servers へ追記する
-/// (既存のコメントと順序は保つ)。再読み込みは呼び出し側で行う。
+/// Append a connection for the chosen SQLite / DuckDB file to the servers of config.yml
+/// (existing comments and order are preserved). Reloading is done by the caller.
 export const addFileConnection = (path: string) =>
   invoke<FileConnection>("add_file_connection", { path });
 
-/// config_override_command を実行して取得した生の YAML を返す
-/// (コピー用ビュー用。表示先では編集できるが保存はしない)。
+/// Run config_override_command and return the raw YAML obtained
+/// (for the copy view. It can be edited at the destination but is not saved).
 export const readOverrideConfigYaml = () =>
   invoke<string>("read_override_config_yaml");
 
-/// エクスポート時の文字コード。既定は UTF-8。
-/// Excel など UTF-8 を前提としないツール向けに CP932 / EUC-JP を選べる。
+/// Character encoding on export. Default is UTF-8.
+/// CP932 / EUC-JP can be chosen for tools such as Excel that do not assume UTF-8.
 export type ExportEncoding = "utf-8" | "cp932" | "euc-jp";
 
-/// 結果テーブルの Export で、ネイティブ保存ダイアログで選んだパスへ
-/// テキスト (CSV/TSV/JSON) を書き出す。パスはユーザーが明示的に選択したもの。
+/// In the result table's Export, write text (CSV/TSV/JSON) to the path chosen in the
+/// native save dialog. The path is one the user explicitly selected.
 export const writeExportFile = (
   path: string,
   contents: string,

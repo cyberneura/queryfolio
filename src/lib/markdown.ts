@@ -1,15 +1,15 @@
-/// AI の応答 (Markdown) を表示するための最小限の分割ユーティリティ。
-/// 完全な Markdown レンダラは持たず、``` フェンスでコードブロックと
-/// テキストに分けるだけ (AiAnalysisModal / ChatPane で共用)。
+/// Minimal splitting utility for displaying AI responses (Markdown).
+/// It has no full Markdown renderer; it only splits the text into code blocks and
+/// text by ``` fences (shared by AiAnalysisModal / ChatPane).
 
 export interface MarkdownSegment {
   type: "text" | "code";
   content: string;
 }
 
-/// ``` フェンスでコードブロックとテキストに分割する。
-/// split の偶数番目がテキスト、奇数番目がコード (閉じフェンスが無い
-/// 末尾の区間もコードとして表示する)。
+/// Splits into code blocks and text by ``` fences.
+/// Even-indexed parts of the split are text and odd-indexed ones are code (a trailing
+/// section with no closing fence is also shown as code).
 export function splitMarkdownSegments(text: string): MarkdownSegment[] {
   const result: MarkdownSegment[] = [];
   text.split("```").forEach((part, i) => {
@@ -19,7 +19,7 @@ export function splitMarkdownSegments(text: string): MarkdownSegment[] {
       }
       return;
     }
-    // コードブロック先頭行の言語タグ (sql 等) を取り除く
+    // Strip the language tag (sql, etc.) from the first line of the code block
     const newline = part.indexOf("\n");
     const firstLine = newline >= 0 ? part.slice(0, newline).trim() : "";
     const content =

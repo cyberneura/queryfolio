@@ -1,29 +1,29 @@
-//! DynamoDB エンジン。
+//! DynamoDB engine.
 //!
-//! PartiQL (SQL 互換サブセット) を ExecuteStatement API で実行する。
-//! エディタは通常の SQL (editor_language "sql" / 拡張子 .sql) で、
-//! readonly / dangerous ガードは db.rs の SQL 系ロジックをそのまま再利用する
-//! (PartiQL は SELECT / INSERT / UPDATE / DELETE のみ。scan_sql の方言は
-//! 標準 SQL 相当で足りる。ダブルクォート識別子は scan_sql が文字列として
-//! 空白化するが、WHERE 等のキーワードはクォートされないため判定に影響しない)。
+//! Executes PartiQL (a SQL-compatible subset) via the ExecuteStatement API.
+//! The editor uses plain SQL (editor_language "sql" / .sql extension), and the
+//! readonly / dangerous guards reuse the SQL logic in db.rs as is
+//! (PartiQL has only SELECT / INSERT / UPDATE / DELETE, so scan_sql's standard-SQL
+//! dialect is sufficient. scan_sql blanks double-quoted identifiers as strings,
+//! but keywords such as WHERE are never quoted, so detection is not affected).
 //!
-//! - 接続: `schema` = AWS リージョン (必須)。`host` / `port` は dynamodb-local
-//!   等のエンドポイント上書き (省略時は AWS の標準エンドポイント)。認証は
-//!   user / password (静的なアクセスキー) → `aws_profile` → 既定の
-//!   credentials chain の順に解決する。
-//! - PartiQL に LIMIT 句が無いため auto LIMIT は付与せず、ExecuteStatement の
-//!   `limit` パラメータ + NextToken ページネーションで max_rows + 1 件まで
-//!   取得して打ち切り、truncated を報告する。
-//! - INSERT / UPDATE / DELETE は API から影響行数が取れないため
-//!   affected_rows = None + 空結果を返す (`UPDATE ... RETURNING ALL OLD *` の
-//!   ように Items が返る文はそのまま表形式にする)。
-//! - すべてのリクエストに SDK のタイムアウト (接続 15 秒 / 操作 120 秒) を
-//!   掛け、ページネーション全体にも 120 秒の締切を置く (フィルタの強い
-//!   SELECT はスキャンの空ページが延々続き得るため)。
-//! - キャンセルはクライアント側で future を打ち切る (`CancelTarget::ClientSide`)。
-//!   接続プールを持たないため打ち切りで壊れる状態は無い。
-//! - HTTPS クライアントは既存依存と同じ ring ベースの rustls を明示する
-//!   (SDK 既定の aws-lc はネイティブビルド (cmake / NASM) を CI に増やすため)。
+//! - Connection: `schema` = AWS region (required). `host` / `port` override the
+//!   endpoint for dynamodb-local etc. (the standard AWS endpoint when omitted).
+//!   Credentials are resolved in the order user / password (static access key) ->
+//!   `aws_profile` -> the default credentials chain.
+//! - PartiQL has no LIMIT clause, so no auto LIMIT is added. Instead, the
+//!   ExecuteStatement `limit` parameter + NextToken pagination fetches up to
+//!   max_rows + 1 items, stops there, and reports truncated.
+//! - INSERT / UPDATE / DELETE cannot get the affected row count from the API, so
+//!   they return affected_rows = None + an empty result (statements that return
+//!   Items, such as `UPDATE ... RETURNING ALL OLD *`, are shown as a table as is).
+//! - Every request gets the SDK timeouts (connect 15 s / operation 120 s), and the
+//!   whole pagination also gets a 120 s deadline (a heavily filtered SELECT can
+//!   keep scanning empty pages indefinitely).
+//! - Cancellation aborts the future on the client side (`CancelTarget::ClientSide`).
+//!   There is no connection pool, so aborting leaves no broken state.
+//! - The HTTPS client explicitly uses the same ring-based rustls as the existing
+//!   dependencies (the SDK default aws-lc would add a native build (cmake / NASM) to CI).
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -41,44 +41,45 @@ use crate::db::{
 use crate::error::AppError;
 use crate::schema_info::{ColumnInfo, TableInfo};
 
-/// 接続 (TCP) と接続確認 (ListTables) のタイムアウト。
-/// タイムアウト無しの確認リクエストは get_pool (DbManager のロック保持中) を
-/// 無期限に止めるため必須。
+/// Timeout for connecting (TCP) and for the connectivity check (ListTables).
+/// A check request without a timeout would block get_pool (while DbManager holds
+/// its lock) indefinitely, so this is required.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// 1 回の API 操作のタイムアウト (SDK の operation timeout)。
-/// ページネーション全体の締切にも同じ値を使う。
+/// Timeout for a single API operation (the SDK operation timeout).
+/// The same value is used for the deadline of the whole pagination.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// エンドポイント上書き (host 指定) 時に port 省略なら dynamodb-local の既定
-/// ポートを使う。
+/// When the endpoint is overridden (host given) and port is omitted, use the
+/// default dynamodb-local port.
 const DEFAULT_LOCAL_PORT: u16 = 8000;
 
-/// TABLES ペインに出すテーブル一覧の件数上限 (非有界の一覧を作らない)。
+/// Upper limit on the number of tables shown in the TABLES pane (never build an unbounded list).
 const MAX_TABLES: usize = 5000;
 
-/// ListTables 1 ページの取得件数 (API 上限は 100)。
+/// Number of items fetched per ListTables page (the API limit is 100).
 const LIST_TABLES_PAGE: i32 = 100;
 
-/// 1 セルに入れるコレクション (L / M / SS / NS / BS) の要素数の共有予算。
-/// 階層ごとの独立上限ではなくセル全体で共有する
-/// (1,000 × 1,000 のネストで 100 万値を直列化しない)。
+/// Shared budget for the number of collection (L / M / SS / NS / BS) elements in
+/// one cell. It is shared across the whole cell rather than being an independent
+/// limit per level (so a 1,000 x 1,000 nest does not serialize 1 million values).
 const MAX_CELL_ELEMENTS: usize = 1000;
 
-/// 結果テーブルのカラム数上限。DynamoDB はスキーマレスでアイテムごとに
-/// 属性集合が違うため、疎なアイテム群の union でカラムが爆発し得る
-/// (1,000 行 × 1,000 属性なら 100 万セルを NULL 充填してしまう)。
-/// 名前昇順の先頭からこの数で打ち切り、truncated を報告する。
+/// Upper limit on the number of columns in a result table. DynamoDB is schemaless
+/// and each item has its own attribute set, so the union over sparse items can
+/// blow up the column count (1,000 rows x 1,000 attributes would fill 1 million
+/// cells with NULL). Truncate at this count from the front in name order and
+/// report truncated.
 const MAX_COLUMNS: usize = 500;
 
-/// 1 セルに入れる文字列 (S / B) の文字数上限。超過は打ち切り + truncated。
+/// Upper limit on the character count of a string (S / B) in one cell. Excess is truncated + truncated flag.
 const MAX_TEXT_CHARS: usize = 10_000;
 
-/// ネスト値 (L / M) を JSON 化する再帰の深さ上限 (スタック保護)。
+/// Recursion depth limit when converting nested values (L / M) to JSON (stack protection).
 const MAX_NESTING_DEPTH: usize = 32;
 
-/// DynamoDB への接続クライアント。DbPool::DynamoDb として保持される。
-/// SDK クライアントは内部に HTTP コネクションプールを持つ。
+/// Client connected to DynamoDB. Held as DbPool::DynamoDb.
+/// The SDK client internally holds an HTTP connection pool.
 #[derive(Clone)]
 pub struct DynamoClient {
     client: aws_sdk_dynamodb::Client,
@@ -90,9 +91,9 @@ impl std::fmt::Debug for DynamoClient {
     }
 }
 
-/// SDK のエラーをアプリのエラー型へ。DisplayErrorContext でエラーチェーン
-/// (サービスエラーの種別・メッセージ) まで展開する。SDK のエラーに認証情報や
-/// 署名は含まれないため、そのまま表示してよい。
+/// Convert an SDK error into the app's error type. DisplayErrorContext expands the
+/// error chain (service error kind and message). SDK errors contain no credentials
+/// or signatures, so they can be shown as is.
 fn sdk_error(context: &str, e: impl std::error::Error) -> AppError {
     AppError::DynamoDb(format!(
         "{context}: {}",
@@ -100,12 +101,12 @@ fn sdk_error(context: &str, e: impl std::error::Error) -> AppError {
     ))
 }
 
-/// ring ベースの rustls HTTPS クライアントを組む。
-/// SDK 既定の aws-lc (aws-lc-sys) はネイティブビルドに cmake / NASM を要し
-/// CI (macOS universal / Windows) のビルドリスクになるため、既存依存
-/// (reqwest / rustls) と同じ ring を明示する。
-/// (SharedHttpClient 型は SDK の config モジュールの re-export を使い、
-/// aws-smithy-runtime-api への直接依存を増やさない)
+/// Build a ring-based rustls HTTPS client.
+/// The SDK default aws-lc (aws-lc-sys) needs cmake / NASM for its native build,
+/// which is a build risk for CI (macOS universal / Windows), so explicitly use ring,
+/// the same as the existing dependencies (reqwest / rustls).
+/// (The SharedHttpClient type uses the re-export from the SDK's config module, so
+/// we do not add a direct dependency on aws-smithy-runtime-api)
 fn build_http_client() -> aws_sdk_dynamodb::config::SharedHttpClient {
     aws_smithy_http_client::Builder::new()
         .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
@@ -114,10 +115,10 @@ fn build_http_client() -> aws_sdk_dynamodb::config::SharedHttpClient {
         .build_https()
 }
 
-/// 設定から SDK クライアントを組み立てる (接続確認はしない)。
+/// Build the SDK client from the config (no connectivity check).
 async fn build_client(server: &ServerConfig) -> Result<DynamoClient, AppError> {
-    // schema = AWS リージョン (必須)。dynamodb-local でも SigV4 署名に
-    // リージョン名が要るため省略は設定エラーにする
+    // schema = AWS region (required). Even dynamodb-local needs a region name for
+    // SigV4 signing, so omitting it is a config error
     let region = server
         .schema
         .as_deref()
@@ -140,11 +141,11 @@ async fn build_client(server: &ServerConfig) -> Result<DynamoClient, AppError> {
                 .build(),
         );
 
-    // 認証の解決順: user / password (静的なアクセスキー ID / シークレット) →
-    // aws_profile (~/.aws のプロファイル) → 既定の credentials chain
-    // (環境変数 → default プロファイル → IMDS)。
-    // user / password は他エンジンと同じキーで書ける queryfolio 独自拡張
-    // (dynamodb-local はダミー値でよい)。
+    // Credential resolution order: user / password (static access key ID / secret) ->
+    // aws_profile (a profile in ~/.aws) -> the default credentials chain
+    // (environment variables -> default profile -> IMDS).
+    // user / password is a queryfolio-specific extension that can be written with the
+    // same keys as other engines (dummy values are fine for dynamodb-local).
     let user = server.user.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let password = server.password.as_deref().filter(|s| !s.is_empty());
     match (user, password) {
@@ -173,11 +174,11 @@ async fn build_client(server: &ServerConfig) -> Result<DynamoClient, AppError> {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                // profile_name だけでは既定チェーンの参照先を変えるだけで、
-                // 環境変数 (AWS_ACCESS_KEY_ID 等) のプロバイダが先勝ちする。
-                // aws_profile 指定時は明示のプロファイルプロバイダを立てて、
-                // 「user/password → aws_profile → 既定チェーン」の優先順を
-                // 環境に依らず成立させる
+                // profile_name alone only changes where the default chain looks, and the
+                // environment variable provider (AWS_ACCESS_KEY_ID etc.) still wins first.
+                // When aws_profile is given, set up an explicit profile provider so that the
+                // priority "user/password -> aws_profile -> default chain" holds regardless of
+                // the environment
                 loader = loader.credentials_provider(
                     aws_config::profile::ProfileFileCredentialsProvider::builder()
                         .profile_name(profile)
@@ -187,9 +188,9 @@ async fn build_client(server: &ServerConfig) -> Result<DynamoClient, AppError> {
         }
     }
 
-    // host / port はエンドポイント上書き (dynamodb-local 用)。
-    // tls: true で https (省略時 http。AWS 標準エンドポイントは host を
-    // 書かなければ SDK が https で解決する)
+    // host / port override the endpoint (for dynamodb-local).
+    // tls: true uses https (http when omitted. For the standard AWS endpoint, the SDK
+    // resolves it over https as long as host is not written)
     if let Some(host) = server
         .host
         .as_deref()
@@ -207,21 +208,21 @@ async fn build_client(server: &ServerConfig) -> Result<DynamoClient, AppError> {
     })
 }
 
-/// 接続を確立して疎通確認 (ListTables limit 1) まで行う。
-/// 確認リクエストにもタイムアウトを掛ける: TCP は繋がるのに応答しない相手で
-/// get_pool (DbManager のロック保持中) が無期限に停止しないようにする。
+/// Establish the connection and go as far as the connectivity check (ListTables limit 1).
+/// The check request also gets a timeout: so that get_pool (while DbManager holds
+/// its lock) does not hang forever on a peer that accepts TCP but never responds.
 pub async fn connect(server: &ServerConfig) -> Result<DynamoClient, AppError> {
     let client = build_client(server).await?;
     let confirm = client.client.list_tables().limit(1).send();
     match tokio::time::timeout(CONNECT_TIMEOUT, confirm).await {
         Ok(Ok(_)) => Ok(client),
         Ok(Err(e)) => {
-            // 最小権限の IAM (特定テーブルの ExecuteStatement のみ許可) では
-            // ListTables が AccessDenied になる。それは「資格情報と到達性は
-            // 正しいが権限が無い」状態なので、接続自体は成功として扱う
-            // (TABLES ペインを開いた時に改めて権限エラーとして表示される)。
-            // 資格情報不正 (UnrecognizedClient 等) やネットワークエラーは
-            // 従来どおり接続エラーにする
+            // With a least-privilege IAM policy (allowing only ExecuteStatement on specific
+            // tables), ListTables gets AccessDenied. That state means "credentials and
+            // reachability are correct but permission is missing", so the connection itself
+            // is treated as successful (the permission error is shown again when the TABLES
+            // pane is opened). Invalid credentials (UnrecognizedClient etc.) and network
+            // errors are connection errors as before
             let text = format!("{:?}", e);
             if text.contains("AccessDenied") {
                 return Ok(client);
@@ -235,8 +236,8 @@ pub async fn connect(server: &ServerConfig) -> Result<DynamoClient, AppError> {
     }
 }
 
-/// PartiQL 文を実行して結果を返す (キャンセル対応版)。
-/// db::run_query_cancellable から DbPool::DynamoDb の場合に委譲される。
+/// Execute a PartiQL statement and return the result (cancellable version).
+/// db::run_query_cancellable delegates here for DbPool::DynamoDb.
 pub async fn run_query_cancellable(
     client: &DynamoClient,
     registry: &CancelRegistry,
@@ -246,27 +247,29 @@ pub async fn run_query_cancellable(
     readonly: ReadonlyGuard,
     allow_dangerous: bool,
 ) -> Result<QueryResult, AppError> {
-    // psql 風メタコマンド (\...) は非対応 (translate が DynamoDb でエラーを返す)
+    // psql-style meta commands (\...) are unsupported (translate returns an error for DynamoDb)
     crate::meta_commands::translate(Engine::DynamoDb, sql)?;
 
     if leading_keyword(sql).is_empty() {
         return Err(AppError::Config("The SQL statement is empty".into()));
     }
 
-    // `tables` はテーブル一覧を返す queryfolio 独自の文 (CYBERNEURA-DEV-406)。
-    // PartiQL に SHOW TABLES に相当する構文が無く、DynamoDB へ投げても構文エラーに
-    // なるため、ここで受けて ListTables に流す。ExecuteStatement を経由しない
-    // 純粋な読み取りなので、readonly / dangerous ガードより前に処理してよい
-    // (ガードに掛けると SQL の先頭キーワード判定で fetch 文と見なされず、
-    // Writable OFF の接続で拒否されてしまう)。
+    // `tables` is a queryfolio-specific statement that returns the table list
+    // (CYBERNEURA-DEV-406). PartiQL has no syntax equivalent to SHOW TABLES and
+    // sending it to DynamoDB gives a syntax error, so it is handled here and routed
+    // to ListTables. It is a pure read that does not go through ExecuteStatement, so it
+    // may be handled before the readonly / dangerous guards (under the guards, the
+    // SQL leading-keyword check would not treat it as a fetch statement and it would
+    // be rejected on connections with Writable OFF).
     if is_tables_statement(sql) {
         return list_tables_query(client, registry, connection_name, max_rows).await;
     }
 
-    // readonly / dangerous ガードは SQL 系の共通ロジックを実行前に全文へ適用する。
-    // PartiQL は SELECT / INSERT / UPDATE / DELETE のみなので判定はそのまま使える。
-    // 複文はガードが 1 文目しか見ないため、ガードが有効なら拒否する
-    // (PartiQL 自体も 1 文しか受け付けないが、判定順を SQL 系と揃えておく)
+    // The readonly / dangerous guards apply the shared SQL logic to the whole text before execution.
+    // PartiQL has only SELECT / INSERT / UPDATE / DELETE, so the detection can be used as is.
+    // The guards only look at the first statement of a multi-statement input, so reject it
+    // when the guard is enabled (PartiQL itself accepts only one statement, but the check
+    // order is kept the same as the SQL engines)
     if (readonly != ReadonlyGuard::Off || !allow_dangerous)
         && crate::db::contains_multiple_statements(sql, Engine::DynamoDb)
     {
@@ -291,8 +294,8 @@ pub async fn run_query_cancellable(
         cancelled,
     );
     let started = Instant::now();
-    // キャンセルは実行の future を打ち切る。biased で実行結果側を先に見る:
-    // 結果とキャンセル通知が同時に ready なら完了済みの結果を優先する
+    // Cancellation aborts the execution future. biased checks the execution result first:
+    // if the result and the cancel notification are ready at the same time, the completed result wins
     let result = tokio::select! {
         biased;
         result = execute_statement(client, sql, max_rows) => result,
@@ -300,7 +303,7 @@ pub async fn run_query_cancellable(
     };
     let was_cancelled = guard.was_cancelled();
     drop(guard);
-    // キャンセルが完了と競合した場合は成功結果をそのまま返す (SQL 側と同じ挙動)
+    // If cancellation races with completion, return the successful result as is (same behavior as the SQL side)
     if was_cancelled && result.is_err() {
         return Err(AppError::Cancelled);
     }
@@ -309,15 +312,15 @@ pub async fn run_query_cancellable(
     Ok(result)
 }
 
-/// ExecuteStatement を実行し、SELECT なら NextToken でページを辿って
-/// max_rows + 1 件まで集める (超過分は shape_items が打ち切って truncated)。
+/// Run ExecuteStatement and, for a SELECT, follow pages with NextToken and collect up to
+/// max_rows + 1 items (shape_items truncates the excess and reports truncated).
 async fn execute_statement(
     client: &DynamoClient,
     sql: &str,
     max_rows: usize,
 ) -> Result<QueryResult, AppError> {
-    // limit パラメータとページネーションは読み取り (SELECT) にのみ意味がある。
-    // 書き込み文 (INSERT / UPDATE / DELETE) は単一アイテム操作で 1 回で終わる
+    // The limit parameter and pagination only matter for reads (SELECT).
+    // Write statements (INSERT / UPDATE / DELETE) are single-item operations that finish in one call
     let is_select = leading_keyword(sql) == "select";
     let started = Instant::now();
     let deadline_error = || {
@@ -332,16 +335,16 @@ async fn execute_statement(
     loop {
         let mut req = client.client.execute_statement().statement(sql);
         if is_select {
-            // limit は「評価するアイテム数」の上限。必要数 + 1 で truncated を
-            // 検知する (i32 へは実用範囲で収まる値に clamp)
+            // limit is an upper bound on the "number of items evaluated". Use needed + 1 to
+            // detect truncated (clamped to a value that fits in i32 in practice)
             let remaining = max_rows.saturating_add(1).saturating_sub(items.len());
             req = req.limit(remaining.min(i32::MAX as usize) as i32);
         }
         req = req.set_next_token(next_token.take());
-        // フィルタの強い SELECT はスキャンの空ページが延々続き得るため、
-        // ページネーション全体に締切を置く。各ページのリクエストを残余時間の
-        // timeout で包むことで、締切をページ間だけでなくリクエスト実行中にも
-        // 効かせる (1 操作の SDK タイムアウトと合算して ~2 倍待たされない)
+        // A heavily filtered SELECT can keep scanning empty pages indefinitely, so put a
+        // deadline on the whole pagination. Wrapping each page's request in a timeout of the
+        // remaining time makes the deadline apply not only between pages but also while a
+        // request is running (so we are not made to wait ~2x including the per-operation SDK timeout)
         let remaining_time = REQUEST_TIMEOUT
             .checked_sub(started.elapsed())
             .filter(|d| !d.is_zero())
@@ -359,11 +362,11 @@ async fn execute_statement(
     Ok(shape_items(items, max_rows))
 }
 
-/// Items (AttributeValue のマップ列) を表形式へ整形する。
-/// columns は全アイテムのキーの union。SDK の Item は HashMap でキー順が
-/// 不定のため、表示を確定的にするようソートして並べる。
-/// 書き込み文で Items が空の場合は空結果 (affected_rows は API から取れない
-/// ため None) になる。
+/// Shape Items (a list of AttributeValue maps) into a table.
+/// columns is the union of the keys of all items. The SDK Item is a HashMap with
+/// undefined key order, so sort them to make the display deterministic.
+/// For a write statement with empty Items, the result is empty (affected_rows is
+/// None because the API cannot provide it).
 fn shape_items(
     items: Vec<HashMap<String, AttributeValue>>,
     max_rows: usize,
@@ -371,10 +374,10 @@ fn shape_items(
     let mut truncated = items.len() > max_rows;
     let items = &items[..items.len().min(max_rows)];
 
-    // カラム union は BTreeSet で収集しながら MAX_COLUMNS に抑える:
-    // 上限超過のたびに最大要素を落とすことで、全 union を実体化せずに
-    // 「名前昇順の先頭 MAX_COLUMNS 個」を O(N log MAX_COLUMNS) で確定させる
-    // (スキーマレス由来の疎な属性群でも中間メモリと走査が有界)
+    // Collect the column union in a BTreeSet while capping it at MAX_COLUMNS:
+    // dropping the largest element whenever the limit is exceeded fixes "the first MAX_COLUMNS
+    // names in ascending order" in O(N log MAX_COLUMNS) without materializing the whole union
+    // (intermediate memory and scanning stay bounded even for sparse attribute sets from schemalessness)
     let mut column_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for item in items {
         for key in item.keys() {
@@ -396,7 +399,7 @@ fn shape_items(
         for column in &columns {
             match item.get(column) {
                 Some(value) => row.push(attr_to_json_cell(value, &mut truncated)),
-                // スキーマレスなのでアイテムに無い属性は NULL 扱い
+                // Schemaless, so attributes missing from an item are treated as NULL
                 None => row.push(serde_json::Value::Null),
             }
         }
@@ -415,26 +418,27 @@ fn shape_items(
     }
 }
 
-/// AttributeValue を JSON へ変換する (セル単位の共有予算付き)。
+/// Convert an AttributeValue to JSON (with a per-cell shared budget).
 fn attr_to_json_cell(value: &AttributeValue, truncated: &mut bool) -> serde_json::Value {
     let mut budget = MAX_CELL_ELEMENTS;
     attr_to_json(value, truncated, 0, &mut budget)
 }
 
-/// N (数値) を JSON へ。DynamoDB の N は任意精度 (最大 38 桁) のため、
-/// JS の安全整数範囲に収まる整数だけ数値にし、それ以外 (小数・巨大整数) は
-/// 精度を保つため文字列のまま返す (invoke 境界の丸め対策)。
+/// Convert N (number) to JSON. DynamoDB's N is arbitrary precision (up to 38 digits), so
+/// only integers within the JS safe integer range become numbers; everything else
+/// (decimals, huge integers) is returned as a string to keep precision (guards against
+/// rounding at the invoke boundary).
 fn number_to_json(n: &str) -> serde_json::Value {
     if !n.contains(['.', 'e', 'E']) {
         if let Ok(v) = n.parse::<i64>() {
-            // json_i64 が安全範囲外を文字列化する
+            // json_i64 stringifies values outside the safe range
             return json_i64(v);
         }
     }
     serde_json::Value::String(n.to_string())
 }
 
-/// 文字列を文字数上限で打ち切る (超えたら truncated を立てて省略記号を付ける)。
+/// Truncate a string at the character limit (when exceeded, set truncated and append an ellipsis).
 fn text_limited(v: &str, truncated: &mut bool) -> serde_json::Value {
     if v.chars().count() <= MAX_TEXT_CHARS {
         return serde_json::Value::String(v.to_string());
@@ -444,8 +448,8 @@ fn text_limited(v: &str, truncated: &mut bool) -> serde_json::Value {
     serde_json::Value::String(format!("{cut}…"))
 }
 
-/// バイナリ (B / BS 要素) を JSON へ (bytes_to_json: UTF-8 なら文字列、
-/// そうでなければ base64)。サイズ上限で先頭だけ変換して打ち切る。
+/// Convert binary (B / BS element) to JSON (bytes_to_json: a string if UTF-8,
+/// otherwise base64). Only the head is converted, cut off at the size limit.
 fn blob_limited(bytes: &[u8], truncated: &mut bool) -> serde_json::Value {
     if bytes.len() > MAX_TEXT_CHARS {
         *truncated = true;
@@ -464,8 +468,8 @@ fn attr_to_json(
     depth: usize,
     budget: &mut usize,
 ) -> serde_json::Value {
-    // データ由来の任意深度ネスト (DynamoDB は 32 階層まで許す) で
-    // スタックを溢れさせない
+    // Do not overflow the stack on arbitrary-depth nesting derived from data
+    // (DynamoDB allows up to 32 levels)
     if depth >= MAX_NESTING_DEPTH
         && matches!(value, AttributeValue::L(_) | AttributeValue::M(_))
     {
@@ -491,7 +495,7 @@ fn attr_to_json(
             serde_json::Value::Array(out)
         }
         AttributeValue::M(map) => {
-            // HashMap のキー順は不定なのでソートして確定的に出す
+            // HashMap key order is undefined, so sort to output deterministically
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
             let mut obj = serde_json::Map::new();
@@ -544,14 +548,14 @@ fn attr_to_json(
             }
             serde_json::Value::Array(out)
         }
-        // AttributeValue は non_exhaustive (将来の型追加に備える)
+        // AttributeValue is non_exhaustive (to allow for future type additions)
         other => serde_json::Value::String(format!("<unsupported: {other:?}>")),
     }
 }
 
-/// DynamoDB のテーブル名を検証する (英数と `_ - .`、3〜255 文字)。
-/// DescribeTable の API パラメータとして送るだけなのでインジェクション面は
-/// 無いが、明らかな不正値 (タイプミス・混入) は API を呼ぶ前に弾く。
+/// Validate a DynamoDB table name (alphanumerics and `_ - .`, 3 to 255 characters).
+/// It is only sent as a DescribeTable API parameter, so there is no injection surface,
+/// but obviously invalid values (typos, contamination) are rejected before calling the API.
 fn validate_table_name(name: &str) -> Result<&str, AppError> {
     let valid = (3..=255).contains(&name.chars().count())
         && name
@@ -566,19 +570,19 @@ fn validate_table_name(name: &str) -> Result<&str, AppError> {
     Ok(name)
 }
 
-/// エディタの入力が `tables` (queryfolio 独自の文) か。
+/// Whether the editor input is `tables` (a queryfolio-specific statement).
 ///
-/// 末尾のセミコロンと前後の空白だけを許し、`tables where ...` のような続きは
-/// 受け付けない (PartiQL の文と紛れないようにするため)。大小は区別しない。
+/// Only a trailing semicolon and surrounding whitespace are allowed; a continuation such as
+/// `tables where ...` is not accepted (so it is not confused with a PartiQL statement). Case-insensitive.
 pub(crate) fn is_tables_statement(sql: &str) -> bool {
     let trimmed = sql.trim();
     let body = trimmed.strip_suffix(';').unwrap_or(trimmed);
     body.trim_end().eq_ignore_ascii_case("tables")
 }
 
-/// `tables` 文の結果 (name / kind の表)。
+/// Result of the `tables` statement (a table of name / kind).
 ///
-/// キャンセルの扱いは PartiQL 経路と揃える (クライアント側で future を打ち切る)。
+/// Cancellation is handled the same as the PartiQL path (abort the future on the client side).
 async fn list_tables_query(
     client: &DynamoClient,
     registry: &CancelRegistry,
@@ -597,7 +601,7 @@ async fn list_tables_query(
     let started = Instant::now();
     let result = tokio::select! {
         biased;
-        // 表示は max_rows 件まで。truncated の判定に 1 件だけ多く取る
+        // Show up to max_rows items. Fetch just one extra to determine truncated
         result = fetch_tables_limited(client, max_rows.saturating_add(1)) => result,
         _ = notify.notified() => Err(AppError::Cancelled),
     };
@@ -608,9 +612,9 @@ async fn list_tables_query(
     }
     let (tables, has_more) = result?;
 
-    // 他の結果と同じく max_rows で打ち切り、切ったことを truncated で伝える。
-    // ページネーションの締切で途中終了した場合も has_more で拾う
-    // (部分的な一覧を完全なものとして扱わない)
+    // Like other results, truncate at max_rows and report the cut via truncated.
+    // Also catch early termination by the pagination deadline via has_more
+    // (do not treat a partial list as complete)
     let truncated = has_more || tables.len() > max_rows;
     let rows: Vec<Vec<serde_json::Value>> = tables
         .into_iter()
@@ -635,22 +639,21 @@ async fn list_tables_query(
     })
 }
 
-/// テーブル一覧 (スキーマブラウザの TABLES ペイン用)。
-/// ListTables をページネーションで辿り、MAX_TABLES 件で打ち切る。
+/// Table list (for the schema browser's TABLES pane).
+/// Follow ListTables with pagination and cut off at MAX_TABLES items.
 pub async fn fetch_tables(client: &DynamoClient) -> Result<Vec<TableInfo>, AppError> {
     Ok(fetch_tables_limited(client, MAX_TABLES).await?.0)
 }
 
-/// テーブル一覧を最大 `limit` 件まで取る。
+/// Fetch up to `limit` tables.
 ///
-/// `limit` を分けているのは、`tables` 文が `max_rows` までしか表示しないのに
-/// MAX_TABLES (5,000) 件ぶんの ListTables を叩くのを避けるため
-/// (CYBERNEURA-DEV-406)。ページ単位でしか止められないので、実際の取得数は
-/// LIST_TABLES_PAGE の切り上げになる。
-/// 返り値の bool は「まだ続きがある」フラグ。`limit` に達した場合と、
-/// ページネーションの締切で打ち切った場合の両方で true になる。呼び出し側が
-/// 結果を truncated として報告できるようにするため
-/// (締切での打ち切りを黙って完全な一覧として扱わない)。
+/// `limit` is separate so that the `tables` statement, which shows only up to `max_rows`,
+/// does not issue ListTables for MAX_TABLES (5,000) items (CYBERNEURA-DEV-406).
+/// We can only stop at page granularity, so the actual count fetched is rounded up
+/// to the next multiple of LIST_TABLES_PAGE.
+/// The returned bool is the "more remain" flag. It is true both when `limit` is
+/// reached and when the pagination deadline cut it off, so the caller can report the
+/// result as truncated (never treat a deadline cutoff silently as a complete list).
 async fn fetch_tables_limited(
     client: &DynamoClient,
     limit: usize,
@@ -660,10 +663,10 @@ async fn fetch_tables_limited(
     let mut start_name: Option<String> = None;
     let mut has_more = false;
     loop {
-        // 1 操作ごとの SDK タイムアウトとは別に、一覧全体にも締切を置く。
-        // ページの完了を待ってから経過時間を見るだけでは、締切の直前に終わった
-        // ページの次の要求がまた丸ごと SDK タイムアウトぶん走れてしまうので、
-        // **残り時間を各要求に被せる**。残りが尽きていれば即座に打ち切られる
+        // Besides the per-operation SDK timeout, also put a deadline on the whole listing.
+        // Merely checking elapsed time after a page completes would let the request after a
+        // page that finished just before the deadline run for a whole SDK timeout again, so
+        // **apply the remaining time to each request**. If nothing remains, it is cut off immediately
         let remaining = REQUEST_TIMEOUT.saturating_sub(started.elapsed());
         let page = tokio::time::timeout(
             remaining,
@@ -677,7 +680,7 @@ async fn fetch_tables_limited(
         .await;
         let out = match page {
             Ok(result) => result.map_err(|e| sdk_error("ListTables failed", e))?,
-            // 締切で打ち切った。集まったぶんを返し、続きがあることを伝える
+            // Cut off by the deadline. Return what was collected and report that more remain
             Err(_) => {
                 has_more = true;
                 break;
@@ -709,23 +712,23 @@ async fn fetch_tables_limited(
     Ok((tables, has_more))
 }
 
-/// ScalarAttributeType (S / N / B) の表示文字列。
+/// Display string for ScalarAttributeType (S / N / B).
 fn scalar_type_label(t: &aws_sdk_dynamodb::types::ScalarAttributeType) -> String {
     t.as_str().to_string()
 }
 
-/// テーブルの「カラム」一覧 (TABLES ペインの展開用)。
-/// DynamoDB はスキーマレスのため、DescribeTable で分かる範囲 = キースキーマ
-/// (パーティション / ソートキー) + 属性定義 (キー・インデックス対象の属性のみ)
-/// を返す。data_type は S / N / B の表記で、キーには役割を添える。
-/// キー属性は必ず存在するため nullable = false、その他は true。
+/// List of "columns" of a table (for expanding in the TABLES pane).
+/// DynamoDB is schemaless, so return what DescribeTable reveals = the key schema
+/// (partition / sort key) + attribute definitions (only attributes used by keys or indexes).
+/// data_type is written as S / N / B, with the role appended for keys.
+/// Key attributes always exist so nullable = false; the others are true.
 pub async fn fetch_columns(
     client: &DynamoClient,
     table: &str,
 ) -> Result<Vec<ColumnInfo>, AppError> {
     let (key_schema, attribute_definitions) = describe_table(client, table).await?;
 
-    // 属性名 → 型 (S / N / B) のマップ
+    // Map of attribute name -> type (S / N / B)
     let mut types: HashMap<String, String> = HashMap::new();
     for def in &attribute_definitions {
         types.insert(
@@ -735,7 +738,7 @@ pub async fn fetch_columns(
     }
 
     let mut columns: Vec<ColumnInfo> = Vec::new();
-    // キースキーマ (HASH → RANGE の順で返る) を先頭に
+    // Put the key schema (returned in HASH -> RANGE order) first
     for element in &key_schema {
         let name = element.attribute_name().to_string();
         let base = types.get(&name).cloned().unwrap_or_else(|| "?".to_string());
@@ -750,7 +753,7 @@ pub async fn fetch_columns(
             nullable: false,
         });
     }
-    // 残りの属性定義 (GSI / LSI のキー属性)。テーブルのキーは除く
+    // The remaining attribute definitions (GSI / LSI key attributes). Table keys are excluded
     for def in &attribute_definitions {
         let name = def.attribute_name();
         if columns.iter().any(|c| c.name == name) {
@@ -765,7 +768,7 @@ pub async fn fetch_columns(
     Ok(columns)
 }
 
-/// テーブルの主キー (パーティションキー → ソートキーの順)。
+/// Primary key of a table (partition key -> sort key order).
 pub async fn fetch_primary_keys(
     client: &DynamoClient,
     table: &str,
@@ -783,7 +786,7 @@ pub async fn fetch_primary_keys(
     Ok(hash)
 }
 
-/// DescribeTable を実行してキースキーマと属性定義を返す。
+/// Run DescribeTable and return the key schema and attribute definitions.
 async fn describe_table(
     client: &DynamoClient,
     table: &str,
@@ -815,9 +818,9 @@ async fn describe_table(
 mod tests {
     use super::*;
 
-    /// `tables` は Writable OFF でも実行できる queryfolio 独自の文
-    /// (CYBERNEURA-DEV-406)。PartiQL の文と紛れないよう、末尾のセミコロンと
-    /// 前後の空白だけを許す。
+    /// `tables` is a queryfolio-specific statement that can run even with Writable OFF
+    /// (CYBERNEURA-DEV-406). To avoid confusion with PartiQL statements, only a trailing
+    /// semicolon and surrounding whitespace are allowed.
     #[test]
     fn test_is_tables_statement() {
         for ok in ["tables", "TABLES", " tables ", "tables;", "  Tables ;  "] {
@@ -827,9 +830,9 @@ mod tests {
             "table",
             "tables where x = 1",
             "select * from tables",
-            // 複文で別の文を紛れ込ませられないこと
+            // Another statement cannot be smuggled in via multiple statements
             "tables; select 1",
-            // セミコロンは 1 個だけ許す
+            // Only one semicolon is allowed
             "tables;;",
             "",
         ] {
@@ -848,7 +851,7 @@ mod tests {
 
     #[test]
     fn test_shape_items_column_cap() {
-        // スキーマレス由来のカラム爆発は MAX_COLUMNS で打ち切る
+        // Column blow-up from schemalessness is cut off by MAX_COLUMNS
         let mut items = Vec::new();
         for i in 0..3 {
             let mut item = HashMap::new();
@@ -868,7 +871,7 @@ mod tests {
         let f = |sql: &str| is_readonly_allowed(sql, Engine::DynamoDb);
         assert!(f("SELECT * FROM \"users\""));
         assert!(f("SELECT * FROM \"users\" WHERE pk = 'a' AND EXISTS(tags)"));
-        // ? プレースホルダを含んでも SELECT は読み取り
+        // A SELECT is a read even if it contains a ? placeholder
         assert!(f("SELECT * FROM \"users\" WHERE pk = ?"));
         assert!(!f("INSERT INTO \"users\" VALUE {'pk': 'a'}"));
         assert!(!f("UPDATE \"users\" SET x = 1 WHERE pk = 'a'"));
@@ -878,21 +881,20 @@ mod tests {
     #[test]
     fn test_dangerous_guard_partiql() {
         let d = |sql: &str| dangerous_reason(sql, Engine::DynamoDb).is_some();
-        // WHERE 無しの UPDATE / DELETE は危険
+        // UPDATE / DELETE without WHERE is dangerous
         assert!(d("DELETE FROM \"users\""));
         assert!(d("UPDATE \"users\" SET x = 1"));
-        // WHERE ありは通す。ダブルクォート識別子 (PartiQL のクォート形) が
-        // scan_sql に文字列として空白化されても、キーワード where は
-        // クォートされないため判定に影響しない (チェックリスト 5)
+        // With WHERE it passes. Even if scan_sql blanks double-quoted identifiers (PartiQL's quoted form)
+        // as strings, the keyword where is never quoted, so detection is not affected (checklist item 5)
         assert!(!d("DELETE FROM \"users\" WHERE \"pk\" = 'a'"));
         assert!(!d("UPDATE \"users\" SET x = 1 WHERE pk = 'a'"));
-        // 識別子としての "where" (クォート済み) は WHERE 句ではない →
-        // 危険側 (WHERE 無し扱い) に倒れる
+        // A quoted "where" as an identifier is not a WHERE clause ->
+        // it falls to the dangerous side (treated as no WHERE)
         assert!(d("DELETE FROM \"where\""));
-        // INSERT / SELECT は対象外
+        // INSERT / SELECT are out of scope
         assert!(!d("INSERT INTO \"users\" VALUE {'pk': 'a'}"));
         assert!(!d("SELECT * FROM \"users\""));
-        // 公開ラッパー (フロントの実行前確認) 経由でも同じ
+        // The same holds via the public wrapper (the frontend's pre-execution confirmation)
         assert!(dangerous_statement_reason("dynamodb", "DELETE FROM \"users\"")
             .unwrap()
             .is_some());
@@ -908,19 +910,19 @@ mod tests {
     fn test_number_to_json() {
         assert_eq!(number_to_json("42"), serde_json::json!(42));
         assert_eq!(number_to_json("-7"), serde_json::json!(-7));
-        // 小数は精度を保つため文字列
+        // Decimals are strings to keep precision
         assert_eq!(number_to_json("1.5"), serde_json::json!("1.5"));
-        // 2^53 超は文字列 (invoke 境界の丸め対策)
+        // Above 2^53 is a string (guards against rounding at the invoke boundary)
         assert_eq!(
             number_to_json("9007199254740993"),
             serde_json::json!("9007199254740993")
         );
-        // i64 を超える任意精度の整数も文字列
+        // Arbitrary-precision integers beyond i64 are also strings
         assert_eq!(
             number_to_json("170141183460469231731687303715884105727"),
             serde_json::json!("170141183460469231731687303715884105727")
         );
-        // 指数表記は文字列のまま
+        // Exponent notation stays a string
         assert_eq!(number_to_json("1e10"), serde_json::json!("1e10"));
     }
 
@@ -939,7 +941,7 @@ mod tests {
             attr_to_json_cell(&AttributeValue::Null(true), &mut truncated),
             serde_json::Value::Null
         );
-        // B: UTF-8 なら文字列、そうでなければ base64
+        // B: a string if UTF-8, otherwise base64
         assert_eq!(
             attr_to_json_cell(
                 &AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(b"abc".to_vec())),
@@ -967,7 +969,7 @@ mod tests {
         map.insert("b".to_string(), n("2"));
         map.insert("a".to_string(), s("x"));
         let m = AttributeValue::M(map);
-        // M のキーはソートされて確定的に出る
+        // M keys are sorted and come out deterministically
         assert_eq!(
             serde_json::to_string(&attr_to_json_cell(&m, &mut truncated)).unwrap(),
             "{\"a\":\"x\",\"b\":2}"
@@ -994,7 +996,7 @@ mod tests {
 
     #[test]
     fn test_cell_budget_is_shared_across_nesting() {
-        // 600 要素 × 2 リストのネストでもセル全体の予算 (1,000) で打ち切る
+        // Even a nest of 600 elements x 2 lists is cut off by the per-cell budget (1,000)
         let inner: Vec<AttributeValue> = (0..600).map(|i| n(&i.to_string())).collect();
         let value = AttributeValue::L(vec![
             AttributeValue::L(inner.clone()),
@@ -1024,7 +1026,7 @@ mod tests {
         let v = attr_to_json_cell(&s(&long), &mut truncated);
         assert!(truncated);
         let text = v.as_str().unwrap();
-        assert_eq!(text.chars().count(), MAX_TEXT_CHARS + 1); // +1 は省略記号
+        assert_eq!(text.chars().count(), MAX_TEXT_CHARS + 1); // +1 is the ellipsis
         assert!(text.ends_with('…'));
 
         let mut truncated = false;
@@ -1060,13 +1062,13 @@ mod tests {
         b.insert("pk".to_string(), s("u2"));
         b.insert("age".to_string(), n("30"));
         let result = shape_items(vec![a, b], 100);
-        // union はソート順で確定
+        // The union is fixed in sorted order
         assert_eq!(result.columns, vec!["age", "name", "pk"]);
         assert_eq!(result.row_count, 2);
-        // アイテムに無い属性は NULL
-        assert_eq!(result.rows[0][0], serde_json::Value::Null); // a に age は無い
+        // Attributes missing from an item are NULL
+        assert_eq!(result.rows[0][0], serde_json::Value::Null); // a has no age
         assert_eq!(result.rows[0][1], serde_json::json!("alice"));
-        assert_eq!(result.rows[1][1], serde_json::Value::Null); // b に name は無い
+        assert_eq!(result.rows[1][1], serde_json::Value::Null); // b has no name
         assert_eq!(result.rows[1][0], serde_json::json!(30));
         assert!(!result.truncated);
         assert_eq!(result.affected_rows, None);
@@ -1085,7 +1087,7 @@ mod tests {
         assert_eq!(result.row_count, 3);
         assert!(result.truncated);
 
-        // 空 Items (書き込み文) は空結果 + affected None
+        // Empty Items (a write statement) give an empty result + affected None
         let result = shape_items(vec![], 100);
         assert_eq!(result.row_count, 0);
         assert!(result.columns.is_empty());
@@ -1097,7 +1099,7 @@ mod tests {
     fn test_validate_table_name() {
         assert!(validate_table_name("users").is_ok());
         assert!(validate_table_name("my-table.v2_x").is_ok());
-        assert!(validate_table_name("ab").is_err()); // 3 文字未満
+        assert!(validate_table_name("ab").is_err()); // fewer than 3 characters
         assert!(validate_table_name("bad name").is_err());
         assert!(validate_table_name("tbl;drop").is_err());
         assert!(validate_table_name(&"x".repeat(256)).is_err());
@@ -1109,21 +1111,21 @@ mod tests {
         assert!(err.to_string().contains("not supported"), "{err}");
         let err = crate::meta_commands::translate(Engine::DynamoDb, "\\c other").unwrap_err();
         assert!(err.to_string().contains("not supported"), "{err}");
-        // 通常の SQL はメタコマンドではない
+        // Plain SQL is not a meta command
         assert!(crate::meta_commands::translate(Engine::DynamoDb, "SELECT 1")
             .unwrap()
             .is_none());
     }
 
-    // ---- 統合テスト (dynamodb-local) ----
+    // ---- Integration tests (dynamodb-local) ----
     //
     // `docker run -d --name queryfolio-test-ddb -p 127.0.0.1:8100:8000 \
-    //    amazon/dynamodb-local` を起動しておくと実行される。
-    // 起動していなければ skip する (CI や docker の無い環境を壊さない)。
+    //    amazon/dynamodb-local` is running. They are skipped if it is not running
+    // (so CI and docker-less environments are not broken).
 
     const LOCAL_ENDPOINT: (&str, u16) = ("127.0.0.1", 8100);
 
-    /// dynamodb-local が起動しているか (TCP 接続の可否) を確認する。
+    /// Whether dynamodb-local is running (whether a TCP connection is possible).
     async fn local_available() -> bool {
         tokio::time::timeout(
             std::time::Duration::from_millis(500),
@@ -1135,7 +1137,7 @@ mod tests {
     }
 
     fn local_server_config(name: &str) -> ServerConfig {
-        // dynamodb-local は認証情報を検証しないためダミーの静的キーでよい
+        // dynamodb-local does not validate credentials, so dummy static keys are fine
         serde_yaml::from_str(&format!(
             "name: {name}\n\
              engine: dynamodb\n\
@@ -1149,7 +1151,7 @@ mod tests {
         .unwrap()
     }
 
-    /// テスト用テーブルを作る (パーティションキー pk (S) + ソートキー sk (N))。
+    /// Create a test table (partition key pk (S) + sort key sk (N)).
     async fn create_test_table(client: &DynamoClient, table: &str) {
         use aws_sdk_dynamodb::types::{
             AttributeDefinition, BillingMode, KeySchemaElement, ScalarAttributeType,
@@ -1196,9 +1198,9 @@ mod tests {
         let _ = client.client.delete_table().table_name(table).send().await;
     }
 
-    /// GUI E2E の代替を兼ねる統合テスト。フロントの Tauri コマンドと同じ
-    /// db.rs の公開経路 (DbManager::get_pool → run_query_cancellable の委譲)
-    /// を dynamodb-local で通しで検証する。
+    /// Integration test that doubles as a substitute for GUI E2E. It verifies end to end,
+    /// against dynamodb-local, the same public path in db.rs as the frontend's Tauri commands
+    /// (DbManager::get_pool -> delegation of run_query_cancellable).
     #[tokio::test]
     async fn test_integration_dynamodb_local() {
         if !local_available().await {
@@ -1209,7 +1211,7 @@ mod tests {
             );
             return;
         }
-        // 並行実行・再実行と衝突しないよう実行ごとに一意なテーブル名を使う
+        // Use a unique table name per run so concurrent runs and reruns do not collide
         let table = format!(
             "qf_it_{}",
             std::time::SystemTime::now()
@@ -1221,7 +1223,7 @@ mod tests {
         let manager = crate::db::DbManager::default();
         let registry = CancelRegistry::default();
 
-        // 接続 (ListTables の疎通確認込み)
+        // Connect (including the ListTables connectivity check)
         let pool = manager.get_pool(&server).await.unwrap();
         let crate::db::DbPool::DynamoDb(client) = &pool else {
             panic!("expected a DynamoDb pool");
@@ -1240,7 +1242,7 @@ mod tests {
             }
         };
 
-        // (a) INSERT (writable): 影響行数は取れないため None + 空結果
+        // (a) INSERT (writable): the affected row count is unavailable, so None + empty result
         for i in 0..30 {
             let result = run(
                 format!(
@@ -1259,7 +1261,7 @@ mod tests {
             assert_eq!(result.affected_rows, None);
         }
 
-        // (b) SELECT: 表形式 (columns union) と型変換
+        // (b) SELECT: table form (columns union) and type conversion
         let result = run(
             format!("SELECT * FROM \"{table}\" WHERE pk = 'user1' AND sk = 0"),
             1000,
@@ -1274,15 +1276,15 @@ mod tests {
             vec!["big", "meta", "name", "pk", "score", "sk", "tags"]
         );
         let row = &result.rows[0];
-        assert_eq!(row[0], serde_json::json!("9007199254740993")); // 2^53 超は文字列
+        assert_eq!(row[0], serde_json::json!("9007199254740993")); // above 2^53 is a string
         assert_eq!(row[1], serde_json::json!({"lang": "ja"}));
         assert_eq!(row[2], serde_json::json!("row0"));
         assert_eq!(row[3], serde_json::json!("user1"));
-        assert_eq!(row[4], serde_json::json!("1.5")); // 小数は文字列 (任意精度)
+        assert_eq!(row[4], serde_json::json!("1.5")); // decimals are strings (arbitrary precision)
         assert_eq!(row[5], serde_json::json!(0));
         assert_eq!(row[6], serde_json::json!(["a", "b"]));
 
-        // (c) max_rows + 1 での打ち切り + truncated (30 行中 10 行)
+        // (c) Truncation at max_rows + 1 + truncated (10 of 30 rows)
         let result = run(
             format!("SELECT * FROM \"{table}\" WHERE pk = 'user1'"),
             10,
@@ -1294,7 +1296,7 @@ mod tests {
         assert_eq!(result.row_count, 10);
         assert!(result.truncated);
 
-        // 全 30 行は truncated 無しで取れる (ページネーションの動作確認)
+        // All 30 rows are fetched without truncated (checks that pagination works)
         let result = run(
             format!("SELECT * FROM \"{table}\" WHERE pk = 'user1'"),
             1000,
@@ -1306,7 +1308,7 @@ mod tests {
         assert_eq!(result.row_count, 30);
         assert!(!result.truncated);
 
-        // (d) readonly ガード: Writable OFF (Switch) では INSERT を拒否
+        // (d) readonly guard: INSERT is rejected with Writable OFF (Switch)
         let err = run(
             format!("INSERT INTO \"{table}\" VALUE {{'pk': 'x', 'sk': 0}}"),
             1000,
@@ -1318,7 +1320,7 @@ mod tests {
         assert!(matches!(err, AppError::Readonly(_)), "{err}");
         assert!(err.to_string().contains("Writable"), "{err}");
 
-        // (e) dangerous ガード: WHERE 無し DELETE を拒否
+        // (e) dangerous guard: DELETE without WHERE is rejected
         let err = run(
             format!("DELETE FROM \"{table}\""),
             1000,
@@ -1329,14 +1331,14 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, AppError::Dangerous(_)), "{err}");
 
-        // (f) メタコマンドは拒否
+        // (f) Meta commands are rejected
         let err = run("\\dt".to_string(), 1000, ReadonlyGuard::Switch, false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not supported"), "{err}");
 
-        // (g) UPDATE / DELETE (WHERE 付き、writable)。
-        //     RETURNING ALL OLD * は変更前アイテムが行として返る
+        // (g) UPDATE / DELETE (with WHERE, writable).
+        //     RETURNING ALL OLD * returns the pre-change item as a row
         let result = run(
             format!(
                 "UPDATE \"{table}\" SET name = 'renamed' \
@@ -1363,7 +1365,7 @@ mod tests {
         assert_eq!(result.row_count, 1);
         assert!(result.columns.iter().any(|c| c == "name"));
 
-        // (h) schema_info: テーブル一覧・カラム (キースキーマ)・主キー
+        // (h) schema_info: table list, columns (key schema), primary key
         let tables = crate::schema_info::fetch_tables(&pool).await.unwrap();
         assert!(tables.iter().any(|t| t.qualified_name == table));
         assert!(tables.iter().all(|t| t.kind == "table"));
@@ -1383,14 +1385,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(keys, vec!["pk", "sk"]);
-        // 存在しないテーブルの DescribeTable はエラー
+        // DescribeTable on a nonexistent table is an error
         assert!(
             crate::schema_info::fetch_columns(&pool, "qf-no-such-table")
                 .await
                 .is_err()
         );
 
-        // (i) SELECT の応答が list_schemas / run_statements の拒否経路を壊さない
+        // (i) A SELECT response does not break the rejection paths of list_schemas / run_statements
         let schemas = crate::db::list_schemas(&pool, &server).await.unwrap();
         assert!(schemas.is_empty());
         let err = crate::db::run_statements(
@@ -1407,11 +1409,11 @@ mod tests {
         manager.disconnect("ddb-it").await;
     }
 
-    /// 接続確認 (ListTables) が到達不能なエンドポイントで速やかに
-    /// エラーになる (無期限に待たない)。
+    /// Connectivity check (ListTables) fails quickly
+    /// with an error on an unreachable endpoint (does not wait indefinitely).
     #[tokio::test]
     async fn test_connect_fails_fast_on_unreachable_endpoint() {
-        // TCP 接続自体が拒否されるポート (何も listen していない前提の高位ポート)
+        // A high port where the TCP connection itself is refused (assuming nothing is listening)
         let server: ServerConfig = serde_yaml::from_str(
             "name: x\nengine: dynamodb\nschema: us-east-1\n\
              host: 127.0.0.1\nport: 59998\nuser: a\npassword: b\n",
@@ -1420,11 +1422,11 @@ mod tests {
         let started = Instant::now();
         let err = connect(&server).await.unwrap_err();
         assert!(matches!(err, AppError::DynamoDb(_)), "{err}");
-        // 接続拒否は即時、悪くても CONNECT_TIMEOUT + マージンで返る
+        // Connection refusal is immediate; at worst it returns within CONNECT_TIMEOUT + margin
         assert!(started.elapsed() < CONNECT_TIMEOUT + std::time::Duration::from_secs(5));
     }
 
-    /// リージョン (schema) 未設定は設定エラー。
+    /// A missing region (schema) is a config error.
     #[tokio::test]
     async fn test_connect_requires_region_and_paired_credentials() {
         let server: ServerConfig =
@@ -1432,7 +1434,7 @@ mod tests {
         let err = build_client(&server).await.unwrap_err();
         assert!(err.to_string().contains("AWS region"), "{err}");
 
-        // user だけ・password だけは設定エラー (黙って chain に落とさない)
+        // Only user or only password is a config error (do not silently fall back to the chain)
         let server: ServerConfig = serde_yaml::from_str(
             "name: x\nengine: dynamodb\nschema: us-east-1\nuser: only-key\n",
         )
@@ -1441,18 +1443,18 @@ mod tests {
         assert!(err.to_string().contains("both user"), "{err}");
     }
 
-    /// クライアント側キャンセル: 応答を返さないエンドポイントで実行中の
-    /// クエリをキャンセルすると、タイムアウトを待たず Cancelled で返る。
+    /// Client-side cancel: cancelling a running query against an endpoint that never
+    /// responds returns Cancelled without waiting for the timeout.
     #[tokio::test]
     async fn test_cancel_aborts_running_query() {
-        // accept するが何も応答しないローカルサーバー
+        // A local server that accepts but never responds
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let hold = tokio::spawn(async move {
             let mut sockets = Vec::new();
             loop {
                 if let Ok((socket, _)) = listener.accept().await {
-                    sockets.push(socket); // 接続は保持したまま応答しない
+                    sockets.push(socket); // keep the connection open without responding
                 }
             }
         });
@@ -1478,7 +1480,7 @@ mod tests {
             )
             .await
         });
-        // 実行が登録されるのを待ってからキャンセルする
+        // Wait for the execution to be registered, then cancel
         let mut cancelled = false;
         for _ in 0..100 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;

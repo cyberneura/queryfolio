@@ -1,38 +1,38 @@
 /**
- * FILES ペインから CONNECTIONS ペインへのクエリファイルのドラッグ & ドロップ。
+ * Drag & drop of a query file from the FILES pane to the CONNECTIONS pane.
  *
- * 独自の MIME タイプを使うのが要点。`dataTransfer.getData()` は drop の時にしか
- * 読めない (dragover では仕様上ブロックされる) が、**タイプの一覧 (`types`) は
- * dragover でも読める**。したがってドロップ可否の判定とハイライトは type で行い、
- * 中身は drop で取り出す。text/plain だけだと、外部から流れてきた無関係な
- * テキストのドラッグまで受け入れてしまう。
+ * The key point is using a custom MIME type. `dataTransfer.getData()` can only be read
+ * on drop (the spec blocks it during dragover), but **the list of types (`types`) can
+ * be read even during dragover**. So whether a drop is allowed and the highlight are decided
+ * by type, and the contents are retrieved on drop. With text/plain alone, drags of unrelated
+ * text coming from outside would be accepted too.
  */
 
 export const FILE_DRAG_MIME = "application/x-queryfolio-query-file";
 
 export interface FileDragPayload {
-  /// ドラッグ元の接続名 (移動元)
+  /// Name of the source connection (where it is moved from)
   connection: string;
-  /// クエリファイル名 (拡張子付き)
+  /// Query file name (with extension)
   fileName: string;
 }
 
-/// ドラッグ開始時に dataTransfer へ積む。
+/// Put it into dataTransfer when the drag starts.
 export const setFileDragPayload = (
   dataTransfer: DataTransfer,
   payload: FileDragPayload,
 ): void => {
   dataTransfer.setData(FILE_DRAG_MIME, JSON.stringify(payload));
-  // エディタ等へ落とした時にファイル名が入るよう、素のテキストも入れておく
+  // Also add plain text so that the file name is inserted when dropped onto an editor, etc.
   dataTransfer.setData("text/plain", payload.fileName);
   dataTransfer.effectAllowed = "move";
 };
 
-/// ドラッグ中のデータがクエリファイルかどうか (dragover で使う)。
+/// Whether the data being dragged is a query file (used in dragover).
 export const hasFileDragPayload = (dataTransfer: DataTransfer | null): boolean =>
   !!dataTransfer && Array.from(dataTransfer.types).includes(FILE_DRAG_MIME);
 
-/// drop 時に取り出す。中身が壊れていたら null。
+/// Retrieve on drop. Returns null if the contents are broken.
 export const readFileDragPayload = (
   dataTransfer: DataTransfer | null,
 ): FileDragPayload | null => {
@@ -51,16 +51,16 @@ export const readFileDragPayload = (
       return parsed as FileDragPayload;
     }
   } catch {
-    // JSON でなければドロップを無視する
+    // If it is not JSON, ignore the drop
   }
   return null;
 };
 
-/// OS (Finder / エクスプローラー) からのファイルのドラッグかどうか。
+/// Whether this is a file drag from the OS (Finder / Explorer).
 ///
-/// `tauri.conf.json` で `dragDropEnabled: false` にしているため、外部ファイルの
-/// ドロップも WebView の既定動作に流れる。既定動作は「そのファイルへ遷移する」で、
-/// SPA が丸ごと置き換わり編集中の状態を失う。アプリはファイルのドロップを
-/// 受け付けないので、`+layout.svelte` がこれで判定して握りつぶす。
+/// Because `tauri.conf.json` sets `dragDropEnabled: false`, drops of external files also
+/// fall through to the WebView's default behavior. The default behavior is "navigate to that
+/// file", which replaces the whole SPA and loses the state being edited. The app does not
+/// accept file drops, so `+layout.svelte` uses this to detect them and swallow them.
 export const isExternalFileDrag = (dataTransfer: DataTransfer | null): boolean =>
   !!dataTransfer && Array.from(dataTransfer.types).includes("Files");

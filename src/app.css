@@ -5,14 +5,14 @@ html,
 body {
   height: 100%;
   overscroll-behavior: none;
-  /* ドキュメント自体はスクロールさせない (CYBERNEURA-DEV-421)。
-     アプリの枠は h-screen で画面ぴったりに組んであり、スクロールが必要な領域
-     (接続一覧・結果グリッド・チャット等) はそれぞれが overflow-auto を持つ。
-     どこか 1 つがはみ出すとウインドウ全体が縦にスクロールし、ツールバーごと
-     画面外へ流れて操作不能になる。はみ出しはクリップして、内側のスクロール
-     領域だけで完結させる。 */
+  /* Do not scroll the document itself (CYBERNEURA-DEV-421).
+     The app frame is laid out with h-screen to fit the screen exactly, and each area that needs
+     scrolling (connection list, result grid, chat, etc.) has its own overflow-auto.
+     If any one of them overflows, the whole window scrolls vertically and the toolbar is
+     pushed off-screen, making the app unusable. Clip the overflow so that only the inner
+     scroll areas scroll. */
   overflow: hidden;
-  /* UI はダーク固定。ネイティブ枠・スクロールバー・フォーム部品も
-     ダーク表示に揃える (WKWebView にダーク外観を宣言する) */
+  /* The UI is dark only. Align native frames, scrollbars and form controls
+     to the dark appearance as well (declares a dark appearance to WKWebView) */
   color-scheme: dark;
 }

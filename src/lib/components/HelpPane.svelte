@@ -4,17 +4,17 @@
   import { parseHelpDoc, parseInline } from "$lib/help/render";
 
   interface Props {
-    /// 選択中の接続のエンジン (未選択なら null)
+    /// Engine of the selected connection (null if none selected)
     engine: string | null;
-    /// ペインを閉じる (ツールバーのトグルと同じ状態を切る)
+    /// Close the pane (turns off the same state as the toolbar toggle)
     onClose: () => void;
-    /// 例文をエディタへ挿入する
+    /// Insert the example into the editor
     onInsert: (text: string) => void;
   }
 
   let { engine, onClose, onInsert }: Props = $props();
 
-  /// Copy を押したコードブロックの添字
+  /// Index of the code block whose Copy was pressed
   let copiedIndex = $state<number | null>(null);
 
   const doc = $derived(helpForEngine(engine));
@@ -30,7 +30,7 @@
         }
       }, 1200);
     } catch {
-      // クリップボードが使えない環境でも表示は壊さない
+      // Do not break the display even where the clipboard is unavailable
       copiedIndex = null;
     }
   };

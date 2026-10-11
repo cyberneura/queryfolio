@@ -1,10 +1,10 @@
 /**
- * データソース別のヘルプ本文。
+  * Help text per data source.
  *
- * ヘルプペインの表示にも、AI チャットへ渡すコンテクストにも同じ本文を使う
- * (CYBERNEURA-DEV-407)。二重管理を避けるため、Markdown はここから一箇所で配る。
+  * The same text is used both for the help pane display and for the context passed to the AI chat
+  * (CYBERNEURA-DEV-407). To avoid maintaining two copies, the Markdown is distributed from this one place.
  *
- * `?raw` は Vite の機能で、ファイルの中身を文字列として取り込む。
+  * `?raw` is a Vite feature that imports the contents of a file as a string.
  */
 import redisHelp from "./redis.md?raw";
 import elasticsearchHelp from "./elasticsearch.md?raw";
@@ -14,11 +14,11 @@ import mssqlHelp from "./mssql.md?raw";
 import sqlHelp from "./sql.md?raw";
 
 /**
- * エンジン名 → ヘルプ本文。
+  * Engine name -> help text.
  *
- * 接続の `engine` はエイリアスを含むため、**バックエンドが受け付ける綴りを全て**
- * 並べる (`db.rs` の `parse_engine`)。片方だけだと `engine: mariadb` の接続が
- * 「ヘルプ無し」になる。エイリアスを足す時は両方を揃えること。
+  * A connection's `engine` may be an alias, so **list every spelling the backend accepts**
+  * (`parse_engine` in `db.rs`). If only one is listed, a connection with `engine: mariadb`
+  * ends up with "no help". When adding an alias, update both places.
  */
 const HELP_BY_ENGINE: Record<string, string> = {
   redis: redisHelp,
@@ -39,19 +39,19 @@ const HELP_BY_ENGINE: Record<string, string> = {
 };
 
 /**
- * AI チャットのコンテクストに載せるエンジン。
+  * Engines to include in the AI chat context.
  *
- * MySQL / PostgreSQL / SQLite は素の SQL でモデルが十分に書けるため、載せても
- * トークンを使うばかりで精度に効かない (CYBERNEURA-DEV-407 の指示)。
- * 載せるのは方言が独特で、モデルが取り違えやすいものだけ。
+  * For MySQL / PostgreSQL / SQLite the model can already write plain SQL well enough, so including
+  * them only spends tokens without improving accuracy (instruction from CYBERNEURA-DEV-407).
+  * Include only engines with a distinctive dialect that the model is likely to get wrong.
  *
- * mssql は T-SQL 自体は書けるが、`EXPLAIN` が queryfolio の疑似文 (SHOWPLAN) で
- * `LIMIT` が無い (TOP) ことをモデルに伝えるために載せる。
+  * For mssql the model can write T-SQL itself, but it is included to tell the model that `EXPLAIN` is
+  * queryfolio's pseudo statement (SHOWPLAN) and that there is no `LIMIT` (it is TOP).
  *
- * **今この経路が実際に効くのは duckdb と mssql だけ**。redis / elasticsearch / dynamodb は
- * `EngineCapabilities.supports_ai` が false で AI チャット自体が使えないため
- * (`engines/mod.rs`)、ここに載せても現状は届かない。将来それらが AI 対応した時に
- * 何もしなくても効くよう、意図として残してある。
+  * **Currently this path actually takes effect only for duckdb and mssql**. redis / elasticsearch /
+  * dynamodb have `EngineCapabilities.supports_ai` set to false, so the AI chat itself is unavailable
+  * (`engines/mod.rs`), and listing them here does not reach anything for now. They are kept as an
+  * intentional placeholder so it works without any change once they support AI.
  */
 const AI_CONTEXT_ENGINES = new Set([
   "redis",
@@ -66,9 +66,9 @@ const AI_CONTEXT_ENGINES = new Set([
 ]);
 
 /**
- * そのエンジンのヘルプ本文を返す。
- * @param engine - 接続の engine 名 (未選択なら null)
- * @returns ヘルプの Markdown。未知のエンジンなら null
+  * Returns the help text for that engine.
+  * @param engine - The connection's engine name (null if none is selected)
+  * @returns The help Markdown. null for an unknown engine
  */
 export function helpForEngine(engine: string | null | undefined): string | null {
   if (!engine) {
@@ -78,11 +78,11 @@ export function helpForEngine(engine: string | null | undefined): string | null 
 }
 
 /**
- * AI チャットのコンテクストに載せるヘルプ本文を返す。
+  * Returns the help text to include in the AI chat context.
  *
- * ペイン表示用 (`helpForEngine`) と違い、SQL 系の一般的なエンジンでは null を返す。
- * @param engine - 接続の engine 名
- * @returns コンテクストに載せる Markdown。載せないエンジンなら null
+  * Unlike the pane display (`helpForEngine`), returns null for common SQL-family engines.
+  * @param engine - The connection's engine name
+  * @returns The Markdown to include in the context. null for engines that are not included
  */
 export function aiContextForEngine(engine: string | null | undefined): string | null {
   if (!engine || !AI_CONTEXT_ENGINES.has(engine.toLowerCase())) {
@@ -92,14 +92,14 @@ export function aiContextForEngine(engine: string | null | undefined): string | 
 }
 
 /**
- * AI チャットの最後のユーザー発言に前置きするリファレンスを組み立てる。
+  * Builds the reference to prepend to the last user message of the AI chat.
  *
- * **最後のユーザー発言に付ける**のが要点。バックエンドは履歴を直近
- * `CHAT_MAX_HISTORY_TURNS` 件に切り詰めるので、先頭に置くと会話が伸びた時点で
- * 落ちて、以後モデルはリファレンス無しで答え続けることになる。
- * 末尾なら常に残り、1 リクエストに 1 部だけ載る。
- * @param engine - 接続の engine 名
- * @returns 前置きするテキスト。載せないエンジンなら null
+  * The key point is to **attach it to the last user message**. The backend truncates the history to the
+  * most recent `CHAT_MAX_HISTORY_TURNS` entries, so if it is placed at the start it drops off once the
+  * conversation grows, and from then on the model keeps answering without the reference.
+  * At the end it always remains, and appears only once per request.
+  * @param engine - The connection's engine name
+  * @returns The text to prepend. null for engines that are not included
  */
 export function buildEngineHelpContext(engine: string | null | undefined): string | null {
   const help = aiContextForEngine(engine);

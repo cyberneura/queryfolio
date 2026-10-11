@@ -1,53 +1,52 @@
-//! Microsoft SQL Server エンジン (engine: mssql / sqlserver)。
+//! Microsoft SQL Server engine (engine: mssql / sqlserver).
 //!
-//! SQL エンジンだが sqlx にドライバが無いため、`tiberius` crate (TDS プロトコルの
-//! pure Rust 実装) で独自に結線する。SQL 系の共通ガード (メタコマンド変換 →
-//! readonly → dangerous) は db.rs の既存ロジックをそのまま再利用し、T-SQL に
-//! 無い部分だけここで補う:
+//! A SQL engine, but sqlx has no driver for it, so it is wired up directly with the `tiberius` crate
+//! (a pure Rust implementation of the TDS protocol). The shared SQL guards (meta-command conversion ->
+//! readonly -> dangerous) reuse the existing logic in db.rs as is; only the parts T-SQL lacks are
+//! added here:
 //!
-//! - **auto LIMIT は `TOP (n)`** を SELECT 直後 (DISTINCT / ALL の後) に差し込む
-//!   (`apply_auto_top`)。T-SQL に LIMIT 句は無い。TOP / OFFSET / FETCH / UNION 等を
-//!   含む文は意味が変わり得るため付けない (保守的側。付けなくても max_rows の
-//!   打ち切りが安全網になる)。
-//! - **EXPLAIN は queryfolio の疑似文**。T-SQL に EXPLAIN は無いので、
-//!   `EXPLAIN <select>` を受け取ったら同じ接続で `SET SHOWPLAN_ALL ON` →
-//!   対象文 → `SET SHOWPLAN_ALL OFF` の 3 バッチを流し、推定実行計画の行を
-//!   結果として返す (SHOWPLAN は対象文を実行しない)。
-//! - **読み取り専用トランザクションは無い**。エージェント経路
-//!   (ReadonlyGuard::Agent) は `BEGIN TRANSACTION` で包み、結果に関わらず
-//!   `ROLLBACK` する。文レベルのガードを抜けた書き込みは取り消されるが、
-//!   `NEXT VALUE FOR` (シーケンス) と IDENTITY の消費はロールバックされない
-//!   (SQL Server の仕様)。Postgres / DuckDB の READ ONLY より弱いことは README に
-//!   明記している。**この経路は専用の接続を張って実行後に捨てる**: SQL Server の
-//!   入れ子トランザクションは独立していないので、ユーザーが同じ接続で
-//!   `BEGIN TRANSACTION` を開いたままにしていると、エージェントの ROLLBACK が
-//!   その未確定の変更まで取り消してしまう。
-//! - **ユーザーのコネクションは 1 本**を `Mutex<Option<Client>>` で維持し、実行を
-//!   直列化する。キャンセルは実行の future を打ち切った (`CancelTarget::ClientSide`)
-//!   後、同じ Client で `cancel_query` (TDS の Attention) を送ってサーバー側の実行を
-//!   止め、**その接続は捨てる** (次の実行で張り直す)。打ち切った future の中で
-//!   開いた `SET SHOWPLAN_ALL ON` やトランザクションの後始末は走っていないので、
-//!   戻すと次の文がその状態を引き継ぐ。Attention はトランザクションを戻さないが、
-//!   接続を閉じればサーバーがセッションごと片付ける。
-//! - **接続は `user` / `password` の SQL Server 認証のみ**。Windows 統合認証・
-//!   Azure AD・名前付きインスタンス (SQL Browser) は非対応。
-//! - **TLS は `ssl_mode` / `tls` を tiberius の EncryptionLevel へ写す**。TDS の
-//!   暗号化はクライアントとサーバーの提示の組み合わせで決まる (tiberius の
-//!   `negotiated_encryption`): disable = NotSupported (サーバーが要求すれば
-//!   それでも暗号化される)、prefer = Off (ログインパケットは常に暗号化し、残りは
-//!   サーバーが On / Required を提示した時だけ暗号化する。証明書は検証しない。
-//!   `On` を提示すると Off / NotSupported のサーバーでプロトコルエラーになり、
-//!   平文への降格ができない)、require = Required (検証しない)、verify-ca /
-//!   verify-full = Required + 検証 (`ssl_root_cert` があれば追加 CA として信頼)。
-//!   SQL Server の TLS はチェーンだけ検証してホスト名を見ない設定を持たないため、
-//!   verify-ca は verify-full と同じ (厳しい側に倒す)。SSH トンネル経由では接続先
-//!   が 127.0.0.1 になるので、証明書のホスト名検証には設定の `host` を使う
-//!   (`hostname_in_certificate`)。
-//! - **TLS バックエンドは vendored OpenSSL** (tiberius の `vendored-openssl` =
-//!   opentls)。既定の native-tls は macOS の Security Framework が SQL Server の
-//!   TLS と動かない (tiberius の README に明記)。rustls は tokio-rustls の既定
-//!   feature (aws_lc_rs) で aws-lc-sys のネイティブビルドを CI に持ち込む。
-//!   OpenSSL は ssh2 が既に静的リンクしている openssl-src と同じもの。
+//! - **auto LIMIT is `TOP (n)`**, inserted right after SELECT (after DISTINCT / ALL)
+//!   (`apply_auto_top`). T-SQL has no LIMIT clause. It is not added to statements containing TOP /
+//!   OFFSET / FETCH / UNION etc., since the meaning could change (the conservative side; even
+//!   without it, the max_rows cutoff acts as a safety net).
+//! - **EXPLAIN is a queryfolio pseudo-statement**. T-SQL has no EXPLAIN, so on receiving
+//!   `EXPLAIN <select>` we run three batches on the same connection: `SET SHOWPLAN_ALL ON` ->
+//!   the target statement -> `SET SHOWPLAN_ALL OFF`, and return the estimated execution plan rows
+//!   as the result (SHOWPLAN does not execute the target statement).
+//! - **There is no read-only transaction**. The agent path
+//!   (ReadonlyGuard::Agent) wraps the statement in `BEGIN TRANSACTION` and always issues
+//!   `ROLLBACK` regardless of the result. Writes that slip past the statement-level guard are undone,
+//!   but `NEXT VALUE FOR` (sequences) and IDENTITY consumption are not rolled back
+//!   (SQL Server behavior). The README states that this is weaker than READ ONLY in Postgres / DuckDB.
+//!   **This path opens a dedicated connection and discards it after execution**: SQL Server's
+//!   nested transactions are not independent, so if the user left a `BEGIN TRANSACTION` open on the
+//!   same connection, the agent's ROLLBACK would also undo those uncommitted changes.
+//! - **The user's connection is a single one**, kept in a `Mutex<Option<Client>>` to serialize
+//!   execution. Cancellation aborts the execution future (`CancelTarget::ClientSide`), then sends
+//!   `cancel_query` (TDS Attention) on the same Client to stop server-side execution, and
+//!   **discards that connection** (it is re-established on the next execution). The cleanup of
+//!   `SET SHOWPLAN_ALL ON` or a transaction opened inside the aborted future has not run, so
+//!   reusing the connection would carry that state into the next statement. Attention does not
+//!   roll back transactions, but closing the connection makes the server clean up the whole session.
+//! - **Connections support only SQL Server authentication with `user` / `password`**. Windows
+//!   integrated authentication, Azure AD and named instances (SQL Browser) are not supported.
+//! - **TLS maps `ssl_mode` / `tls` to tiberius's EncryptionLevel**. TDS encryption is decided
+//!   by the combination of what the client and server offer (tiberius's
+//!   `negotiated_encryption`): disable = NotSupported (still encrypted if the server requires it),
+//!   prefer = Off (the login packet is always encrypted, and the rest is encrypted only if the
+//!   server offers On / Required; the certificate is not verified. Offering `On` causes a
+//!   protocol error with servers offering Off / NotSupported, so it cannot downgrade to
+//!   plaintext), require = Required (no verification), verify-ca /
+//!   verify-full = Required + verification (`ssl_root_cert`, if set, is trusted as an extra CA).
+//!   SQL Server's TLS has no setting to verify only the chain without checking the hostname, so
+//!   verify-ca is the same as verify-full (erring on the strict side). Over an SSH tunnel the
+//!   destination becomes 127.0.0.1, so the configured `host` is used for certificate hostname
+//!   verification (`hostname_in_certificate`).
+//! - **The TLS backend is vendored OpenSSL** (tiberius's `vendored-openssl` =
+//!   opentls). The default native-tls does not work with SQL Server's TLS on macOS's Security
+//!   Framework (stated in tiberius's README). rustls, with tokio-rustls's default
+//!   feature (aws_lc_rs), would bring a native build of aws-lc-sys into CI.
+//!   This OpenSSL is the same openssl-src that ssh2 already links statically.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -67,52 +66,52 @@ use crate::db::{
 use crate::error::AppError;
 use crate::schema_info::{ColumnInfo, TableInfo};
 
-/// SQL Server の既定ポート。
+/// The default SQL Server port.
 pub const DEFAULT_PORT: u16 = 1433;
 
-/// 接続 (TCP + TDS ハンドシェイク + ログイン) 全体のタイムアウト。
-/// get_pool (DbManager のロック保持中) を無期限に止めないため必須。
+/// Timeout for the whole connection (TCP + TDS handshake + login).
+/// Required so that get_pool (while holding DbManager's lock) is never blocked indefinitely.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// キャンセル (Attention) の送信と応答の読み捨てを待つ上限。
-/// 超えたら接続を捨てて張り直す。
+/// Upper limit for sending cancellation (Attention) and draining the response.
+/// If exceeded, the connection is discarded and re-established.
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 1 セルに入れる文字列 (NVARCHAR / VARBINARY / XML) の文字数上限。
-/// 超過分は打ち切って truncated を立てる (webview へ非有界の値を送らない)。
+/// Maximum number of characters for a string in one cell (NVARCHAR / VARBINARY / XML).
+/// The excess is cut off and truncated is set (no unbounded values are sent to the webview).
 const MAX_TEXT_CHARS: usize = 10_000;
 
-/// スキーマ修飾の無いテーブル名が属する既定スキーマ。
-/// (schema_info::build_qualified_name の public と同じ扱いで、修飾しない)
+/// The default schema that unqualified table names belong to.
+/// (Treated like public in schema_info::build_qualified_name, i.e. not qualified.)
 const DEFAULT_SCHEMA: &str = "dbo";
 
-/// `EXPLAIN` 疑似文の実体。build_explain_sql (db.rs) がこの語を前置する。
+/// The body of the `EXPLAIN` pseudo-statement. build_explain_sql (db.rs) prefixes this word.
 const EXPLAIN_KEYWORD: &str = "explain";
 
 type MsSqlClient = Client<Compat<TcpStream>>;
 
-/// SQL Server 接続のハンドル。DbPool::MsSql として保持される。
-/// `client` はユーザー操作用の 1 本のコネクション (無ければ次の実行で張り直す。
-/// エージェント経路は毎回専用の接続を張るのでここには入らない)。tokio の Mutex で
-/// 実行を接続単位で直列化する: キャンセル登録 (CancelRegistry) は接続名ごとに
-/// 1 件なので、同一接続の 2 本目が並行実行されると登録が上書きされ、キャンセルが
-/// 混線する (duckdb と同じ理由)。
+/// Handle for a SQL Server connection. Held as DbPool::MsSql.
+/// `client` is the single connection for user operations (if absent, it is re-established on the
+/// next execution; the agent path opens a dedicated connection each time, so it never goes here).
+/// The tokio Mutex serializes execution per connection: cancel registration (CancelRegistry) holds
+/// one entry per connection name, so if a second execution on the same connection ran concurrently,
+/// the registration would be overwritten and cancellation would get mixed up (same reason as duckdb).
 #[derive(Clone)]
 pub struct MsSqlHandle {
     config: Arc<Config>,
     client: Arc<tokio::sync::Mutex<Option<MsSqlClient>>>,
 }
 
-// Config はパスワードを持つため Debug を導出せず、名前だけ出す
+// Config holds the password, so Debug is not derived; only the name is shown
 impl std::fmt::Debug for MsSqlHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("MsSqlHandle")
     }
 }
 
-/// 設定から tiberius の Config を組み立てる (接続はしない)。
-/// `host` / `port` は SSH トンネルで差し替わった後の接続先。証明書の
-/// ホスト名検証には設定上の `server.host` を使う。
+/// Builds a tiberius Config from the settings (does not connect).
+/// `host` / `port` are the destination after any SSH tunnel substitution. The configured
+/// `server.host` is used for certificate hostname verification.
 fn build_config(server: &ServerConfig, host: &str, port: u16) -> Result<Config, AppError> {
     let Some(user) = server
         .user
@@ -141,16 +140,16 @@ fn build_config(server: &ServerConfig, host: &str, port: u16) -> Result<Config, 
         server.password.clone().unwrap_or_default(),
     ));
     config.application_name("queryfolio");
-    // 既定の 30 秒は「サーバーからの次の応答を待つ上限」で、重い集計がそれで
-    // 失敗する。止めたい時はキャンセルがあるので、無期限にする
+    // The default 30 seconds is the limit for waiting for the next response from the server, and
+    // heavy aggregations fail on it. Cancellation exists for stopping, so make it unlimited
     config.command_timeout(None);
     config.handshake_timeout(Some(CONNECT_TIMEOUT));
 
     match server.sql_ssl_mode()? {
         SqlSslMode::Disable => config.encryption(EncryptionLevel::NotSupported),
-        // Off = 「ログインパケットだけは暗号化し、残りはサーバーの提示に従う」。
-        // On だと Off / NotSupported を返すサーバーでプロトコルエラーになり、
-        // prefer の約束 (張れなければ降格) が守れない (Codex レビューの指摘)
+        // Off = "encrypt only the login packet and follow the server's offer for the rest".
+        // With On, servers returning Off / NotSupported cause a protocol error, which would break
+        // the prefer promise (downgrade if a connection cannot be made) (Codex review finding)
         SqlSslMode::Prefer => {
             config.encryption(EncryptionLevel::Off);
             config.trust_cert();
@@ -164,8 +163,8 @@ fn build_config(server: &ServerConfig, host: &str, port: u16) -> Result<Config, 
             if let Some(path) = crate::db::ssl_root_cert_path(server)? {
                 config.trust_cert_ca(path.display().to_string());
             }
-            // トンネル経由 (接続先が 127.0.0.1) でも証明書は設定上のホスト名で
-            // 検証する。host 未設定なら localhost 宛てなのでそのまま
+            // Even through a tunnel (destination 127.0.0.1), the certificate is verified against the
+            // configured hostname. If host is unset it targets localhost, so leave it as is
             if let Some(configured) = server
                 .host
                 .as_deref()
@@ -181,7 +180,7 @@ fn build_config(server: &ServerConfig, host: &str, port: u16) -> Result<Config, 
     Ok(config)
 }
 
-/// TCP を張って TDS のログインまで済ませた Client を返す。
+/// Returns a Client that has opened TCP and completed the TDS login.
 async fn open_client(config: &Config) -> Result<MsSqlClient, AppError> {
     let connect = async {
         let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| {
@@ -203,8 +202,8 @@ async fn open_client(config: &Config) -> Result<MsSqlClient, AppError> {
         })?
 }
 
-/// 接続を確立する。設定の誤り (認証・TLS・database) はここで分かるよう、
-/// ログインまで済ませた Client を持って返す。
+/// Establishes a connection. So that configuration errors (auth, TLS, database) show up here,
+/// returns a Client that has already completed the login.
 pub async fn connect(
     server: &ServerConfig,
     host: &str,
@@ -218,7 +217,7 @@ pub async fn connect(
     })
 }
 
-/// スロットから Client を取り出す (無ければ張り直す)。
+/// Takes the Client out of the slot (re-establishes it if absent).
 async fn take_client(
     handle: &MsSqlHandle,
     slot: &mut Option<MsSqlClient>,
@@ -229,9 +228,9 @@ async fn take_client(
     }
 }
 
-/// 実行の失敗。`reusable` は接続をスロットへ戻してよいか (サーバーが返した
-/// SQL エラーは接続を壊さないが、I/O やプロトコルのエラーは途中で切れた
-/// 接続なので捨てる)。
+/// A failed execution. `reusable` says whether the connection may be returned to the slot (a SQL
+/// error returned by the server does not break the connection, but I/O and protocol errors mean
+/// a connection cut off midway, so it is discarded).
 struct ExecFailure {
     error: AppError,
     reusable: bool,
@@ -258,8 +257,8 @@ impl From<AppError> for ExecFailure {
 
 type ExecResult = Result<QueryResult, ExecFailure>;
 
-/// SQL を実行して結果を返す (キャンセル対応版)。
-/// db::run_query_cancellable から DbPool::MsSql の場合に委譲される。
+/// Runs SQL and returns the result (cancellable version).
+/// Delegated from db::run_query_cancellable for DbPool::MsSql.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_query_cancellable(
     handle: &MsSqlHandle,
@@ -271,8 +270,8 @@ pub async fn run_query_cancellable(
     readonly: ReadonlyGuard,
     allow_dangerous: bool,
 ) -> Result<QueryResult, AppError> {
-    // psql 風メタコマンドはカタログ照会 SQL に変換する。\c / USE は lib.rs の
-    // run_query が先に処理する (ここへ来るのはエージェント経路なので拒否する)
+    // psql-style meta-commands are converted to catalog query SQL. \c / USE are handled first by
+    // run_query in lib.rs (reaching here means the agent path, so they are rejected)
     let translated = match crate::meta_commands::translate(Engine::MsSql, sql)? {
         Some(crate::meta_commands::MetaCommand::Sql(sql)) => Some(sql),
         Some(crate::meta_commands::MetaCommand::Connect(_)) => {
@@ -288,15 +287,15 @@ pub async fn run_query_cancellable(
         return Err(AppError::Config("The SQL statement is empty".into()));
     }
 
-    // エージェント経路は狭いホワイトリスト (db.rs の run_query_on と同じ理由)
+    // The agent path uses a narrow whitelist (same reason as run_query_on in db.rs)
     if readonly == ReadonlyGuard::Agent {
         if let Some(reason) = crate::db::agent_rejection_reason(sql, Engine::MsSql) {
             return Err(AppError::Readonly(reason));
         }
     }
-    // 複文は 1 文目しか見ないガードをすり抜けるため、ガードが有効なら拒否する。
-    // T-SQL はセミコロンが省略できるので、`;` の有無に加えて 2 文目になり得る
-    // キーワードが後ろにあるかも見る (contains_trailing_statement)
+    // A multi-statement batch slips past a guard that only looks at the first statement, so reject it
+    // if the guard is enabled. T-SQL allows omitting semicolons, so besides the presence of `;`, also
+    // check whether a keyword that could start a second statement follows (contains_trailing_statement)
     if (readonly != ReadonlyGuard::Off || !allow_dangerous)
         && (crate::db::contains_multiple_statements(sql, Engine::MsSql)
             || contains_trailing_statement(sql))
@@ -312,12 +311,12 @@ pub async fn run_query_cancellable(
         }
     }
 
-    // EXPLAIN は queryfolio の疑似文 (SHOWPLAN)。ガードの後で剥がす
-    // (剥がす前に判定するので、readonly ガードは EXPLAIN を fetch 文として通す)
+    // EXPLAIN is a queryfolio pseudo-statement (SHOWPLAN). Stripped after the guard
+    // (the check runs before stripping, so the readonly guard lets EXPLAIN through as a fetch statement)
     let explain_target = explain_target(sql);
 
-    // LIMIT 未指定の SELECT には TOP (n) を差し込む (メタコマンド変換後の SQL と
-    // EXPLAIN には適用しない。db.rs の run_query_on と同じ)
+    // Insert TOP (n) into a SELECT without a LIMIT (not applied to SQL after meta-command
+    // conversion or to EXPLAIN; same as run_query_on in db.rs)
     let mut applied_limit = None;
     let limited_sql;
     let sql = match auto_limit {
@@ -334,12 +333,12 @@ pub async fn run_query_cancellable(
         _ => sql,
     };
 
-    // 実行を接続単位で直列化してからキャンセル対象を登録する
+    // Serialize execution per connection, then register the cancel target
     let mut slot = handle.client.lock().await;
     let readonly_tx = readonly == ReadonlyGuard::Agent;
-    // エージェント経路は専用の接続で実行し、終わったら捨てる。ユーザーの接続で
-    // 実行すると、ユーザーが開いたままのトランザクションをエージェントの
-    // ROLLBACK が巻き込む (SQL Server の入れ子トランザクションは独立していない)
+    // The agent path runs on a dedicated connection and discards it afterwards. Running on the user's
+    // connection would let the agent's ROLLBACK catch a transaction the user left open
+    // (SQL Server's nested transactions are not independent)
     let mut client = if readonly_tx {
         open_client(&handle.config).await?
     } else {
@@ -357,8 +356,8 @@ pub async fn run_query_cancellable(
     );
     let started = Instant::now();
 
-    // キャンセルは実行の future を打ち切る。biased で結果側を先に見る
-    // (結果とキャンセル通知が同時に ready なら完了済みの結果を優先する)
+    // Cancellation aborts the execution future. biased checks the result side first
+    // (if the result and the cancel notification are ready at the same time, the completed result wins)
     let result = tokio::select! {
         biased;
         result = execute(&mut client, sql, explain_target, max_rows, readonly_tx) => Some(result),
@@ -369,11 +368,11 @@ pub async fn run_query_cancellable(
 
     let result = match result {
         None => {
-            // future を落としただけではサーバーは実行を続ける。Attention を送って
-            // 止める (応答を待つのは CANCEL_TIMEOUT まで)。接続は戻さず捨てる:
-            // 打ち切った future の中で開いた SET SHOWPLAN_ALL ON やトランザクション
-            // の後始末が走っていないので、戻すと次の文がその状態を引き継ぐ。
-            // 閉じればサーバーがセッションごと片付ける
+            // Merely dropping the future leaves the server running the statement. Send Attention to
+            // stop it (waiting for the response up to CANCEL_TIMEOUT). The connection is discarded, not returned:
+            // the cleanup of `SET SHOWPLAN_ALL ON` or a transaction opened inside the aborted future
+            // has not run, so returning it would carry that state into the next statement.
+            // Closing it makes the server clean up the whole session
             let _ = tokio::time::timeout(CANCEL_TIMEOUT, client.cancel_query()).await;
             drop(client);
             return Err(AppError::Cancelled);
@@ -381,8 +380,8 @@ pub async fn run_query_cancellable(
         Some(result) => result,
     };
 
-    // 専用接続 (エージェント経路) は戻さない。ユーザーの接続は、サーバーが返した
-    // SQL エラーなら健全なので戻し、I/O やプロトコルのエラーなら捨てる
+    // Dedicated connections (agent path) are not returned. The user's connection is healthy if it
+    // was a SQL error returned by the server, so return it; discard it on I/O or protocol errors
     let reusable = !readonly_tx
         && match &result {
             Ok(_) => true,
@@ -399,7 +398,7 @@ pub async fn run_query_cancellable(
             Ok(result)
         }
         Err(failure) => {
-            // キャンセル要求後のエラーは「キャンセルされた」として返す
+            // An error after a cancel request is returned as "cancelled"
             if was_cancelled {
                 return Err(AppError::Cancelled);
             }
@@ -408,25 +407,25 @@ pub async fn run_query_cancellable(
     }
 }
 
-/// 先頭以外に現れたら「2 文目が始まっている」とみなす語。T-SQL は文の区切りの
-/// `;` を省略できるので、`SELECT 1\nDROP TABLE t` は contains_multiple_statements
-/// (`;` を数える) をすり抜けて先頭の SELECT だけで readonly / dangerous ガードを
-/// 通り、バッチ全体が実行される (Codex レビューの指摘)。書き込み・制御・実行の
-/// キーワードが後続にあればガードが有効な接続では拒否する。
-/// `select` / `with` は入れない: サブクエリと `WITH (NOLOCK)` ヒントが 1 文の中に
-/// 普通に現れるため (後続の DML は `WITH ... DELETE` でも delete の語で捕まる)。
-/// `set` も入れない: `UPDATE ... SET` の中に必ず現れる (後続の `SET NOCOUNT ON`
-/// は書き込みではないので見逃してよい)。
-/// 列名が `update` のような文を素で書くと誤って拒否される側に倒れる
-/// (角括弧で書けば通る。Writable ON + allow_dangerous_statements で外せる)。
+/// Words that, when they appear anywhere but the start, mean "a second statement has started". T-SQL can
+/// omit the statement-separating `;`, so `SELECT 1\nDROP TABLE t` slips past
+/// contains_multiple_statements (which counts `;`), passes the readonly / dangerous guards on just the
+/// leading SELECT, and the whole batch is executed (Codex review finding). If a write, control or
+/// execute keyword follows, reject it on connections where the guard is enabled.
+/// `select` / `with` are not included: subqueries and `WITH (NOLOCK)` hints appear
+/// normally within one statement (a following DML is caught by the delete word even in `WITH ... DELETE`).
+/// `set` is not included either: it always appears inside `UPDATE ... SET` (a following
+/// `SET NOCOUNT ON` is not a write, so missing it is fine).
+/// A statement written with a bare column name like `update` is wrongly rejected
+/// (it passes if written in square brackets; it can be lifted with Writable ON + allow_dangerous_statements).
 const TRAILING_STATEMENT_KEYWORDS: &[&str] = &[
     "insert", "update", "delete", "merge", "create", "alter", "drop", "truncate", "grant",
     "revoke", "deny", "exec", "execute", "declare", "use", "begin", "commit", "rollback", "save",
     "backup", "restore", "bulk", "kill", "go", "dbcc", "shutdown",
 ];
 
-/// 先頭の文の後ろに別の文が始まっている形か (セミコロンの無い複文)。
-/// 判定はリテラル・コメント・角括弧を空白化した cleaned に対する単語境界で行う。
+/// Whether another statement starts after the first one (a multi-statement batch with no semicolon).
+/// The check uses word boundaries on cleaned, where literals, comments and brackets are blanked.
 fn contains_trailing_statement(sql: &str) -> bool {
     let cleaned = scan_sql(sql, Engine::MsSql).cleaned;
     cleaned
@@ -436,7 +435,7 @@ fn contains_trailing_statement(sql: &str) -> bool {
         .any(|word| TRAILING_STATEMENT_KEYWORDS.contains(&word))
 }
 
-/// `EXPLAIN <sql>` なら対象の SQL を返す (先頭のコメントは残さない)。
+/// If `EXPLAIN <sql>`, returns the target SQL (leading comments are not kept).
 fn explain_target(sql: &str) -> Option<&str> {
     if leading_keyword(sql) != EXPLAIN_KEYWORD {
         return None;
@@ -449,7 +448,7 @@ fn explain_target(sql: &str) -> Option<&str> {
     Some(target)
 }
 
-/// 1 文を実行する (トランザクションの内外・SHOWPLAN の振り分け)。
+/// Runs one statement (dispatches inside/outside a transaction and SHOWPLAN).
 async fn execute(
     client: &mut MsSqlClient,
     sql: &str,
@@ -458,20 +457,20 @@ async fn execute(
     readonly_tx: bool,
 ) -> ExecResult {
     if let Some(target) = explain_target {
-        // SHOWPLAN は対象文を実行しないので、トランザクションで包む必要が無い
+        // SHOWPLAN does not execute the target statement, so no transaction wrapping is needed
         return run_showplan(client, target, max_rows).await;
     }
     if !readonly_tx {
         return execute_statement(client, sql, max_rows).await;
     }
-    // エージェント経路 (専用接続): 書き込みが抜けてもロールバックで取り消す。
-    // この接続はユーザーの文を実行しないので、ROLLBACK が巻き込む外側の
-    // トランザクションは無い
+    // Agent path (dedicated connection): even if a write slips through, the rollback undoes it.
+    // This connection never runs user statements, so there is no outer
+    // transaction for the ROLLBACK to catch
     drain(client.simple_query("BEGIN TRANSACTION").await?).await?;
     let result = execute_statement(client, sql, max_rows).await;
-    // 読み取りしかしていないので COMMIT は不要。文のエラーで aborted に
-    // なっていても ROLLBACK は受け付けられる。ROLLBACK 自体が通らなければ
-    // トランザクションを開いたままの接続を戻さないよう捨てる
+    // Only reads were done, so COMMIT is not needed. ROLLBACK is accepted even if the
+    // transaction is aborted by a statement error. If ROLLBACK itself fails, the connection is
+    // discarded so as not to return one with a transaction left open
     let rollback = async {
         drain(
             client
@@ -495,23 +494,23 @@ async fn execute(
     }
 }
 
-/// 先頭キーワードがこれなら「行を返さず、影響行数に意味がある」文として
-/// sp_executesql (execute) で流す。それ以外はバッチ (simple_query) で流して
-/// 結果セットがあれば表にする (影響行数は None)。バッチ側に倒す理由は 2 つ:
-/// - SELECT 系・EXEC・`IF EXISTS (...) SELECT ...`・DECLARE から始まる
-///   スクリプトは中身が先頭キーワードでは分からない。行を取りこぼす側では
-///   なく影響行数を取りこぼす側に倒す
-/// - **sp_executesql はプロシージャのスコープで実行される**ので、その中で
-///   `SET` したセッション設定・`BEGIN TRANSACTION`・`#temp` の作成は呼び出しが
-///   終わると消える (トランザクションはエラー 266 になる)。接続に残すべき文は
-///   バッチで流さないと「次の文で消えている」になる (Codex レビューの指摘)
+/// If the leading keyword is one of these, the statement is treated as "returns no rows, and the affected row
+/// count is meaningful" and run via sp_executesql (execute). Anything else is run as a batch (simple_query)
+/// and any result set is turned into a table (affected rows is None). Two reasons for leaning toward the batch side:
+/// - For scripts starting with SELECT-like statements, EXEC, `IF EXISTS (...) SELECT ...` or
+///   DECLARE, the leading keyword does not reveal the contents. Lean toward losing the affected
+///   row count rather than losing rows
+/// - **sp_executesql runs in a procedure scope**, so session settings made with `SET`,
+///   `BEGIN TRANSACTION` and `#temp` creation inside it vanish when the call
+///   ends (a transaction fails with error 266). Statements that must leave state on the connection
+///   have to be run as a batch, or they become "gone by the next statement" (Codex review finding)
 const NO_ROWS_KEYWORDS: &[&str] = &[
     "insert", "update", "delete", "merge", "create", "alter", "drop", "truncate", "grant",
     "revoke", "deny", "backup", "restore", "bulk",
 ];
 
-/// 行を返し得る文か / 接続に状態を残す文か (= バッチとして流すか)。
-/// readonly ガードは別で、ここへ来るのは Writable な接続か読み取り文だけ。
+/// Whether the statement can return rows / leaves state on the connection (= run as a batch).
+/// The readonly guard is separate; only Writable connections or read statements reach here.
 fn is_mssql_fetch(sql: &str) -> bool {
     if is_fetch_statement(sql) {
         return true;
@@ -524,23 +523,23 @@ fn is_mssql_fetch(sql: &str) -> bool {
     if !NO_ROWS_KEYWORDS.contains(&first) {
         return true;
     }
-    // ローカル一時テーブル (`#t` / `##t`) を触る文は、sp_executesql の
-    // スコープで作ると呼び出し終了時に消えるためバッチで流す。`#` は
-    // scan_sql が文字列・コメント・角括弧の中を空白化した後に見る。
-    // 角括弧で書かれた一時テーブル (`[#t]`) は空白化されて見えないので、
-    // 原文の `[#` も見る (文字列の中の `[#` にも反応するが、バッチ側に倒れる
-    // だけで害は無い: 影響行数が None になる)
+    // Statements touching local temp tables (`#t` / `##t`) are run as a batch, since creating them in
+    // sp_executesql's scope makes them vanish when the call ends. `#` is checked after
+    // scan_sql has blanked the inside of strings, comments and brackets.
+    // Temp tables written in brackets (`[#t]`) are blanked and invisible, so the raw `[#` is
+    // also checked (it also reacts to `[#` inside a string, but that merely leans toward the batch
+    // side with no harm: the affected row count becomes None)
     if cleaned.contains('#') || sql.contains("[#") {
         return true;
     }
-    // INSERT / UPDATE / DELETE / MERGE ... OUTPUT は行を返す
+    // INSERT / UPDATE / DELETE / MERGE ... OUTPUT return rows
     cleaned
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .any(|word| word == "output")
 }
 
-/// 1 文を実行する。行を返す文はバッチ (simple_query) で流して最初の結果セット
-/// を表にし、それ以外は sp_executesql (execute) で影響行数だけ取る。
+/// Runs one statement. Statements returning rows are run as a batch (simple_query) and the first
+/// result set becomes a table; everything else uses sp_executesql (execute) to get only the affected row count.
 async fn execute_statement(client: &mut MsSqlClient, sql: &str, max_rows: usize) -> ExecResult {
     if !is_mssql_fetch(sql) {
         let affected = client.execute(sql, &[]).await?.total();
@@ -558,10 +557,10 @@ async fn execute_statement(client: &mut MsSqlClient, sql: &str, max_rows: usize)
     fetch_first_result_set(client, sql, max_rows).await
 }
 
-/// バッチを流し、最初の結果セットを表にして返す。
-/// 2 つ目以降の結果セット (複文や複数の SELECT を返すプロシージャ) は
-/// 読まずに打ち切る。残りの応答は次の実行時に tiberius が読み捨てる
-/// (Client の各メソッドが先頭で flush_stream する)。
+/// Runs a batch and returns the first result set as a table.
+/// The second and later result sets (multi-statement batches or procedures returning several SELECTs)
+/// are not read and are cut off. tiberius drains the rest of the response on the next execution
+/// (each Client method calls flush_stream at the start).
 async fn fetch_first_result_set(
     client: &mut MsSqlClient,
     sql: &str,
@@ -603,17 +602,17 @@ async fn fetch_first_result_set(
     })
 }
 
-/// 結果セットを読み捨てる (SET 文等、行の要らないバッチ用)。
+/// Drains result sets (for batches that need no rows, such as SET statements).
 async fn drain(stream: tiberius::QueryStream<'_>) -> Result<(), ExecFailure> {
     let mut rows = stream.into_row_stream();
     while rows.try_next().await?.is_some() {}
     Ok(())
 }
 
-/// `EXPLAIN` 疑似文: 推定実行計画 (SHOWPLAN_ALL) の行を返す。
-/// ON / 対象文 / OFF を同じ接続で続けて流す。対象文が失敗しても OFF は
-/// 必ず試み、OFF が通らなければ SHOWPLAN が立ったままの接続を戻さない
-/// (以降の文が全部プランになる)。
+/// The `EXPLAIN` pseudo-statement: returns the rows of the estimated execution plan (SHOWPLAN_ALL).
+/// ON / target statement / OFF are run in sequence on the same connection. Even if the target statement
+/// fails, OFF is always attempted, and if OFF fails the connection with SHOWPLAN still on is not
+/// returned (all later statements would become plans).
 async fn run_showplan(client: &mut MsSqlClient, target: &str, max_rows: usize) -> ExecResult {
     drain(client.simple_query("SET SHOWPLAN_ALL ON").await?).await?;
     let result = fetch_first_result_set(client, target, max_rows).await;
@@ -632,12 +631,12 @@ async fn run_showplan(client: &mut MsSqlClient, target: &str, max_rows: usize) -
     }
 }
 
-/// LIMIT 未指定の SELECT に `TOP (limit)` を差し込む。
-/// 対象は先頭が SELECT の文だけ (WITH は最後の SELECT の位置が分からない)。
-/// TOP / OFFSET / FETCH / INTO / FOR (XML / JSON / BROWSE) / 集合演算
-/// (UNION / EXCEPT / INTERSECT。先頭の SELECT だけに TOP が掛かり意味が
-/// 変わる) / DML / OUTPUT を含む文は付けない。判定は scan_sql がリテラルと
-/// コメントを除いた cleaned に対する単語境界で行う。
+/// Inserts `TOP (limit)` into a SELECT without a LIMIT.
+/// Only statements that start with SELECT are targeted (for WITH, the position of the last SELECT is unknown).
+/// It is not added to statements containing TOP / OFFSET / FETCH / INTO / FOR (XML / JSON / BROWSE) / set operations
+/// (UNION / EXCEPT / INTERSECT; TOP would apply only to the leading SELECT and change the
+/// meaning) / DML / OUTPUT. The check uses word boundaries on cleaned, where scan_sql has removed literals and
+/// comments.
 pub(crate) fn apply_auto_top(sql: &str, limit: u64) -> Option<String> {
     if leading_keyword(sql) != "select" {
         return None;
@@ -664,9 +663,9 @@ pub(crate) fn apply_auto_top(sql: &str, limit: u64) -> Option<String> {
     {
         return None;
     }
-    // SELECT の直後。DISTINCT / ALL があればその後ろ (TOP は DISTINCT の後に書く)。
-    // SELECT と DISTINCT の間のコメント・空白は strip_leading_comments で読み飛ばす
-    // (`SELECT /* c */ DISTINCT` の間に差し込むと構文エラーになる)
+    // Right after SELECT. If there is DISTINCT / ALL, after it (TOP is written after DISTINCT).
+    // Comments and whitespace between SELECT and DISTINCT are skipped with strip_leading_comments
+    // (inserting between `SELECT /* c */ DISTINCT` would cause a syntax error)
     let rest = strip_leading_comments(sql);
     let select_end = sql.len() - rest.len() + "select".len();
     let tail = &sql[select_end..];
@@ -687,7 +686,7 @@ pub(crate) fn apply_auto_top(sql: &str, limit: u64) -> Option<String> {
     ))
 }
 
-/// 文字列を文字数上限で打ち切る (超えたら truncated を立てて省略記号を付ける)。
+/// Truncates a string to the character limit (if exceeded, sets truncated and appends an ellipsis).
 fn text_to_json_limited(v: &str, truncated: &mut bool) -> serde_json::Value {
     if v.chars().count() <= MAX_TEXT_CHARS {
         return serde_json::Value::String(v.to_string());
@@ -703,8 +702,8 @@ fn json_f64(v: f64) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::Value::String(v.to_string()))
 }
 
-/// chrono の型へ変換して書式化する (日付時刻系の共通経路)。
-/// 範囲外などで変換できなければ生の値の Debug 表現で返す (落とさない)。
+/// Converts to a chrono type and formats it (shared path for date/time types).
+/// If conversion fails, e.g. out of range, returns the Debug representation of the raw value (does not panic).
 fn temporal_to_json<'a, T, F>(data: &'a ColumnData<'static>, format: F) -> serde_json::Value
 where
     T: FromSql<'a>,
@@ -717,11 +716,11 @@ where
     }
 }
 
-/// tiberius の値を JSON へ変換する。
-/// - BIGINT は JS の安全整数範囲を超えたら文字列 (json_i64)
-/// - DECIMAL / NUMERIC は精度を保つため文字列、MONEY も DECIMAL として届く
-/// - 日付時刻は db.rs の他エンジンと同じ書式 (DATETIMEOFFSET は RFC 3339)
-/// - VARBINARY は UTF-8 なら文字列、そうでなければ base64 (bytes_to_json)
+/// Converts a tiberius value to JSON.
+/// - BIGINT becomes a string when it exceeds JS's safe integer range (json_i64)
+/// - DECIMAL / NUMERIC are strings to preserve precision; MONEY also arrives as DECIMAL
+/// - Date/time uses the same format as the other engines in db.rs (DATETIMEOFFSET is RFC 3339)
+/// - VARBINARY is a string if UTF-8, otherwise base64 (bytes_to_json)
 pub(crate) fn column_data_to_json(
     data: &ColumnData<'static>,
     truncated: &mut bool,
@@ -776,9 +775,9 @@ pub(crate) fn column_data_to_json(
     }
 }
 
-/// パラメータ付きの SELECT を実行し、全行を ColumnData のまま返す
-/// (schema_info 用の小さなカタログ照会専用。識別子は @P1 以降にバインドする
-/// ので SQL に埋め込まない)。クエリ実行と同じ Mutex で直列化する。
+/// Runs a parameterized SELECT and returns all rows as ColumnData
+/// (only for small catalog queries for schema_info; identifiers are bound to @P1 onwards,
+/// so they are not embedded in SQL). Serialized with the same Mutex as query execution.
 async fn query_rows(
     handle: &MsSqlHandle,
     sql: &str,
@@ -827,21 +826,21 @@ fn integer(value: Option<&ColumnData<'static>>) -> Option<i64> {
     }
 }
 
-/// 識別子を角括弧で囲む (`]` は `]]` にエスケープ)。
+/// Wraps an identifier in square brackets (`]` is escaped as `]]`).
 fn bracket(part: &str) -> String {
     format!("[{}]", part.replace(']', "]]"))
 }
 
-/// SQL に埋め込める形の識別子。**常に角括弧で囲む**: 文字種だけ見ても
-/// `Order` のような予約語は見分けられず、素で埋め込むとスニペットが構文エラー
-/// になる (Codex レビューの指摘)。角括弧付きなら予約語も空白もドットも
-/// そのまま使え、`split_qualified` が同じ規則で戻す。
+/// An identifier that can be embedded in SQL. **Always wrapped in square brackets**: looking only at
+/// the character classes cannot tell reserved words such as `Order`, and embedding it bare makes the
+/// snippet a syntax error (Codex review finding). With brackets, reserved words, spaces and dots
+/// can be used as is, and `split_qualified` restores it by the same rule.
 fn quote_identifier(part: &str) -> String {
     bracket(part)
 }
 
-/// 先頭の角括弧付き識別子を 1 つ読む。`[` で始まらない、または閉じていない
-/// 入力は None。返すのは中身 (`]]` は `]` に戻す) と、閉じ括弧の後ろ。
+/// Reads one bracketed identifier at the start. Input that does not start with `[` or is unclosed
+/// gives None. Returns the contents (`]]` restored to `]`) and the part after the closing bracket.
 pub(crate) fn parse_bracketed(input: &str) -> Option<(String, &str)> {
     let mut rest = input.strip_prefix('[')?;
     let mut out = String::new();
@@ -859,8 +858,8 @@ pub(crate) fn parse_bracketed(input: &str) -> Option<(String, &str)> {
     }
 }
 
-/// 修飾名の先頭の識別子を 1 つ読む。角括弧付きなら中身を、そうでなければ
-/// 最初の `.` の手前までを返し、残りも返す。
+/// Reads one leading identifier of a qualified name. If bracketed, returns the contents; otherwise
+/// returns up to the first `.`, along with the rest.
 fn read_identifier(input: &str) -> (String, &str) {
     if let Some(parsed) = parse_bracketed(input) {
         return parsed;
@@ -871,20 +870,20 @@ fn read_identifier(input: &str) -> (String, &str) {
     }
 }
 
-/// SQL に埋め込める修飾名を作る。**スキーマは dbo でも省かない**: ログインの
-/// 既定スキーマが dbo でないと、素の `[users]` はカタログが列挙した `dbo.users`
-/// ではなく既定スキーマ側の `users` を指してしまう (Codex レビューの指摘)。
-/// 各部分は角括弧で囲む (`[dbo].[users]` / `[sales].[orders]`) — 修飾名は
-/// フロントが SQL へ挿入し、`split_qualified` が (schema, table) へ戻すので、
-/// 空白・ドット・予約語を含む名前でもどちらにも曖昧さが残らない。
+/// Builds a qualified name that can be embedded in SQL. **The schema is not omitted even for dbo**: if the
+/// login's default schema is not dbo, a bare `[users]` points to `users` in the default schema
+/// rather than the `dbo.users` the catalog enumerated (Codex review finding).
+/// Each part is wrapped in brackets (`[dbo].[users]` / `[sales].[orders]`) — the qualified name is
+/// inserted into SQL by the frontend and `split_qualified` restores it to (schema, table), so
+/// no ambiguity remains in either direction even for names containing spaces, dots or reserved words.
 fn qualified_name(schema: &str, name: &str) -> String {
     format!("{}.{}", quote_identifier(schema), quote_identifier(name))
 }
 
-/// `qualified_name` が作った修飾名を (schema, table) に戻す。角括弧付きの部分は
-/// 中身に戻し、非修飾名 (`\d users` のように人が打ったもの) は既定スキーマ dbo
-/// とみなす。読み切れない形 (閉じていない括弧等) は最初のドットで割る従来の
-/// 読み方に倒す。
+/// Restores a name built by `qualified_name` to (schema, table). Bracketed parts are
+/// restored to their contents, and unqualified names (typed by a person, like `\d users`) are
+/// treated as the default schema dbo. Forms that cannot be fully read (unclosed brackets etc.) fall
+/// back to the old way of splitting at the first dot.
 pub(crate) fn split_qualified(table: &str) -> (String, String) {
     let (first, rest) = read_identifier(table);
     if rest.is_empty() {
@@ -902,8 +901,8 @@ pub(crate) fn split_qualified(table: &str) -> (String, String) {
     }
 }
 
-/// INFORMATION_SCHEMA.COLUMNS の型情報を `nvarchar(50)` / `decimal(10,2)` /
-/// `varchar(max)` のような表記にまとめる。
+/// Summarizes the INFORMATION_SCHEMA.COLUMNS type info into notation like `nvarchar(50)` / `decimal(10,2)` /
+/// `varchar(max)`.
 fn format_data_type(
     data_type: &str,
     char_max_length: Option<i64>,
@@ -945,7 +944,7 @@ fn column_info(row: &[ColumnData<'static>], offset: usize) -> ColumnInfo {
     }
 }
 
-/// テーブル / ビューの一覧 (スキーマブラウザの TABLES ペイン用)。
+/// List of tables / views (for the TABLES pane of the schema browser).
 pub async fn fetch_tables(handle: &MsSqlHandle) -> Result<Vec<TableInfo>, AppError> {
     let rows = query_rows(
         handle,
@@ -974,21 +973,21 @@ pub async fn fetch_tables(handle: &MsSqlHandle) -> Result<Vec<TableInfo>, AppErr
         .collect())
 }
 
-/// テーブルのカラム一覧。テーブル名はバインドするので SQL には埋め込まない。
+/// Column list of a table. The table name is bound, so it is not embedded in SQL.
 pub async fn fetch_columns(handle: &MsSqlHandle, table: &str) -> Result<Vec<ColumnInfo>, AppError> {
     let (schema, name) = split_qualified(table);
     let rows = query_rows(handle, COLUMNS_SQL, &[&schema.as_str(), &name.as_str()]).await?;
     let columns: Vec<ColumnInfo> = rows.iter().map(|row| column_info(row, 0)).collect();
-    // 存在しないテーブルは空になるため明示的にエラーにする
+    // A nonexistent table yields an empty result, so make it an explicit error
     if columns.is_empty() {
         return Err(AppError::Config(format!("Table not found: {table}")));
     }
     Ok(columns)
 }
 
-/// テーブルの主キーを構成するカラム名。
-/// セル編集は非対応 (supports_editable_cells = false) のため実利用は無いが、
-/// INFORMATION_SCHEMA から取れる範囲で返す。
+/// Column names that make up a table's primary key.
+/// Cell editing is unsupported (supports_editable_cells = false), so this has no practical use,
+/// but it returns what can be obtained from INFORMATION_SCHEMA.
 pub async fn fetch_primary_keys(
     handle: &MsSqlHandle,
     table: &str,
@@ -1012,7 +1011,7 @@ pub async fn fetch_primary_keys(
     Ok(rows.iter().map(|row| text(row.first())).collect())
 }
 
-/// 全テーブルの全カラム (SQL 補完のスキーママップ用)。
+/// All columns of all tables (for the schema map used in SQL completion).
 pub async fn fetch_all_columns(
     handle: &MsSqlHandle,
 ) -> Result<std::collections::BTreeMap<String, Vec<ColumnInfo>>, AppError> {
@@ -1037,7 +1036,7 @@ pub async fn fetch_all_columns(
     Ok(map)
 }
 
-/// サーバー上の database 一覧 (Database 欄のプルダウン用)。
+/// List of databases on the server (for the Database field dropdown).
 pub async fn list_databases(handle: &MsSqlHandle) -> Result<Vec<String>, AppError> {
     let rows = query_rows(handle, "SELECT name FROM sys.databases ORDER BY name", &[]).await?;
     Ok(rows.iter().map(|row| text(row.first())).collect())
@@ -1062,7 +1061,7 @@ mod tests {
 
     #[test]
     fn test_build_config_maps_ssl_mode() {
-        // 既定 (ssl_mode 無し・tls 無し) は prefer = 可能なら暗号化
+        // The default (no ssl_mode, no tls) is prefer = encrypt if possible
         let config = build_config(
             &server("{name: x, engine: mssql, host: h, user: sa, password: p}"),
             "h",
@@ -1070,17 +1069,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.get_addr(), "h:1433");
-        // 既定の 30 秒コマンドタイムアウトは外す (重い集計を落とさない)
+        // Drop the default 30-second command timeout (so heavy aggregations are not killed)
         assert_eq!(config.get_command_timeout(), None);
 
-        // disable → 暗号化しない (接続自体は組める)
+        // disable -> no encryption (the connection can still be built)
         build_config(
             &server("{name: x, engine: mssql, host: h, user: sa, password: p, ssl_mode: disable}"),
             "h",
             1433,
         )
         .unwrap();
-        // tls: true → verify-full。トンネル経由 (接続先が差し替わる) でも組める
+        // tls: true -> verify-full. Buildable even through a tunnel (where the destination is swapped)
         build_config(
             &server(
                 "{name: x, engine: mssql, host: db.example.com, user: sa, password: p, tls: true}",
@@ -1089,7 +1088,7 @@ mod tests {
             50000,
         )
         .unwrap();
-        // 不正な ssl_mode は接続前に設定エラー
+        // An invalid ssl_mode is a configuration error before connecting
         assert!(build_config(
             &server("{name: x, engine: mssql, host: h, user: sa, password: p, ssl_mode: nope}"),
             "h",
@@ -1112,12 +1111,12 @@ mod tests {
             apply_auto_top("SELECT ALL name FROM users;", 10).as_deref(),
             Some("SELECT ALL TOP (10) name FROM users;")
         );
-        // 先頭のコメントは残す
+        // Leading comments are kept
         assert_eq!(
             apply_auto_top("-- recent\nSELECT id FROM t", 5).as_deref(),
             Some("-- recent\nSELECT TOP (5) id FROM t")
         );
-        // SELECT と DISTINCT の間のコメントを挟んでも DISTINCT の後ろに入る
+        // Even with a comment between SELECT and DISTINCT, it goes after DISTINCT
         assert_eq!(
             apply_auto_top("SELECT /* c */ DISTINCT name FROM t", 5).as_deref(),
             Some("SELECT /* c */ DISTINCT TOP (5) name FROM t")
@@ -1126,7 +1125,7 @@ mod tests {
             apply_auto_top("SELECT -- c\n  name FROM t", 5).as_deref(),
             Some("SELECT TOP (5) -- c\n  name FROM t")
         );
-        // 既に TOP / OFFSET-FETCH / 集合演算 / INTO / FOR XML がある文には付けない
+        // Not added to statements that already have TOP / OFFSET-FETCH / set operations / INTO / FOR XML
         for sql in [
             "SELECT TOP 10 * FROM t",
             "SELECT * FROM t ORDER BY id OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY",
@@ -1142,21 +1141,21 @@ mod tests {
                 "should not add TOP: {sql}"
             );
         }
-        // リテラル内の単語には反応しない
+        // Does not react to words inside literals
         assert_eq!(
             apply_auto_top("SELECT 'union' FROM t", 3).as_deref(),
             Some("SELECT TOP (3) 'union' FROM t")
         );
-        // 角括弧識別子の中の単語にも反応しない (scan_sql の MsSql 方言)
+        // Does not react to words inside bracketed identifiers either (scan_sql's MsSql dialect)
         assert_eq!(
             apply_auto_top("SELECT [top] FROM [for]", 3).as_deref(),
             Some("SELECT TOP (3) [top] FROM [for]")
         );
     }
 
-    /// lib.rs は should_auto_limit で「LIMIT が付くか」を先読みして max_rows を
-    /// 決める。T-SQL では TOP を差し込む側と同じ判定でないと、TOP の付かない文で
-    /// default_limit が効かなくなる (Codex レビューの指摘)
+    /// lib.rs looks ahead with should_auto_limit for "will a LIMIT be added" to decide max_rows.
+    /// For T-SQL it must use the same decision as the side that inserts TOP, otherwise default_limit
+    /// stops working for statements to which TOP is not added (Codex review finding)
     #[test]
     fn test_should_auto_limit_matches_apply_auto_top() {
         for sql in [
@@ -1176,8 +1175,8 @@ mod tests {
         }
     }
 
-    /// T-SQL はセミコロン無しで文を並べられるので、ガードが有効な接続では
-    /// 後続の文の始まりも複文として拒否する (Codex レビューの指摘)
+    /// T-SQL can list statements without semicolons, so on connections where the guard is enabled
+    /// the start of a following statement is also rejected as a multi-statement batch (Codex review finding)
     #[test]
     fn test_contains_trailing_statement() {
         for sql in [
@@ -1194,12 +1193,12 @@ mod tests {
             "SELECT 1",
             "SELECT * FROM t WITH (NOLOCK) WHERE id = 1",
             "SELECT a FROM t WHERE b IN (SELECT b FROM u)",
-            // リテラル・コメント・角括弧の中の語は文ではない
+            // Words inside literals, comments and brackets are not statements
             "SELECT 'drop table t' FROM t",
             "SELECT 1 -- drop table t",
             "SELECT [drop] FROM [update]",
             "SELECT created, updated_at FROM t",
-            // 先頭の語自身は数えない
+            // The leading word itself is not counted
             "DELETE FROM t WHERE id = 1",
             "UPDATE t SET x = 1 WHERE id = 1",
         ] {
@@ -1226,29 +1225,29 @@ mod tests {
         assert!(is_mssql_fetch(
             "INSERT INTO t OUTPUT inserted.id VALUES (1)"
         ));
-        // 制御フロー・スクリプトは中に SELECT を持ち得るのでバッチで流す
-        // (Codex レビューの指摘)
+        // Control flow and scripts can contain a SELECT inside, so run them as a batch
+        // (Codex review finding)
         assert!(is_mssql_fetch(
             "IF EXISTS (SELECT 1 FROM t) SELECT * FROM t"
         ));
         assert!(is_mssql_fetch("DECLARE @n INT = 1; SELECT @n"));
         assert!(is_mssql_fetch("BEGIN SELECT 1 END"));
         assert!(is_mssql_fetch("PRINT 'x'"));
-        // 接続に状態を残す文も sp_executesql のスコープに閉じないようバッチで流す
-        // (Codex レビューの指摘: #temp は呼び出し終了時に消える)
+        // Statements that leave state on the connection are also run as a batch so their effects are not confined to sp_executesql's scope
+        // (Codex review finding: #temp vanishes when the call ends)
         assert!(is_mssql_fetch("BEGIN TRANSACTION"));
         assert!(is_mssql_fetch("SET NOCOUNT ON"));
         assert!(is_mssql_fetch("CREATE TABLE #stage (id INT)"));
         assert!(is_mssql_fetch("INSERT INTO #stage VALUES (1)"));
         assert!(is_mssql_fetch("DROP TABLE ##global_tmp"));
-        // 角括弧で書かれた一時テーブルも (scan_sql は角括弧の中を空白化する)
+        // Temp tables written in brackets too (scan_sql blanks the inside of brackets)
         assert!(is_mssql_fetch("CREATE TABLE [#stage] (id INT)"));
         assert!(is_mssql_fetch("INSERT INTO [dbo].[#stage] VALUES (1)"));
-        // 行を返さず接続にも何も残さない文は影響行数の経路
+        // Statements that return no rows and leave nothing on the connection take the affected-row-count path
         assert!(!is_mssql_fetch("INSERT INTO t VALUES (1)"));
         assert!(!is_mssql_fetch("UPDATE t SET x = 'output' WHERE id = 1"));
         assert!(!is_mssql_fetch("-- note\nCREATE TABLE t (id INT)"));
-        // 文字列・角括弧の中の # は一時テーブルではない
+        // A # inside a string or brackets is not a temp table
         assert!(!is_mssql_fetch("INSERT INTO t VALUES ('#1')"));
         assert!(!is_mssql_fetch("DELETE FROM [a#b] WHERE id = 1"));
     }
@@ -1273,7 +1272,7 @@ mod tests {
             f(ColumnData::F64(Some(1.5)), &mut truncated),
             serde_json::json!(1.5)
         );
-        // 2^53 超の BIGINT は文字列
+        // BIGINT above 2^53 becomes a string
         assert_eq!(
             f(ColumnData::I64(Some(9007199254740993)), &mut truncated),
             serde_json::json!("9007199254740993")
@@ -1285,7 +1284,7 @@ mod tests {
             ),
             serde_json::json!("hello")
         );
-        // DECIMAL は精度を保つため文字列
+        // DECIMAL is a string to preserve precision
         assert_eq!(
             f(
                 ColumnData::Numeric(Some(tiberius::numeric::Numeric::new_with_scale(12345, 2))),
@@ -1293,7 +1292,7 @@ mod tests {
             ),
             serde_json::json!("123.45")
         );
-        // VARBINARY は UTF-8 なら文字列、そうでなければ base64
+        // VARBINARY is a string if UTF-8, otherwise base64
         assert_eq!(
             f(
                 ColumnData::Binary(Some(Cow::Borrowed(b"abc"))),
@@ -1314,7 +1313,7 @@ mod tests {
     #[test]
     fn test_column_data_to_json_temporal() {
         let mut truncated = false;
-        // Date は 0001-01-01 からの日数
+        // Date is the number of days since 0001-01-01
         let base = chrono::NaiveDate::from_ymd_opt(1, 1, 1).unwrap();
         let days = chrono::NaiveDate::from_ymd_opt(2026, 10, 7)
             .unwrap()
@@ -1327,7 +1326,7 @@ mod tests {
             ),
             serde_json::json!("2026-10-07")
         );
-        // Time は増分 × 10^-scale 秒
+        // Time is increments x 10^-scale seconds
         assert_eq!(
             column_data_to_json(
                 &ColumnData::Time(Some(tiberius::time::Time::new(12 * 3600 + 34 * 60 + 56, 0))),
@@ -1335,7 +1334,7 @@ mod tests {
             ),
             serde_json::json!("12:34:56")
         );
-        // 旧 DATETIME は 1900-01-01 からの日数 + 1/300 秒
+        // The old DATETIME is days since 1900-01-01 + 1/300 seconds
         assert_eq!(
             column_data_to_json(
                 &ColumnData::DateTime(Some(tiberius::time::DateTime::new(0, 300))),
@@ -1362,9 +1361,9 @@ mod tests {
 
     #[test]
     fn test_qualified_names() {
-        // 常に角括弧 + 常にスキーマ付き: 予約語 (`Order`) も空白・ドット・`]` も
-        // 同じ形で SQL に埋め込め、既定スキーマが dbo でないログインでも
-        // カタログが列挙したテーブルを指す
+        // Always bracketed + always schema-qualified: reserved words (`Order`), spaces, dots and `]` can all be
+        // embedded in SQL in the same form, and it points to the table the catalog enumerated even
+        // for logins whose default schema is not dbo
         assert_eq!(qualified_name("dbo", "users"), "[dbo].[users]");
         assert_eq!(qualified_name("dbo", "Order"), "[dbo].[Order]");
         assert_eq!(qualified_name("sales", "orders"), "[sales].[orders]");
@@ -1382,8 +1381,8 @@ mod tests {
             split_qualified("sales.orders"),
             ("sales".to_string(), "orders".to_string())
         );
-        // 往復: カタログの名前がそのまま戻る (Codex レビューの指摘: 素の
-        // `a.b` では dbo のテーブル a.b とスキーマ a のテーブル b が区別できない)
+        // Round trip: the catalog's name comes back unchanged (Codex review finding: with a bare
+        // `a.b`, table a.b in dbo and table b in schema a cannot be told apart)
         for (schema, name) in [
             ("dbo", "Order Details"),
             ("dbo", "Order"),
@@ -1398,7 +1397,7 @@ mod tests {
                 "{schema} / {name}"
             );
         }
-        // 閉じていない括弧は従来の読み方に倒す (落とさない)
+        // Unclosed brackets fall back to the old way of reading (does not panic)
         assert_eq!(
             split_qualified("[broken"),
             ("dbo".to_string(), "[broken".to_string())
@@ -1431,7 +1430,7 @@ mod tests {
 
     #[test]
     fn test_sql_guards_use_mssql_dialect() {
-        // 角括弧識別子の中のセミコロン・キーワードはガードに影響しない
+        // Semicolons and keywords inside bracketed identifiers do not affect the guard
         assert!(!crate::db::contains_multiple_statements(
             "SELECT [a;b] FROM t",
             Engine::MsSql
@@ -1440,10 +1439,10 @@ mod tests {
             "SELECT 1; DROP TABLE t",
             Engine::MsSql
         ));
-        // 識別子としての [where] は WHERE 句ではない → 危険側に倒れる
+        // [where] as an identifier is not a WHERE clause -> errs on the dangerous side
         assert!(dangerous_reason("DELETE FROM [where]", Engine::MsSql).is_some());
         assert!(dangerous_reason("DELETE FROM t WHERE id = 1", Engine::MsSql).is_none());
-        // EXEC は読み取り扱いしない (中で何でも実行できる)
+        // EXEC is not treated as read-only (it can run anything inside)
         assert!(!is_readonly_allowed("EXEC sp_who", Engine::MsSql));
         assert!(is_readonly_allowed("EXPLAIN SELECT 1", Engine::MsSql));
     }

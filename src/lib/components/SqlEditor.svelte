@@ -30,17 +30,17 @@
   interface Props {
     content: string;
     engine: string | null;
-    /// エディタ言語 (capabilities.editor_language)。null は "sql" 扱い
+    /// Editor language (capabilities.editor_language). null is treated as "sql"
     editorLanguage: string | null;
-    /// スキーマベース補完用のテーブル名 → カラム名リスト (未取得なら null)
+    /// Table name -> column name list for schema-based completion (null if not fetched yet)
     schemaMap: Record<string, string[]> | null;
     onChange: (content: string) => void;
-    /// 実行対象 (SQL とエディタ上の範囲、📝 マーカーの有無) を渡す。
-    /// 呼び出し側は結果が返った後に writeRunLog() で同じ target を戻す
+    /// Passes the execution target (the SQL, its range in the editor, and whether there is a 📝 marker).
+    /// After the result comes back, the caller returns the same target via writeRunLog()
     onRun: (target: RunTarget) => void;
-    /// 選択範囲が変わるたびに呼ぶ。複数行選択かどうか (Replace Multiline
-    /// ボタンの表示条件) を通知する。選択テキスト自体は開く時点で
-    /// getMainSelection() で snapshot するのでここでは渡さない
+    /// Called every time the selection changes. Notifies whether it spans multiple lines (the display
+    /// condition of the Replace Multiline button). The selected text itself is snapshotted with
+    /// getMainSelection() at the time the dialog opens, so it is not passed here
     onSelectionChange?: (info: { hasMultilineSelection: boolean }) => void;
   }
 
@@ -54,14 +54,14 @@
     onSelectionChange,
   }: Props = $props();
 
-  /// 行単位で実行する言語か (redis: 1 行 = 1 コマンド)。
-  /// SQL は構文木の Statement 単位で実行する
+  /// Whether the language executes line by line (redis: 1 line = 1 command).
+  /// SQL executes per Statement of the syntax tree
   const isLineBased = () => editorLanguage === "redis";
 
-  /// リクエストブロック単位で実行する言語か (es: メソッド行 + JSON body)
+  /// Whether the language executes per request block (es: method line + JSON body)
   const isBlockBased = () => editorLanguage === "es";
 
-  /// SQL 言語か (Format 等の SQL 専用処理の対象か)。null は "sql" 扱い
+  /// Whether it is the SQL language (a target of SQL-only processing such as Format). null is treated as "sql"
   const isSqlLanguage = () =>
     editorLanguage === null || editorLanguage === "sql";
 
@@ -69,8 +69,8 @@
   let view: EditorView | null = null;
   const languageCompartment = new Compartment();
 
-  /// スキーマ補完に使うテーブル数の上限。超えた場合はカラムを渡さず
-  /// テーブル名のみにする (補完候補の構築コストとメモリの抑制)
+  /// Upper limit on the number of tables used for schema completion. Beyond it, columns are not
+  /// passed and only table names are used (limits the build cost and memory of completion candidates)
   const MAX_SCHEMA_TABLES_WITH_COLUMNS = 2000;
 
   const dialectFor = (engineName: string | null) => {
@@ -92,10 +92,10 @@
     }
   };
 
-  // スキーママップを lang-sql の schema オプションへ変換する。
-  // Record<string, string[]> はそのまま SQLNamespace として渡せる
-  // (PostgreSQL の "schema.table" のようなドット付きキーは lang-sql 側で
-  // 階層に分解される)。巨大スキーマではカラムを省いてテーブル名のみにする。
+  // Convert the schema map into the schema option of lang-sql.
+  // Record<string, string[]> can be passed as is as a SQLNamespace
+  // (dotted keys such as PostgreSQL's "schema.table" are split into a hierarchy
+  // on the lang-sql side). For a huge schema, omit the columns and keep only table names.
   const schemaNamespace = (
     map: Record<string, string[]> | null,
   ): SQLNamespace | undefined => {
@@ -109,9 +109,9 @@
     return Object.fromEntries(tables.map((table) => [table, []]));
   };
 
-  // languageCompartment に入れる言語拡張。エンジンの editor_language で切り替える
-  // (sql: 方言 + スキーマ補完。予約語の補完は大文字で挿入する SQL の慣習に合わせる)。
-  // 新しいエディタ言語を追加する時はここに分岐を足す
+  // The language extension put into languageCompartment. Switched by the engine's editor_language
+  // (sql: dialect + schema completion. Reserved-word completion is inserted in uppercase, following SQL convention).
+  // When adding a new editor language, add a branch here
   const languageExtension = (
     language: string | null,
     engineName: string | null,
@@ -130,8 +130,8 @@
     });
   };
 
-  // カーソル位置を含む Statement ノードの範囲を返す。
-  // カーソルが文と文の間にある場合は直前の文を返す (一般的な SQL エディタと同様の挙動)。
+  // Return the range of the Statement node that contains the cursor.
+  // If the cursor is between two statements, return the previous one (same behavior as common SQL editors).
   const statementRangeAt = (
     state: EditorState,
     pos: number,
@@ -156,16 +156,16 @@
     return previous;
   };
 
-  // ES のメソッド行 (リクエストブロックの開始行) か。
-  // バックエンド (elasticsearch.rs の leading_method) と同じ規則:
-  // 行頭トークンが HTTP メソッドならメソッド行 (JSON body の行が
-  // メソッド名で始まることは無い)
+  // Whether it is an ES method line (the first line of a request block).
+  // Same rule as the backend (leading_method in elasticsearch.rs):
+  // if the first token of the line is an HTTP method, it is a method line (a line of the JSON body
+  // never starts with a method name)
   const ES_METHOD_LINE = /^(GET|POST|PUT|DELETE|HEAD|PATCH)(\s|$)/i;
 
-  // カーソル位置を含む ES リクエストブロックの範囲を返す。
-  // カーソル行から上方向に最初のメソッド行を探し、そこから下方向に
-  // 次のメソッド行の手前 (または EOF) まで。上方向にメソッド行が
-  // 無ければ null (実行対象なし)。
+  // Return the range of the ES request block that contains the cursor.
+  // Search upward from the cursor line for the first method line, then downward from there
+  // up to just before the next method line (or EOF). If there is no method line
+  // upward, null (no execution target).
   const esBlockRange = (
     state: EditorState,
     pos: number,
@@ -189,7 +189,7 @@
         break;
       }
     }
-    // 末尾の空行はブロックに含めない (ハイライトが間延びしないように)
+    // Do not include trailing blank lines in the block (so the highlight does not stretch)
     while (endLine > startLine && doc.line(endLine).text.trim() === "") {
       endLine--;
     }
@@ -201,7 +201,7 @@
     return { from: first.from, to: last.to };
   };
 
-  // ある行の trim 済みテキストの範囲を返す (空行なら null)
+  // Return the range of the trimmed text of a line (null for a blank line)
   const trimmedLineRange = (
     state: EditorState,
     pos: number,
@@ -216,25 +216,25 @@
     return { from: line.from + leading, to: line.to - trailing };
   };
 
-  // 実行対象の範囲を返す。**ハイライトと実行は必ずこの同じ範囲を使うこと**
-  // (別ロジックにすると表示と実行される SQL が乖離するバグになる)。
+  // Return the range of the execution target. **Always use this same range for both highlighting and execution**
+  // (using separate logic would cause a bug where the displayed and the executed SQL diverge).
   //
-  // 注意: lezer のエラー回復は "\d" を ⚠(バックスラッシュ) + Statement("d")
-  // とパースするため、Statement 範囲をそのまま使うとバックスラッシュが
-  // 欠落した SQL が実行される。以下のルールで補正する:
-  // - カーソル行が \ 始まりで、カーソルを含む Statement が無い、または
-  //   その Statement の開始行も \ 始まり (メタ行由来の誤パース) の場合は、
-  //   カーソル行の trim 範囲を実行対象にする
-  // - それ以外は Statement 範囲を使うが、範囲の直前 (行頭から Statement
-  //   開始まで) が空白とバックスラッシュのみなら範囲を行頭側へ拡張して
-  //   バックスラッシュを含める (直前の文フォールバックがメタ行を返す場合)
+  // Note: lezer's error recovery parses "\d" as ⚠(backslash) + Statement("d"),
+  // so using the Statement range as is would execute SQL with the backslash
+  // missing. Correct it with the following rules:
+  // - If the cursor line starts with \ and there is no Statement containing the cursor, or
+  //   that Statement's start line also starts with \ (a misparse caused by a meta line), use the
+  //   trimmed range of the cursor line as the execution target
+  // - Otherwise use the Statement range, but if what precedes the range (from the line start to
+  //   the Statement start) is only whitespace and backslashes, extend the range toward the line
+  //   start to include the backslash (when the previous-statement fallback returns a meta line)
   const executionTargetRange = (
     state: EditorState,
     pos: number,
   ): { from: number; to: number } | null => {
-    // 行単位の言語 (redis): 選択があれば選択範囲 (複数行の一括実行)、
-    // 無ければカーソル行を実行対象にする。カーソル行が空なら直前の
-    // 非空行へフォールバックする (SQL の「直前の文」と同じ挙動)
+    // Line-based language (redis): if there is a selection, use it (batch execution of multiple
+    // lines); otherwise use the cursor line. If the cursor line is empty, fall back to the previous
+    // non-empty line (same behavior as the SQL "previous statement")
     if (isLineBased()) {
       const sel = state.selection.main;
       if (!sel.empty) {
@@ -256,8 +256,8 @@
       }
       return null;
     }
-    // ブロック単位の言語 (es): 選択があれば選択範囲、無ければカーソル位置を
-    // 含むリクエストブロック (メソッド行 + body)
+    // Block-based language (es): if there is a selection, use it; otherwise use the request block
+    // containing the cursor (method line + body)
     if (isBlockBased()) {
       const sel = state.selection.main;
       if (!sel.empty) {
@@ -290,7 +290,7 @@
       return null;
     }
 
-    // Statement 直前のバックスラッシュ (エラートークン) を範囲に含める
+    // Include the backslash (error token) just before the Statement in the range
     const startLine = state.doc.lineAt(range.from);
     const beforeStatement = state.sliceDoc(startLine.from, range.from);
     const match = beforeStatement.match(/^(\s*)\\+$/);
@@ -300,7 +300,7 @@
     return range;
   };
 
-  // 現在の主選択が複数行にまたがっているかを通知する
+  // Notify whether the current main selection spans multiple lines
   const emitSelectionChange = (state: EditorState) => {
     if (!onSelectionChange) {
       return;
@@ -313,8 +313,8 @@
     });
   };
 
-  // 現在の主選択のスナップショット (Replace Multiline を開いた時点で取得)。
-  // 後で範囲がドキュメント編集でズレていないかを text で照合する
+  // Snapshot of the current main selection (taken when Replace Multiline is opened).
+  // Later, verify by text that the range has not shifted due to document edits
   export function getMainSelection(): {
     from: number;
     to: number;
@@ -331,10 +331,10 @@
     };
   }
 
-  // スナップショットした範囲 [from, to) を text で置換する公開メソッド。
-  // その範囲の現在テキストが expected と一致する時だけ実行し、ファイル切替や
-  // 編集で範囲がズレている場合は何もせず false を返す (無関係な箇所への
-  // 誤挿入・破壊を防ぐ)。置換後は挿入テキスト全体を選択状態にする
+  // Public method that replaces the snapshotted range [from, to) with text.
+  // It runs only when the current text of that range matches expected; if the range has shifted
+  // because of a file switch or edit, it does nothing and returns false (prevents inserting into
+  // or destroying an unrelated place). After replacing, the whole inserted text is selected
   export function replaceRangeIfMatches(
     from: number,
     to: number,
@@ -367,12 +367,12 @@
     return state.sliceDoc(range.from, range.to);
   };
 
-  /// 実行対象を、書き戻しに必要な情報 (範囲と 📝 ラベル) ごと取り出す。
-  /// 実行対象が無い / 空白だけの場合は null。
+  /// Extract the execution target together with the information needed for writing back (range and 📝 label).
+  /// null if there is no execution target / it is only whitespace.
   ///
-  /// ログの書き戻しは SQL のブロックコメント (`/* ... */`) を使うため、
-  /// SQL 言語のエディタでのみマーカーを見る (redis / es は行コメントの
-  /// 記法もブロックコメントも異なる)
+  /// The log write-back uses a SQL block comment (`/* ... */`), so
+  /// the marker is looked at only in SQL-language editors (redis / es differ in both the line
+  /// comment syntax and the block comment)
   const runTargetAt = (state: EditorState): RunTarget | null => {
     const range = executionTargetRange(state, state.selection.main.head);
     if (!range) {
@@ -392,12 +392,12 @@
     };
   };
 
-  /// 実行した文の直後へ結果ログのブロックコメントを書き戻す公開メソッド。
-  /// 書けるかどうかの判定 (範囲の照合・ラベルの取り直し) は
-  /// planRunLogWrite (runLog.ts) を参照。
+  /// Public method that writes the result-log block comment back right after the executed statement.
+  /// For deciding whether it can be written (range verification and re-fetching the label),
+  /// see planRunLogWrite (runLog.ts).
   ///
-  /// カーソル位置とフォーカスは動かさない — 書き戻しは実行完了後の非同期な
-  /// 差し込みなので、その間にユーザーが別の場所を編集していることがある。
+  /// The cursor position and focus are not moved — the write-back is an asynchronous insertion
+  /// after execution completes, and the user may be editing another place in the meantime.
   export function writeRunLog(
     target: RunTarget,
     buildBlock: (label: string) => string,
@@ -415,7 +415,7 @@
     return "written";
   }
 
-  // カーソル位置の文の行に枠線・背景を付けるハイライトプラグイン
+  // Highlight plugin that adds a border and background to the line of the statement at the cursor
   const statementHighlight = ViewPlugin.fromClass(
     class {
       decorations: DecorationSet;
@@ -431,7 +431,7 @@
       }
 
       build(view: EditorView): DecorationSet {
-        // 実行対象と同じ範囲をハイライトする (表示と実行の乖離を防ぐ)
+        // Highlight the same range as the execution target (prevents display and execution from diverging)
         const range = executionTargetRange(
           view.state,
           view.state.selection.main.head,
@@ -461,7 +461,7 @@
     { decorations: (plugin) => plugin.decorations },
   );
 
-  // ツールバーの Run ボタンから呼ぶための公開メソッド
+  // Public method to be called from the toolbar's Run button
   export function runCurrentStatement() {
     if (!view) {
       return;
@@ -472,17 +472,17 @@
     }
   }
 
-  // カーソル位置の文 (実行対象と同じ範囲) を返す公開メソッド。
-  // ツールバーの Explain ボタンが EXPLAIN の対象文を取るのに使う
+  // Public method that returns the statement at the cursor (the same range as the execution target).
+  // Used by the toolbar's Explain button to get the statement for EXPLAIN
   export function getCurrentStatement(): string {
     return view ? currentStatementText(view.state) : "";
   }
 
-  // カーソル位置の文を整形して、その範囲を整形結果で置換する公開メソッド。
-  // 整形できない (未対応構文・壊す恐れ) 場合は formatSql が原文を返すため
-  // 変化がなく、何もしない。
+  // Public method that formats the statement at the cursor and replaces its range with the result.
+  // When it cannot be formatted (unsupported syntax, risk of breaking it), formatSql returns the
+  // original text, so nothing changes and nothing is done.
   export function formatCurrentStatement() {
-    // SQL 整形器は SQL 専用 (Format ボタン自体も capability で隠れる)
+    // The SQL formatter is SQL-only (the Format button itself is also hidden by capability)
     if (!view || !isSqlLanguage()) {
       return;
     }
@@ -492,7 +492,7 @@
       return;
     }
     const original = state.sliceDoc(range.from, range.to);
-    // T-SQL は角括弧識別子と #temp を字句として知らないと壊す (sqlFormat.ts)
+    // T-SQL breaks unless the formatter lexes bracket identifiers and #temp (sqlFormat.ts)
     const dialect = /^(mssql|sqlserver)$/i.test(engine ?? "") ? "mssql" : undefined;
     const formatted = formatSql(original, dialect);
     if (formatted === original) {
@@ -569,25 +569,25 @@
           drawSelection(),
           history(),
           autocompletion(),
-          // 検索パネルはエディタの上端に出す (ConfigEditorModal と揃える)
+          // Show the search panel at the top of the editor (aligned with ConfigEditorModal)
           search({ top: true }),
-          // VSCode 互換のマルチカーソル / 複数選択 (Alt+click, Shift+Alt+drag,
-          // Mod-l)。Mod-d / Mod-Shift-l は下の searchKeymap 側にある
+          // VSCode-compatible multi-cursor / multiple selections (Alt+click, Shift+Alt+drag,
+          // Mod-l). Mod-d / Mod-Shift-l are in the searchKeymap below
           vscodeMultiSelection,
-          // Mod-Enter を defaultKeymap より先に評価させる
+          // Evaluate Mod-Enter before defaultKeymap
           runKeymap,
-          // searchKeymap を defaultKeymap より先に置く。Escape がどちらにも
-          // あり、検索パネルを開いている間は「パネルを閉じる」を勝たせるため
-          // (閉じるパネルが無ければ false を返して defaultKeymap の
-          // simplifySelection へ落ちる)
+          // Put searchKeymap before defaultKeymap. Escape is in both, and
+          // while the search panel is open we want "close the panel" to win
+          // (if there is no panel to close it returns false and falls through to defaultKeymap's
+          // simplifySelection)
           keymap.of(searchKeymap),
           keymap.of([
             ...defaultKeymap,
             ...historyKeymap,
             ...completionKeymap,
-            // 補完候補が出ている間の Tab は候補の確定 (VSCode と同じ)。completionKeymap は
-            // Enter でしか確定しないため足している。候補が無ければ acceptCompletion が
-            // false を返し、次の indentWithTab でインデントになる
+            // While completion candidates are shown, Tab confirms the candidate (same as VSCode). Added because completionKeymap
+            // confirms only with Enter. With no candidates, acceptCompletion
+            // returns false and the next indentWithTab indents
             { key: "Tab", run: acceptCompletion },
             indentWithTab,
           ]),
@@ -602,7 +602,7 @@
             if (update.docChanged) {
               onChange(update.state.doc.toString());
             }
-            // 選択の変化 (ドキュメント変更でズレる場合も含む) を通知する
+            // Notify of selection changes (including shifts caused by document changes)
             if (update.selectionSet || update.docChanged) {
               emitSelectionChange(update.state);
             }
@@ -618,7 +618,7 @@
     view = null;
   });
 
-  // ファイル切り替え等で外部から content が変わった時にエディタへ反映する
+  // Reflect it in the editor when content is changed externally, e.g. by switching files
   $effect(() => {
     const nextContent = content;
     if (!view) {
@@ -632,9 +632,9 @@
     }
   });
 
-  // エンジン・スキーママップ変更時にエディタ言語と補完スキーマを差し替える
+  // Swap the editor language and the completion schema when the engine or schema map changes
   $effect(() => {
-    // view のガードより先に評価し、依存をリアクティブ依存として追跡させる
+    // Evaluate before the view guard so the dependencies are tracked as reactive dependencies
     const extension = languageExtension(editorLanguage, engine, schemaMap);
     if (!view) {
       return;
@@ -652,8 +652,8 @@
 ></div>
 
 <style>
-  /* oneDark テーマの背景指定は CodeMirror のテーマ優先順位で
-     EditorView.theme の上書きに勝つことがあるため、CSS で確実に上書きする */
+  /* oneDark theme background rules can win over the EditorView.theme override
+     due to CodeMirror's theme precedence, so override reliably with CSS */
   .sql-editor-host :global(.cm-editor),
   .sql-editor-host :global(.cm-gutters) {
     background-color: #111111 !important;

@@ -25,7 +25,7 @@
   import CellInspector from "./CellInspector.svelte";
   import AiAnalysisModal from "./AiAnalysisModal.svelte";
 
-  // Copy / Export / Cmd+C コピーで共有する出力フォーマット。
+  // Output format shared by Copy / Export / Cmd+C copy.
   type CopyFormat = "csv" | "tsv" | "json";
   const COPY_FORMAT_KEY = "queryfolio.results.copyFormat";
   const isCopyFormat = (v: string): v is CopyFormat =>
@@ -37,7 +37,7 @@
         return v;
       }
     } catch {
-      // localStorage が使えなくても既定値で継続する
+      // Continue with the default even if localStorage is unavailable
     }
     return "tsv";
   }
@@ -46,16 +46,16 @@
     try {
       localStorage.setItem(COPY_FORMAT_KEY, copyFormat);
     } catch {
-      // localStorage が使えなくても動作は継続する
+      // Behavior continues even if localStorage is unavailable
     }
   });
 
-  // Copy / Export ボタンの一時的なフィードバック表示
+  // Temporary feedback display for the Copy / Export buttons
   let copiedWhole = $state(false);
   let exported = $state(false);
 
-  // Export の文字コード選択メニュー (分割ボタンの ▼)。
-  // 本体のボタンは UTF-8 なので、ここには UTF-8 以外だけを並べる。
+  // Character-encoding selection menu for Export (the ▼ of the split button).
+  // The main button is UTF-8, so only non-UTF-8 encodings are listed here.
   const EXPORT_ENCODINGS: { value: api.ExportEncoding; label: string }[] = [
     { value: "cp932", label: "CP932" },
     { value: "euc-jp", label: "EUC-JP" },
@@ -64,16 +64,16 @@
 
   const activeTab = $derived(appStore.activeResultTab);
 
-  /// 結果セットを持たない文 (INSERT / UPDATE / DELETE / DDL 等) の実行結果を、
-  /// DB コンソール風の生の実行メッセージとして組み立てる。最終行には
-  /// [ No result set ] のラベルを置き、表形式の結果が無かったことを明示する。
+  /// Build the execution result of a statement without a result set (INSERT / UPDATE / DELETE / DDL etc.)
+  /// as a raw execution message in the style of a DB console. The last line carries the
+  /// [ No result set ] label to make clear that there was no tabular result.
   function noResultSetText(result: api.QueryResult): string {
     const lines: string[] = [];
     if (result.affected_rows !== null) {
       const n = result.affected_rows;
       lines.push(`Query OK, ${n} row${n === 1 ? "" : "s"} affected`);
     } else {
-      // fetch 系だが列も行も得られなかった稀なケース (describe 不可の SHOW 等)
+      // A rare case that is fetch-type but yields neither columns nor rows (SHOW etc. that cannot be described)
       lines.push("Query executed. No rows returned.");
     }
     lines.push(`Elapsed: ${result.elapsed_ms} ms`);
@@ -82,8 +82,8 @@
     return lines.join("\n");
   }
 
-  /// Analyze with AI ボタンの表示条件: EXPLAIN 由来のタブに結果があり、
-  /// AI が設定済みであること
+  /// Display condition for the Analyze with AI button: an EXPLAIN-derived tab has a result and
+  /// AI is configured
   const canAnalyzePlan = $derived(
     activeTab !== null &&
       activeTab.result !== null &&
@@ -91,17 +91,17 @@
       (appStore.aiInfo?.configured ?? false),
   );
 
-  // インスペクタで表示中のセル。どのタブのセルかを tabId で覚えておき、
-  // タブ切替・タブクローズ時に別タブのセルを表示し続けないようにする
+  // The cell shown in the inspector. We remember which tab's cell it is via tabId,
+  // so that we do not keep showing another tab's cell after a tab switch / tab close
   let selectedCell = $state<{
     tabId: number;
     rowIndex: number;
     colIndex: number;
   } | null>(null);
 
-  // 結果テーブルの矩形選択。anchor から focus までを選択範囲とする。
-  // mode: cell = 単一セル基点の矩形, row = 行まるごと, col = 列まるごと。
-  // tabId で対象タブを覚え、タブ切替・再実行で範囲外になったら破棄する。
+  // Rectangular selection of the result table. The range runs from anchor to focus.
+  // mode: cell = rectangle based on a single cell, row = whole rows, col = whole columns.
+  // We remember the target tab via tabId and discard the selection if it falls out of range after a tab switch or re-execution.
   let selection = $state<{
     tabId: number;
     mode: "cell" | "row" | "col";
@@ -111,53 +111,53 @@
     focusCol: number;
   } | null>(null);
 
-  // ドラッグ選択の状態 ($state 不要: レンダリングに使わない内部フラグ)
+  // Drag-selection state (no $state needed: internal flags not used for rendering)
   let dragging = false;
   let dragMode: "cell" | "row" | "col" | null = null;
-  // ドラッグでセルをまたいだか。単純クリックとの区別に使い、
-  // ドラッグ後にセルインスペクタを誤って開閉しないようにする
+  // Whether the drag crossed cells. Used to tell it apart from a simple click,
+  // so the cell inspector is not opened/closed by mistake after a drag
   let dragMoved = false;
 
-  // キーボード操作 (Cmd+C / Cmd+A) を結果グリッドに限定するためのフォーカス先
+  // Focus target used to limit keyboard operations (Cmd+C / Cmd+A) to the result grid
   let gridEl = $state<HTMLDivElement | null>(null);
 
-  // ---- 結果テーブルの行仮想化 ----
-  // 全行 × 全列を DOM に置くと、レイアウトのコストがセル数に比例して増え、
-  // 同じドキュメントにいる SQL エディタの入力までカクつく (実測: 500 行 ×
-  // 60 列 = 31,000 セルで 1 打鍵あたり 17ms、2,000 セルで 1ms、0 セルで 0ms)。
-  // さらに全セルが cellBgClass / isSelectedCell 経由で selection を購読するため、
-  // ドラッグ選択のたびに全セルのエフェクトが再評価される。表示範囲 +
-  // オーバースキャンぶんだけ描画してセル数を数千に抑える。
+  // ---- Row virtualization of the result table ----
+  // Putting all rows x all columns in the DOM makes layout cost grow in proportion to the cell count,
+  // and even typing in the SQL editor in the same document stutters (measured: 500 rows x
+  // 60 columns = 31,000 cells costs 17ms per keystroke, 2,000 cells 1ms, 0 cells 0ms).
+  // In addition, every cell subscribes to the selection via cellBgClass / isSelectedCell,
+  // so the effects of all cells are re-evaluated on every drag selection. We render only the visible range +
+  // overscan to keep the cell count in the low thousands.
   const ROW_OVERSCAN = 10;
   const DEFAULT_ROW_HEIGHT = 21;
-  /// 列幅の上限 (文字数)。従来の max-w-96 (384px) 相当
+  /// Upper limit of the column width (in characters). Equivalent to the previous max-w-96 (384px)
   const MAX_COL_CHARS = 48;
-  /// オブジェクト値の列幅見積り (文字数)。幅を決めるためだけに全行を
-  /// JSON.stringify すると仮想化の意味が無くなるので実測しない
+  /// Estimated column width for object values (in characters). JSON.stringify-ing all rows
+  /// just to decide the width would defeat the point of virtualization, so we do not measure
   const OBJECT_WIDTH_CHARS = 24;
-  /// セル 1 個ぶんの文字以外の幅: padding (px-2 = 8px * 2) + 境界線 1px + 余裕 3px
+  /// Width per cell other than characters: padding (px-2 = 8px * 2) + 1px border + 3px margin
   const CELL_CHROME_PX = 20;
 
   let rowHeight = $state(DEFAULT_ROW_HEIGHT);
   let gridScrollTop = $state(0);
   let gridViewportHeight = $state(0);
 
-  /// 等幅フォントでの表示幅を「半角何文字ぶんか」で返す。CSS の ch は半角 (0 の
-  /// 送り幅) なので、`String.length` をそのまま ch に使うと日本語などの全角文字が
-  /// 半分の幅になり、table-layout: fixed では伸びずに切り詰められてしまう。
-  /// East Asian Wide / Fullwidth の範囲を 2 と数える近似で足りる
-  /// 範囲は必ず \u エスケープで書くこと。文字リテラルで書くと、見た目が同じでも
-  /// 意図しないコードポイントになる (CJK 互換漢字 U+F900 のつもりで書いた文字が
-  /// U+8C48 になり、範囲がサロゲート領域を飲み込んで追加面の文字が全て幅2に
-  /// なっていた)。u フラグ + for...of のコードポイント単位反復で、絵文字や
-  /// CJK 拡張B以降も明示的に扱う
+  /// Return the display width in a monospace font as "how many half-width characters". CSS ch is the half-width (width of 0)
+  /// advance, so using `String.length` as ch as-is makes full-width characters such as Japanese
+  /// take half the width and get truncated instead of stretched under table-layout: fixed.
+  /// An approximation that counts East Asian Wide / Fullwidth ranges as 2 is enough.
+  /// Always write the ranges with \u escapes. Writing them as character literals can yield
+  /// unintended code points even when they look the same (a character meant as CJK Compatibility Ideograph U+F900 became
+  /// U+8C48, so the range swallowed the surrogate area and all characters in the supplementary planes
+  /// were counted as width 2). Iterating by code point with the u flag + for...of also
+  /// handles emoji and CJK Extension B and beyond explicitly
   const WIDE_CHAR =
     /[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE10-\uFE19\uFE30-\uFE6F\uFF00-\uFF60\uFFE0-\uFFE6\u{1F300}-\u{1FAFF}\u{20000}-\u{3FFFD}]/u;
-  /// limit に達したら打ち切る。呼び出し側は結果を MAX_COL_CHARS で頭打ちにするので
-  /// 値は完全に等価だが、打ち切らないとコストがセル数でなく**総文字数**に比例し、
-  /// 長い TEXT 列で秒単位のフリーズになる (実測: 500 行 × 3 列 × 100KB で 1,971ms →
-  /// 打ち切りありで 1ms)。db.rs は sqlx 経路でセルの文字数を切り詰めないため、
-  /// 100KB の TEXT や長い JSON 文字列はそのままここへ届く
+  /// Stop once limit is reached. The caller caps the result at MAX_COL_CHARS, so
+  /// the value is exactly equivalent, but without stopping, the cost is proportional to the **total character count** rather than the cell count,
+  /// causing second-scale freezes on long TEXT columns (measured: 500 rows x 3 columns x 100KB: 1,971ms ->
+  /// 1ms with the cutoff). db.rs does not truncate cell character counts on the sqlx path,
+  /// so a 100KB TEXT or a long JSON string reaches here as is
   const displayWidth = (s: string, limit = Infinity): number => {
     let w = 0;
     for (const ch of s) {
@@ -169,9 +169,9 @@
     return w;
   };
 
-  // 描画する行の範囲と、スクロール量を保つための上下スペーサーの高さ。
-  // sticky ヘッダの高さは「コンテンツ上端からの距離」と「ヘッダに隠れる量」で
-  // 相殺されるため、start の算出には入らない
+  // The range of rows to render, and the heights of the top/bottom spacers that preserve the scroll amount.
+  // The sticky header height is offset by "distance from the content top" and "amount hidden by the header",
+  // so it does not enter the computation of start
   const rowWindow = $derived.by(() => {
     const total = activeTab?.result?.rows.length ?? 0;
     const h = rowHeight > 0 ? rowHeight : DEFAULT_ROW_HEIGHT;
@@ -179,9 +179,9 @@
       return { start: 0, end: 0, padTop: 0, padBottom: 0 };
     }
     const visible = Math.ceil((gridViewportHeight || 600) / h);
-    // start は必ず最終行までに収める。行数の少ない結果へ差し替わった直後は
-    // gridScrollTop が新しい総高さより大きいままになりうるので、クランプしないと
-    // start > end で 0 行描画 (列ヘッダと巨大な空白だけ) になる
+    // start must always stay within the last row. Right after switching to a result with fewer rows,
+    // gridScrollTop can remain larger than the new total height, and without clamping,
+    // start > end renders 0 rows (only the column header and a huge blank area)
     const start = Math.min(
       Math.max(0, total - 1),
       Math.max(0, Math.floor(gridScrollTop / h) - ROW_OVERSCAN),
@@ -195,17 +195,17 @@
     };
   });
 
-  // 列幅。仮想化すると「描画中のセル」だけで auto レイアウトの列幅が決まり、
-  // スクロールのたびに幅が動いてしまうため、table-layout: fixed + 実データから
-  // 求めた固定幅にする。等幅フォントなので ch 単位で文字数から直接引ける
-  // (DOM 実測が要らない)。padding (px-2 = 8px * 2) + 境界線 1px = 17px に、
-  // サブピクセルの丸めで 1 文字の値まで `y…` と切れないよう 3px の余裕を足す。
+  // Column widths. With virtualization, the auto-layout column widths would be decided only by the "cells being rendered",
+  // and widths would shift on every scroll, so we use table-layout: fixed + fixed widths
+  // computed from the actual data. Since the font is monospace, widths can be derived directly from
+  // character counts in ch units (no DOM measurement needed). To padding (px-2 = 8px * 2) + 1px border = 17px,
+  // we add 3px of margin so that subpixel rounding does not cut a one-character value like `y…`.
   //
-  // table-layout: fixed は **table の width が auto でないときだけ有効**なので、
-  // `min-width: 100%` では自動レイアウトのままになる (col の幅は単なるヒント扱いに
-  // なり、描画中の行で幅が動く)。かといって `width: 100%` にすると、ペインが狭い時に
-  // 指定幅を下回るまで列が圧縮されてしまう。そこで「100% と列幅の合計の大きい方」を
-  // 明示的な width として与え、狭い時は横スクロール・広い時は余白列が余りを吸う形にする。
+  // table-layout: fixed is **effective only when the table's width is not auto**, so
+  // `min-width: 100%` leaves it in auto layout (the col widths become mere hints
+  // and widths shift on the rows being rendered). On the other hand, `width: 100%` would compress columns when the pane is narrow
+  // until they fall below the specified widths. So we explicitly give "the larger of 100% and the sum of column widths"
+  // as the width: horizontal scroll when narrow, and a spacer column absorbs the surplus when wide.
   const columnWidths = $derived.by<{
     rowNum: string;
     cols: string[];
@@ -234,7 +234,7 @@
       const capped = lens.map((n) => Math.min(n, MAX_COL_CHARS));
       const rowNumChars = String(result.rows.length).length;
       const width = (chars: number) => `calc(${chars}ch + ${CELL_CHROME_PX}px)`;
-      // 全列の合計 (行番号列を含む)。余白列は 0 として数える
+      // Sum of all columns (including the row-number column). The spacer column counts as 0
       const totalChars = capped.reduce((a, b) => a + b, rowNumChars);
       const totalPad = (capped.length + 1) * CELL_CHROME_PX;
       return {
@@ -245,8 +245,8 @@
     },
   );
 
-  // スクロール量とビューポート高さを追う。行高はテーマ変更等でずれうるので
-  // 実際に描画された行から測り直す
+  // Track the scroll amount and viewport height. Row height can drift due to theme changes etc.,
+  // so re-measure it from the actually rendered rows
   const syncGridMetrics = () => {
     const el = gridEl;
     if (!el) {
@@ -254,8 +254,8 @@
     }
     gridScrollTop = el.scrollTop;
     gridViewportHeight = el.clientHeight;
-    // offsetHeight は整数へ丸められるため、端数のある行高だとスペーサーと
-    // 実際の行位置が少しずつずれる。getBoundingClientRect は端数を保つ
+    // offsetHeight is rounded to an integer, so with a fractional row height the spacer and
+    // the actual row positions drift apart little by little. getBoundingClientRect keeps the fraction
     const row = el.querySelector<HTMLElement>("tbody tr[data-row-index]");
     const h = row?.getBoundingClientRect().height ?? 0;
     if (h > 0 && h !== rowHeight) {
@@ -263,14 +263,14 @@
     }
   };
 
-  // 行がアンマウントされるとフォーカスが body へ移り、選択が残っているのに Cmd+C /
-  // Cmd+A が効かなくなる (handleWindowKeydown が gridEl.contains(activeElement) で
-  // 判定するため)。**scroll ハンドラの中では戻せない**: その時点ではまだ行が DOM に
-  // 居てフォーカスは body ではなく、Svelte が行を捨てるのはその後だから。しかも
-  // PageDown のような単発スクロールでは次の scroll イベントが来ない。
-  // DOM 更新後に走る $effect で、描画ウインドウの変化を見てから戻す。
-  // グリッド外へ意図的に移した場合 (エディタ・チャット入力・モーダル) は
-  // activeElement が body にならないので、フォーカスを奪わない
+  // When a row is unmounted, focus moves to body, and Cmd+C /
+  // Cmd+A stop working even though the selection remains (because handleWindowKeydown decides by gridEl.contains(activeElement)).
+  // **It cannot be restored inside the scroll handler**: at that point the row is still in the DOM,
+  // focus is not on body yet, and Svelte discards the row afterward. Moreover,
+  // a one-shot scroll such as PageDown produces no further scroll event.
+  // So we restore it in a $effect that runs after DOM updates, after looking at the change of the rendering window.
+  // When focus was intentionally moved outside the grid (editor, chat input, modal),
+  // activeElement does not become body, so we do not steal the focus
   $effect(() => {
     void rowWindow;
     if (selection && gridEl && document.activeElement === document.body) {
@@ -290,7 +290,7 @@
   });
 
 
-  // Cmd+C コピーにヘッダ行を含めるか。localStorage に保存する
+  // Whether the Cmd+C copy includes the header row. Saved to localStorage
   const COPY_HEADERS_KEY = "queryfolio.results.copyWithHeaders";
   let copyWithHeaders = $state(loadCopyWithHeaders());
   function loadCopyWithHeaders(): boolean {
@@ -304,38 +304,38 @@
     try {
       localStorage.setItem(COPY_HEADERS_KEY, copyWithHeaders ? "1" : "0");
     } catch {
-      // localStorage が使えなくても動作は継続する
+      // Behavior continues even if localStorage is unavailable
     }
   });
 
-  // 選択範囲コピー時の一時的なフィードバック表示
+  // Temporary feedback display when copying the selection
   let selectionCopied = $state(false);
 
-  // タブ切替 (クローズによる切替を含む) でインスペクタ・選択を閉じる
+  // Close the inspector and the selection on tab switch (including switches caused by closing)
   $effect(() => {
     void appStore.activeTabId;
     selectedCell = null;
     selection = null;
   });
 
-  // 別の結果を表示する時は先頭へ戻す (前の結果のスクロール量のまま行ウインドウを
-  // 計算すると、行数の違う結果で範囲外を描画してしまう)。**タブ切替だけでなく
-  // 同一タブでの再実行も対象にする**: prepareTargetTab はピン留めの無いタブを
-  // 使い回すため、SQL を書き換えて実行し直しても activeTabId は変わらない
+  // When showing a different result, return to the top (computing the row window with the previous result's
+  // scroll amount would render out of range for a result with a different row count). **Not only on tab switch but also
+  // on re-execution in the same tab**: prepareTargetTab reuses tabs without a pin,
+  // so activeTabId does not change even if the SQL is rewritten and run again
   $effect(() => {
     void appStore.activeTabId;
     void activeTab?.executedAt;
     if (gridEl) {
       gridEl.scrollTop = 0;
-      // 横位置も戻す。戻さないと、横に広い結果を右へスクロールした状態で別の結果へ
-      // 切り替えた時に、# 列と左端の列が画面外のまま途中の列から表示される
+      // Also reset the horizontal position. Otherwise, when switching to another result after scrolling a horizontally wide result to the right,
+      // the # column and the leftmost column stay off-screen and the display starts from a column in the middle
       gridEl.scrollLeft = 0;
     }
     gridScrollTop = 0;
   });
 
-  // 選択範囲を結果サイズにクランプして正規化する (min/max を確定)。
-  // アクティブタブ・結果が無い、または別タブの選択なら null。
+  // Clamp the selection to the result size and normalize it (fix min/max).
+  // null if there is no active tab / result, or the selection belongs to another tab.
   const selectedRange = $derived.by<CellRange | null>(() => {
     const tab = activeTab;
     if (!selection || !tab || selection.tabId !== tab.id) {
@@ -384,7 +384,7 @@
     );
   };
 
-  // 行ヘッダ (#) / 列ヘッダのハイライト条件
+  // Highlight conditions for the row header (#) / column header
   const isRowHeaderSelected = (rowIndex: number): boolean => {
     const r = selectedRange;
     const cols = activeTab?.result?.columns.length ?? 0;
@@ -428,7 +428,7 @@
       focusRow: rowIndex,
       focusCol: colIndex,
     };
-    // ドラッグ後 (クリックが発火しない) でも Cmd+C が届くようにグリッドへフォーカス
+    // Focus the grid so that Cmd+C still reaches it even after a drag (when no click fires)
     gridEl?.focus();
   };
 
@@ -441,8 +441,8 @@
     if (!dragging) {
       return;
     }
-    // pointerup をウインドウ外で取りこぼした場合の保険。ボタンが押されて
-    // いない pointerenter (ただのホバー) が来たらドラッグを終了する
+    // Safety net for when pointerup is missed outside the window. If a pointerenter
+    // arrives with no button pressed (just a hover), end the drag
     if (e.buttons === 0) {
       endDrag();
       return;
@@ -480,9 +480,9 @@
     }, 1500);
   };
 
-  // 結果グリッドにフォーカスがあるか。SQL エディタ等からのキー操作を
-  // 横取りしないための共通ガード。セル入力 (編集 input / 読み取り専用ビューの
-  // textarea) にフォーカスがある間も、入力内の通常のキー操作を優先して false
+  // Whether the result grid has focus. A common guard so that key operations from the SQL editor etc.
+  // are not hijacked. Also returns false while a cell input (edit input / read-only view
+  // textarea) has focus, giving priority to normal key operations within the input
   const isGridKeyTarget = (): boolean => {
     if (
       document.activeElement instanceof HTMLInputElement ||
@@ -493,10 +493,10 @@
     return gridEl !== null && gridEl.contains(document.activeElement);
   };
 
-  // テーブル全体を選択する。選択できる結果が無ければ false (既定動作に任せる)。
-  // mode は "cell" のままでよい: 行/列ヘッダのハイライトは
-  // isRowHeaderSelected / isColHeaderSelected が mode ではなく確定後の範囲が
-  // 全行・全列に及ぶかで判定するため、全体を覆う矩形なら両方点灯する
+  // Select the whole table. Returns false if there is no selectable result (leave it to the default behavior).
+  // mode can stay "cell": the row/column header highlight is decided by
+  // whether the fixed range after clamping covers all rows / all columns in isRowHeaderSelected / isColHeaderSelected, not by mode,
+  // so a rectangle covering everything lights up both
   const selectAll = (): boolean => {
     const tab = activeTab;
     const result = tab?.result;
@@ -519,8 +519,8 @@
     return true;
   };
 
-  // Cmd+C (Ctrl+C) で選択範囲を CSV コピー、Cmd+A (Ctrl+A) でテーブル全体を選択。
-  // どちらも結果グリッドにフォーカスがある時だけ処理する
+  // Cmd+C (Ctrl+C) copies the selection as CSV, Cmd+A (Ctrl+A) selects the whole table.
+  // Both are handled only while the result grid has focus
   const handleWindowKeydown = (e: KeyboardEvent) => {
     if (!(e.metaKey || e.ctrlKey)) {
       return;
@@ -545,8 +545,8 @@
     void copySelection();
   };
 
-  // インスペクタに渡す値。再実行などで結果が入れ替わり
-  // 選択位置が範囲外になった場合は null (= 非表示) にする
+  // Value passed to the inspector. null (= hidden) when the result is replaced, e.g. by re-execution,
+  // and the selection position falls out of range
   const inspectedCell = $derived.by(() => {
     const tab = activeTab;
     if (!selectedCell || !tab || selectedCell.tabId !== tab.id) {
@@ -567,7 +567,7 @@
     };
   });
 
-  // セルクリックで選択してインスペクタを開く。選択中セルの再クリックで閉じる
+  // Clicking a cell selects it and opens the inspector. Clicking the selected cell again closes it
   const selectCell = (rowIndex: number, colIndex: number) => {
     if (!activeTab) {
       return;
@@ -584,15 +584,15 @@
     selectedCell = { tabId: activeTab.id, rowIndex, colIndex };
   };
 
-  // セルの click。直前がドラッグ選択だった場合はインスペクタ開閉を抑制する
+  // Cell click. If the previous action was a drag selection, suppress opening/closing the inspector
   const onCellClick = (rowIndex: number, colIndex: number) => {
     if (dragMoved) {
       dragMoved = false;
       return;
     }
-    // 選択中セルの再クリック (インスペクタを閉じる操作) では、
-    // pointerdown で張られた 1 セルの矩形選択も一緒に解除して
-    // ハイライトが残らないようにする
+    // Re-clicking the selected cell (the action that closes the inspector) also
+    // clears the single-cell rectangular selection set up on pointerdown,
+    // so that no highlight remains
     const closingInspector = isSelectedCell(rowIndex, colIndex);
     selectCell(rowIndex, colIndex);
     if (closingInspector) {
@@ -606,10 +606,10 @@
     selectedCell.rowIndex === rowIndex &&
     selectedCell.colIndex === colIndex;
 
-  // アクティブセルのコピーアイコンの一時的なフィードバック表示 (`${row}:${col}`)
+  // Temporary feedback display for the active cell's copy icon (`${row}:${col}`)
   let copiedCellKey = $state<string | null>(null);
 
-  // アクティブセルの値をコピーする (NULL / オブジェクトの文字列化はセル表示と同じ)
+  // Copy the active cell's value (stringification of NULL / objects is the same as the cell display)
   const copyCellValue = async (rowIndex: number, colIndex: number) => {
     const result = activeTab?.result;
     if (!result) {
@@ -622,8 +622,8 @@
     }, 1500);
   };
 
-  // セル背景色: インスペクタで開いているセルを最優先で強調し、
-  // 次に矩形選択の範囲を淡く強調する
+  // Cell background color: the cell open in the inspector is emphasized first,
+  // then the rectangular selection range is lightly emphasized
   const cellBgClass = (rowIndex: number, colIndex: number): string => {
     if (isSelectedCell(rowIndex, colIndex)) {
       return "bg-sky-800/60";
@@ -634,7 +634,7 @@
     return "";
   };
 
-  // 結果テーブル全体を選択中フォーマットで文字列化する (Copy / Export 共通)。
+  // Stringify the whole result table in the selected format (shared by Copy / Export).
   const serializeResult = (
     format: CopyFormat,
     result: api.QueryResult | null | undefined,
@@ -649,12 +649,12 @@
         : toJson(result);
   };
 
-  // Copy / Export で出力する結果を用意する。
+  // Prepare the result to output for Copy / Export.
   //
-  // 結果テーブルの表示は設定の default_limit で絞られているが、Copy / Export では
-  // その制限を無視して全件を出す。取り直しが要らない (default_limit が付いて
-  // いなかった) 場合は表示中の結果をそのまま使う。
-  // 取り直し中は Copy / Export を二重に走らせない。
+  // The result table display is limited by the setting default_limit, but Copy / Export
+  // ignore that limit and output all rows. If no refetch is needed (default_limit was not
+  // applied), use the currently displayed result as is.
+  // While refetching, do not run Copy / Export twice.
   let preparingOutput = $state(false);
   const resultForOutput = async (): Promise<api.QueryResult | null> => {
     const tab = activeTab;
@@ -666,8 +666,8 @@
     try {
       full = await appStore.fetchResultWithoutDefaultLimit(tab);
     } catch (e) {
-      // 取り直しに失敗したら黙って表示中の結果を出さない
-      // (件数が違うものを気付かず出力するほうが危険)
+      // If the refetch fails, do not silently output the displayed result
+      // (unknowingly outputting something with a different row count is more dangerous)
       toast.error(`Failed to fetch the full result: ${e}`);
       return null;
     } finally {
@@ -682,7 +682,7 @@
     return result;
   };
 
-  // Copy ボタン: 結果テーブル全体を選択中フォーマットでクリップボードへ。
+  // Copy button: copy the whole result table to the clipboard in the selected format.
   const copyResult = async () => {
     if (preparingOutput) {
       return;
@@ -691,8 +691,8 @@
     if (text === null) {
       return;
     }
-    // navigator.clipboard は Tauri 2 で OS のパーミッションプロンプトが
-    // 出ることがあるため、公式プラグイン経由で書き込む
+    // navigator.clipboard can trigger an OS permission prompt in Tauri 2,
+    // so write via the official plugin
     await writeText(text);
     copiedWhole = true;
     setTimeout(() => {
@@ -700,9 +700,9 @@
     }, 1500);
   };
 
-  // Export ボタン: 結果テーブル全体を選択中フォーマットでファイルへ保存する。
-  // ネイティブ保存ダイアログで選ばせたパスへ Rust 側で書き込む。
-  // encoding は分割ボタンの選択 (既定は UTF-8)。
+  // Export button: save the whole result table to a file in the selected format.
+  // Rust writes to the path chosen in the native save dialog.
+  // encoding is the split button's selection (UTF-8 by default).
   const exportResult = async (encoding: api.ExportEncoding = "utf-8") => {
     if (!activeTab?.result || preparingOutput) {
       return;
@@ -719,10 +719,10 @@
       return;
     }
     if (!path) {
-      // ユーザーがダイアログをキャンセルした
+      // The user canceled the dialog
       return;
     }
-    // 取り直しとシリアライズはパス確定後に行う (キャンセル時の無駄な処理を避ける)
+    // Do the refetch and serialization after the path is confirmed (avoids wasted work on cancel)
     const text = serializeResult(copyFormat, await resultForOutput());
     if (text === null) {
       return;
@@ -748,7 +748,7 @@
     return String(value);
   };
 
-  // タブ見出し用に SQL を 1 行・短縮表示にする
+  // Show the SQL on one line, shortened, for tab titles
   const tabLabel = (tab: ResultTab): string => {
     const compact = tab.sql.replace(/\s+/g, " ").trim();
     if (!compact) {
@@ -768,8 +768,8 @@
 
   const aiConfigured = $derived(appStore.aiInfo?.configured ?? false);
 
-  /// アクティブなタブの接続が AI 機能に対応しているか (redis 等は非対応)。
-  /// Fix with AI は SQL 修正プロンプト前提なので、非対応エンジンでは出さない
+  /// Whether the active tab's connection supports AI features (not supported for redis etc.).
+  /// Fix with AI assumes an SQL-fix prompt, so it is not shown for unsupported engines
   const activeTabSupportsAi = $derived.by(() => {
     const conn = activeTab?.connection;
     if (!conn) return true;
@@ -777,8 +777,8 @@
     return info?.capabilities.supports_ai ?? true;
   });
 
-  /// Fix with AI ボタンの title (未設定・エラー時は設定方法を案内する)。
-  /// DB エラーメッセージには値が含まれ得るため、送信内容を明示する
+  /// Title of the Fix with AI button (guides to the setup when unconfigured / on error).
+  /// DB error messages can contain values, so state explicitly what is sent
   const aiFixButtonTitle = $derived(
     aiConfigured
       ? `Ask AI to fix this SQL (${appStore.aiInfo?.model}). ` +
@@ -790,21 +790,21 @@
           "api_key: ...) to config.yml or the override YAML.",
   );
 
-  // ------- 結果セルの編集 (ダブルクリック → 保留 → Preview/Edit/Submit/Cancel) -------
+  // ------- Editing result cells (double-click -> pending -> Preview/Edit/Submit/Cancel) -------
 
-  /// あるタブの編集可否と対象テーブル / 主キー / 編集可能列。
+  /// Whether a tab is editable, plus the target table / primary key / editable columns.
   interface EditContext {
     table: string;
     pkColumns: string[];
     editableColumns: Set<string>;
   }
 
-  // tabId ごとにキャッシュ。値 null = 判定済みで編集不可、キー無し = 未判定。
+  // Cached per tabId. Value null = judged not editable, no key = not yet judged.
   let editContexts = $state(new Map<number, EditContext | null>());
-  // tabId -> (`${rowIndex}:${column}` -> 編集内容)
+  // tabId -> (`${rowIndex}:${column}` -> edit content)
   let pendingEdits = $state(new Map<number, Map<string, CellEdit>>());
-  // インライン編集中のセル (1 つ)。readonly = true は編集不可セルを
-  // 読み取り専用入力で開いている状態 (全文の選択・コピー用。書き込みはしない)
+  // The cell being edited inline (one). readonly = true means a non-editable cell is
+  // opened in a read-only input (for selecting/copying the full text; nothing is written)
   let editingCell = $state<{
     tabId: number;
     rowIndex: number;
@@ -812,9 +812,9 @@
     readonly: boolean;
   } | null>(null);
   let editingValue = $state("");
-  // Preview モーダルに出す UPDATE 文 (非表示中は null)
+  // UPDATE statements shown in the Preview modal (null while hidden)
   let previewStatements = $state<string[] | null>(null);
-  // 結果が再取得された (executedAt 変化) タブの編集状態を破棄するための記録
+  // Record for discarding the edit state of a tab whose result was refetched (executedAt changed)
   const seenExecutedAt = new Map<number, number>();
 
   const activeEngine = $derived.by<NormalizedEngine | null>(() => {
@@ -824,13 +824,13 @@
     return info ? normalizeEngine(info.engine) : null;
   });
 
-  /// 編集はアクティブ接続かつ Writable ON かつ config readonly でない時のみ。
-  /// セル編集非対応のエンジン (capabilities.supports_editable_cells = false、
-  /// redis 等) では常に不可。
-  /// さらにタブの実行時スキーマが現在のアクティブスキーマと一致する時だけ許可する。
-  /// 生成する UPDATE はスキーマ未修飾で「接続の現在のアクティブスキーマ」に対して
-  /// 走るため、実行後にスキーマを切り替えていると別スキーマの同名テーブルを
-  /// 更新してしまう。スキーマ不一致時は編集不可にしてこれを防ぐ。
+  /// Editing is allowed only when the connection is active, Writable is ON, and config is not readonly.
+  /// Always disallowed for engines that do not support cell editing (capabilities.supports_editable_cells = false,
+  /// e.g. redis).
+  /// Further, it is allowed only when the tab's execution-time schema matches the current active schema.
+  /// The generated UPDATE is unqualified by schema and runs against "the connection's current active schema",
+  /// so if the schema was switched after execution, it would update a same-named table in a different schema.
+  /// On schema mismatch we make it non-editable to prevent this.
   const canEditActiveConnection = $derived(
     activeTab !== null &&
       activeTab.connection === appStore.selectedConnection &&
@@ -847,13 +847,13 @@
     activeTab ? (pendingEdits.get(activeTab.id) ?? null) : null,
   );
   const pendingCount = $derived(activePending ? activePending.size : 0);
-  // 適用中 (または同一接続でクエリ実行中) は Submit を無効化し、二重 Submit や
-  // 並列実行を防ぐ (submitCellEdits 側の isConnectionRunning ガードと二重の防御)。
+  // Disable Submit while applying (or while a query is running on the same connection) to prevent
+  // double Submit and parallel execution (a double defense with the isConnectionRunning guard on the submitCellEdits side).
   const submitDisabled = $derived(
     activeTab === null || appStore.isConnectionRunning(activeTab.connection),
   );
 
-  // 結果の入れ替わりで編集状態を破棄し、編集可能な状況なら editContext を求める
+  // Discard the edit state when the result is replaced, and request editContext if editing is possible
   $effect(() => {
     const tab = activeTab;
     if (!tab) return;
@@ -879,8 +879,8 @@
     const result = tab.result;
     if (!result) return;
     const rawTable = singleTableSelectTable(tab.sql);
-    // 実テーブルに合わせてエンジン別に表名を正規化する (PG は小文字化)。
-    // 正規化名を PK / カラム照会と生成 UPDATE の両方で一貫して使う。
+    // Normalize the table name per engine to match the actual table (PG lowercases).
+    // The normalized name is used consistently for both the PK / column lookup and the generated UPDATE.
     const info = appStore.connections.find((c) => c.name === tab.connection);
     const engine = info ? normalizeEngine(info.engine) : null;
     const table = rawTable && engine ? normalizeTableName(engine, rawTable) : null;
@@ -892,7 +892,7 @@
           api.listColumns(tab.connection, table),
         ]);
         const colNames = new Set(cols.map((c) => c.name));
-        // 列名に重複があると行/列の対応が曖昧なため編集不可 (安全側)
+        // Duplicate column names make the row/column mapping ambiguous, so not editable (safe side)
         const hasDup = result.columns.length !== new Set(result.columns).size;
         const pkPresent =
           pk.length > 0 && pk.every((k) => result.columns.includes(k));
@@ -905,10 +905,10 @@
           }
         }
       } catch {
-        ctx = null; // 取得失敗は編集不可に倒す
+        ctx = null; // A fetch failure falls back to not editable
       }
     }
-    // 応答が古い (結果が入れ替わった) なら捨てる
+    // Discard if the response is stale (the result was replaced)
     const current = appStore.resultTabs.find((t) => t.id === tab.id);
     if (!current || current.executedAt !== tab.executedAt) return;
     editContexts.set(tab.id, ctx);
@@ -925,9 +925,9 @@
     return !!ctx && col != null && ctx.editableColumns.has(col);
   };
 
-  // その行の主キー値がすべて非 NULL か。NULL を含む主キーは行を一意に
-  // 同定できず (特に SQLite は複合 / 非整数 PK に NULL を許し、WHERE pk IS NULL が
-  // 複数行に当たる)、UPDATE が意図しない行にも及ぶため編集不可にする。
+  // Whether all primary key values of the row are non-NULL. A primary key containing NULL cannot
+  // uniquely identify the row (SQLite in particular allows NULL in composite / non-integer PKs, and WHERE pk IS NULL can match
+  // multiple rows) and the UPDATE would affect unintended rows too, so make it non-editable.
   const rowPkComplete = (rowIndex: number): boolean => {
     const ctx = activeEditContext;
     const result = activeTab?.result;
@@ -938,7 +938,7 @@
     });
   };
 
-  // オブジェクト (JSON / blob) セルはインライン編集の対象外にする
+  // Object (JSON / blob) cells are excluded from inline editing
   const isCellEditable = (rowIndex: number, colIndex: number): boolean => {
     if (!isColumnEditable(colIndex)) return false;
     if (!rowPkComplete(rowIndex)) return false;
@@ -961,7 +961,7 @@
   const beginCellEdit = (rowIndex: number, colIndex: number) => {
     if (!activeTab?.result) return;
     if (!isCellEditable(rowIndex, colIndex)) {
-      // 編集不可セルは読み取り専用入力で開き、全文を選択・コピーしやすくする
+      // Open a non-editable cell in a read-only input to make it easy to select and copy the full text
       editingCell = { tabId: activeTab.id, rowIndex, colIndex, readonly: true };
       editingValue = cellText(activeTab.result.rows[rowIndex][colIndex]);
       return;
@@ -973,21 +973,21 @@
     editingValue = existing ? existing.input : editText(original);
   };
 
-  // 編集中の値を保留編集へ確定する。**対象タブは activeTab ではなく
-  // editingCell.tabId から引く**: 確定の契機には「編集中のまま別の結果タブへ
-  // 切り替えた」場合が含まれ、その時点で activeTab は既に切替先になっているため、
-  // activeTab を見ると確定できずに入力が黙って消える
+  // Commit the edited value into a pending edit. **The target tab is looked up from
+  // editingCell.tabId, not activeTab**: the triggers for committing include switching to another result tab
+  // while still editing, and at that point activeTab is already the destination,
+  // so looking at activeTab would fail to commit and the input would silently vanish
   const commitCellEdit = () => {
     const ec = editingCell;
     const tab = ec ? appStore.resultTabs.find((t) => t.id === ec.tabId) : null;
-    // 読み取り専用ビューは閉じるだけで保留編集には登録しない
+    // The read-only view is just closed and not registered as a pending edit
     if (!ec || ec.readonly || !tab || !tab.result) {
       editingCell = null;
       return;
     }
     const col = tab.result.columns[ec.colIndex];
     const row = tab.result.rows[ec.rowIndex];
-    // 結果が差し替わって行が消えている場合は確定しない (範囲外アクセスを避ける)
+    // If the result was replaced and the row is gone, do not commit (avoids out-of-range access)
     if (!row || col === undefined) {
       editingCell = null;
       return;
@@ -995,7 +995,7 @@
     const original = row[ec.colIndex];
     const key = `${ec.rowIndex}:${col}`;
     const map = new Map(pendingEdits.get(tab.id) ?? []);
-    // 元の表示と同じに戻したら保留を解除する
+    // If it is restored to the same as the original display, release the pending edit
     if (editingValue === editText(original)) {
       map.delete(key);
     } else {
@@ -1016,17 +1016,17 @@
     editingCell = null;
   };
 
-  // 編集中の行が仮想化の描画範囲から外れたら、その場で確定する。
-  // 確定は input の blur 頼みだが、**フォーカス中の要素が DOM から取り除かれた時に
-  // blur は発火しない**ため、スクロールで行を範囲外へ出したまま別セルを編集すると
-  // editingValue が上書きされ、入力が黙って失われる
+  // When the row being edited leaves the virtualization render range, commit it on the spot.
+  // Committing relies on the input's blur, but **blur does not fire when the focused element is
+  // removed from the DOM**, so if a row is scrolled out of range and another cell is then edited,
+  // editingValue is overwritten and the input is silently lost
   $effect(() => {
     const ec = editingCell;
     if (!ec) {
       return;
     }
-    // 別タブへ切り替わった場合も input は DOM から消えるので同様に確定する
-    // (commitCellEdit は editingCell.tabId のタブへ積むので切替後でも正しい)
+    // If switched to another tab, the input also disappears from the DOM, so commit likewise
+    // (commitCellEdit pushes to the tab of editingCell.tabId, so it is correct even after the switch)
     if (
       ec.tabId !== activeTab?.id ||
       ec.rowIndex < rowWindow.start ||
@@ -1079,10 +1079,10 @@
     if (stmts.length > 0) previewStatements = stmts;
   };
 
-  // 生成した UPDATE をエディタへ貼り、保留は解除する (以降は手動で実行する想定)。
-  // insertSqlSnippet は「現在選択中の接続」のエディタへ挿入するため、結果タブの
-  // 接続と選択中接続が違う時は貼らない (別接続の同名テーブルへ A の UPDATE を
-  // 流し込む事故を防ぐ。Submit の接続ガードと揃える)。
+  // Paste the generated UPDATE into the editor and release the pending edits (assuming they are run manually afterward).
+  // insertSqlSnippet inserts into the editor of "the currently selected connection", so when the result tab's
+  // connection differs from the selected connection, do not paste (prevents the accident of pouring A's UPDATE
+  // into a same-named table on another connection. Aligned with Submit's connection guard).
   const editInEditor = () => {
     const tab = activeTab;
     if (!tab) return;
@@ -1092,9 +1092,9 @@
       );
       return;
     }
-    // 生成 UPDATE はスキーマ未修飾。実行時からスキーマを切り替えていると、
-    // 貼り付けた UPDATE が別スキーマの同名テーブルに走り得るため貼らない
-    // (Submit の tab.schema !== activeSchema ガードと揃える)。
+    // The generated UPDATE is unqualified by schema. If the schema was switched since execution,
+    // the pasted UPDATE could run against a same-named table in a different schema, so do not paste
+    // (aligned with Submit's tab.schema !== activeSchema guard).
     if (tab.schema !== appStore.activeSchema) {
       toast.warning(
         "The active schema changed since these edits were made. Cancel them and re-run the query.",
@@ -1116,7 +1116,7 @@
     if (!tab || stmts.length === 0) return;
     const ok = await appStore.submitCellEdits(tab.id, stmts);
     if (ok) {
-      // 成功時は再実行で結果が入れ替わり effect が保留を破棄するが、明示的にも消す
+      // On success, re-execution replaces the result and the effect discards the pending edits, but clear them explicitly too
       clearPending();
       previewStatements = null;
     }
@@ -1128,8 +1128,8 @@
   };
 </script>
 
-<!-- ドラッグ選択はセルの pointerenter で追跡するため、
-     pointer capture は使わず window で終了を拾う -->
+<!-- Drag selection is tracked via the cell's pointerenter, so
+     pointer capture is not used and the end is caught on window -->
 <svelte:window
   onpointerup={endDrag}
   onpointercancel={endDrag}
@@ -1137,13 +1137,13 @@
 />
 
 <div class="flex h-full min-h-0 flex-col bg-zinc-900">
-  <!-- タブバー -->
+  <!-- Tab bar -->
   <div
     class="flex shrink-0 items-start gap-3 border-b border-zinc-700 px-3 py-1 text-xs text-zinc-400"
   >
     <span class="mt-0.5 font-semibold tracking-wide">RESULTS</span>
     {#if appStore.resultTabs.length > 0}
-      <!-- 多段タブ: タブが増えたら折り返して複数段で表示する -->
+      <!-- Multi-row tabs: when tabs increase, wrap and show them in multiple rows -->
       <div class="flex min-w-0 flex-1 flex-wrap items-center gap-1">
         {#each appStore.resultTabs as tab (tab.id)}
           <div
@@ -1194,7 +1194,7 @@
     {/if}
   </div>
 
-  <!-- アクティブタブの実行情報 -->
+  <!-- Execution info of the active tab -->
   {#if activeTab}
     <div
       class="flex shrink-0 items-center gap-3 border-b border-zinc-700 px-3 py-1.5 text-xs text-zinc-400"
@@ -1272,7 +1272,7 @@
           <i class="bi bi-arrow-repeat" aria-hidden="true"></i> Re-run
         </button>
         {#if canAnalyzePlan}
-          <!-- EXPLAIN の実行計画を AI に解説させる (AI 設定済みのタブのみ) -->
+          <!-- Have AI explain the EXPLAIN plan (only for tabs where AI is configured) -->
           <button
             class="flex items-center gap-1 rounded border border-blue-500/50 bg-blue-500/15 px-1.5 py-0.5 text-blue-300 hover:bg-blue-500/25 disabled:cursor-not-allowed disabled:opacity-50"
             title="Explain the plan with AI ({appStore.aiInfo?.model})"
@@ -1281,7 +1281,7 @@
             onclick={() => appStore.analyzeExplainTab(activeTab.id)}
           >
             {#if appStore.aiAnalyzing}
-              <!-- 解説中スピナー -->
+              <!-- Spinner while explaining -->
               <span
                 class="inline-block size-3 animate-spin rounded-full border-2 border-blue-300 border-t-transparent"
                 data-annotate="spinner-ai-analyzing"
@@ -1310,7 +1310,7 @@
             />
             Copy with headers
           </label>
-          <!-- 出力フォーマット。Copy / Export / Cmd+C コピーで共通に使う -->
+          <!-- Output format. Shared by Copy / Export / Cmd+C copy -->
           <select
             class="cursor-pointer rounded border border-zinc-700 bg-zinc-800 px-1 py-0.5 uppercase hover:bg-zinc-700 hover:text-zinc-200"
             title="Output format for Copy / Export and Cmd+C (Ctrl+C)"
@@ -1329,7 +1329,7 @@
           >
             {copiedWhole ? "Copied!" : "Copy"}
           </button>
-          <!-- Export は分割ボタン。本体は UTF-8、▼ で文字コードを選ぶ -->
+          <!-- Export is a split button. The main button is UTF-8, and ▼ selects the character encoding -->
           <span class="relative inline-flex">
             <button
               class="rounded-l border border-zinc-700 px-1.5 py-0.5 hover:bg-zinc-700 hover:text-zinc-200"
@@ -1350,7 +1350,7 @@
               <i class="bi bi-caret-down-fill text-[0.6rem]"></i>
             </button>
             {#if exportMenuOpen}
-              <!-- 外側クリックで閉じるための背面レイヤー -->
+              <!-- Backdrop layer for closing on outside click -->
               <button
                 class="fixed inset-0 z-20 cursor-default"
                 aria-label="Close menu"
@@ -1382,7 +1382,7 @@
     </div>
   {/if}
 
-  <!-- 保留中のセル編集バー (未確定の編集がある時のみ) -->
+  <!-- Pending cell edit bar (only when there are uncommitted edits) -->
   {#if pendingCount > 0}
     <div
       class="flex shrink-0 items-center gap-3 border-b border-amber-700/60 bg-amber-950/40 px-3 py-1.5 text-xs text-amber-200"
@@ -1430,8 +1430,8 @@
   {/if}
 
   <div class="flex min-h-0 flex-1">
-    <!-- tabindex/bind: セル選択後の Cmd+C コピー・Cmd+A 全選択を結果グリッドに
-         限定する (window の keydown で gridEl 内にフォーカスがある時だけ処理) -->
+    <!-- tabindex/bind: limit Cmd+C copy and Cmd+A select-all after cell selection to the result grid
+         (the window keydown handles it only when focus is inside gridEl) -->
     <div
       class="min-h-0 flex-1 overflow-auto focus:outline-none"
       tabindex="-1"
@@ -1459,7 +1459,7 @@
                 onclick={() => appStore.fixSqlWithAi(activeTab.id)}
               >
                 {#if activeTab.fixing}
-                  <!-- 修正案の生成中スピナー -->
+                  <!-- Spinner while generating the fix suggestion -->
                   <span
                     class="inline-block size-3 animate-spin rounded-full border-2 border-blue-300 border-t-transparent"
                     data-annotate="spinner-ai-fixing"
@@ -1472,7 +1472,7 @@
             {/if}
           </div>
 
-          <!-- AI の修正案 (元の SQL と並べて表示。Apply までは実行しない) -->
+          <!-- AI fix suggestion (shown side by side with the original SQL. Not executed until Apply) -->
           {#if activeTab.fixSuggestion}
             <div
               class="mt-2 rounded border border-zinc-700 bg-zinc-800/40"
@@ -1527,23 +1527,23 @@
           class="table-fixed border-separate font-mono text-xs select-none"
           style="border-spacing:0; width:{columnWidths?.table ?? '100%'}"
         >
-          <!-- 仮想化で描画中の行が変わっても列幅が動かないよう固定幅にする -->
+          <!-- Use fixed widths so column widths do not move even as the rendered rows change with virtualization -->
           {#if columnWidths}
             <colgroup>
               <col style="width:{columnWidths.rowNum}" />
               {#each columnWidths.cols as width, colIndex (colIndex)}
                 <col style="width:{width}" />
               {/each}
-              <!-- 幅指定の無い余白列。table-layout: fixed では余ったスペースが
-                   幅未指定の列へ回るので、テーブルが親幅より狭い時に各列が
-                   引き伸ばされるのを防ぐ (# 列が極端に広がるのを避ける) -->
+              <!-- Spacer column with no width specified. In table-layout: fixed the surplus space goes to
+                   columns with no specified width, so this prevents each column from being
+                   stretched when the table is narrower than its parent (avoids the # column growing extremely wide) -->
               <col />
             </colgroup>
           {/if}
-          <!-- WKWebView は border-collapse テーブルの thead / tr に付けた
-               背景・sticky を描画しないため (下の行が透けて見える)、各 th に
-               直接 sticky と不透明背景を付ける。選択時の色味は不透明な th の
-               上に重なるよう内側の button 側に載せる -->
+          <!-- WKWebView does not paint the background / sticky set on the thead / tr of a
+               border-collapse table (rows below show through), so sticky and an opaque background are put
+               directly on each th. The selection tint is placed on the inner button so that
+               it overlays the opaque th -->
           <thead>
             <tr>
               <th
@@ -1552,7 +1552,7 @@
                 #
               </th>
               {#each result.columns as column, colIndex (colIndex)}
-                <!-- ヘッダクリックでその列を選択。ドラッグで複数列に拡張 -->
+                <!-- Clicking a header selects that column. Dragging extends it to multiple columns -->
                 <th
                   class="sticky top-0 z-10 border-b border-r border-zinc-700 bg-zinc-800 p-0 text-left font-semibold {isColHeaderSelected(
                     colIndex,
@@ -1575,14 +1575,14 @@
                   </button>
                 </th>
               {/each}
-              <!-- 余白列 (colgroup の最後の col に対応) -->
+              <!-- Spacer column (corresponds to the last col of the colgroup) -->
               <th
                 class="sticky top-0 z-10 border-b border-zinc-700 bg-zinc-800 p-0"
               ></th>
             </tr>
           </thead>
           <tbody>
-            <!-- 上下のスペーサーで未描画ぶんの高さを確保し、スクロール量を保つ -->
+            <!-- Top/bottom spacers reserve the height of unrendered rows and preserve the scroll amount -->
             {#if rowWindow.padTop > 0}
               <tr aria-hidden="true">
                 <td
@@ -1594,7 +1594,7 @@
             {#each result.rows.slice(rowWindow.start, rowWindow.end) as row, windowIndex (rowWindow.start + windowIndex)}
               {@const rowIndex = rowWindow.start + windowIndex}
               <tr class="hover:bg-zinc-800/60" data-row-index={rowIndex}>
-                <!-- 行番号クリックでその行を選択。ドラッグで複数行に拡張 -->
+                <!-- Clicking a row number selects that row. Dragging extends it to multiple rows -->
                 <td
                   class="border-b border-r border-zinc-800 p-0 text-right {isRowHeaderSelected(
                     rowIndex,
@@ -1615,9 +1615,9 @@
                 {#each row as value, colIndex (colIndex)}
                   {@const pending = pendingInput(rowIndex, colIndex)}
                   {@const editable = isCellEditable(rowIndex, colIndex)}
-                  <!-- クリックでセルインスペクタ、ドラッグで矩形選択、
-                       ダブルクリックで編集 (編集不可セルは読み取り専用ビュー)。
-                       truncate のためボタン/入力をセル全面に敷く -->
+                  <!-- Click opens the cell inspector, drag does rectangular selection,
+                       double-click edits (non-editable cells get a read-only view).
+                       For truncate, the button/input is laid over the whole cell -->
                   <td
                     class="relative border-b border-r border-zinc-800 p-0 {pending !==
                     null
@@ -1626,8 +1626,8 @@
                   >
                     {#if isEditingCell(rowIndex, colIndex)}
                       {#if editingCell?.readonly}
-                        <!-- 読み取り専用ビュー: 全文を選択済みで開き、コピーだけできる。
-                             input は値サニタイズで改行を除去するため textarea を使う -->
+                        <!-- Read-only view: opens with the full text selected, only copying is possible.
+                             input strips newlines through value sanitizing, so use a textarea -->
                         <!-- svelte-ignore a11y_autofocus -->
                         <textarea
                           class="block w-full resize-none bg-zinc-950 px-2 py-0.5 font-mono text-xs text-zinc-200 ring-1 ring-sky-500 outline-none"
@@ -1676,8 +1676,8 @@
                       {#if isSelectedCell(rowIndex, colIndex)}
                         {@const copied =
                           copiedCellKey === `${rowIndex}:${colIndex}`}
-                        <!-- アクティブセルのコピーアイコン。button の入れ子は
-                             不正なため td 直下に重ねて配置する -->
+                        <!-- Copy icon of the active cell. Nesting a button is
+                             invalid, so it is overlaid directly under the td -->
                         <button
                           class="absolute top-1/2 right-0.5 -translate-y-1/2 rounded bg-zinc-800/90 px-1 {copied
                             ? 'text-emerald-400'
@@ -1723,7 +1723,7 @@
       {/if}
     </div>
 
-    <!-- セルインスペクタ (セル選択中のみ表示) -->
+    <!-- Cell inspector (shown only while a cell is selected) -->
     {#if inspectedCell}
       <CellInspector
         value={inspectedCell.value}
@@ -1735,7 +1735,7 @@
   </div>
 </div>
 
-<!-- AI による実行計画解説のモーダル -->
+<!-- Modal for the AI explanation of the execution plan -->
 {#if appStore.aiAnalysis !== null}
   <AiAnalysisModal
     text={appStore.aiAnalysis}
@@ -1743,7 +1743,7 @@
   />
 {/if}
 
-<!-- セル編集の UPDATE プレビュー -->
+<!-- UPDATE preview for cell edits -->
 {#if previewStatements !== null}
   <div
     class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6"
@@ -1773,11 +1773,11 @@
         </button>
       </div>
       <!--
-        SQL は行末で折り返し、高さは内容に合わせる (CYBERNEURA-DEV-578)。
-        flex-1 だと短い SQL でもモーダルが 80vh まで伸び、長い SQL は
-        横スクロールバーの向こう側に隠れて読めなかった。
-        max-h-75 は Tailwind 4 の動的スペーシング (0.25rem * 75) で 300px。
-        break-words は折り返し位置の無い長いリテラルのためのもの。
+        The SQL wraps at line ends and the height fits the content (CYBERNEURA-DEV-578).
+        With flex-1, even a short SQL stretched the modal up to 80vh, and a long SQL
+        was hidden behind the horizontal scrollbar and unreadable.
+        max-h-75 is Tailwind 4's dynamic spacing (0.25rem * 75), i.e. 300px.
+        break-words is for long literals that have no wrap point.
       -->
       <pre
         class="max-h-75 min-h-0 overflow-auto px-3 py-2 font-mono text-xs break-words whitespace-pre-wrap text-zinc-200"

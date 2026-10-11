@@ -1,45 +1,45 @@
-//! GUI を起動せずに終わる CLI オプション (`--help` / `--version` / `--license` / `--list-servers`)。
+//! CLI options that finish without launching the GUI (`--help` / `--version` / `--license` / `--list-servers`).
 //!
-//! `open` / `write` のサブコマンド ([`crate::router`]) は「アプリを起動して
-//! ファイルを開く」ためのものだが、ここで扱うのは**標準出力に書いて終了する**
-//! だけのものなので、ルーターとは別に持つ。lib.rs の `run()` が Tauri を組み立てる
-//! 前に [`info_command_from_args`] を見て、該当すれば表示して終了する。
+//! The `open` / `write` subcommands ([`crate::router`]) are for "launching the app and
+//! opening a file", whereas what is handled here only **writes to standard output and exits**,
+//! so it is kept separate from the router. Before `run()` in lib.rs assembles Tauri, it looks at
+//! [`info_command_from_args`] and, if it matches, prints and exits.
 //!
-//! 表示の組み立ては Tauri にもファイルシステムにも依存しない純粋な関数にして、
-//! 単体テストで固める (特に `--list-servers` は**パスワードを出さない**ことが
-//! 要件なので、テストで担保する)。
+//! The output is built by pure functions that depend on neither Tauri nor the filesystem and
+//! is pinned by unit tests (in particular `--list-servers` must **not print passwords**, which
+//! is a requirement, so the tests guarantee it).
 
 use crate::config::{ConnectionInfo, ServerConfig};
 use crate::db::Engine;
 use std::path::Path;
 
-/// GUI を起動せず、標準出力に書いて終わるオプション。
+/// Options that write to standard output and finish without launching the GUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InfoCommand {
-    /// 使い方を表示する。
+    /// Print the usage.
     Help,
-    /// バージョンを表示する。
+    /// Print the version.
     Version,
-    /// 同梱している依存ライブラリのライセンス一覧を表示する。
+    /// Print the list of licenses of the bundled dependency libraries.
     License,
-    /// 設定されている接続の一覧を表示する。
+    /// Print the list of configured connections.
     ListServers,
 }
 
-/// 起動時引数から [`InfoCommand`] を取り出す。
+/// Extract an [`InfoCommand`] from the startup arguments.
 ///
-/// **`open` / `write` サブコマンドが先に現れたら `None` を返す。**
-/// `write` の第 3 引数 (クエリの内容) に `--help` のような文字列が入っていても
-/// それは書き出す中身であって、オプションではないため
-/// (`queryfolio write conn a.sql "-- help"` のようなケースを取り違えない)。
+/// **Returns `None` if an `open` / `write` subcommand appears first.**
+/// Even if the third argument of `write` (the query content) contains a string like `--help`,
+/// that is the content to be written out, not an option
+/// (so a case like `queryfolio write conn a.sql "-- help"` is not mistaken).
 ///
-/// 位置固定ではなく走査にしているのは、macOS が `.app` を起動する時に
-/// `-psn_0_12345` のような引数を先頭へ差し込むことがあるため
-/// (`router::route_from_cli_args` が同じ理由で走査している)。
+/// It scans instead of fixing the position because macOS may insert an argument such as
+/// `-psn_0_12345` at the front when launching the `.app`
+/// (`router::route_from_cli_args` scans for the same reason).
 pub fn info_command_from_args<S: AsRef<str>>(args: &[S]) -> Option<InfoCommand> {
     for arg in args {
         match arg.as_ref() {
-            // サブコマンドが先に来たら、以降は全てその引数なので見ない
+            // If a subcommand comes first, everything after it is its arguments, so do not look at them
             "open" | "write" => return None,
             "--help" | "-h" | "help" => return Some(InfoCommand::Help),
             "--version" | "-V" => return Some(InfoCommand::Version),
@@ -51,15 +51,15 @@ pub fn info_command_from_args<S: AsRef<str>>(args: &[S]) -> Option<InfoCommand> 
     None
 }
 
-/// アプリの版番号。
+/// The version number of the app.
 ///
-/// `build.rs` が `tauri.conf.json` の `version` から埋め込む。
-/// **`CARGO_PKG_VERSION` を使ってはいけない** — リリースの版番号は
-/// `tauri.conf.json` 側で管理されており、Cargo.toml の version は追随していない
-/// (配布物が 0.1.4 でも `--version` が 0.1.0 と答えることになる)。
+/// `build.rs` embeds it from `version` in `tauri.conf.json`.
+/// **Do not use `CARGO_PKG_VERSION`** -- the release version is managed on the
+/// `tauri.conf.json` side, and the version in Cargo.toml does not follow it
+/// (even if the distributed build is 0.1.4, `--version` would answer 0.1.0).
 const APP_VERSION: &str = env!("QUERYFOLIO_VERSION");
 
-/// `--help` で表示する使い方。
+/// Usage printed by `--help`.
 pub fn help_text() -> String {
     let version = APP_VERSION;
     format!(
@@ -100,30 +100,30 @@ On macOS the app bundle takes the same arguments after --args:
     )
 }
 
-/// `--version` で表示する 1 行。
+/// The single line printed by `--version`.
 pub fn version_text() -> String {
     format!("Queryfolio {APP_VERSION}")
 }
 
-/// Windows で、情報系オプションの出力を呼び出し元の端末へ届ける。
+/// On Windows, deliver the output of the info options to the caller's terminal.
 ///
-/// `main.rs` の `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]` により、
-/// **Windows の release ビルドは GUI サブシステムとしてリンクされ、プロセスにコンソールが
-/// 割り当てられない**。この状態では Rust の std が書き込み先とする
-/// `GetStdHandle(STD_OUTPUT_HANDLE)` が無効ハンドルを返し、`print!` の内容が
-/// 黙って捨てられる (端末には何も出ないまま終了する)。表示そのものが目的の
-/// `--help` / `--version` / `--list-servers` では機能が成立しないので、表示の前に
-/// 親プロセス (起動した cmd.exe / PowerShell) のコンソールへ繋ぎ直す。
+/// Because of `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]` in `main.rs`,
+/// **a Windows release build is linked as a GUI subsystem and the process is not assigned a
+/// console**. In that state `GetStdHandle(STD_OUTPUT_HANDLE)`, which Rust's std uses as the
+/// write destination, returns an invalid handle and the content of `print!` is silently
+/// discarded (the process exits with nothing shown in the terminal). The feature cannot work for
+/// `--help` / `--version` / `--list-servers`, whose whole purpose is printing, so before printing
+/// we re-attach to the console of the parent process (the cmd.exe / PowerShell that launched us).
 ///
-/// 標準出力が既に有効な場合 (パイプやファイルへのリダイレクト、親にコンソールが無い等) は
-/// `AttachConsole` が失敗するだけで、元の書き込み先がそのまま使われる。戻り値を見ないのは
-/// そのため — ここでの失敗は「今までどおり」であって、報告できることが無い。
-/// C ランタイム流の `freopen("CONOUT$")` に相当する処理は要らない
-/// (Rust の std は書き込みのたびに `GetStdHandle` を引き直すため)。
+/// If standard output is already valid (redirected to a pipe or file, the parent has no console,
+/// etc.), `AttachConsole` merely fails and the original destination is used as-is. That is why
+/// the return value is not checked -- a failure here means "the same as before", and there is
+/// nothing to report. The equivalent of the C runtime's `freopen("CONOUT$")` is not needed
+/// (Rust's std looks up `GetStdHandle` again on every write).
 ///
-/// **この経路は実機の Windows では未検証** (開発ホストにも CI にも Windows が無い)。
-/// 呼ぶのは情報系オプションの表示直前だけなので、失敗しても現状どおり出力が出ないだけで、
-/// GUI 起動の経路には影響しない。
+/// **This path is unverified on a real Windows machine** (neither the dev host nor CI has Windows).
+/// It is called only right before printing the info options, so even if it fails the output
+/// simply stays absent as before, and the GUI launch path is unaffected.
 #[cfg(windows)]
 pub fn attach_parent_console() {
     // (DWORD)-1 = ATTACH_PARENT_PROCESS
@@ -136,36 +136,36 @@ pub fn attach_parent_console() {
     unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
 }
 
-/// Windows 以外では何もしない (常にコンソールへ書ける)。
+/// Does nothing on non-Windows platforms (it can always write to the console).
 #[cfg(not(windows))]
 pub fn attach_parent_console() {}
 
-/// `--list-servers` の表の列。
+/// Columns of the `--list-servers` table.
 const COLUMNS: [&str; 9] = [
     "NAME", "ENGINE", "HOST", "PORT", "USER", "DATABASE", "SSL", "SSH", "FOLDER",
 ];
 
-/// 値が無い欄の表示。
+/// What is shown for a field with no value.
 const EMPTY: &str = "-";
 
-/// 設定が壊れていて TLS の状態を決められない欄の表示。
-/// 有効なモード名 (`disable` / `prefer` / ...) とも `on` / `off` とも被らない語にする。
+/// What is shown for a field whose TLS state cannot be determined because the config is broken.
+/// Use a word that collides with neither a valid mode name (`disable` / `prefer` / ...) nor `on` / `off`.
 const INVALID: &str = "invalid";
 
-/// 値そのものが資格情報なので伏せた欄の表示。
-/// `EMPTY` (未設定) と区別できる語にする — 「AWS のキーを設定していない」と
-/// 「設定しているが出していない」は別の話なので、同じ `-` にはしない。
+/// What is shown for a field that is hidden because the value itself is a credential.
+/// Use a word distinguishable from `EMPTY` (unset) -- "the AWS key is not set" and
+/// "it is set but not shown" are different things, so do not use the same `-` for both.
 const HIDDEN: &str = "(hidden)";
 
-/// USER 欄に出す値。
+/// The value shown in the USER column.
 ///
-/// **dynamodb の `user` は AWS のアクセスキー ID で、DB のユーザー名ではない。**
-/// 秘密鍵ほどではないが資格情報の片割れの識別子なので、端末やその履歴・
-/// ログに残す値ではない。`folder_meta.rs` が同じ理由で `(aws access key, hidden)`
-/// に差し替えているのと同じ扱いにする (こちらは表の 1 列なので短い語にする)。
+/// **The `user` of dynamodb is an AWS access key ID, not a DB user name.**
+/// It is not as sensitive as a secret key, but it is an identifier that is half of a credential,
+/// so it should not remain in a terminal, its history, or logs. Treat it the same way as
+/// `folder_meta.rs`, which replaces it with `(aws access key, hidden)` (this is one column of a table, so use a short word).
 ///
-/// 他のエンジンの `user` はただのユーザー名なので、そのまま出す
-/// (どのアカウントで繋ぐ設定なのかは、この一覧を見る目的そのもの)。
+/// The `user` of other engines is just a user name, so it is shown as is
+/// (which account the config connects with is the very purpose of looking at this list).
 fn user_cell(server: &ServerConfig, info: &ConnectionInfo) -> String {
     match info.user.as_deref() {
         Some(_) if server.engine.eq_ignore_ascii_case("dynamodb") => HIDDEN.to_string(),
@@ -174,12 +174,12 @@ fn user_cell(server: &ServerConfig, info: &ConnectionInfo) -> String {
     }
 }
 
-/// 接続設定でエンドポイントを上書きしているか (dynamodb-local 等を指しているか)。
+/// Whether the connection config overrides the endpoint (points at dynamodb-local etc.).
 ///
-/// 判定は [`crate::engines::dynamodb::build_client`] の分岐と揃える。
-/// あちらが `endpoint_url` を組み立てる条件そのものなので、ずれると
-/// 「上書きしていないのに `tls` を出す」「上書きしているのに `on` と出す」の
-/// どちらかになる。
+/// The decision is aligned with the branch in [`crate::engines::dynamodb::build_client`].
+/// That is exactly the condition under which it builds `endpoint_url`, so if they diverge we get
+/// either "showing `tls` although it is not overriding" or
+/// "showing `on` although it is overriding".
 fn has_endpoint_override(server: &ServerConfig) -> bool {
     server
         .host
@@ -188,25 +188,25 @@ fn has_endpoint_override(server: &ServerConfig) -> bool {
         .is_some_and(|host| !host.is_empty())
 }
 
-/// AWS SDK がエンドポイント上書きとして読む**環境変数**を、SDK と同じ優先順で解決する。
+/// Resolve the **environment variables** that the AWS SDK reads as an endpoint override, in the same precedence as the SDK.
 ///
-/// 接続設定に `host` を書いていない dynamodb 接続でも、SDK は地域エンドポイントとは
-/// 限らない: `aws_config::defaults` は環境変数とプロファイルの `endpoint_url` 設定を
-/// 見るため、`AWS_ENDPOINT_URL=http://localhost:8000` が効いていれば**平文**で繋がる。
-/// 「`host` が無い = https」と決め打つと、その環境で平文の接続を `on` と見せることになる。
+/// Even for a dynamodb connection with no `host` in its config, the SDK does not necessarily use
+/// the regional endpoint: `aws_config::defaults` looks at the environment variables and the
+/// `endpoint_url` setting of the profile, so if `AWS_ENDPOINT_URL=http://localhost:8000` is in effect it connects in **plaintext**.
+/// Assuming "no `host` = https" would show a plaintext connection as `on` in that environment.
 ///
-/// 優先順は aws-config の `endpoint_url` / `env_service_config` に合わせる:
-/// `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS` が真なら上書きは無視され、そうでなければ
-/// サービス個別 (`AWS_ENDPOINT_URL_DYNAMODB`) → 全体 (`AWS_ENDPOINT_URL`) の順。
+/// The precedence follows aws-config's `endpoint_url` / `env_service_config`:
+/// if `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS` is true the override is ignored; otherwise the order is
+/// per-service (`AWS_ENDPOINT_URL_DYNAMODB`) then global (`AWS_ENDPOINT_URL`).
 ///
-/// **プロファイルファイル (`~/.aws/config`) の `endpoint_url` / `services` セクションは
-/// 見ていない。** ここはファイルシステムに触らない純粋な経路に保ちたいうえ、SDK の
-/// プロファイル解決 (プロファイル名の決定・`services` セクションの参照・
-/// `AWS_CONFIG_FILE` 等) を写すと本体とずれた第二の実装になる。プロファイルで
-/// エンドポイントを上書きしている環境では、この列は地域エンドポイント (`on`) を出す。
+/// **The `endpoint_url` / `services` sections of the profile file (`~/.aws/config`) are not
+/// looked at.** We want to keep this a pure path that does not touch the filesystem, and mirroring
+/// the SDK's profile resolution (deciding the profile name, referring to the `services` section,
+/// `AWS_CONFIG_FILE`, etc.) would create a second implementation that diverges from the real one.
+/// In an environment that overrides the endpoint through a profile, this column shows the regional endpoint (`on`).
 ///
-/// 環境変数の読み取りを引数にしているのはテストのため (プロセスの環境変数を
-/// 書き換えるテストは並列実行で干渉する)。
+/// The environment variable reader is a parameter for the sake of tests (tests that
+/// modify the process's environment variables interfere with each other when run in parallel).
 pub fn aws_endpoint_override(get: impl Fn(&str) -> Option<String>) -> Option<String> {
     let non_empty = |value: String| {
         let trimmed = value.trim().to_string();
@@ -223,21 +223,21 @@ pub fn aws_endpoint_override(get: impl Fn(&str) -> Option<String>) -> Option<Str
         .or_else(|| get("AWS_ENDPOINT_URL").and_then(non_empty))
 }
 
-/// プロセスの環境変数から [`aws_endpoint_override`] を解決する。
+/// Resolve [`aws_endpoint_override`] from the process's environment variables.
 pub fn aws_endpoint_override_from_env() -> Option<String> {
     aws_endpoint_override(|key| std::env::var(key).ok())
 }
 
-/// エンドポイント URL のスキームから SSL 欄の値を決める。
+/// Decide the value of the SSL column from the scheme of the endpoint URL.
 ///
-/// **`https://` でない限り `on` を出さない。** この列の `on` は「暗号化されている」の
-/// 意味なので、確認できない値を丸め込む先にしてはいけない。
+/// **Do not show `on` unless it is `https://`.** The `on` in this column means "encrypted", so
+/// it must not become the place where unverifiable values are rounded off to.
 ///
-/// `aws_config` の `parse_url` は `url::Url::parse` が通れば受理するため、
-/// `ftp://...` のような http(s) 以外のスキームもそのまま SDK へ渡り、接続時に失敗する。
-/// 繋がらない設定なので `invalid` を出す (`ssl_mode` の不正値と同じ扱い)。
-/// 逆に URL として解釈できない値は SDK が警告して捨て、地域エンドポイント (https) に
-/// 戻すので `on`。
+/// `aws_config`'s `parse_url` accepts anything that `url::Url::parse` can parse, so a
+/// non-http(s) scheme such as `ftp://...` is also passed to the SDK as is and fails at connection time.
+/// Since that config cannot connect, show `invalid` (the same treatment as an invalid `ssl_mode`).
+/// Conversely, a value that cannot be interpreted as a URL is warned about and discarded by the SDK,
+/// which falls back to the regional endpoint (https), so `on`.
 fn scheme_summary(endpoint: &str) -> &'static str {
     let lower = endpoint.trim().to_ascii_lowercase();
     if lower.starts_with("https://") {
@@ -245,63 +245,63 @@ fn scheme_summary(endpoint: &str) -> &'static str {
     } else if lower.starts_with("http://") {
         "off"
     } else if lower.contains("://") {
-        // http(s) 以外のスキーム。SDK は受理するが、この URL では接続できない
+        // A scheme other than http(s). The SDK accepts it, but this URL cannot be connected to
         INVALID
     } else {
-        // URL として解釈できない値。parse_url がエラーにするので上書きは効かない
+        // A value that cannot be interpreted as a URL. parse_url makes it an error, so the override has no effect
         "on"
     }
 }
 
-/// TLS / SSL の状態を 1 語で表す。
+/// Express the TLS / SSL state in one word.
 ///
-/// mysql / postgres / redis は実効モード ([`ConnectionInfo::sql_ssl_mode`]) を
-/// そのまま出す (`disable` / `prefer` / `require` / `verify-ca` / `verify-full`)。
-/// 「`prefer` は暗号化されないことがある」という区別が消えると、この一覧で
-/// 接続の安全性を確認できなくなるため、yes / no には丸めない。
+/// For mysql / postgres / redis, show the effective mode ([`ConnectionInfo::sql_ssl_mode`])
+/// as is (`disable` / `prefer` / `require` / `verify-ca` / `verify-full`).
+/// It is not rounded to yes / no, because losing the distinction that "`prefer` may not be encrypted"
+/// would make it impossible to check the safety of a connection from this list.
 ///
-/// それ以外のエンジン (elasticsearch / dynamodb 等) には実効モードが無いので、
-/// 設定の `tls` をそのまま `on` / `off` で出す。
+/// For other engines (elasticsearch / dynamodb, etc.) there is no effective mode, so
+/// the `tls` of the config is shown as `on` / `off` as is.
 ///
-/// **ただし `tls` が実際の接続方式を決めていないエンジンでは、そのまま出さない。**
-/// dynamodb の `host` / `port` / `tls` は dynamodb-local 向けのエンドポイント上書き
-/// 専用で、`host` を書かない通常の AWS 接続では SDK が地域エンドポイントを
-/// **常に https で解決する** (`engines::dynamodb::build_client` は `host` がある時しか
-/// `endpoint_url` を組み立てない)。`tls` の既定値 `false` をそのまま出すと、
-/// 暗号化されている接続を `off` = 平文と読ませることになる。
+/// **However, for engines where `tls` does not decide the actual connection method, it is not shown as is.**
+/// The `host` / `port` / `tls` of dynamodb exist only to override the endpoint for dynamodb-local;
+/// for a normal AWS connection without `host`, the SDK **always resolves the regional endpoint
+/// over https** (`engines::dynamodb::build_client` builds `endpoint_url` only when there is a `host`).
+/// Showing the default value `false` of `tls` as is would make an encrypted connection look like
+/// `off` = plaintext.
 ///
-/// **`sql_ssl_mode` が `None` でも、そのまま `tls` に落としてはいけない。**
-/// `ConnectionInfo::from` は「実効モードを持たないエンジン」だけでなく
-/// 「`engine` / `ssl_mode` の値が不正で解決できなかった」場合も `None` にする。
-/// 後者を `tls` の `on` / `off` として出すと、**接続時にエラーになる設定を
-/// 有効な TLS 設定として見せる**ことになる (`ssl_mode: requre` の書き間違いが
-/// `off` = 平文で繋がる、と読める)。この列は接続の安全性を確認するためのものなので、
-/// 決められない時は `invalid` と出して隠さない。
+/// **Even when `sql_ssl_mode` is `None`, it must not simply fall back to `tls`.**
+/// `ConnectionInfo::from` also makes it `None` not only for "engines with no effective mode" but
+/// also when "the value of `engine` / `ssl_mode` is invalid and could not be resolved".
+/// Showing the latter as `on` / `off` of `tls` would **present a config that errors at connection
+/// time as a valid TLS config** (a typo like `ssl_mode: requre` would read as
+/// `off` = connects in plaintext). This column is for checking the safety of a connection, so
+/// when it cannot be decided it shows `invalid` rather than hiding it.
 ///
-/// **逆に、`invalid` を出す範囲は「その値で実際に接続が失敗するエンジン」に限る。**
-/// `ssl_mode` を読むのは `db::connect` の mysql / postgres / mssql の分岐だけで、
-/// elasticsearch / sqlite / duckdb / dynamodb の接続経路は見ない。共有テンプレート等で
-/// 不正な `ssl_mode` が紛れ込んでいても**それらは普通に繋がる**ので、`invalid` と
-/// 出すと使える接続を壊れているように見せることになる。`invalid` の意味は
-/// 「この設定では繋がらない」であって「設定に無効な値が書いてある」ではない。
+/// **Conversely, the range in which `invalid` is shown is limited to "engines where the connection actually fails with that value".**
+/// Only the mysql / postgres / mssql branches of `db::connect` read `ssl_mode`; the connection paths of
+/// elasticsearch / sqlite / duckdb / dynamodb do not look at it. Even if an invalid `ssl_mode` has crept in
+/// through a shared template or the like, **those connect normally**, so showing `invalid`
+/// would make a usable connection look broken. The meaning of `invalid` is
+/// "this config will not connect", not "an invalid value is written in the config".
 ///
-/// **`ssl_mode` が解決できても、TLS 設定の組み合わせが拒否される場合がある。**
-/// `ssl_root_cert` を検証しないモード (`disable` / `prefer` / `require`) と併記した
-/// 設定は `sql_ssl_root_cert` がエラーにするため (sqlx が CA を黙って無視するので、
-/// 「CA を指定したから検証されている」という誤解を放置しない設計)、`db::connect` は
-/// 必ず失敗する。実効モードだけ見て `prefer` と出すと、繋がらない接続を有効な設定と
-/// して見せることになる。**ファイルとして開けるか (`db::ssl_root_cert_path` の
-/// `is_file`) までは見ない** — この一覧の組み立てはファイルシステムに触らない純粋な
-/// 関数として単体テストで固めてあり、後から置ける不在ファイルは設定の誤りとも違う。
+/// **Even if `ssl_mode` can be resolved, some TLS setting combinations are rejected.**
+/// A config that lists `ssl_root_cert` together with a mode that does not verify it (`disable` / `prefer` / `require`)
+/// is made an error by `sql_ssl_root_cert` (the design avoids leaving the misunderstanding
+/// that "specifying a CA means it is verified", since sqlx silently ignores the CA), so `db::connect`
+/// always fails. Looking only at the effective mode and showing `prefer` would present a config that
+/// cannot connect as a valid one. **We do not go as far as checking whether it can be opened as a file (`is_file` in
+/// `db::ssl_root_cert_path`)** -- building this list is a pure function that does not touch the
+/// filesystem and is pinned by unit tests, and a missing file that can be placed later is different from a config mistake.
 fn ssl_summary(server: &ServerConfig, info: &ConnectionInfo, aws_endpoint: Option<&str>) -> String {
-    // エンジン名自体が解決できない接続は、どの経路でも繋がらない
+    // A connection whose engine name itself cannot be resolved does not connect by any path
     let Ok(engine) = crate::db::parse_engine(&server.engine) else {
         return INVALID.to_string();
     };
-    // sql_ssl_mode() が Err になるのは ssl_mode が設定されていて解決できない時だけ
-    // (未設定なら tls から既定値を返す) なので、未設定の接続を誤って invalid にはしない。
-    // sql_ssl_root_cert() は ssl_root_cert が未設定なら mode を見ないので、
-    // 2 つとも呼ぶ必要がある (前者は値の解決、後者は組み合わせの検証)
+    // sql_ssl_mode() returns Err only when ssl_mode is set and cannot be resolved
+    // (when unset it returns a default derived from tls), so a connection with it unset is not wrongly marked invalid.
+    // sql_ssl_root_cert() does not look at the mode when ssl_root_cert is unset,
+    // so both need to be called (the former resolves the value, the latter validates the combination)
     if matches!(engine, Engine::MySql | Engine::Postgres | Engine::MsSql)
         && (server.sql_ssl_mode().is_err() || server.sql_ssl_root_cert().is_err())
     {
@@ -310,9 +310,9 @@ fn ssl_summary(server: &ServerConfig, info: &ConnectionInfo, aws_endpoint: Optio
     if let Some(mode) = &info.sql_ssl_mode {
         return mode.clone();
     }
-    // 接続設定でエンドポイントを上書きしていない dynamodb は、tls フラグではなく
-    // SDK が実際に解決するエンドポイントの方式を出す (環境変数の上書きが無ければ
-    // 地域エンドポイントの https)
+    // For dynamodb whose connection config does not override the endpoint, show not the tls flag but the scheme of the
+    // endpoint the SDK actually resolves (the https regional endpoint unless an environment
+    // variable overrides it)
     if engine == Engine::DynamoDb && !has_endpoint_override(server) {
         return match aws_endpoint {
             Some(endpoint) => scheme_summary(endpoint),
@@ -323,19 +323,19 @@ fn ssl_summary(server: &ServerConfig, info: &ConnectionInfo, aws_endpoint: Optio
     if server.tls { "on" } else { "off" }.to_string()
 }
 
-/// 表のセルに出す前に制御文字を可視表現へ落とす。
+/// Turn control characters into visible representations before putting them in a table cell.
 ///
-/// 設定の値は `config.yml` だけでなく `config_override_command` の出力からも来る。
-/// 改行やタブが混ざると「1 接続 = 1 行」の形が崩れて他の接続の行を偽装でき、
-/// ANSI / OSC のエスケープシーケンスが混ざると端末側で解釈されてしまう。
-/// 値の中身を見せることより、行の形が崩れないことを優先する。
+/// Config values come not only from `config.yml` but also from the output of `config_override_command`.
+/// If newlines or tabs are mixed in, the "1 connection = 1 line" shape breaks and rows of other connections can be
+/// forged, and if ANSI / OSC escape sequences are mixed in they get interpreted by the terminal.
+/// Keeping the row shape intact takes priority over showing the contents of the value.
 fn sanitize_cell(value: &str) -> String {
     value
         .chars()
         .map(|c| {
             if c.is_control() {
-                // 見えない文字が「消える」と何が入っていたか分からないので、
-                // 落とさずに可視の記号へ置き換える
+                // If invisible characters simply "disappeared" we could not tell what was in there,
+                // so replace them with visible symbols instead of dropping them
                 '\u{fffd}'
             } else {
                 c
@@ -344,18 +344,18 @@ fn sanitize_cell(value: &str) -> String {
         .collect()
 }
 
-/// `--list-servers` の本文を組み立てる。
+/// Build the body of `--list-servers`.
 ///
-/// **パスワード・SSH の鍵やパスフレーズ・AWS のアクセスキー ID は出さない。**
-/// 出す項目は [`ConnectionInfo`] (フロントへ渡す「機密を含まない」射影) と
-/// フォルダ名だけに限り、[`ServerConfig`] のフィールドを直接読むのは
-/// TLS の判定 (`tls`) と USER 欄の伏せ字判定 (`engine`) だけにしている。
-/// 項目を増やす時もこの経路を守ること。
+/// **Passwords, SSH keys and passphrases, and AWS access key IDs are not shown.**
+/// The items shown are limited to [`ConnectionInfo`] (the projection passed to the frontend that "contains no secrets")
+/// and the folder name, and the only places that read fields of [`ServerConfig`] directly are
+/// the TLS decision (`tls`) and the USER column masking decision (`engine`).
+/// Keep to this path when adding items.
 ///
-/// なお [`ConnectionInfo`] は「フロント (自分の画面) に渡してよい」射影であって
-/// 「端末に出してよい」射影ではない。`user` のように**エンジンによって意味が
-/// 変わるフィールド**があるので、そのまま流さず [`user_cell`] のような
-/// 用途別の判断を挟むこと。
+/// Note that [`ConnectionInfo`] is a projection that "may be passed to the frontend (your own screen)"
+/// and not one that "may be shown in a terminal". There are **fields whose meaning
+/// changes depending on the engine**, like `user`, so do not pass them through as they are;
+/// insert a purpose-specific decision such as [`user_cell`].
 pub fn format_server_list(
     servers: &[ServerConfig],
     sqlfiles_dir: &Path,
@@ -391,7 +391,7 @@ pub fn format_server_list(
         })
         .collect();
 
-    // 列幅は見出しと値の最大長 (文字数) に合わせる。
+    // Column widths match the longest of the header and the values (in characters).
     let widths: Vec<usize> = (0..COLUMNS.len())
         .map(|i| {
             rows.iter()
@@ -410,7 +410,7 @@ pub fn format_server_list(
     out
 }
 
-/// 1 行を列幅に合わせて連結する (末尾の余白は落とす)。
+/// Join one line according to the column widths (trailing padding is dropped).
 fn join_row(cells: &[String; 9], widths: &[usize]) -> String {
     let mut line = String::new();
     for (i, cell) in cells.iter().enumerate() {
@@ -419,8 +419,8 @@ fn join_row(cells: &[String; 9], widths: &[usize]) -> String {
         }
         line.push_str(cell);
         if i + 1 < cells.len() {
-            // chars().count() で数えるのは、見出しも値も表示幅ではなく
-            // 文字数で揃える割り切り (全角を含む名前では多少ずれる)。
+            // chars().count() is used because both header and values are aligned by
+            // character count, not display width (a compromise; names containing full-width characters are slightly off).
             let pad = widths[i].saturating_sub(cell.chars().count());
             line.push_str(&" ".repeat(pad));
         }
@@ -459,19 +459,19 @@ mod tests {
             info_command_from_args(&["--list-servers"]),
             Some(InfoCommand::ListServers)
         );
-        // .app 起動で先頭に入る引数があっても拾える
+        // The option is still picked up even when .app launch inserts arguments in front of it
         assert_eq!(
             info_command_from_args(&["-psn_0_12345", "--list-servers"]),
             Some(InfoCommand::ListServers)
         );
-        // 引数なしは GUI 起動
+        // No arguments means a GUI launch
         assert_eq!(info_command_from_args::<&str>(&[]), None);
         assert_eq!(info_command_from_args(&["--unknown"]), None);
     }
 
     #[test]
     fn test_subcommand_wins_over_option_like_argument() {
-        // write の内容にオプションらしき文字列が入っていても、それは中身
+        // Even if the content of write contains something that looks like an option, it is just the content
         assert_eq!(
             info_command_from_args(&["write", "conn", "a.sql", "--help"]),
             None
@@ -481,15 +481,15 @@ mod tests {
             None
         );
         assert_eq!(info_command_from_args(&["open", "--help"]), None);
-        // サブコマンドより前にあれば拾う
+        // Picked up if it comes before the subcommand
         assert_eq!(
             info_command_from_args(&["--help", "write", "conn", "a.sql"]),
             Some(InfoCommand::Help)
         );
     }
 
-    /// 版番号はリリースの基準である tauri.conf.json のものを出す。
-    /// `CARGO_PKG_VERSION` へ戻すと、この 2 つがずれた時に気付けなくなる。
+    /// Output the version of tauri.conf.json, which is the basis of releases.
+    /// If it were reverted to `CARGO_PKG_VERSION`, we would fail to notice when the two diverge.
     #[test]
     fn test_version_comes_from_the_tauri_config() {
         let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
@@ -527,9 +527,9 @@ mod tests {
         assert!(!out.to_lowercase().contains("password"));
     }
 
-    /// SSH トンネルの機密 (パスワード / 秘密鍵のパス / パスフレーズ /
-    /// エージェントのソケット) も出さない。`ServerConfig` に機密フィールドが
-    /// 増えた時に、この一覧へ漏れる回帰をここで止める。
+    /// The secrets of an SSH tunnel (password / path of the private key / passphrase /
+    /// agent socket) are not shown either. Stops here the regression where a secret field
+    /// added to `ServerConfig` leaks into this list.
     #[test]
     fn test_format_server_list_never_shows_the_ssh_secrets() {
         let with_tunnel: ServerConfig = serde_yaml::from_str(
@@ -563,19 +563,19 @@ mod tests {
                 "{secret} must not be printed:\n{out}"
             );
         }
-        // トンネルを使っていることは分かる (SSH 列)
+        // It can be seen that a tunnel is used (SSH column)
         assert!(out.contains("yes"), "{out}");
     }
 
-    /// dynamodb の `tls` は dynamodb-local 向けのエンドポイント上書き専用なので、
-    /// `host` を書かない通常の AWS 接続にそのまま出さない。
+    /// The `tls` of dynamodb exists only to override the endpoint for dynamodb-local, so
+    /// it is not shown as is for a normal AWS connection without `host`.
     ///
-    /// SDK は地域エンドポイントを常に https で解決するため、`tls` の既定値
-    /// (false) を出すと**暗号化されている接続を平文と読ませる**ことになる。
-    /// この列は接続の安全性を確認するためのものなので、誤りの向きとしては最悪。
+    /// The SDK always resolves the regional endpoint over https, so showing the default value of `tls`
+    /// (false) would **make an encrypted connection look like plaintext**.
+    /// This column is for checking the safety of a connection, so this is the worst direction to be wrong in.
     #[test]
     fn test_format_server_list_reports_https_for_the_aws_dynamodb_endpoint() {
-        // host 無し = AWS の地域エンドポイント。tls を書いていなくても https
+        // No host = AWS regional endpoint. https even if tls is not written
         let aws: ServerConfig =
             serde_yaml::from_str("name: events\nengine: dynamodb\nschema: ap-northeast-1\n")
                 .expect("test fixture should parse");
@@ -583,7 +583,7 @@ mod tests {
         assert!(out.contains(" on"), "{out}");
         assert!(!out.contains(" off"), "{out}");
 
-        // 空白だけの host も「未指定」(build_client の trim と揃える)
+        // A host that is only whitespace also counts as "unspecified" (aligned with the trim in build_client)
         let blank_host: ServerConfig = serde_yaml::from_str(
             "name: events\nengine: dynamodb\nschema: ap-northeast-1\nhost: \"   \"\n",
         )
@@ -591,7 +591,7 @@ mod tests {
         let out = format_server_list(&[blank_host], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains(" on"), "{out}");
 
-        // host を書いた = dynamodb-local 等のエンドポイント上書き。ここでは tls が効く
+        // A host is written = endpoint override for dynamodb-local etc. Here tls takes effect
         let local: ServerConfig = serde_yaml::from_str(
             "name: local\nengine: dynamodb\nschema: ap-northeast-1\n\
              host: 127.0.0.1\nport: 8000\n",
@@ -608,7 +608,7 @@ mod tests {
         let out = format_server_list(&[local_tls], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains(" on"), "{out}");
 
-        // 実効モードを持たない他のエンジンは今までどおり tls をそのまま出す
+        // Other engines without an effective mode show tls as is, same as before
         let es: ServerConfig =
             serde_yaml::from_str("name: search\nengine: elasticsearch\nhost: es.example.com\n")
                 .expect("test fixture should parse");
@@ -616,16 +616,16 @@ mod tests {
         assert!(out.contains(" off"), "{out}");
     }
 
-    /// `host` を書いていない dynamodb でも、環境変数でエンドポイントを上書きして
-    /// いれば地域エンドポイントとは限らない。SDK が実際に使う方を出す。
+    /// Even for dynamodb with no `host`, if the endpoint is overridden by an environment variable
+    /// it is not necessarily the regional endpoint. Show the one the SDK actually uses.
     #[test]
     fn test_format_server_list_follows_the_aws_endpoint_environment() {
         let aws: ServerConfig =
             serde_yaml::from_str("name: events\nengine: dynamodb\nschema: ap-northeast-1\n")
                 .expect("test fixture should parse");
 
-        // AWS_ENDPOINT_URL=http://... は平文。これを on と出すと、平文の接続を
-        // 暗号化されていると読ませることになる
+        // AWS_ENDPOINT_URL=http://... is plaintext. Showing this as on would make a plaintext
+        // connection look encrypted
         let out = format_server_list(
             std::slice::from_ref(&aws),
             Path::new("/tmp/sqlfiles"),
@@ -641,7 +641,7 @@ mod tests {
         assert!(out.contains(" on"), "{out}");
         assert!(!out.contains(" off"), "{out}");
 
-        // 大文字のスキームでも判定できること (SDK は大小を区別しない)
+        // A scheme in upper case can also be judged (the SDK does not distinguish case)
         let out = format_server_list(
             std::slice::from_ref(&aws),
             Path::new("/tmp/sqlfiles"),
@@ -649,7 +649,7 @@ mod tests {
         );
         assert!(out.contains(" off"), "{out}");
 
-        // SDK は解釈できない値を警告して捨て、地域エンドポイントへ戻す
+        // The SDK warns about and discards values it cannot interpret, and falls back to the regional endpoint
         let out = format_server_list(
             std::slice::from_ref(&aws),
             Path::new("/tmp/sqlfiles"),
@@ -657,8 +657,8 @@ mod tests {
         );
         assert!(out.contains(" on"), "{out}");
 
-        // http(s) 以外のスキームは SDK が受理するが接続できない。
-        // **確認できない値を on に丸めない** (この列の on は「暗号化されている」の意味)
+        // A scheme other than http(s) is accepted by the SDK but cannot connect.
+        // **Do not round unverifiable values to on** (the on of this column means "encrypted")
         for endpoint in ["ftp://localhost:8000", "ws://localhost:8000"] {
             let out = format_server_list(
                 std::slice::from_ref(&aws),
@@ -669,8 +669,8 @@ mod tests {
             assert!(!out.contains(" on"), "{endpoint}:\n{out}");
         }
 
-        // 接続設定に host がある = 明示のエンドポイント上書き。こちらが優先されるので
-        // 環境変数ではなく tls を見る (build_client が endpoint_url を組み立てる)
+        // A host in the connection config = explicit endpoint override. That takes precedence, so
+        // look at tls rather than the environment variable (build_client builds endpoint_url)
         let local: ServerConfig = serde_yaml::from_str(
             "name: local\nengine: dynamodb\nschema: ap-northeast-1\n\
              host: 127.0.0.1\nport: 8000\ntls: true\n",
@@ -683,7 +683,7 @@ mod tests {
         );
         assert!(out.contains(" on"), "{out}");
 
-        // 他のエンジンは AWS の環境変数と無関係
+        // Other engines are unrelated to the AWS environment variables
         let es: ServerConfig =
             serde_yaml::from_str("name: search\nengine: elasticsearch\nhost: es.example.com\n")
                 .expect("test fixture should parse");
@@ -695,7 +695,7 @@ mod tests {
         assert!(out.contains(" off"), "{out}");
     }
 
-    /// 環境変数の優先順は aws-config に合わせる。
+    /// The precedence of environment variables follows aws-config.
     #[test]
     fn test_aws_endpoint_override_precedence() {
         let env = |pairs: &[(&str, &str)]| {
@@ -713,7 +713,7 @@ mod tests {
 
         assert_eq!(aws_endpoint_override(env(&[])), None);
 
-        // サービス個別が全体より優先
+        // Per-service takes precedence over global
         assert_eq!(
             aws_endpoint_override(env(&[
                 ("AWS_ENDPOINT_URL", "http://global:1"),
@@ -726,7 +726,7 @@ mod tests {
             Some("http://global:1".to_string())
         );
 
-        // AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true なら上書きは効かない
+        // If AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true the override has no effect
         assert_eq!(
             aws_endpoint_override(env(&[
                 ("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "TRUE"),
@@ -734,7 +734,7 @@ mod tests {
             ])),
             None
         );
-        // true 以外の値は無視 (false / 空文字で上書きを殺さない)
+        // Values other than true are ignored (false / an empty string must not kill the override)
         assert_eq!(
             aws_endpoint_override(env(&[
                 ("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false"),
@@ -743,7 +743,7 @@ mod tests {
             Some("http://global:1".to_string())
         );
 
-        // 空 / 空白だけの値は未設定として扱い、次の候補へ落とす
+        // An empty / whitespace-only value is treated as unset and falls through to the next candidate
         assert_eq!(
             aws_endpoint_override(env(&[
                 ("AWS_ENDPOINT_URL_DYNAMODB", "   "),
@@ -753,11 +753,11 @@ mod tests {
         );
     }
 
-    /// dynamodb の `user` は AWS のアクセスキー ID なので USER 欄に出さない。
+    /// The `user` of dynamodb is an AWS access key ID, so it is not shown in the USER column.
     ///
-    /// `ConnectionInfo` は「機密を含まない」射影だが、それは**フロントへ渡す**
-    /// 基準であって端末に出す基準ではない。ここを素通しにすると、資格情報の
-    /// 識別子が端末とシェル履歴・ログに残る。
+    /// `ConnectionInfo` is a projection that "contains no secrets", but that is the standard for
+    /// **passing to the frontend**, not for showing in a terminal. Passing it through here would leave
+    /// an identifier of a credential in the terminal, shell history, and logs.
     #[test]
     fn test_format_server_list_hides_the_aws_access_key_id() {
         let dynamo: ServerConfig = serde_yaml::from_str(
@@ -767,14 +767,14 @@ mod tests {
         .expect("test fixture should parse");
         let out = format_server_list(&[dynamo], Path::new("/tmp/sqlfiles"), None);
 
-        // engine の綴りが DynamoDB / dynamodb のどちらでも伏せる
+        // Masked whether engine is spelled DynamoDB or dynamodb
         assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"), "{out}");
         assert!(!out.contains("wJalrXUtnFEMI"), "{out}");
         assert!(out.contains(HIDDEN), "{out}");
-        // 接続そのものは一覧に出る (行ごと消してしまわない)
+        // The connection itself still appears in the list (the row is not removed entirely)
         assert!(out.contains("events"), "{out}");
 
-        // 他のエンジンの user はユーザー名なので今までどおり出す
+        // The user of other engines is a user name, so it is shown as before
         let out = format_server_list(&[server("reporting")], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains("app"), "{out}");
         assert!(!out.contains(HIDDEN), "{out}");
@@ -782,9 +782,9 @@ mod tests {
 
     #[test]
     fn test_format_server_list_neutralizes_control_characters() {
-        // 設定は config_override_command の出力からも来る。改行が通ると
-        // 「1 接続 = 1 行」の形が崩れて別の接続の行を偽装でき、ANSI / OSC の
-        // エスケープが通ると端末側で解釈される
+        // Settings also come from the output of config_override_command. If newlines get through,
+        // the "1 connection = 1 line" shape breaks and rows of other connections can be forged, and if ANSI / OSC
+        // escapes get through they are interpreted by the terminal
         let hostile: ServerConfig = serde_yaml::from_str(
             "name: \"evil\\nfake-row  postgres\"\nengine: postgres\n\
              host: \"h\\u001b[31mred\\u001b[0m\"\nuser: \"a\\tb\"\n",
@@ -792,7 +792,7 @@ mod tests {
         .expect("test fixture should parse");
         let out = format_server_list(&[hostile], Path::new("/tmp/sqlfiles"), None);
 
-        // 見出し 1 行 + 接続 1 行 + 先頭の情報行 + 空行 だけ
+        // Only the header line + one connection line + the leading info line + a blank line
         assert_eq!(
             out.lines().count(),
             4,
@@ -815,14 +815,14 @@ mod tests {
         assert!(out.contains("db.example.com"));
         assert!(out.contains("5432"));
         assert!(out.contains("app"));
-        // フォルダ名は <host>_<engine>_<schema>_<user>
+        // The folder name is <host>_<engine>_<schema>_<user>
         assert!(out.contains("db.example.com_postgres_appdb_app"));
     }
 
     #[test]
     fn test_format_server_list_reports_the_effective_ssl_mode() {
-        // ssl_mode も tls も無い postgres は prefer (平文に降格しうる)。
-        // yes/no に丸めるとこの区別が消えるので、実効モードをそのまま出す
+        // A postgres with neither ssl_mode nor tls is prefer (it can downgrade to plaintext).
+        // Rounding to yes/no would lose this distinction, so the effective mode is shown as is
         let out = format_server_list(&[server("reporting")], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains("prefer"), "{out}");
 
@@ -833,7 +833,7 @@ mod tests {
         let out = format_server_list(&[tls], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains("verify-full"), "{out}");
 
-        // 実効モードを持たないエンジンは tls をそのまま出す
+        // Engines without an effective mode show tls as is
         let es: ServerConfig = serde_yaml::from_str(
             "name: search\nengine: elasticsearch\nhost: es.example.com\ntls: true\n",
         )
@@ -842,11 +842,11 @@ mod tests {
         assert!(out.contains(" on"), "{out}");
     }
 
-    /// 解決できない設定を「有効な TLS 設定」として見せない。
+    /// Do not present a config that cannot be resolved as a "valid TLS config".
     ///
-    /// `ConnectionInfo::sql_ssl_mode` は値が不正な時も `None` になるため、素直に
-    /// `tls` へ落とすと `ssl_mode: requre` (書き間違い) が `off` = 平文で繋がる、と
-    /// 読めてしまう。実際には接続時にエラーになるだけで、そんなモードは存在しない。
+    /// `ConnectionInfo::sql_ssl_mode` is also `None` when the value is invalid, so naively
+    /// falling back to `tls` would let `ssl_mode: requre` (a typo) read as `off` = connects in plaintext.
+    /// In reality it only errors at connection time, and no such mode exists.
     #[test]
     fn test_format_server_list_marks_unresolvable_ssl_settings() {
         let bad_mode: ServerConfig = serde_yaml::from_str(
@@ -855,7 +855,7 @@ mod tests {
         .expect("test fixture should parse");
         let out = format_server_list(&[bad_mode], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains(INVALID), "{out}");
-        // 「平文で繋がる」と読める表示にはしない
+        // Do not make a display that can be read as "connects in plaintext"
         assert!(!out.contains(" off"), "{out}");
 
         let bad_engine: ServerConfig =
@@ -864,13 +864,13 @@ mod tests {
         let out = format_server_list(&[bad_engine], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains(INVALID), "{out}");
 
-        // `ssl_mode` を読まないエンジンは巻き込まない。共有テンプレート等で不正な値が
-        // 紛れ込んでいても、これらの接続経路 (db::connect の該当分岐 / engines/) は
-        // sql_ssl_mode を見ないので普通に繋がる。`invalid` の意味は「この設定では
-        // 繋がらない」なので、使える接続を壊れているように見せてはいけない
-        // ssl_mode が解決できても、組み合わせが拒否される設定は繋がらない。
-        // ssl_root_cert を検証しないモードと併記すると sql_ssl_root_cert が
-        // エラーにするため、db::connect は必ず失敗する
+        // Do not drag in engines that do not read `ssl_mode`. Even if an invalid value has crept in through a shared template or the like,
+        // their connection paths (the corresponding branch of db::connect / engines/) do not look at
+        // sql_ssl_mode, so they connect normally. The meaning of `invalid` is "this config
+        // will not connect", so a usable connection must not be made to look broken
+        // Even if ssl_mode can be resolved, a config whose combination is rejected does not connect.
+        // Listing ssl_root_cert together with a mode that does not verify it makes sql_ssl_root_cert
+        // return an error, so db::connect always fails
         for mode in ["disable", "prefer", "require"] {
             let cert_without_verify: ServerConfig = serde_yaml::from_str(&format!(
                 "name: ca-{mode}\nengine: postgres\nhost: db.example.com\n\
@@ -879,11 +879,11 @@ mod tests {
             .expect("test fixture should parse");
             let out = format_server_list(&[cert_without_verify], Path::new("/tmp/sqlfiles"), None);
             assert!(out.contains(INVALID), "{mode}:\n{out}");
-            // 解決できる実効モードの方を出してはいけない (繋がらないので)
+            // The resolvable effective mode must not be shown (because it cannot connect)
             assert!(!out.contains(&format!(" {mode}")), "{mode}:\n{out}");
         }
 
-        // ssl_mode を省略した場合の既定は prefer なので、これも検証されない
+        // The default when ssl_mode is omitted is prefer, so this is not verified either
         let cert_without_mode: ServerConfig = serde_yaml::from_str(
             "name: ca-default\nengine: postgres\nhost: db.example.com\n\
              ssl_root_cert: /etc/ssl/ca.pem\n",
@@ -892,7 +892,7 @@ mod tests {
         let out = format_server_list(&[cert_without_mode], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains(INVALID), "{out}");
 
-        // 空の ssl_root_cert も同じくエラーになる (黙って未設定に倒さない)
+        // An empty ssl_root_cert is also an error in the same way (it is not silently treated as unset)
         let empty_cert: ServerConfig = serde_yaml::from_str(
             "name: ca-empty\nengine: postgres\nhost: db.example.com\n\
              ssl_mode: verify-full\nssl_root_cert: \"  \"\n",
@@ -901,8 +901,8 @@ mod tests {
         let out = format_server_list(&[empty_cert], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains(INVALID), "{out}");
 
-        // 検証するモードとの併記は正しい設定なので、実効モードをそのまま出す。
-        // **ファイルが実在するかは見ない** (この関数はファイルシステムに触らない)
+        // Listing it together with a verifying mode is a correct config, so the effective mode is shown as is.
+        // **Whether the file actually exists is not checked** (this function does not touch the filesystem)
         let verifying: ServerConfig = serde_yaml::from_str(
             "name: ca-ok\nengine: postgres\nhost: db.example.com\n\
              ssl_mode: verify-ca\nssl_root_cert: /nonexistent/ca.pem\n",
@@ -922,8 +922,8 @@ mod tests {
             assert!(!out.contains(INVALID), "{engine}:\n{out}");
         }
 
-        // ssl_mode を書いていない接続を巻き込まないこと (実効モードを持たない
-        // エンジンは今までどおり tls の on / off)
+        // Must not drag in connections that do not write ssl_mode (engines without an
+        // effective mode show tls on / off as before)
         let es: ServerConfig =
             serde_yaml::from_str("name: search\nengine: elasticsearch\nhost: es.example.com\n")
                 .expect("test fixture should parse");
@@ -939,7 +939,7 @@ mod tests {
                 .expect("test fixture should parse");
         let out = format_server_list(&[sqlite], Path::new("/tmp/sqlfiles"), None);
         assert!(out.contains("local"));
-        // host / port / user が無い行でも列がずれない
+        // Columns must not shift even for rows with no host / port / user
         assert!(out.contains(EMPTY));
     }
 

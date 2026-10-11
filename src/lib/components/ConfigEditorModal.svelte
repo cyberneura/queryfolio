@@ -27,18 +27,18 @@
   import appStore from "$lib/stores/app.svelte";
 
   interface Props {
-    /// "config" = config.yml を編集・保存する。
-    /// "source" = config_override_command が返す YAML を表示する。
-    ///            編集はできるがメモリ上だけで、保存はできない (コピーして使う想定)。
+    /// "config" = edit and save config.yml.
+    /// "source" = show the YAML returned by config_override_command.
+    ///            Editable, but only in memory; it cannot be saved (meant to be copied and used).
     mode: "config" | "source";
     onClose: () => void;
-    /// 未保存の変更の有無を親に知らせる (別のモードへ切り替える時の巻き添え破棄を防ぐ)
+    /// Tells the parent whether there are unsaved changes (prevents discarding them as collateral when switching to another mode)
     onDirtyChange?: (dirty: boolean) => void;
   }
 
   let { mode, onClose, onDirtyChange }: Props = $props();
 
-  /// source モードは取得元が外部コマンドなので書き戻せない。編集自体は許可する。
+  /// source mode is fetched from an external command, so it cannot be written back. Editing itself is allowed.
   const canSave = $derived(mode === "config");
   const title = $derived(
     mode === "config" ? "Edit config.yml" : "Override config yaml (Copy only)",
@@ -51,7 +51,7 @@
   let saveError = $state<string | null>(null);
   let saving = $state(false);
   let dirty = $state(false);
-  /// 未保存の変更がある状態で閉じようとした時に、破棄の確認を出す
+  /// Show a discard confirmation when trying to close with unsaved changes
   let confirmDiscard = $state(false);
 
   const editorTheme = EditorView.theme({
@@ -61,20 +61,20 @@
     ".cm-scroller": {
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, monospace",
     },
-    // 検索パネル (Cmd+F) をモーダルの配色に合わせる。
-    // 既定のままだと明るいフォームパーツが暗いエディタの上に乗って浮く。
+    // Match the search panel (Cmd+F) to the modal's color scheme.
+    // Left as default, the light form parts would float on top of the dark editor.
     ".cm-panels": { backgroundColor: "#18181b", color: "#e4e4e7" },
     ".cm-panels.cm-panels-top": { borderBottom: "1px solid #3f3f46" },
-    // フォントサイズは入力欄・ボタン・ラベルに**個別に**指定する。CodeMirror の
-    // 基本テーマが `.cm-textfield` / `.cm-button` に `font-size: 70%`、検索パネルの
-    // `label` に `80%` を当てているため、パネル側の指定だけでは 70% / 80% を掛けた
-    // 大きさになってしまう (12px 指定で実測 8.4px)。モーダル内の他のボタンが
-    // Tailwind の text-xs (12px) なので、パネルの操作系もそこへ揃える。
+    // Font size is specified **individually** for the input, buttons and labels. CodeMirror's
+    // base theme applies `font-size: 70%` to `.cm-textfield` / `.cm-button` and `80%` to the
+    // search panel's `label`, so a panel-level setting alone ends up multiplied by 70% / 80%
+    // (measured 8.4px for a 12px setting). Other buttons in the modal use
+    // Tailwind's text-xs (12px), so align the panel's controls to that.
     ".cm-panel.cm-search": { fontSize: "13px", padding: "4px 6px" },
-    // 検索・置換の入力欄は `.cm-textfield` で引く。**`input[type=text]` では引けない**:
-    // @codemirror/search はこの 2 つを type 属性なしで生成するため、属性セレクタに
-    // 一致しない (既定の type が text でも属性は無い)。以前この指定だったので、
-    // 下の配色は一度も当たっていなかった。
+    // Select the search / replace inputs with `.cm-textfield`. **`input[type=text]` does not match**:
+    // @codemirror/search creates these two without a type attribute, so an attribute selector
+    // does not match (even though the default type is text, the attribute is absent). The
+    // colors below never applied while it was written that way.
     ".cm-panel.cm-search input.cm-textfield": {
       backgroundColor: "#27272a",
       color: "#f3f5f9",
@@ -95,7 +95,7 @@
     ".cm-panel.cm-search label": { fontSize: "12px" },
   });
 
-  // SqlEditor と同じ、oneDark より明るい配色
+  // Same as SqlEditor, a lighter color scheme than oneDark
   const brightHighlightStyle = HighlightStyle.define([
     { tag: [t.keyword, t.operatorKeyword, t.modifier], color: "#eac6ff" },
     { tag: [t.string, t.special(t.string)], color: "#d8f5b0" },
@@ -106,12 +106,12 @@
     { tag: [t.typeName, t.className], color: "#ffeab0" },
   ]);
 
-  /// YAML のパースエラー・警告をエディタ上に表示する。
-  /// 保存できない source モードでも崩れに気付けるよう、両モードで有効にする。
-  /// パースは常に doc 全体をやり直すが、対象は設定ファイル規模なので十分速い。
+  /// Show YAML parse errors and warnings in the editor.
+  /// Enabled in both modes so that breakage is noticed even in source mode, which cannot be saved.
+  /// Parsing always redoes the whole doc, but the target is config-file sized, so it is fast enough.
   const yamlLinter = linter((view): Diagnostic[] => {
     const docLength = view.state.doc.length;
-    /// yaml が返す位置は基本 doc 内だが、範囲外でも CodeMirror が例外を投げないよう丸める
+    /// Positions returned by yaml are normally within the doc; clamp them so CodeMirror does not throw even if out of range
     const toDiagnostic = (
       err: { pos?: [number, number]; message: string },
       severity: "error" | "warning",
@@ -128,7 +128,7 @@
         ...parsed.warnings.map((w) => toDiagnostic(w, "warning")),
       ];
     } catch (e) {
-      // parseDocument は基本 errors に積むが、想定外の例外でも lint を落とさない
+      // parseDocument normally accumulates into errors, but do not let an unexpected exception break lint
       return [
         {
           from: 0,
@@ -152,15 +152,15 @@
           highlightActiveLineGutter(),
           drawSelection(),
           history(),
-          // 検索パネルはエディタの上端に出す (下端だとフッターのボタン列と隣接して紛らわしい)
+          // Show the search panel at the top of the editor (at the bottom it would sit next to the footer buttons and be confusing)
           search({ top: true }),
-          // VSCode 互換のマルチカーソル / 複数選択 (SqlEditor と揃える)。
-          // Mod-d / Mod-Shift-l は searchKeymap 側にある
+          // VSCode-compatible multi-cursor / multiple selections (same as SqlEditor).
+          // Mod-d / Mod-Shift-l are in searchKeymap
           vscodeMultiSelection,
           keymap.of(searchKeymap),
-          // Escape の扱い。searchKeymap より後 = 検索パネルを開いている間は
-          // 「パネルを閉じる」が勝つ。defaultKeymap より前 = テキスト選択中でも
-          // simplifySelection ではなくモーダルを閉じる (検索を足す前と同じ挙動)
+          // How Escape is handled. After searchKeymap = while the search panel is open,
+          // "close the panel" wins. Before defaultKeymap = even with text selected,
+          // it closes the modal rather than simplifySelection (same behavior as before search was added)
           keymap.of([
             {
               key: "Escape",
@@ -203,7 +203,7 @@
     }
   };
 
-  // onMount から Promise を返すとクリーンアップ関数と誤認されるため、投げっぱなしにする
+  // Returning a Promise from onMount would be mistaken for a cleanup function, so fire and forget
   onMount(() => {
     void load();
   });
@@ -223,13 +223,13 @@
       const path = await writeConfigFile(view.state.doc.toString());
       dirty = false;
       onDirtyChange?.(false);
-      // 保存しただけでは実行中の接続に反映されないため、続けて再読込する
+      // Saving alone does not apply to the running connection, so reload right after
       if (await appStore.reloadConnections()) {
         toast.success(`Saved ${path}`);
         onClose();
         return;
       }
-      // 保存自体は成功しているので、失敗したのは再読込であることを明示する
+      // Saving itself succeeded, so make clear that it was the reload that failed
       saveError = `Saved ${path}, but reloading the config failed: ${
         appStore.errorMessage ?? "unknown error"
       }`;
@@ -248,7 +248,7 @@
     toast.success("Copied to the clipboard");
   };
 
-  /// 未保存の変更を巻き添えで捨てないよう、dirty なら確認を挟む
+  /// Confirm if dirty so unsaved changes are not discarded as collateral
   const requestClose = () => {
     if (dirty) {
       confirmDiscard = true;
@@ -257,10 +257,10 @@
     onClose();
   };
 
-  /// Escape の共通処理。エディタにフォーカスがある時は CodeMirror のキーマップから、
-  /// それ以外 (ボタンや読み込みエラー表示) は window のハンドラから呼ばれる。
+  /// Common Escape handling. Called from the CodeMirror keymap when the editor has focus,
+  /// and from the window handler otherwise (buttons or the load error display).
   const handleEscape = () => {
-    // 破棄確認を出している間の Escape は「編集に戻る」(誤って捨てない)
+    // Escape while the discard confirmation is shown means "back to editing" (never discard by accident)
     if (confirmDiscard) {
       confirmDiscard = false;
       return;
@@ -269,9 +269,9 @@
   };
 
   const onWindowKeydown = (e: KeyboardEvent) => {
-    // エディタ側 (CodeMirror のキーマップ) が処理済みのキーには手を出さない。
-    // 検索パネルを開いている間の Escape はパネルを閉じるだけにしたいので、
-    // これが無いとモーダルごと閉じてしまう。
+    // Do not touch keys already handled by the editor side (CodeMirror keymap).
+    // Escape while the search panel is open should only close the panel;
+    // without this, the whole modal would close.
     if (e.defaultPrevented) {
       return;
     }
@@ -280,7 +280,7 @@
       handleEscape();
       return;
     }
-    // Cmd+S / Ctrl+S で保存
+    // Save with Cmd+S / Ctrl+S
     if (canSave && (e.metaKey || e.ctrlKey) && e.key === "s") {
       e.preventDefault();
       void save();
@@ -394,7 +394,7 @@
 </div>
 
 <style>
-  /* oneDark の背景指定が EditorView.theme に勝つため、CSS で確実に上書きする */
+  /* oneDark's background rule beats EditorView.theme, so override it reliably with CSS */
   .config-editor-host :global(.cm-editor),
   .config-editor-host :global(.cm-gutters) {
     background-color: #111111 !important;

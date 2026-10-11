@@ -1,15 +1,15 @@
-// SQL 整形器。ユーザー指定のスタイル (2sp インデント・浅い段・主要
-// キーワード行頭) を再現する。@codemirror などの外部依存は持たず、
-// 自前の軽量トークナイザで実装する (文字列リテラル・コメントを壊さない
-// ことが最優先)。
+// SQL formatter. Reproduces the user-specified style (2-space indent, shallow levels, major
+// keywords at line start). It has no external dependencies such as @codemirror and is
+// implemented with a small hand-written tokenizer (never breaking string literals or comments
+// is the top priority).
 //
-// 設計方針:
-// - SELECT (および UNION/INTERSECT/EXCEPT で連結された SELECT) のみを
-//   整形する。それ以外 (INSERT/UPDATE/DELETE/WITH 等) は原文のまま返す。
-// - パース不能・未対応・行コメント (-- や #) を含む場合は原文のまま返す。
-// - 整形結果を再トークナイズし、入力と (空白を除いた) トークン列が一致
-//   しない場合は原文を返す安全ネットを持つ (トークンの欠落・破壊・
-//   並び替えを検出して整形をあきらめる)。
+// Design policy:
+// - Only SELECT (and SELECTs joined by UNION/INTERSECT/EXCEPT) is formatted.
+//   Anything else (INSERT/UPDATE/DELETE/WITH etc.) is returned as is.
+// - Input that cannot be parsed, is unsupported, or contains line comments (-- or #) is returned as is.
+// - Has a safety net: the formatted result is re-tokenized, and if its token sequence (ignoring
+//   whitespace) does not match the input, the original is returned (missing, broken or
+//   reordered tokens are detected and formatting is abandoned).
 
 type TokType =
   | "ws"
@@ -26,17 +26,17 @@ interface Token {
 }
 
 /**
- * 方言ごとの字句の違い。今あるのは T-SQL (mssql) だけ:
- * - `[name]` の角括弧識別子を 1 トークンとして保つ (中の空白・記号は識別子の
- *   一部で、`[order-id]` を `[order - id]` にすると別のオブジェクトになる)
- * - `#temp` / `##global` の一時テーブル名を識別子として読む (他の方言では
- *   `#` は MySQL 風の行コメントの始まり)
- * - `N'...'` の Unicode 文字列定数を接頭辞ごと 1 トークンとして保つ
+ * Lexical differences per dialect. The only one so far is T-SQL (mssql):
+ * - Keep a `[name]` bracketed identifier as one token (whitespace and symbols inside are part of
+ *   the identifier; turning `[order-id]` into `[order - id]` would refer to a different object)
+ * - Read `#temp` / `##global` temporary table names as identifiers (in other dialects
+ *   `#` starts a MySQL-style line comment)
+ * - Keep a `N'...'` Unicode string literal, prefix included, as one token
  */
 export type SqlDialect = "mssql";
 
-// 大文字化して比較・出力するキーワード集合。関数名 (count/sum 等) は
-// ユーザーの記述を保つため意図的に含めない。
+// Set of keywords that are uppercased for comparison and output. Function names (count/sum etc.)
+// are intentionally excluded to preserve what the user wrote.
 const KEYWORDS = new Set<string>([
   "SELECT",
   "DISTINCT",
@@ -85,7 +85,7 @@ const KEYWORDS = new Set<string>([
   "FALSE",
 ]);
 
-// 複数文字の演算子 (長いものを先に試す)
+// Multi-character operators (try longer ones first)
 const MULTI_PUNCT = [
   "->>",
   "->",
@@ -101,16 +101,16 @@ const MULTI_PUNCT = [
   ">>",
 ];
 
-// 識別子に使える文字。ASCII の英数字・_・$ に加え、非 ASCII
-// (U+0080 以上、日本語エイリアス等) を許可する。記号類が識別子に
-// 混入しないよう、範囲は charCodeAt で明示的に判定する。
+// Characters allowed in identifiers. In addition to ASCII alphanumerics, _ and $, non-ASCII
+// (U+0080 and above, e.g. Japanese aliases) is allowed. The range is checked explicitly via
+// charCodeAt so that symbols do not leak into identifiers.
 const isWordStart = (c: string): boolean =>
   /[A-Za-z_$]/.test(c) || c.charCodeAt(0) >= 0x80;
 const isWordPart = (c: string): boolean =>
   /[A-Za-z0-9_$]/.test(c) || c.charCodeAt(0) >= 0x80;
 
-// 入力文字列をトークン列へ分解する。文字列・コメントは 1 トークンとして
-// 中身をそのまま保持する。
+// Splits the input string into a token sequence. Strings and comments are kept as a single
+// token with their contents intact.
 function tokenize(sql: string, dialect?: SqlDialect): Token[] {
   const tokens: Token[] = [];
   const n = sql.length;
@@ -119,7 +119,7 @@ function tokenize(sql: string, dialect?: SqlDialect): Token[] {
   while (i < n) {
     const c = sql[i];
 
-    // 空白
+    // Whitespace
     if (c === " " || c === "\t" || c === "\r" || c === "\n" || c === "\f") {
       let j = i + 1;
       while (j < n && /\s/.test(sql[j])) j++;
@@ -128,7 +128,7 @@ function tokenize(sql: string, dialect?: SqlDialect): Token[] {
       continue;
     }
 
-    // 行コメント (-- ...)
+    // Line comment (-- ...)
     if (c === "-" && sql[i + 1] === "-") {
       let j = i + 2;
       while (j < n && sql[j] !== "\n") j++;
@@ -137,8 +137,8 @@ function tokenize(sql: string, dialect?: SqlDialect): Token[] {
       continue;
     }
 
-    // 角括弧識別子 ([name]) — T-SQL。`]]` は `]` のエスケープ。閉じていない
-    // 場合は末尾まで 1 トークンにする (壊すより原文のまま返す側に倒す)
+    // Bracketed identifier ([name]) - T-SQL. `]]` is an escaped `]`. If it is not closed,
+    // take everything to the end as one token (better to return the original than to break it)
     if (mssql && c === "[") {
       let j = i + 1;
       while (j < n) {
@@ -157,7 +157,7 @@ function tokenize(sql: string, dialect?: SqlDialect): Token[] {
       continue;
     }
 
-    // 行コメント (# ...) — MySQL。T-SQL では # は一時テーブル名の先頭
+    // Line comment (# ...) - MySQL. In T-SQL, # starts a temporary table name
     if (c === "#" && !mssql) {
       let j = i + 1;
       while (j < n && sql[j] !== "\n") j++;
@@ -166,7 +166,7 @@ function tokenize(sql: string, dialect?: SqlDialect): Token[] {
       continue;
     }
 
-    // ブロックコメント (/* ... */)
+    // Block comment (/* ... */)
     if (c === "/" && sql[i + 1] === "*") {
       let j = i + 2;
       while (j < n && !(sql[j] === "*" && sql[j + 1] === "/")) j++;
@@ -176,20 +176,20 @@ function tokenize(sql: string, dialect?: SqlDialect): Token[] {
       continue;
     }
 
-    // 文字列 / クォート付き識別子 ( ' " ` )
+    // String / quoted identifier ( ' " ` )
     if (c === "'" || c === '"' || c === "`") {
       const quote = c;
       let j = i + 1;
       while (j < n) {
         const d = sql[j];
-        // ' と " はバックスラッシュエスケープを考慮 (MySQL 等)
+        // ' and " take backslash escapes into account (MySQL etc.)
         if (d === "\\" && (quote === "'" || quote === '"')) {
           j += 2;
           continue;
         }
         if (d === quote) {
           if (sql[j + 1] === quote) {
-            // クォートの二重化によるエスケープ
+            // Escape by doubling the quote
             j += 2;
             continue;
           }
@@ -203,8 +203,8 @@ function tokenize(sql: string, dialect?: SqlDialect): Token[] {
       continue;
     }
 
-    // 数値 (16進 / 小数 / 指数表記)。先頭が数字か「.数字」のときだけ判定
-    // する (全文字で slice しないようにするための前置ガード)。
+    // Number (hex / decimal / exponent). Only checked when it starts with a digit or ".digit"
+    // (a pre-guard so that we do not slice on every character).
     if (
       (c >= "0" && c <= "9") ||
       (c === "." && sql[i + 1] >= "0" && sql[i + 1] <= "9")
@@ -220,13 +220,13 @@ function tokenize(sql: string, dialect?: SqlDialect): Token[] {
       }
     }
 
-    // 識別子・キーワード (T-SQL の #temp / ##global も識別子。2 つ目の # も
-    // 名前の一部として読む)
+    // Identifier / keyword (T-SQL #temp / ##global are identifiers too; the second # is
+    // also read as part of the name)
     if (isWordStart(c) || (mssql && c === "#")) {
       let j = i + 1;
       while (j < n && (isWordPart(sql[j]) || (mssql && sql[j] === "#"))) j++;
-      // T-SQL の Unicode 文字列 N'...' は接頭辞と文字列で 1 つの定数。
-      // 別トークンにすると N と '...' の間に空白が入り、別の式に変わる
+      // A T-SQL Unicode string N'...' is one literal made of the prefix and the string.
+      // As separate tokens, whitespace would end up between N and '...', turning it into a different expression
       if (mssql && j === i + 1 && (c === "N" || c === "n") && sql[j] === "'") {
         let k = j + 1;
         while (k < n) {
@@ -249,7 +249,7 @@ function tokenize(sql: string, dialect?: SqlDialect): Token[] {
       continue;
     }
 
-    // 複数文字の記号
+    // Multi-character symbols
     let matched = false;
     for (const op of MULTI_PUNCT) {
       if (sql.startsWith(op, i)) {
@@ -261,7 +261,7 @@ function tokenize(sql: string, dialect?: SqlDialect): Token[] {
     }
     if (matched) continue;
 
-    // 単一文字の記号
+    // Single-character symbols
     tokens.push({ type: "punct", text: c });
     i += 1;
   }
@@ -274,7 +274,7 @@ const up = (t: Token | undefined): string =>
 const wordUpAt = (toks: Token[], i: number): string =>
   isWord(toks[i]) ? toks[i].text.toUpperCase() : "";
 
-// word トークンの表示テキスト。キーワードは大文字化、それ以外は原文維持。
+// Display text of a word token. Keywords are uppercased; others keep the original.
 function displayText(t: Token): string {
   if (t.type === "word" && KEYWORDS.has(t.text.toUpperCase())) {
     return t.text.toUpperCase();
@@ -282,21 +282,21 @@ function displayText(t: Token): string {
   return t.text;
 }
 
-// 2 つのトークン間に空白を入れるべきか判定する。
+// Decides whether whitespace should go between two tokens.
 function needSpace(prev: Token, cur: Token): boolean {
   const p = prev.text;
   const c = cur.text;
 
-  // 直後に空白を入れない (前トークン基準)
+  // No space right after (based on the previous token)
   if (p === "(" || p === "[" || p === ".") return false;
   if (p === "::") return false;
 
-  // 直前に空白を入れない (後トークン基準)
+  // No space right before (based on the next token)
   if (c === "," || c === ";" || c === ")" || c === "]") return false;
   if (c === "." || c === "::") return false;
 
-  // 関数呼び出しの ( は識別子に密着させる (count(*) 等)。
-  // 予約語の後の ( は空白を空ける (IN (...), VALUES (...) 等)。
+  // The ( of a function call sticks to the identifier (count(*) etc.).
+  // A ( after a reserved word gets a space (IN (...), VALUES (...) etc.).
   if (c === "(") {
     if (prev.type === "word" && !KEYWORDS.has(p.toUpperCase())) return false;
     return true;
@@ -305,7 +305,7 @@ function needSpace(prev: Token, cur: Token): boolean {
   return true;
 }
 
-// トークン列を 1 行に整形して返す (キーワード大文字化・空白調整)。
+// Formats the token sequence onto one line (uppercase keywords, adjust whitespace).
 function renderInline(tokens: Token[]): string {
   let out = "";
   let prev: Token | null = null;
@@ -322,7 +322,7 @@ interface ClauseInfo {
   wordCount: number;
 }
 
-// toks[i] が新しい句を開始するキーワードなら情報を返す。
+// If toks[i] is a keyword that starts a new clause, return its info.
 function matchClauseStarter(toks: Token[], i: number): ClauseInfo | null {
   if (!isWord(toks[i])) return null;
   const w = toks[i].text.toUpperCase();
@@ -364,8 +364,8 @@ function matchClauseStarter(toks: Token[], i: number): ClauseInfo | null {
   }
 }
 
-// toks[k] から始まる JOIN キーワード句 (LEFT OUTER JOIN 等) のトークン数を
-// 返す。JOIN で終わらない場合は 0 (JOIN 句ではない)。
+// Number of tokens in a JOIN keyword phrase (LEFT OUTER JOIN etc.) starting at toks[k].
+// Returns 0 if it does not end in JOIN (not a JOIN clause).
 function matchJoin(toks: Token[], k: number): number {
   if (wordUpAt(toks, k) === "STRAIGHT_JOIN") return 1;
   const mods = new Set([
@@ -393,7 +393,7 @@ interface Clause {
   body: Token[];
 }
 
-// トークン列を句 (SELECT / FROM / WHERE ...) 単位に分割する。
+// Splits the token sequence into clauses (SELECT / FROM / WHERE ...).
 function segment(toks: Token[]): Clause[] | null {
   const clauses: Clause[] = [];
   let i = 0;
@@ -419,8 +419,8 @@ function segment(toks: Token[]): Clause[] | null {
   return clauses;
 }
 
-// トップレベルのカンマで区切り、各要素を 2sp インデントで 1 行ずつ、
-// 行末カンマで出力する (SELECT / GROUP BY / ORDER BY 用)。
+// Split at top-level commas and output each element on its own line with a 2-space indent
+// and a trailing comma (for SELECT / GROUP BY / ORDER BY).
 function renderCommaList(body: Token[]): string {
   if (body.length === 0) return "";
   const items: Token[][] = [];
@@ -444,8 +444,8 @@ function renderCommaList(body: Token[]): string {
     .join("\n");
 }
 
-// FROM 句の本体を整形する。テーブル参照・JOIN・ON をそれぞれ 2sp
-// インデントで 1 行ずつ出力する (段は深くしない)。
+// Formats the body of a FROM clause. Table references, JOINs and ONs are each output on
+// their own line with a 2-space indent (the levels are not made deeper).
 function renderFrom(body: Token[]): string {
   const lines: string[] = [];
   let buf: Token[] = [];
@@ -490,9 +490,9 @@ function renderFrom(body: Token[]): string {
   return lines.join("\n");
 }
 
-// WHERE / HAVING の本体を整形する。トップレベルの AND / OR で改行し、
-// 各条件を 2sp インデントで出力する。BETWEEN ... AND ... の AND や
-// CASE ... END 内の AND/OR は分割しない。
+// Formats the body of WHERE / HAVING. Breaks the line at top-level AND / OR and outputs
+// each condition with a 2-space indent. The AND in BETWEEN ... AND ... and AND/OR
+// inside CASE ... END are not split.
 function renderCondition(body: Token[]): string {
   const lines: string[] = [];
   let buf: Token[] = [];
@@ -518,7 +518,7 @@ function renderCondition(body: Token[]): string {
         pendingBetween++;
       } else if ((u === "AND" || u === "OR") && caseDepth === 0) {
         if (u === "AND" && pendingBetween > 0) {
-          // BETWEEN ... AND ... の AND なので分割しない
+          // This is the AND of BETWEEN ... AND ..., so do not split
           pendingBetween--;
         } else {
           flush();
@@ -533,7 +533,7 @@ function renderCondition(body: Token[]): string {
   return lines.join("\n");
 }
 
-// 1 つの句を整形して文字列にする。
+// Formats one clause into a string.
 function renderClause(cl: Clause): string {
   const header = renderInline(cl.headerTokens);
   switch (cl.name) {
@@ -558,16 +558,16 @@ function renderClause(cl: Clause): string {
       return b ? header + " " + b : header;
     }
     default: {
-      // UNION / INTERSECT / EXCEPT は通常 body が空 (直後に SELECT が続く)
+      // UNION / INTERSECT / EXCEPT usually have an empty body (a SELECT follows right after)
       const b = renderInline(cl.body);
       return b ? header + "\n  " + b : header;
     }
   }
 }
 
-// 空白を除いたトークン列を比較用のキー配列に変換する。
-// word は大文字小文字を無視し、それ以外 (文字列・コメント・数値・記号) は
-// 完全一致で比較する。
+// Converts the whitespace-free token sequence into an array of keys for comparison.
+// A word ignores case; anything else (string, comment, number, symbol) is compared by
+// exact match.
 function signature(sql: string, dialect?: SqlDialect): string[] {
   return tokenize(sql, dialect)
     .filter((t) => t.type !== "ws")
@@ -584,16 +584,16 @@ function sameTokens(a: string, b: string, dialect?: SqlDialect): boolean {
   return true;
 }
 
-// 整形の本体。整形できない場合は null を返す。
+// The core of formatting. Returns null if it cannot be formatted.
 function tryFormat(sql: string, dialect?: SqlDialect): string | null {
   let toks = tokenize(sql, dialect).filter((t) => t.type !== "ws");
   if (toks.length === 0) return null;
 
-  // 行コメントを含む場合は安全のため整形しない (レイアウト崩しでコードを
-  // コメントアウトしてしまう事故を避ける)
+  // Do not format when line comments are present, for safety (to avoid code being
+  // commented out by a broken layout)
   if (toks.some((t) => t.type === "lineComment")) return null;
 
-  // 先頭・末尾のブロックコメントは前後にそのまま退避する
+  // Leading and trailing block comments are set aside and kept as is before and after
   const preamble: Token[] = [];
   while (toks.length && toks[0].type === "blockComment") {
     preamble.push(toks.shift() as Token);
@@ -603,7 +603,7 @@ function tryFormat(sql: string, dialect?: SqlDialect): string | null {
     postamble.unshift(toks.pop() as Token);
   }
 
-  // 末尾のセミコロン
+  // Trailing semicolon
   let semi = false;
   if (toks.length && toks[toks.length - 1].text === ";") {
     semi = true;
@@ -611,7 +611,7 @@ function tryFormat(sql: string, dialect?: SqlDialect): string | null {
   }
   if (toks.length === 0) return null;
 
-  // 複数ステートメント (トップレベルの ; が途中にある) は整形しない
+  // Do not format multiple statements (a top-level ; in the middle)
   {
     let d = 0;
     for (const t of toks) {
@@ -621,7 +621,7 @@ function tryFormat(sql: string, dialect?: SqlDialect): string | null {
     }
   }
 
-  // 先頭は SELECT のみ対応する (WITH / INSERT / UPDATE / DELETE は非対応)
+  // Only SELECT is supported at the start (WITH / INSERT / UPDATE / DELETE are unsupported)
   if (up(toks[0]) !== "SELECT") return null;
 
   const clauses = segment(toks);
@@ -637,13 +637,13 @@ function tryFormat(sql: string, dialect?: SqlDialect): string | null {
   return out;
 }
 
-// SQL 文字列を整形して返す。整形できない・壊す恐れがある場合は原文を返す。
-// dialect は字句の違いだけ (SqlDialect 参照)。省略時は標準 SQL + MySQL 風。
+// Formats an SQL string and returns it. Returns the original if it cannot be formatted or might be broken.
+// dialect only covers lexical differences (see SqlDialect). When omitted: standard SQL + MySQL style.
 export function formatSql(sql: string, dialect?: SqlDialect): string {
   try {
     const formatted = tryFormat(sql, dialect);
     if (formatted === null) return sql;
-    // 安全ネット: トークン列が変化していたら整形を破棄して原文を返す
+    // Safety net: if the token sequence has changed, discard the formatting and return the original
     if (!sameTokens(sql, formatted, dialect)) return sql;
     return formatted;
   } catch {
