@@ -234,7 +234,7 @@ fab -l                       # list all tasks (dev / check / unittest / build_lo
 The script requires a clean `main` in sync with `origin/main`. It bumps the version in
 `src-tauri/tauri.conf.json` and `package.json`, pushes the bump commit, follows the run that
 push started, and checks that the Release was actually published. The workflow creates one
-**draft** Release, builds the macOS universal dmg (Developer ID signed + notarized + stapled)
+**draft** Release, builds the macOS universal dmg (the app and the dmg are both Developer ID signed, notarized and stapled)
 and the Windows NSIS installer in parallel, uploads both to that draft, and publishes it only
 after every platform succeeded (a missing signing
 secret fails the macOS job up front, so an unsigned or un-notarized build is never
