@@ -1,21 +1,21 @@
 <script lang="ts">
-  // ペイン間のドラッグ可能な区切り線。
-  // 透明のヒットエリアを既存の border (可視線) に重ねる想定なので、
-  // 負マージンで両隣に 2px ずつ食い込ませている。
-  // ドラッグは Pointer Events + setPointerCapture で追跡するため、
-  // カーソルが区切り線から外れても (CodeMirror や webview の上でも) 追従する。
+  // A draggable divider line between panes.
+  // The transparent hit area is meant to overlay the existing border (the visible line),
+  // so it is pulled 2px into each neighbor with negative margins.
+  // Dragging is tracked with Pointer Events + setPointerCapture, so it keeps following
+  // even when the cursor leaves the divider (including over CodeMirror or a webview).
   interface Props {
-    /// vertical = 縦線 (左右にドラッグ) / horizontal = 横線 (上下にドラッグ)
+    /// vertical = vertical line (drag left/right) / horizontal = horizontal line (drag up/down)
     direction: "vertical" | "horizontal";
-    /// ドラッグ開始時。親はここで基準サイズをスナップショットする
+    /// At drag start. The parent snapshots the base size here
     onDragStart?: () => void;
-    /// ドラッグ開始位置からの累積移動量 (px)。vertical は X、horizontal は Y。
-    /// 相対 delta ではなく累積にすることで、クランプで飽和しても基準サイズは
-    /// 動かず、上下限を超えて戻したときにポインタとペイン端がずれない。
+    /// Cumulative movement (px) from the drag start position. X for vertical, Y for horizontal.
+    /// Using a cumulative value rather than a relative delta means the base size does not move even
+    /// when clamping saturates, so the pointer and the pane edge do not drift after going past the limits and back.
     onDrag: (totalDelta: number) => void;
-    /// ドラッグ終了時 (サイズの永続化用)
+    /// At drag end (for persisting the size)
     onDragEnd?: () => void;
-    /// data-annotate 識別子
+    /// data-annotate identifier
     annotate: string;
   }
 

@@ -1,13 +1,14 @@
-# Queryfolio 設定ファイルのサンプル。
-# ~/.config/queryfolio/config.yml (または config.yaml) に置く。
+# Sample Queryfolio configuration file.
+# Place it at ~/.config/queryfolio/config.yml (or config.yaml).
 #
-# 開発・テスト用に QUERYFOLIO_CONFIG_YAML 環境変数でこのファイル全体の内容を
-# 上書きできる (GUI を Finder / Dock から起動した場合、shell の環境変数は渡らない)。
+# For development and testing, the QUERYFOLIO_CONFIG_YAML environment variable can override the
+# entire contents of this file (when the GUI is launched from Finder / the Dock, shell
+# environment variables are not passed).
 
-# --- servers (接続定義。各エントリの形式は sql-agent-mcp-server 互換) ---
+# --- servers (connection definitions; the format of each entry is compatible with sql-agent-mcp-server) ---
 #
-# 注意: このキーは以前 sql_servers という名前だった (server_templates も
-# 旧名 sql_server_templates)。旧名のままだと起動時にエラーになる。
+# Note: this key used to be named sql_servers (and server_templates was formerly
+# sql_server_templates). Using the old names causes an error at startup.
 
 servers:
   - name: dev-postgres
@@ -28,25 +29,26 @@ servers:
     user: mysql_user
     password: your_mysql_password
 
-  # --- SQL エンジン (mysql / postgres) の TLS ---
+  # --- TLS for SQL engines (mysql / postgres) ---
   #
-  # 重要: ssl_mode も tls も指定しない直接接続は sqlx の既定 (prefer) で動く。
-  # prefer は「TLS を試み、張れなければ平文へ降格する。張れてもサーバー証明書を
-  # 検証しない」ため、経路上の攻撃者に盗聴・改竄されうる。
-  # インターネット越しに直接つなぐ接続 (RDS 等) では必ず tls: true か
-  # ssl_mode を指定すること。接続をホバーすると詳細に TLS の値が出る。
+  # Important: a direct connection with neither ssl_mode nor tls runs with sqlx's default (prefer).
+  # prefer "tries TLS, falls back to plaintext if it cannot be established, and does not verify
+  # the server certificate even when it can", so an attacker on the path can eavesdrop on or
+  # tamper with the traffic.
+  # For connections made directly over the internet (RDS, etc.), always specify tls: true or
+  # ssl_mode. Hovering over a connection shows its TLS values in the details.
   #
-  # tls: true         → ssl_mode 省略時の既定が verify-full になる
-  # ssl_mode:         → disable / prefer / require / verify-ca / verify-full
-  #                      (tls より優先。MySQL の verify-full は VerifyIdentity)
-  # ssl_root_cert:    → 自己署名 CA を使う場合のルート証明書 (PEM)。~ 展開あり。
-  #                      検証しないモード (disable / prefer / require) と併記すると
-  #                      黙って無視されるため設定エラーにしている
-  #                      (verify-ca / verify-full を指定すること)
+  # tls: true         -> the default when ssl_mode is omitted becomes verify-full
+  # ssl_mode:         -> disable / prefer / require / verify-ca / verify-full
+  #                      (takes precedence over tls. MySQL's verify-full is VerifyIdentity)
+  # ssl_root_cert:    -> root certificate (PEM) for using a self-signed CA. ~ is expanded.
+  #                      Combining it with a non-verifying mode (disable / prefer / require)
+  #                      would be silently ignored, so it is treated as a configuration error
+  #                      (specify verify-ca / verify-full)
   #
-  # SSH トンネル経由の接続は接続先が 127.0.0.1 になるため、verify-full は
-  # 証明書のホスト名検証で失敗する。トンネル自体が暗号化されているので
-  # 指定しない (prefer のまま) か require までに留める。
+  # For connections through an SSH tunnel the target becomes 127.0.0.1, so verify-full fails at
+  # certificate hostname verification. The tunnel itself is encrypted, so either leave it
+  # unspecified (stay on prefer) or stop at require.
   - name: prod-postgres
     description: "本番 PostgreSQL (TLS 必須 + 証明書検証)"
     engine: postgres
@@ -60,26 +62,26 @@ servers:
     # ssl_mode: verify-full
     # ssl_root_cert: ~/.config/queryfolio/certs/rds-ca.pem
 
-  # queryfolio 拡張: sqlite は schema に DB ファイルパスを指定する
+  # queryfolio extension: sqlite takes the DB file path in schema
   - name: local-sqlite
     description: "ローカルの SQLite ファイル"
     engine: sqlite
     schema: ~/data/example.sqlite3
 
-  # queryfolio 拡張: duckdb は sqlite と同じく schema に DB ファイルパスを
-  # 指定する (ファイルが存在しない場合はエラー。新規作成はしない)。
-  # SQL エンジンとして SELECT / メタコマンド / EXPLAIN / auto LIMIT が使える。
+  # queryfolio extension: like sqlite, duckdb takes the DB file path in schema
+  # (it is an error if the file does not exist; a new one is not created).
+  # As a SQL engine, SELECT / meta commands / EXPLAIN / auto LIMIT are available.
   - name: local-duckdb
     description: "ローカルの DuckDB ファイル"
     engine: duckdb
     schema: ~/data/example.duckdb
 
-  # queryfolio 拡張: mssql (エイリアス: sqlserver)。Microsoft SQL Server に
-  # TDS (tiberius) で繋ぐ。schema は database 名 (省略時 master)、認証は
-  # user / password の SQL Server 認証のみ。ssl_mode / tls / ssl_root_cert は
-  # mysql / postgres と同じ (verify-ca は verify-full と同じ扱い)。
-  # SQL エンジンとして SELECT / メタコマンド / EXPLAIN (SHOWPLAN) / auto LIMIT (TOP)
-  # が使える。セル編集のみ非対応。
+  # queryfolio extension: mssql (alias: sqlserver). Connects to Microsoft SQL Server over
+  # TDS (tiberius). schema is the database name (master if omitted); authentication is only SQL
+  # Server authentication with user / password. ssl_mode / tls / ssl_root_cert are the same as
+  # for mysql / postgres (verify-ca is treated the same as verify-full).
+  # As a SQL engine, SELECT / meta commands / EXPLAIN (SHOWPLAN) / auto LIMIT (TOP) are
+  # available. Only cell editing is unsupported.
   - name: dev-mssql
     description: "開発用 SQL Server"
     engine: mssql
@@ -90,13 +92,13 @@ servers:
     password: your_password
     # tls: true
 
-  # queryfolio 拡張: redis (エイリアス: valkey)。
-  # エディタは 1 行 = 1 コマンド (GET my-key / MGET a b c ...)。
-  # schema は database 番号 (省略時 0)。user / password は ACL / AUTH に使う。
-  # SSH トンネルも SQL エンジンと同様に使える。
-  # tls: true (queryfolio 拡張、省略時 false) で TLS 接続 (rediss://) になる。
-  # 証明書は常に検証する (システムの信頼ストア)。SSH トンネル経由では接続先が
-  # 127.0.0.1 になりホスト名検証に失敗するため、併用しないこと。
+  # queryfolio extension: redis (alias: valkey).
+  # The editor takes 1 line = 1 command (GET my-key / MGET a b c ...).
+  # schema is the database number (0 if omitted). user / password are used for ACL / AUTH.
+  # SSH tunnels can be used just like with SQL engines.
+  # tls: true (queryfolio extension, false if omitted) makes it a TLS connection (rediss://).
+  # The certificate is always verified (system trust store). Through an SSH tunnel the target
+  # becomes 127.0.0.1 and hostname verification fails, so do not combine them.
   - name: local-redis
     description: "ローカルの Redis"
     engine: redis
@@ -105,11 +107,11 @@ servers:
     schema: "0"
     # tls: true
 
-  # queryfolio 拡張: elasticsearch (エイリアス: es / opensearch)。
-  # エディタは Kibana Console 風のリクエストブロック
-  # (`GET /index/_search` のメソッド行 + JSON body。# 行はコメント)。
-  # user / password は Basic 認証に使う。SSH トンネルも SQL エンジンと同様。
-  # tls: true (queryfolio 拡張、省略時 false) で https 接続になる。
+  # queryfolio extension: elasticsearch (alias: es / opensearch).
+  # The editor takes Kibana Console-style request blocks
+  # (a method line like `GET /index/_search` + a JSON body; lines starting with # are comments).
+  # user / password are used for Basic authentication. SSH tunnels work as with SQL engines.
+  # tls: true (queryfolio extension, false if omitted) makes it an https connection.
   - name: local-elasticsearch
     description: "ローカルの Elasticsearch"
     engine: elasticsearch
@@ -119,24 +121,24 @@ servers:
     # user: elastic
     # password: your_es_password
 
-  # queryfolio 拡張: dynamodb。PartiQL (SQL 互換サブセット) を
-  # ExecuteStatement API で実行する。エディタは SQL (SELECT / INSERT / UPDATE /
-  # DELETE。PartiQL に LIMIT 句は無く、行数はアプリ側の上限で抑える)。
-  # schema = AWS リージョン (必須)。認証は次の順で解決する:
-  #   1. user / password (静的なアクセスキー ID / シークレットアクセスキー)
-  #   2. aws_profile (queryfolio 拡張。~/.aws のプロファイル名)
-  #   3. 既定の credentials chain (環境変数 → default プロファイル → IMDS)
+  # queryfolio extension: dynamodb. Runs PartiQL (a SQL-compatible subset) through the
+  # ExecuteStatement API. The editor takes SQL (SELECT / INSERT / UPDATE /
+  # DELETE. PartiQL has no LIMIT clause; the row count is capped by an app-side limit).
+  # schema = AWS region (required). Authentication is resolved in this order:
+  #   1. user / password (static access key ID / secret access key)
+  #   2. aws_profile (queryfolio extension; a profile name in ~/.aws)
+  #   3. the default credentials chain (environment variables -> default profile -> IMDS)
   - name: aws-dynamodb
     description: "AWS の DynamoDB (ap-northeast-1)"
     engine: dynamodb
     schema: ap-northeast-1
     # aws_profile: my-profile
-    # readonly: true   # SELECT のみ許可したい場合
+    # readonly: true   # when only SELECT should be allowed
 
-  # dynamodb-local (docker run -p 8000:8000 amazon/dynamodb-local) の例。
-  # host / port でエンドポイントを上書きする (tls: true で https)。
-  # dynamodb-local は認証を検証しないため user / password はダミーでよい
-  # (英数字のみ。dynamodb-local はハイフン等を含むキーを拒否する)。
+  # Example for dynamodb-local (docker run -p 8000:8000 amazon/dynamodb-local).
+  # Override the endpoint with host / port (tls: true for https).
+  # dynamodb-local does not validate credentials, so user / password can be dummies
+  # (alphanumeric only; dynamodb-local rejects keys containing hyphens, etc.).
   - name: local-dynamodb
     description: "ローカルの dynamodb-local"
     engine: dynamodb
@@ -146,11 +148,11 @@ servers:
     user: dummyAccessKey
     password: dummySecretKey
 
-  # queryfolio 拡張: readonly: true (省略時 false) を指定すると、
-  # 書き込み系の文 (INSERT / UPDATE / DELETE / DDL、CTE 付き DML、
-  # SELECT INTO 等) の実行を拒否する。
-  # SELECT に副作用のある関数 (nextval 等) までは防げない。
-  # あくまで事故防止のガード。
+  # queryfolio extension: specifying readonly: true (false if omitted) rejects execution of
+  # write statements (INSERT / UPDATE / DELETE / DDL, DML with a CTE,
+  # SELECT INTO, etc.).
+  # It cannot prevent SELECTs that call functions with side effects (nextval, etc.).
+  # It is only a guard against accidents.
   - name: production-replica
     description: "本番レプリカ (読み取り専用)"
     engine: mysql
@@ -161,10 +163,10 @@ servers:
     password: replica_password
     readonly: true
 
-  # queryfolio 拡張: allow_dangerous_statements (省略時 false)。
-  # 省略時は、危険な文 (WHERE 無しの UPDATE / DELETE、DROP、TRUNCATE) を
-  # 誤操作による全行破壊・テーブル消失防止のため拒否する。
-  # true にするとこれらの文を実行できるが、実行前に確認ダイアログが出る。
+  # queryfolio extension: allow_dangerous_statements (false if omitted).
+  # When omitted, dangerous statements (UPDATE / DELETE without WHERE, DROP, TRUNCATE) are
+  # rejected to prevent destroying all rows or losing tables through a mistaken operation.
+  # With true these statements can be run, but a confirmation dialog appears before execution.
   - name: dev-db
     description: "開発用 DB (危険な文も確認の上で実行できる)"
     engine: postgres
@@ -178,7 +180,7 @@ servers:
   - name: remote-db-with-ssh
     description: "SSH トンネル経由でアクセスするリモートデータベース"
     engine: postgres
-    host: localhost  # SSH トンネル経由の場合、踏み台から見た DB ホストを指定
+    host: localhost  # For an SSH tunnel, specify the DB host as seen from the bastion
     port: 5432
     schema: remote_db
     user: remote_user
@@ -187,7 +189,7 @@ servers:
       host: ssh.example.com
       port: 22
       user: ssh_user
-      # password: ssh_password  # または private_key_path を使用
+      # password: ssh_password  # or use private_key_path
       private_key_path: ~/.ssh/id_rsa
       # private_key_passphrase: key_passphrase
       # When no password/private_key_path is set, the SSH agent is used.
@@ -200,7 +202,7 @@ servers:
   - name: remote-db-via-ssh-config
     description: "~/.ssh/config の Host エイリアスで接続 (ProxyJump / 多段トンネル対応)"
     engine: postgres
-    host: localhost  # 踏み台 (ssh_config の最終ホスト) から見た DB ホスト
+    host: localhost  # DB host as seen from the bastion (the final host in ssh_config)
     port: 5432
     schema: remote_db
     user: remote_user
@@ -218,11 +220,11 @@ servers:
       # checking are handled entirely by OpenSSH).
       ssh_config: pop-three-ec2-staging
 
-# --- servers: グループ機能 (queryfolio 拡張) ---
-# リスト項目に group_name + servers を書くと、その中のサーバーが
-# 接続一覧でグループ見出し付きで表示される。直書きサーバーとの混在も可
-# (設定した順序のまま表示される)。グループの中にさらにグループは書けない。
-# グループ内でも template: による雛形継承は使える。
+# --- servers: grouping (queryfolio extension) ---
+# Writing group_name + servers as a list item shows the servers inside it under a group
+# heading in the connection list. It can be mixed with directly written servers
+# (they are displayed in the order configured). A group cannot contain another group.
+# Template inheritance via template: also works inside a group.
 #
 # servers:
 #   - group_name: production
@@ -241,28 +243,28 @@ servers:
 #         engine: postgres
 #         host: localhost
 #         ...
-#   - name: ungrouped-db   # グループ無しの直書きも混在できる
+#   - name: ungrouped-db   # ungrouped, directly written entries can be mixed in too
 #     engine: sqlite
 #     schema: ~/data/example.sqlite3
 
-# --- 設定を外部から上書きする (任意) ---
-# config_override_command に書いたコマンドを実行し、その stdout (YAML) を
-# この設定へ再帰的にマージする。取得した YAML 側が優先。
+# --- Overriding the configuration from outside (optional) ---
+# Runs the command written in config_override_command and recursively merges its stdout (YAML)
+# into this configuration. The fetched YAML takes precedence.
 #
-# マージ規則:
-#   - マッピング同士は再帰的に混ざる (例: ai の api_key だけ差し替え)
-#   - スカラーとリスト (servers を含む) は丸ごと置き換わる
-#   - servers に限らずどのキーでも上書きできる
+# Merge rules:
+#   - Mappings are merged recursively (e.g. replace only ai's api_key)
+#   - Scalars and lists (including servers) are replaced wholesale
+#   - Any key can be overridden, not only servers
 #
-# 取得した YAML の中に config_override_command があっても再帰取得はしない。
-# コマンドはシェル非経由で実行される (パイプやリダイレクトは使えない)。
+# Even if the fetched YAML contains config_override_command, it is not fetched recursively.
+# The command is run without a shell (pipes and redirects cannot be used).
 #
-# 1Password から取得する例:
+# Example of fetching from 1Password:
 # config_override_command: op read "op://development/queryfolio/config-yaml"
 
-# --- 接続情報の雛形 ---
-# servers 側で template: <名前> を指定して継承できる。
-# サーバー側で指定したキーはテンプレートの同名キーを上書きする (シャローマージ)。
+# --- Connection templates ---
+# In servers, specify template: <name> to inherit from one.
+# Keys specified on the server side override same-named keys of the template (shallow merge).
 server_templates:
   - name: my-awesome-sql-host
     engine: mysql
@@ -271,43 +273,45 @@ server_templates:
     user: shared_user
     password: shared_password
 
-# --- AI (自然言語 → SQL 生成) の設定 (任意) ---
-# ここ (ローカル config.yml のトップレベル)、または config_override_command で
-# 取得する YAML のトップレベルに書ける。マージの結果、取得 YAML 側が優先される
-# (API キーを 1Password 内の YAML に置けば、ローカルに平文で残らない)。
+# --- AI (natural language -> SQL generation) settings (optional) ---
+# Can be written here (top level of the local config.yml) or at the top level of the YAML
+# fetched by config_override_command. After merging, the fetched YAML takes precedence
+# (if the API key is placed in a YAML inside 1Password, it does not remain in plaintext locally).
 # ai:
-#   provider: openai   # 現状 openai のみ対応
+#   provider: openai   # currently only openai is supported
 #   api_key: sk-your-api-key
-#   model: gpt-6-luna     # 任意 (省略時 gpt-6-luna)
-#   base_url: https://api.openai.com/v1  # 任意 (OpenAI 互換 API 用)
-#   # AI チャットは function calling を使う。gpt-6-luna 等の推論モデルは
-#   # /v1/chat/completions で tools を使う場合 reasoning_effort が "none" でないと
-#   # エラーになるため、接続先が OpenAI 公式なら省略時に "none" を送る。
-#   # base_url で OpenAI 互換 API を指している場合は、明示指定した時だけ送る
-#   # (このパラメータを受け付けない相手を勝手に壊さないため)。
-#   # 空文字を指定すると常に送らない。
-#   # なお reasoning_effort が原因で拒否された場合は、そのパラメータを外して
-#   # 自動で 1 度だけ再送するため、受け付けないモデルでも設定変更なしで動く。
-#   # ただし gpt-6-astra は "none" を受け付けず、外すと tools 併用の制約で拒否される
-#   # ため、AI チャットには使えない (SQL 生成 / EXPLAIN 解説は tools を使わない)。
-#   tool_reasoning_effort: none   # 任意 ("" で送らない)
+#   model: gpt-6-luna     # optional (gpt-6-luna if omitted)
+#   base_url: https://api.openai.com/v1  # optional (for OpenAI-compatible APIs)
+#   # AI chat uses function calling. Reasoning models such as gpt-6-luna fail on
+#   # /v1/chat/completions when tools are used unless reasoning_effort is "none", so when the
+#   # target is the official OpenAI, "none" is sent if this is omitted.
+#   # When base_url points to an OpenAI-compatible API, it is sent only when explicitly specified
+#   # (so as not to break servers that do not accept this parameter).
+#   # An empty string means it is never sent.
+#   # Also, if the request is rejected because of reasoning_effort, the parameter is removed and
+#   # the request is automatically resent exactly once, so models that do not accept it work
+#   # without any configuration change.
+#   # However, gpt-6-astra does not accept "none", and removing it is rejected because of the
+#   # constraint on combining with tools, so it cannot be used for AI chat (SQL generation /
+#   # EXPLAIN explanation do not use tools).
+#   tool_reasoning_effort: none   # optional ("" means do not send)
 
-# --- LIMIT 未指定の SELECT に自動付与する行数上限 (任意。デフォルト 500、0 で無効) ---
+# --- Row limit automatically added to SELECTs without a LIMIT (optional; default 500, 0 disables) ---
 # default_limit: 500
 
-# --- クエリファイルの保存先 (任意。デフォルト ~/.config/queryfolio/sqlfiles) ---
+# --- Where query files are saved (optional; default ~/.config/queryfolio/sqlfiles) ---
 # sqlfiles_dir: ~/queries
 #
-# 相対パスを書いた場合は、カレントディレクトリではなく設定ディレクトリ
-# (~/.config/queryfolio) を基準に解決する。CLI と実行中のウインドウは
-# 別プロセス (別 cwd) なので、cwd 基準だと互いに違う場所を指してしまうため。
+# A relative path is resolved against the configuration directory (~/.config/queryfolio), not
+# the current directory. The CLI and the running window are separate processes (with different
+# cwds), so a cwd-based path would make them point to different places.
 #
-# クエリファイルは <sqlfiles_dir>/<フォルダ名>/<name>.sql に保存される。
-# フォルダ名は接続ごとに次のルールで決まる (接続 name は使わない):
-#   - サーバーに folder_name を指定していればそれを使う
-#   - 無ければ <host>_<engine>_<schema>_<user> を組み立てる
-# 例: 上の dev-postgres は "localhost_postgres_development_db_dev_user"。
-# folder_name を明示するとフォルダ名を固定できる (host 等を変えても移動しない):
+# Query files are saved to <sqlfiles_dir>/<folder name>/<name>.sql.
+# The folder name is determined per connection by the following rules (the connection name is not used):
+#   - if the server specifies folder_name, it is used
+#   - otherwise <host>_<engine>_<schema>_<user> is assembled
+# Example: dev-postgres above becomes "localhost_postgres_development_db_dev_user".
+# Specifying folder_name explicitly pins the folder name (it does not move when host etc. change):
 #   - name: dev-postgres
 #     folder_name: dev-pg
 #     engine: postgres

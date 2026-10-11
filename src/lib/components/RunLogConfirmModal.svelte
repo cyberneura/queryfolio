@@ -2,9 +2,9 @@
   import type { RunLogChoice } from "$lib/runLog";
 
   interface Props {
-    /// 書き戻そうとしている結果の行数
+    /// Number of result rows about to be written back
     rows: number;
-    /// 「一部だけ書く」を選んだ時に書く行数
+    /// Number of rows to write when "write only some" is chosen
     limit: number;
     onChoose: (choice: RunLogChoice) => void;
   }

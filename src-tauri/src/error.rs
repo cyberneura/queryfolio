@@ -1,7 +1,7 @@
 use serde::{Serialize, Serializer};
 
-/// アプリ全体のエラー型。Tauri コマンドの戻り値としてフロントエンドに
-/// 文字列として渡す。
+/// Application-wide error type. Returned from Tauri commands and passed to the frontend
+/// as a string.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("Config error: {0}")]
@@ -16,30 +16,30 @@ pub enum AppError {
     #[error("Query history error: {0}")]
     History(String),
 
-    /// readonly 接続で書き込み系の文が実行されようとした
+    /// A write statement was about to be executed on a readonly connection
     #[error("{0}")]
     Readonly(String),
 
-    /// 危険な文 (WHERE 無しの UPDATE / DELETE、DROP / TRUNCATE 等) が
-    /// allow_dangerous_statements を有効にしていない接続で実行されようとした
+    /// A dangerous statement (UPDATE / DELETE without WHERE, DROP / TRUNCATE, etc.) was
+    /// about to be executed on a connection without allow_dangerous_statements enabled
     #[error("{0}")]
     Dangerous(String),
 
-    /// AI 機能のエラー (設定不備・API 呼び出し失敗)
+    /// AI feature error (bad configuration or API call failure)
     #[error("AI error: {0}")]
     Ai(String),
 
-    /// 結果のエクスポートに失敗した (未対応の文字コード、変換できない文字)
+    /// Exporting the result failed (unsupported character encoding, unconvertible character)
     #[error("{0}")]
     Export(String),
 
-    /// EXPLAIN の対象にできない文 (SELECT / WITH 以外) が指定された
+    /// A statement that cannot be EXPLAINed (anything other than SELECT / WITH) was given
     #[error("{0}")]
     Explain(String),
 
-    /// ユーザーのキャンセル要求でクエリが中断された。
-    /// フロントエンドはこの文字列 ("Query cancelled") との一致で
-    /// エラーではなくキャンセルとして表示を分ける。
+    /// The query was aborted by a user cancel request.
+    /// The frontend matches this string ("Query cancelled") to show it as a
+    /// cancellation rather than an error.
     #[error("Query cancelled")]
     Cancelled,
 
@@ -79,8 +79,8 @@ impl From<duckdb::Error> for AppError {
 
 impl From<tiberius::error::Error> for AppError {
     fn from(e: tiberius::error::Error) -> Self {
-        // tiberius の Server エラーは Display でメッセージ本文 (コード・状態・
-        // 行番号付き) になる。接続文字列や認証情報は含まれない
+        // tiberius Server errors render via Display as the message body (with code, state and
+        // line number). It contains no connection string or credentials
         AppError::MsSql(e.to_string())
     }
 }

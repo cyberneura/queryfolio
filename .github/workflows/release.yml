@@ -1,68 +1,70 @@
 name: Release
 
-# リリースは main の src-tauri/tauri.conf.json の version で決まる。まだリリースされて
-# いない (かつ公開中の最新より新しい) version を main に載せればリリースされ、
-# リリース済みの version のままなら何度 push しても何も起きない。
-# ローカルからは `pnpm release [patch|minor|major]` (scripts/release.sh) で採番して
-# push する。PR の中で version を上げてマージしても同じようにリリースされる。
+# A release is decided by the version in src-tauri/tauri.conf.json on main. Putting a version on
+# main that has not been released yet (and is newer than the latest published one) releases it;
+# if it stays at an already released version, nothing happens no matter how often you push.
+# Locally, `pnpm release [patch|minor|major]` (scripts/release.sh) numbers the version and
+# pushes. Bumping the version inside a PR and merging it releases the same way.
 #
-# 実行可否を決めるのは diff ではなく「その version がリリース済みか」。squash / rebase /
-# 直 push で diff は変わるが結果は変わらない (冪等)。path フィルターを付けないのも
-# 同じ理由で、bump が想定外の形で入っても取りこぼさないため。
+# What decides whether to run is not the diff but "has this version been released". Squash /
+# rebase / direct push change the diff but not the result (idempotent). No path filter is added
+# for the same reason: so that a bump that lands in an unexpected shape is not missed.
 on:
   push:
     branches: [main]
-  # PR では test ジョブだけが走る (plan 以降は if で止めてある)。門番のテストを
-  # マージ前に同じ定義で回すためで、リリース経路とテストの内容がずれない。
+  # On a PR only the test job runs (plan and later are stopped by `if`). This runs the gate tests
+  # with the same definition before merge, so the release path and the tests do not drift apart.
   pull_request:
-  # version は正しいのに、その時の run が (API の一時障害等で) 失敗した場合の再実行用。
-  # 同じ判定を通るので、公開済みの version をもう一度出すことはできない。
+  # For re-running when the version is correct but that run failed (e.g. a transient API failure).
+  # It goes through the same check, so an already published version cannot be released again.
   workflow_dispatch:
 
-# 既定は権限なし。必要な job にだけ与える。特に test は PR が持ち込んだコードを
-# 実行するので contents: read までしか渡さない (同一リポジトリからの PR では
-# GITHUB_TOKEN が write を持ちうるため、ここを既定に任せない)。
+# No permissions by default; grant them only to the jobs that need them. In particular, test runs
+# code brought in by a PR, so it gets nothing beyond contents: read (for PRs from the same
+# repository GITHUB_TOKEN may have write, so we do not leave it to the default here).
 #
-# この workflow は pull_request でも起動するが、「PR で workflow 自体を書き換えれば
-# contents: write のジョブを動かせる」ことにはならない。public リポジトリの fork から
-# の pull_request では、permissions の記述に関わらず GITHUB_TOKEN が read-only に
-# 切り下げられ secrets も渡らない (write token を渡す設定があるのは private リポジトリ
-# 側の話で、ここには無い)。同一リポジトリのブランチから PR を出せるのは既に write
-# 権限を持つ相手だけなので、そちらも権限の昇格にはならない。
+# This workflow also triggers on pull_request, but that does not mean "rewriting the workflow
+# itself in a PR can run a contents: write job". For pull_request from a fork of a public
+# repository, GITHUB_TOKEN is downgraded to read-only regardless of the permissions block and
+# secrets are not passed (the setting that hands out a write token concerns private
+# repositories, and does not apply here). Only people who already have write access can open a
+# PR from a branch in the same repository, so that is not a privilege escalation either.
 permissions: {}
 
-# 同時に走らないよう直列化する。1 回の dispatch が 1 つの version に対応するため、
-# キャンセルされた run の version は (bump コミットは main に載ったまま) 永久に
-# 公開されない状態になる。それを防ぐために 2 つとも要る:
-#   cancel-in-progress: false — 走行中の run を後発でキャンセルしない。
-#   queue: max — pending も最大 100 件まで積む。既定の `queue: single` は
-#     「pending は 1 件だけ。新しく queue されたら既存の pending をキャンセルして
-#     置き換える」なので、3 回連続で dispatch すると真ん中の version が消える。
-# (queue: max と cancel-in-progress: true の併用は validation error になる)
+# Serialize runs so they do not run concurrently. One dispatch corresponds to one version, so the
+# version of a cancelled run would never be published (the bump commit stays on main). Both of
+# these are needed to prevent that:
+#   cancel-in-progress: false — do not cancel a running run with a later one.
+#   queue: max — queue pending runs too, up to 100. The default `queue: single` means
+#     "only one pending; when a new one is queued, cancel the existing pending and replace it",
+#     so dispatching three times in a row loses the middle version.
+# (combining queue: max with cancel-in-progress: true is a validation error)
 #
-# run 単位で直列なので、後続の run の plan は先行 run の publish が終わってから走り、
-# 同じ version を二重にビルドしない。ただし pending の消化順は push 順とは限らない
-# (GitHub は開始順を保証しない)。新しい version が先に公開された後で古い version の
-# run が回ってきても、plan が「最新より古い」で止める。
+# Because runs are serialized, the plan of a later run runs after the publish of the earlier run
+# is done, so the same version is never built twice. However, the order in which pending runs are
+# consumed is not necessarily the push order (GitHub does not guarantee start order). Even if an
+# older version's run comes around after a newer version has been published first, plan stops it
+# as "older than the latest".
 #
-# PR の検査 run は「1 push = 1 version」の直列化とは無関係なので、リリース用の
-# グループへ入れない。同じグループにすると PR が 1 本走るだけでリリースが pending に
-# 積まれる (cancel-in-progress: false なので待たされ続ける)。さらに commit ごとに
-# 別グループにして、PR 側では直列化そのものを効かせない — ここで PR をまとめると
-# 同じ PR へ連続 push した時に古い commit の検査が順番待ちを作り、最新 commit の
-# 結果が最も遅れる (この設定では cancel-in-progress を PR だけ true にはできない)。
+# A PR check run is unrelated to the "1 push = 1 version" serialization, so it is not put in
+# the release group. In the same group, a single PR run would leave the release pending
+# (it keeps waiting because cancel-in-progress is false). Further, each commit gets its own
+# group so that serialization is not applied on the PR side at all — if PRs were grouped here,
+# consecutive pushes to the same PR would make checks of older commits queue up and the result
+# of the newest commit would be the latest to arrive (this setup cannot make cancel-in-progress
+# true only for PRs).
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('{0}-{1}', github.ref, github.sha) || 'release' }}
   cancel-in-progress: false
   queue: max
 
 jobs:
-  # ビルドに 30 分以上かける前に、その version がまだリリースされておらず、公開中の
-  # 最新より新しいことを確かめる。ここが false を返す限り、push のたびに
-  # macOS / Windows ランナーが動くことはない。
-  # PR ではリリース判定そのものが無意味なので走らせない。この job が skipped に
-  # なると、依存している build / publish も (always() を使っていないので) skipped に
-  # なる — PR では test だけが動く。
+  # Before spending 30+ minutes on a build, confirm the version has not been released yet and is
+  # newer than the latest published one. As long as this returns false, macOS / Windows runners
+  # never start on a push.
+  # The release decision is meaningless on a PR, so do not run it. When this job is skipped, the
+  # build / publish that depend on it are also skipped (always() is not used) — on a PR only test
+  # runs.
   plan:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -73,9 +75,9 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       release: ${{ steps.decide.outputs.release }}
     steps:
-      # dispatch は自分の ref を指定できる。未公開 version を載せたブランチが、
-      # そのブランチの内容でリリースされてしまわないようにする (push では main 以外
-      # 起こり得ないが、dispatch では起こる)。
+      # dispatch can specify its own ref. This prevents a branch carrying an unpublished version from
+      # being released with that branch's contents (it cannot happen on push except for main, but it
+      # can with dispatch).
       - name: Refuse to release from anywhere but main
         if: github.ref != 'refs/heads/main'
         env:
@@ -99,9 +101,10 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      # 判定の中身は scripts/release-decide.sh。publish が公開直前にも同じ判定を使う。
-      # `release=$(...)` を代入で受けるのは、スクリプトの失敗 (判定不能) で step を
-      # 落とすため (echo の引数の中でコマンド置換が失敗しても -e は効かない)。
+      # The decision itself lives in scripts/release-decide.sh. publish uses the same decision right
+      # before publishing. `release=$(...)` is captured by assignment so that a script failure
+      # (undecidable) fails the step (-e does not take effect when a command substitution fails inside
+      # echo's arguments).
       - name: Decide whether this version still needs releasing
         id: decide
         env:
@@ -112,20 +115,20 @@ jobs:
           release=$(bash scripts/release-decide.sh)
           echo "release=$release" >> "$GITHUB_OUTPUT"
 
-  # リリースビルドの門番。方針: cyberneura/cyberneura-github-actions の
+  # Gate for the release build. Policy: docs/build-requires-tests.md in cyberneura/cyberneura-github-actions
   # docs/build-requires-tests.md
   #
-  # runs-on を build と同じ macOS / Windows にしてあるのは方針のルール 4 による。
-  # lib.rs の #[cfg(target_os = "macos")] や cli.rs の Windows 専用コード
-  # (attach_parent_console) は、他の OS では 1 行もコンパイルされない。ubuntu で
-  # cargo test を回しても、配布物に入るコードの一部を検査しないまま通してしまう。
+  # runs-on is the same macOS / Windows as build because of the policy's rule 4.
+  # lib.rs's #[cfg(target_os = "macos")] and the Windows-only code in cli.rs
+  # (attach_parent_console) are not compiled at all, not even one line, on other OSes. Running
+  # cargo test on ubuntu would pass without checking part of the code that goes into the artifacts.
   test:
-    # push / dispatch では、実際にリリースする version の時だけ走らせる。plan を
-    # 通さず無条件に走らせると、リリースを伴わない main への push のたびに
-    # macOS / Windows ランナーが動く — plan を置いた目的そのものが無くなる。
-    # PR では plan が skipped になり、既定ではこの job も道連れで skipped になる
-    # ので、!cancelled() で自動スキップを外してからイベント名で判定する
-    # (plan が失敗した時は needs.plan.result で止まる)。
+    # On push / dispatch, run only when this is a version that will actually be released. Running
+    # unconditionally without going through plan would start macOS / Windows runners on every push
+    # to main that does not carry a release — defeating the purpose of having plan. On a PR plan is
+    # skipped and by default this job would be dragged along and skipped too, so remove the
+    # automatic skip with !cancelled() and then decide by event name (when plan fails, it stops at
+    # needs.plan.result).
     needs: plan
     if: >-
       ${{ !cancelled()
@@ -157,8 +160,8 @@ jobs:
           node-version: 22
           cache: pnpm
 
-      # ビルド用ではないので matrix.rust-targets (universal 用の 2 アーキ) は要らない。
-      # ホストターゲットでテストする。
+      # This is not a build, so matrix.rust-targets (the 2 architectures for universal) is not needed.
+      # Test on the host target.
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
@@ -172,8 +175,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # cargo test でも build.rs は走る。tauri-build は frontendDist (../build) が
-      # 実在しないとアプリのコードへ到達する前に落ちるので、先にフロントを作る。
+      # build.rs runs under cargo test too. tauri-build fails before reaching the app code unless
+      # frontendDist (../build) actually exists, so build the frontend first.
       - name: Build frontend
         run: pnpm build
 
@@ -183,18 +186,20 @@ jobs:
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
-  # matrix の全ジョブが成果物を上げる先の draft Release を、ビルドの前に 1 つだけ用意する。
+  # Prepare, before the build, exactly one draft Release that all jobs in the matrix upload artifacts to.
   #
-  # tauri-action に tagName だけを渡すと、各ジョブがビルド後に「その tag の Release を
-  # 一覧から探し、無ければ作る」。macOS と Windows のビルドがほぼ同時に終わると (キャッシュが
-  # 効いた再実行など) 両方が「無い」と判断し、同じ tag の draft が 2 つできる。publish は
-  # そのうち片方しか公開できず、もう片方のプラットフォームの成果物が Release から欠ける。
-  # ここで作った id を releaseId で渡せば、tauri-action は探しも作りもせずそこへ上げる。
+  # If only tagName is passed to tauri-action, each job "looks for the Release for that tag in the
+  # list and creates it if missing" after its build. If the macOS and Windows builds finish almost
+  # at the same time (e.g. a cached re-run), both decide "missing" and two drafts for the same tag
+  # are created. publish can publish only one of them, and the other platform's artifacts are
+  # missing from the Release. If the id created here is passed as releaseId, tauri-action uploads
+  # to it without searching or creating.
   #
-  # 失敗した run が残した draft は再利用し、target_commitish をこの run の commit に
-  # 直す (draft を最初に作った run の commit のまま公開すると、tag が中身と食い違う)。
+  # A draft left by a failed run is reused, and target_commitish is fixed to this run's commit
+  # (publishing it with the commit of the run that first created the draft would make the tag
+  # disagree with the contents).
   draft:
-    # test を通らないうちは draft を作らない (失敗するたびに空の draft が残るため)。
+    # Do not create a draft until test passes (an empty draft would remain after each failure).
     needs: [plan, test]
     if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-latest
@@ -211,8 +216,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: v${{ needs.plan.outputs.version }}
         run: |
-          # draft は tag からは引けない (releases/tags/<tag> は 404 を返す) ので一覧から探す。
-          # contents: write のトークンなら一覧に draft も含まれる。
+          # A draft cannot be looked up by tag (releases/tags/<tag> returns 404), so search the list.
+          # With a contents: write token, the list includes drafts too.
           found=$(gh api --paginate "repos/${GH_REPO}/releases?per_page=100" \
             --jq '.[] | select(.tag_name == env.TAG) | "\(.id) \(.draft)"')
           published=$(printf '%s\n' "$found" | awk '$2 == "false" { n++ } END { print n + 0 }')
@@ -222,8 +227,8 @@ jobs:
             echo "::error::${TAG} is already published, but plan decided to release it. Not touching it."
             exit 1
           fi
-          # どれに上げるべきかを決められない。黙って 1 つ選ぶと、残りの draft と成果物が
-          # 分かれたまま公開される。不要な draft を消してから再実行する。
+          # We cannot decide which one to upload to. Silently picking one would publish with the remaining
+          # drafts and artifacts split apart. Delete the unneeded drafts and re-run.
           if [ "$draft_count" -gt 1 ]; then
             echo "::error::found ${draft_count} draft releases for ${TAG} (ids: $(echo $drafts)). Delete all but one, then re-run."
             exit 1
@@ -247,8 +252,8 @@ jobs:
           echo "release_id=$id" >> "$GITHUB_OUTPUT"
 
   build:
-    # test を通らずにビルドしない。needs は同じ run の job にしか効かないので、
-    # テストを別 workflow に切り出さないこと。
+    # Do not build without passing test. needs only works on jobs in the same run, so do not split
+    # the tests out into a separate workflow.
     needs: [plan, test, draft]
     if: needs.plan.outputs.release == 'true'
     permissions:
@@ -257,14 +262,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Intel / Apple Silicon 両対応の universal バイナリを dmg で配布する。
-          # 署名は下記ステップで Developer ID + 公証 (notarization)。ローカルビルドは
-          # tauri.conf.json の signingIdentity "-" で ad-hoc、CI は APPLE_SIGNING_IDENTITY が
-          # それを上書きする (tauri-cli の優先順位: env > config)。
+          # Distribute a universal binary that supports both Intel / Apple Silicon as a dmg.
+          # Signing is Developer ID + notarization in the steps below. Local builds are ad-hoc via
+          # signingIdentity "-" in tauri.conf.json, and in CI APPLE_SIGNING_IDENTITY overrides it
+          # (tauri-cli precedence: env > config).
           - platform: macos-latest
             rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
             args: --target universal-apple-darwin --bundles dmg
-          # Windows は署名なしの NSIS インストーラー (.exe) のみ。MSI は作らない。
+          # Windows is only an unsigned NSIS installer (.exe). No MSI is built.
           - platform: windows-latest
             rust-targets: ''
             args: --bundles nsis
@@ -272,12 +277,12 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      # persist-credentials: false — checkout が write 権限の GITHUB_TOKEN を
-      # .git/config に残さないようにする。以降のステップ (pnpm install の install
-      # script や third-party action) がそれを拾えないようにするため。
-      # Apple の証明書を扱うジョブなので `uses:` は全て commit SHA に固定する
-      # (tauri-action だけ固定しても、先行ステップの action が改変されれば同じ)。
-      # 更新時は行末の `# v4` 等のコメントを頼りに新しい SHA を調べて置き換える。
+      # persist-credentials: false — so that checkout does not leave the write-capable GITHUB_TOKEN in
+      # `.git/config`, so that later steps (pnpm install's install scripts and third-party actions)
+      # cannot pick it up.
+      # This job handles Apple certificates, so pin every `uses:` to a commit SHA (pinning only
+      # tauri-action is not enough — the same happens if an action in an earlier step is tampered with).
+      # When updating, look up the new SHA using the trailing `# v4` style comment and replace it.
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -294,11 +299,10 @@ jobs:
           node-version: 22
           cache: pnpm
 
-      # SHA は **master 履歴のコミット**を選ぶこと。`stable` / `1.89.0` などの
-      # 生成ブランチの先端 SHA を pin すると、ブランチが進んだ時にその commit が
-      # GC され、以降の run が Rust セットアップ前に落ちる (action の README の
-      # "Choice of full-length commit SHA" 参照)。master SHA を pin する場合は
-      # ref からツールチェインを推測できないので `toolchain` を明示する。
+      # Choose a SHA from **master history commits**. If you pin the tip SHA of a generated branch such as
+      # `stable` / `1.89.0`, that commit is GC'd when the branch advances and later runs fail before the
+      # Rust setup (see "Choice of full-length commit SHA" in the action's README). When pinning a
+      # master SHA, the toolchain cannot be inferred from the ref, so specify `toolchain` explicitly.
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
@@ -313,10 +317,10 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # 署名・公証の Secret が 1 つでも欠けていると、tauri-action には空文字が渡るだけで
-      # ビルドは通ってしまう (ad-hoc 署名や公証なしの成果物ができる)。publish ジョブは
-      # 成否しか見ないため、そのまま「署名 + 公証済み」のつもりで公開される。ここで
-      # 明示的に落として、配布不能な dmg が公開されるのを防ぐ。
+      # If even one signing / notarization Secret is missing, tauri-action just gets an empty string
+      # and the build still passes (producing ad-hoc signed or non-notarized artifacts). The publish job
+      # only looks at success or failure, so it would publish as if it were "signed + notarized". Fail
+      # explicitly here to prevent an undistributable dmg from being published.
       - name: Check macOS signing secrets
         if: matrix.platform == 'macos-latest'
         env:
@@ -340,9 +344,9 @@ jobs:
           fi
           echo "All signing and notarization secrets are present."
 
-      # macOS のみ: Developer ID 証明書を一時 keychain にインポートする。
-      # tauri-action 自身は証明書をインポートしないため、ビルド前にこのステップで
-      # 用意しておく。keychain のパスワードは使い捨てなので Secret にせず生成する。
+      # macOS only: import the Developer ID certificate into a temporary keychain.
+      # tauri-action itself does not import certificates, so prepare it in this step before the build.
+      # The keychain password is disposable, so generate it instead of making it a Secret.
       - name: Import Apple Developer certificate (macOS)
         if: matrix.platform == 'macos-latest'
         env:
@@ -359,13 +363,13 @@ jobs:
             -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASSWORD" build.keychain
-          # 検索リストにも入れる。codesign は default keychain ではなく検索リストから
-          # identity を引く。default-keychain だけでも実際には通る (v0.1.1 の同一手順で
-          # 公証済み dmg がビルドできている) が、runner イメージの既定に依存しないよう明示する。
+          # Add it to the search list as well. codesign looks up the identity from the search list, not the
+          # default keychain. The default-keychain alone does work in practice (the same procedure in v0.1.1
+          # built a notarized dmg), but be explicit so we do not depend on the runner image's defaults.
           security list-keychains -d user -s build.keychain
-          # 検索リスト経由で Developer ID が引けることをここで確認し、駄目なら即失敗させる。
-          # find-identity は identity が **0 件でも exit 0** なので、単に呼ぶだけでは
-          # チェックにならない。grep で判定してビルドの奥で落ちるのを防ぐ。
+          # Confirm here that the Developer ID can be found via the search list, and fail immediately if not.
+          # find-identity **exits 0 even with 0 identities**, so just calling it is not a check. Decide
+          # with grep to avoid failing deep inside the build.
           security find-identity -v -p codesigning
           security find-identity -v -p codesigning | grep -q "Developer ID Application" || {
             echo "Error: no 'Developer ID Application' identity in the keychain search list" >&2
@@ -373,33 +377,33 @@ jobs:
           }
           rm "$RUNNER_TEMP/certificate.p12"
 
-      # draft ジョブが用意した draft Release (releaseId) にビルド成果物をアップロードする。
-      # 並列 matrix の片方だけで公開状態にならないよう、全プラットフォーム成功後に
-      # publish ジョブで公開する。releaseId を渡すと tauri-action は Release を
-      # 探しも作りもしないので、tagName / releaseName / releaseDraft は渡さない
-      # (Release の名前と tag は draft ジョブが決める)。
-      # macOS の APPLE_* を渡すと tauri-action が Developer ID 署名 + 公証 + staple を
-      # 自動で行う。Apple 認証情報を受け取るため、可変タグ @v0 ではなく commit SHA に
-      # 固定する (タグが差し替えられて secrets を抜かれるサプライチェーン攻撃を防ぐ)。
+      # Upload the build artifacts to the draft Release (releaseId) prepared by the draft job.
+      # So that one side of the parallel matrix does not make it public by itself, publish it in the
+      # publish job after all platforms succeed. When releaseId is passed, tauri-action neither looks
+      # for nor creates a Release, so do not pass tagName / releaseName / releaseDraft
+      # (the Release name and tag are decided by the draft job).
+      # Passing macOS's APPLE_* makes tauri-action automatically do Developer ID signing +
+      # notarization + staple. Since it receives Apple credentials, pin it to a commit SHA rather than
+      # the mutable tag @v0 (to prevent a supply-chain attack that swaps the tag and steals secrets).
       - name: Build and upload to GitHub Release (draft)
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Apple 認証情報は macOS ジョブにのみ渡す (Windows では空文字にして露出させない)。
+          # Apple credentials are passed only to the macOS job (empty strings on Windows so they are not exposed).
           APPLE_SIGNING_IDENTITY: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_SIGNING_IDENTITY || '' }}
           APPLE_ID: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_ID || '' }}
           APPLE_PASSWORD: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_PASSWORD || '' }}
           APPLE_TEAM_ID: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_TEAM_ID || '' }}
         with:
-          # tauri CLI を直接叩き、package.json の "tauri" スクリプトを迂回する。
-          # あちらはローカル署名用に APPLE_SIGNING_IDENTITY を env 前置きで
-          # ハードコードしており、Windows のシェルでは構文エラーになる。
+          # Call the tauri CLI directly, bypassing the "tauri" script in package.json.
+          # That one hard-codes APPLE_SIGNING_IDENTITY as an env prefix for local signing,
+          # which is a syntax error in the Windows shell.
           tauriScript: pnpm exec tauri
           releaseId: ${{ needs.draft.outputs.release_id }}
           args: ${{ matrix.args }}
 
-  # 全プラットフォームのビルド・アップロードが成功した時のみ draft を公開する。
-  # どれかが失敗した場合は draft のまま残る (不完全な Release は公開されない)。
+  # Publish the draft only when the build and upload of all platforms succeeded.
+  # If any fails, it stays a draft (an incomplete Release is never published).
   publish:
     needs: [plan, draft, build]
     if: needs.plan.outputs.release == 'true'
@@ -413,13 +417,13 @@ jobs:
         with:
           persist-credentials: false
 
-      # 公開直前に plan と同じ判定をやり直す。「Re-run failed jobs」は成功済みの plan を
-      # 再実行せず当時の release=true を使い回すので、その間に新しい version が
-      # 公開されていると make_latest で最新を巻き戻してしまう。止めた場合 draft は残る。
+      # Redo the same decision as plan right before publishing. "Re-run failed jobs" does not re-run a
+      # successful plan and reuses its release=true from back then, so if a newer version was published
+      # in the meantime, make_latest would roll back the latest. If stopped, the draft remains.
       #
-      # 公開は tag 名ではなく draft ジョブが返した id で行う (同じ tag の draft が
-      # 他にあっても取り違えない)。target_commitish もここで改めてこの run の commit に
-      # 合わせる — tag は draft を公開した時にその commit に作られる。
+      # Publishing is done by the id returned by the draft job, not by tag name (so it is not mixed up
+      # even if there are other drafts for the same tag). target_commitish is also set again here to
+      # this run's commit — the tag is created at that commit when the draft is published.
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -7,7 +7,7 @@
   import { hasFileDragPayload, readFileDragPayload } from "$lib/fileDrag";
 
   type Props = {
-    /// 設定エディタ (ConfigEditorModal) を開く。メニューの Edit config.yml と同じ
+    /// Open the config editor (ConfigEditorModal). Same as the Edit config.yml menu item
     onEditConfig: () => void;
   };
 
@@ -16,12 +16,12 @@
   const SETTINGS_DOC_URL =
     "https://github.com/cyberneura/queryfolio/blob/main/docs/settings.md";
 
-  /// ファイル選択 → config.yml へ追記 → 再読み込み → 選択、の途中か (二重押し防止)
+  /// Whether we are in the middle of: pick a file -> append to config.yml -> reload -> select (prevents double clicks)
   let addingFile = $state(false);
 
-  /// 接続 0 件の画面の「Open SQLite / DuckDB file…」。選んだファイルの接続を
-  /// config.yml の servers に 1 件足し (バックエンドがコメントを保ったまま追記する)、
-  /// 設定を読み直してその接続を選ぶ。
+  /// "Open SQLite / DuckDB file…" on the screen with zero connections. Adds a connection for the
+  /// chosen file to the servers in config.yml (the backend appends while preserving comments),
+  /// then reloads the config and selects that connection.
   const openDatabaseFile = async () => {
     if (addingFile) return;
     addingFile = true;
@@ -43,7 +43,7 @@
         toast.error("Failed to open the file dialog", { description: String(e) });
         return;
       }
-      // null = キャンセル
+      // null = cancelled
       if (typeof selected !== "string") return;
       let added;
       try {
@@ -59,9 +59,9 @@
         return;
       }
       if (!appStore.connections.some((c) => c.name === added.name)) {
-        // config_override_command が servers を丸ごと置き換えている等で、
-        // ローカルの config.yml にある接続が一覧に出てこない。追記したのか
-        // 元からあったのかは added で言い分ける
+        // e.g. config_override_command replaces servers wholesale, so a connection in the local
+        // config.yml does not show up in the list. Whether it was appended or already existed
+        // is told apart by `added`
         toast.warning(
           added.added
             ? `Added "${added.name}" to config.yml, but it is not in the list`
@@ -111,14 +111,14 @@
   const isSqlite = (engine: string): boolean =>
     engine.toLowerCase() === "sqlite" || engine.toLowerCase() === "sqlite3";
 
-  /// ツールチップに並べる詳細行を接続情報から組み立てる。
-  /// 値が無い項目は省く。SSH トンネル情報は機密を含まない host/port/user のみ。
+  /// Build the detail lines for the tooltip from the connection info.
+  /// Items without a value are omitted. SSH tunnel info is only host/port/user, which contain nothing sensitive.
   const detailRows = (c: ConnectionInfo): { label: string; value: string }[] => {
     const rows: { label: string; value: string }[] = [];
     rows.push({ label: "Engine", value: engineLabel(c.engine) });
     if (isSqlite(c.engine)) {
-      // sqlite は DB ファイルパスを schema に置くが、無ければ host に置いた
-      // 設定も backend (db.rs の connect) がサポートする。同じフォールバックで表示する。
+      // sqlite puts the DB file path in schema, but the backend (connect in db.rs) also supports
+      // a config that puts it in host. Display it with the same fallback.
       const file = c.schema ?? c.host;
       if (file) rows.push({ label: "File", value: file });
     } else {
@@ -147,8 +147,8 @@
     return rows;
   };
 
-  /// 設定順を保ったまま、連続する同一グループ名の接続をセクションにまとめる。
-  /// group_name が無い接続はヘッダ無しのセクションになる。
+  /// Group consecutive connections with the same group name into sections, keeping the config order.
+  /// A connection without group_name becomes a section with no header.
   const sections = $derived.by(() => {
     const result: { group: string | null; items: ConnectionInfo[] }[] = [];
     for (const connection of appStore.connections) {
@@ -163,24 +163,24 @@
     return result;
   });
 
-  /// ホバー中の接続とアンカー (カーソル) 位置・ツールチップ表示位置 (viewport 座標)。
+  /// The hovered connection, the anchor (cursor) position, and the tooltip display position (viewport coordinates).
   let hovered = $state<ConnectionInfo | null>(null);
   let anchorX = $state(0);
   let anchorY = $state(0);
   let tipX = $state(0);
   let tipY = $state(0);
-  /// レンダリング済みツールチップ要素 ($state にすることで bind:this 後に
-  /// clamp の $effect が再実行され、実寸法で位置補正できる)。
+  /// The rendered tooltip element (making it `$state` re-runs the clamp `$effect` after
+  /// bind:this so the position can be corrected with the real dimensions).
   let tipEl = $state<HTMLDivElement | null>(null);
 
   const TIP_MARGIN = 16;
 
-  /// クエリファイルをドラッグして重ねている接続名 (ドロップ先のハイライト用)
+  /// Name of the connection a query file is being dragged over (for highlighting the drop target)
   let dropTarget = $state<string | null>(null);
 
-  // FILES ペインからドラッグしてきたクエリファイルを受ける。
-  // dragover では dataTransfer の中身を読めないので、種別 (MIME タイプ) だけで
-  // 判定する。移動元と同じ接続には落とさせない (no-op なのでハイライトも出さない)。
+  // Accepts query files dragged from the FILES pane.
+  // dragover cannot read the contents of dataTransfer, so decide by the type (MIME type) only.
+  // Do not allow dropping on the same connection as the source (it is a no-op, so no highlight either).
   const canDrop = (e: DragEvent, connection: ConnectionInfo): boolean =>
     hasFileDragPayload(e.dataTransfer) &&
     appStore.selectedConnection !== connection.name;
@@ -189,7 +189,7 @@
     if (!canDrop(e, connection)) {
       return;
     }
-    // preventDefault しないとドロップが許可されない (HTML の DnD 仕様)
+    // Without preventDefault the drop is not allowed (HTML DnD spec)
     e.preventDefault();
     if (e.dataTransfer) {
       e.dataTransfer.dropEffect = "move";
@@ -213,8 +213,8 @@
     if (!payload || payload.connection === connection.name) {
       return;
     }
-    // 移動元はドラッグ開始時の接続 (payload) を使う。ドロップまでの間に
-    // 選択接続が変わっていても、掴んだファイルを取り違えない。
+    // Use the connection at drag start (payload) as the source. Even if the selected
+    // connection changes before the drop, the file that was grabbed is never mixed up.
     const moved = await appStore.moveFileToConnection(
       payload.fileName,
       payload.connection,
@@ -237,8 +237,8 @@
   const setAnchor = (e: MouseEvent) => {
     anchorX = e.clientX;
     anchorY = e.clientY;
-    // 実測クランプ ($effect) の前でもカーソル付近に出しておく (初回表示時に
-    // 前回位置や左上へ一瞬ちらつくのを防ぐ)。溢れ補正は $effect が行う。
+    // Place it near the cursor even before the measured clamp ($effect) (prevents a brief flicker
+    // to the previous position or the top left on first display). The $effect handles overflow correction.
     tipX = e.clientX + TIP_MARGIN;
     tipY = e.clientY + TIP_MARGIN;
   };
@@ -247,12 +247,12 @@
     hovered = null;
   };
 
-  // アンカー位置とレンダリング済みツールチップの実寸法から、ビューポート内に
-  // 収まる表示位置を決める。カーソルの右下に出し、右端・下端で溢れる場合は
-  // 左側・上側へ反転させる。長い値 (SQLite パスや description) で折り返して
-  // 高さ/幅が変わっても、実測サイズを使うので確実に画面内へ収まる。
+  // From the anchor position and the real dimensions of the rendered tooltip, decide a display
+  // position that fits in the viewport. Show it at the lower right of the cursor, and flip to the
+  // left / upper side when it would overflow the right / bottom edge. Even if a long value (SQLite
+  // path or description) wraps and changes the height/width, the measured size is used, so it always fits on screen.
   $effect(() => {
-    // hovered / anchor / tipEl を依存に取る (tipEl 確定後に再実行される)
+    // Depend on hovered / anchor / tipEl (re-runs once tipEl is set)
     if (!hovered || !tipEl) return;
     const w = tipEl.offsetWidth;
     const h = tipEl.offsetHeight;
@@ -363,9 +363,9 @@
                 >
               {/if}
               {#if connection.sql_ssl_mode}
-                <!-- 画面には出さない。詳細ツールチップは mouseenter でしか開かない
-                     ため、バッヂを消すとキーボード / スクリーンリーダーからは TLS の
-                     状態を知る手段が無くなる。警告ではなく値そのものを読ませる。 -->
+                <!-- Not shown on screen. The detail tooltip opens only on mouseenter,
+                     so removing the badge would leave keyboard / screen reader users no way to learn the
+                     TLS state. Have them read the value itself, not a warning. -->
                 <span class="sr-only">TLS: {connection.sql_ssl_mode}</span>
               {/if}
             </span>

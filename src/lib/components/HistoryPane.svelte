@@ -4,16 +4,16 @@
   import appStore from "$lib/stores/app.svelte";
 
   interface Props {
-    /// FILES / TABLES タブへの切り替え (タブ状態は +page.svelte が持つ)
+    /// Switch to the FILES / TABLES tab (+page.svelte owns the tab state)
     onShowFiles: () => void;
     onShowTables: () => void;
   }
 
   let { onShowFiles, onShowTables }: Props = $props();
 
-  /// インクリメンタル検索のデバウンス時間
+  /// Debounce time for incremental search
   const SEARCH_DEBOUNCE_MS = 250;
-  /// 一度に取得する履歴の件数
+  /// Number of history entries fetched at once
   const FETCH_LIMIT = 200;
 
   let search = $state("");
@@ -43,9 +43,9 @@
     }
   };
 
-  // 接続・検索語の変化で再読込する (初回マウント時も走る)。
-  // クエリ実行の完了 (running の変化) も購読し、実行直後の履歴を拾う。
-  // 検索はインクリメンタルなのでデバウンスして呼び出し回数を抑える。
+  // Reload when the connection or search term changes (also runs on first mount).
+  // Also subscribe to query execution completion (changes in running) to pick up the history just after execution.
+  // Search is incremental, so debounce it to limit the number of calls.
   $effect(() => {
     const connection = appStore.selectedConnection;
     const searchText = search.trim();
@@ -56,7 +56,7 @@
     return () => clearTimeout(timer);
   });
 
-  /// 履歴の時刻 (ISO 8601) をローカルの短い表記にする
+  /// Turn a history timestamp (ISO 8601) into a short local format
   const formatTime = (iso: string): string => {
     const date = new Date(iso);
     if (Number.isNaN(date.getTime())) {
@@ -69,7 +69,7 @@
     );
   };
 
-  /// リスト表示用に SQL の先頭行を返す
+  /// Return the first line of the SQL for list display
   const firstLine = (sql: string): string => sql.trimStart().split("\n")[0];
 </script>
 
@@ -84,7 +84,7 @@
       FILES
     </button>
     <span class="text-xs font-semibold tracking-wide text-zinc-400">HISTORY</span>
-    <!-- テーブルの概念が無いエンジン (redis 等) では TABLES を出さない -->
+    <!-- Engines with no table concept (redis etc.) do not show TABLES -->
     {#if appStore.selectedCapabilities?.supports_tables ?? true}
       <button
         class="text-xs font-semibold tracking-wide text-zinc-600 hover:text-zinc-300"

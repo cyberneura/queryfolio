@@ -1,14 +1,14 @@
-//! クエリファイル保存フォルダに置く、接続を説明するメタファイルの生成。
+//! Generates the metadata file that describes the connection, placed in the query-file folder.
 //!
-//! 各接続のクエリファイルは `<sqlfiles_dir>/<folder>/*.sql` に保存される。
-//! AI エージェント (sql-agent 系や coding agent) や人間がそのフォルダを開いた
-//! 時に「どの DB のどんな用途のクエリか」を理解できるよう、接続の非機密メタ
-//! 情報を Markdown で書き出す。
+//! Each connection's query files are stored in `<sqlfiles_dir>/<folder>/*.sql`.
+//! So that AI agents (sql-agent family or coding agents) and humans opening that folder can
+//! tell which DB and what purpose the queries are for, the connection's non-secret metadata
+//! is written out as Markdown.
 //!
-//! 機密 (パスワード・SSH 鍵・パスフレーズ) は絶対に含めない。含めるのは
-//! ConnectionInfo でフロントに既に渡している範囲の情報 (name / description /
-//! engine / host / port / schema / user / readonly / group / SSH トンネルの
-//! 有無) に留める。
+//! Secrets (passwords, SSH keys, passphrases) must never be included. Only information that
+//! ConnectionInfo already hands to the frontend is included (name / description /
+//! engine / host / port / schema / user / readonly / group / whether an SSH tunnel is
+//! used).
 
 use std::fs;
 use std::path::Path;
@@ -16,11 +16,11 @@ use std::path::Path;
 use crate::config::ServerConfig;
 use crate::error::AppError;
 
-/// メタファイル名。`.sql` ではないためクエリファイル一覧・検索 (.sql のみ対象)
-/// には現れない。dot 始まりでもないためエージェント/Finder から可視。
+/// Metadata file name. It is not `.sql`, so it does not appear in the query-file list or search
+/// (which only cover .sql). It does not start with a dot, so it is visible to agents / Finder.
 pub const META_FILE_NAME: &str = "_queryfolio.md";
 
-/// Option<String> を表示用に整形する (None / 空白のみは "-")。
+/// Formats an Option<String> for display (None / whitespace-only becomes "-").
 fn field(value: Option<&str>) -> String {
     match value.map(str::trim) {
         Some(v) if !v.is_empty() => v.to_string(),
@@ -28,7 +28,7 @@ fn field(value: Option<&str>) -> String {
     }
 }
 
-/// 接続の非機密メタ情報から Markdown を生成する。
+/// Generates Markdown from the connection's non-secret metadata.
 pub fn render_meta(server: &ServerConfig) -> String {
     let mut out = String::new();
     out.push_str(&format!("# Queryfolio — {}\n\n", server.name));
@@ -59,8 +59,8 @@ overwritten. No secrets (passwords, SSH keys) are included.\n\n",
         "- **Database (schema):** {}\n",
         field(server.schema.as_deref())
     ));
-    // dynamodb の user は AWS アクセスキー ID (資格情報の識別子) なので
-    // メタファイルには出さない
+    // For dynamodb the user is an AWS access key ID (a credential identifier), so
+    // it is not written to the metadata file
     let user_display = if server.engine.eq_ignore_ascii_case("dynamodb") {
         server.user.as_ref().map(|_| "(aws access key, hidden)")
     } else {
@@ -90,10 +90,10 @@ overwritten. No secrets (passwords, SSH keys) are included.\n\n",
     out
 }
 
-/// フォルダにメタファイルを書き出す。
+/// Writes the metadata file into the folder.
 ///
-/// - フォルダが存在しない時は何もしない (メタだけのために空フォルダを作らない)。
-/// - 内容が既存と同じなら書かない (mtime churn 回避)。
+/// - Does nothing if the folder does not exist (no empty folder is created just for metadata).
+/// - Does not write if the content is identical to the existing one (avoids mtime churn).
 pub fn write_folder_meta(dir: &Path, server: &ServerConfig) -> Result<(), AppError> {
     if !dir.is_dir() {
         return Ok(());
@@ -148,7 +148,7 @@ mod tests {
         assert!(meta.contains("- **Read-only:** yes"));
         assert!(meta.contains("- **Group:** Production"));
         assert!(meta.contains("- **SSH tunnel:** no"));
-        // パスワードは絶対に含めない
+        // Never include the password
         assert!(!meta.contains("s3cret"));
     }
 
@@ -186,7 +186,7 @@ mod tests {
         });
         let meta = render_meta(&s);
         assert!(meta.contains("- **SSH tunnel:** via tunnel@bastion.example.com:22"));
-        // トンネルの機密も含めない
+        // Do not include tunnel secrets either
         assert!(!meta.contains("tunnelpass"));
         assert!(!meta.contains("keypass"));
         assert!(!meta.contains("id_ed25519"));
@@ -200,15 +200,15 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = fs::remove_dir_all(&dir);
-        // フォルダが無ければ書かない (空フォルダも作らない)
+        // Do not write if the folder does not exist (no empty folder is created either)
         write_folder_meta(&dir, &base_server()).unwrap();
         assert!(!dir.exists());
     }
 
     #[test]
     fn test_meta_file_does_not_appear_in_query_file_listing() {
-        // lib.rs のフロー (クエリファイル作成 → メタファイル書き出し) を再現し、
-        // メタファイルがクエリファイル一覧・検索 (.sql のみ対象) に出ないことを確認する。
+        // Reproduce the lib.rs flow (create query file -> write metadata file) and
+        // verify the metadata file does not appear in the query-file list / search (.sql only).
         use crate::query_files;
 
         let sqlfiles_dir = std::env::temp_dir().join(format!(
@@ -219,19 +219,19 @@ mod tests {
         let _ = fs::remove_dir_all(&sqlfiles_dir);
         let folder = "db.example.com_postgres_orders_app";
 
-        // クエリファイルを 1 つ作る (フォルダが作られる)
+        // Create one query file (this creates the folder)
         query_files::create_query_file(&sqlfiles_dir, folder, "report", "sql").unwrap();
-        // メタファイルを書き出す (lib.rs の refresh_folder_meta 相当)
+        // Write the metadata file (equivalent to refresh_folder_meta in lib.rs)
         let dir = query_files::connection_dir(&sqlfiles_dir, folder).unwrap();
         write_folder_meta(&dir, &base_server()).unwrap();
 
-        // メタファイルは実在する
+        // The metadata file exists
         assert!(dir.join(META_FILE_NAME).exists());
-        // が、クエリファイル一覧には現れない (.sql のみ)
+        // but does not appear in the query-file list (.sql only)
         let files = query_files::list_query_files(&sqlfiles_dir, folder, "sql").unwrap();
         assert_eq!(files, vec!["report.sql"]);
-        // 検索にも現れない (中身の "Production" は base_server の group 名だが
-        // メタファイルは .sql でないため検索対象外)
+        // Nor in search ("Production" in the content is the base_server group name, but
+        // the metadata file is not .sql, so it is excluded from search)
         let hits =
             query_files::search_query_files(&sqlfiles_dir, folder, "Production", "sql").unwrap();
         assert!(hits.is_empty());
@@ -256,7 +256,7 @@ mod tests {
         let written = fs::read_to_string(&path).unwrap();
         assert_eq!(written, render_meta(&server));
 
-        // 内容が同じなら mtime を変えない (書き込みをスキップする)
+        // If the content is identical, do not change mtime (skip the write)
         let mtime1 = fs::metadata(&path).unwrap().modified().unwrap();
         write_folder_meta(&dir, &server).unwrap();
         let mtime2 = fs::metadata(&path).unwrap().modified().unwrap();

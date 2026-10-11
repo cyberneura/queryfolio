@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 
 use crate::error::AppError;
 
-/// パス要素として安全な名前かを検証して返す。
-/// パストラバーサルや不可視ファイルを防ぐ。
-/// (history.rs でも接続名の検証に使う)
+/// Validate that a name is safe as a path component and return it.
+/// Guards against path traversal and hidden files.
+/// (Also used by history.rs to validate connection names.)
 pub(crate) fn validate_component(name: &str) -> Result<&str, AppError> {
     let name = name.trim();
     if name.is_empty() {
@@ -25,9 +25,9 @@ pub(crate) fn validate_component(name: &str) -> Result<&str, AppError> {
     Ok(name)
 }
 
-/// クエリファイル名を正規化する (接続エンジンの拡張子を保証する)。
-/// ext は "sql" / "redis" などドット無しの拡張子 (engines::EngineCapabilities
-/// の file_extension)。
+/// Normalize a query file name (ensures the connection engine's extension).
+/// `ext` is an extension without the dot, such as "sql" / "redis" (the
+/// file_extension of engines::EngineCapabilities).
 pub(crate) fn normalize_file_name(name: &str, ext: &str) -> Result<String, AppError> {
     let name = validate_component(name)?;
     let suffix = format!(".{}", ext.to_ascii_lowercase());
@@ -38,7 +38,7 @@ pub(crate) fn normalize_file_name(name: &str, ext: &str) -> Result<String, AppEr
     }
 }
 
-/// 接続名に対応するクエリファイル保存ディレクトリを返す。
+/// Return the directory where query files are stored for a connection name.
 pub(crate) fn connection_dir(
     sqlfiles_dir: &Path,
     connection: &str,
@@ -57,16 +57,18 @@ fn file_path(
     Ok(connection_dir(sqlfiles_dir, connection)?.join(file_name))
 }
 
-/// 数字の並びを数値として扱う比較 (自然順)。
+/// Comparison that treats runs of digits as numbers (natural order).
 ///
-/// 素の辞書順だと桁数の違う連番が作成順とズレる: 同一分に複数作った時の連番は
-/// ゼロ埋めされないため (FilesPane の defaultFileName)、"-9" と "-10" では
-/// '1' < '9' により降順で "-9" が先に来る = 古い方が上に並んでしまう。
-/// 数字の並びをまとめて数値として比較することでこれを避ける。
+/// Plain lexicographic order makes numbered suffixes of different digit counts disagree with
+/// creation order: the sequence numbers appended when several files are created within the same
+/// minute are not zero-padded (FilesPane's defaultFileName), so for "-9" vs "-10" the '1' < '9'
+/// rule puts "-9" first in descending order, i.e. the older file ends up on top.
+/// Comparing each run of digits as a number avoids this.
 ///
-/// 値が同じ数字列 ("02" と "2") は、比較を決定的にするため桁数の少ない方を先にする。
+/// Digit strings with the same value ("02" and "2") are ordered with the one having fewer digits
+/// first, to keep the comparison deterministic.
 fn natural_cmp(a: &str, b: &str) -> Ordering {
-    /// 先頭から続く ASCII 数字を消費して返す。
+    /// Consume and return the leading run of ASCII digits.
     fn take_digits(it: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
         let mut out = String::new();
         while let Some(c) = it.peek() {
@@ -84,15 +86,15 @@ fn natural_cmp(a: &str, b: &str) -> Ordering {
     loop {
         match (ai.peek().copied(), bi.peek().copied()) {
             (None, None) => return Ordering::Equal,
-            // 前方一致する短い方を小さいとみなす (辞書順と同じ)
+            // The shorter one that is a prefix is considered smaller (same as lexicographic order)
             (None, Some(_)) => return Ordering::Less,
             (Some(_), None) => return Ordering::Greater,
             (Some(x), Some(y)) => {
                 if x.is_ascii_digit() && y.is_ascii_digit() {
                     let da = take_digits(&mut ai);
                     let db = take_digits(&mut bi);
-                    // 先頭ゼロを除けば「桁数 → 辞書順」で数値の大小になる
-                    // (u64 へのパースだと極端に長い数字列で溢れる)
+                    // Once leading zeros are stripped, "digit count, then lexicographic" gives numeric order
+                    // (parsing into u64 would overflow on extremely long digit strings)
                     let ta = da.trim_start_matches('0');
                     let tb = db.trim_start_matches('0');
                     let ord = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
@@ -116,19 +118,20 @@ fn natural_cmp(a: &str, b: &str) -> Ordering {
     }
 }
 
-/// ディレクトリ直下の、拡張子が ext のファイル名を**降順**で返す。存在しなければ空。
-/// (list_query_files と search_query_files で列挙条件を共有し、
-///  隠しファイル/拡張子判定/ソートが片方だけズレるのを防ぐ)
+/// Return the file names directly under the directory that have extension `ext`, in **descending**
+/// order. Empty if the directory does not exist.
+/// (list_query_files and search_query_files share the enumeration criteria so that hidden-file /
+/// extension checks and sorting cannot drift apart in only one of them.)
 ///
-/// dot 始まりの隠しファイルは除外する。validate_component が dot 始まりの名前を
-/// 拒否する (= CRUD で開けない) のと一貫させ、手動配置された隠しファイルの中身が
-/// 検索プレビューから漏れないようにする。
+/// Hidden dot-files are excluded. This is consistent with validate_component rejecting names that
+/// start with a dot (= they cannot be opened via CRUD), and keeps the contents of manually placed
+/// hidden files from leaking into search previews.
 ///
-/// 降順にしているのは「新しいファイルを一覧の上に出す」ため。既定のファイル名は
-/// `YYYYMMDD-HHMM` 形式で、名前順がそのまま時系列になるよう作られている
-/// (FilesPane の defaultFileName)。したがって名前の降順 = 新しい順になる。
-/// 更新日時ではなく名前を基準にするのは、保存のたびに並びが入れ替わって
-/// 作業中に一覧が跳ねるのを避けるため。
+/// Descending order is used so that "new files appear at the top of the list". The default file
+/// name has the form `YYYYMMDD-HHMM`, designed so that name order is chronological order
+/// (FilesPane's defaultFileName). Hence descending name order = newest first.
+/// Names rather than modification time are used so the list does not reshuffle on every save and
+/// jump around while the user is working.
 fn list_query_file_names(dir: &Path, ext: &str) -> Result<Vec<String>, AppError> {
     if !dir.exists() {
         return Ok(vec![]);
@@ -141,30 +144,30 @@ fn list_query_file_names(dir: &Path, ext: &str) -> Result<Vec<String>, AppError>
         .filter(|name| !name.starts_with('.'))
         .filter(|name| name.to_ascii_lowercase().ends_with(&suffix))
         .collect();
-    // 降順 (新しいものが先頭)。比較は**拡張子を除いた部分**を自然順で行う。
+    // Descending (newest first). The comparison is done on the **part without the extension** in natural order.
     //
-    // 拡張子を付けたまま比べると、同じ分に作られた連番ファイル
-    // ("20260804-1200.sql" と "20260804-1200-2.sql") の順序が逆になる:
-    // '.' (0x2E) > '-' (0x2D) なので、降順では古い無印の方が先に来てしまう。
-    // 拡張子を落とせば "20260804-1200-2" > "20260804-1200" (前方一致する
-    // 短い方が小さい) となり、作成順どおり新しいものが先頭に来る。
+    // Comparing with the extension attached would reverse the order of numbered files created in
+    // the same minute ("20260804-1200.sql" and "20260804-1200-2.sql"):
+    // '.' (0x2E) > '-' (0x2D), so in descending order the older un-numbered one would come first.
+    // Dropping the extension gives "20260804-1200-2" > "20260804-1200" (the shorter prefix-match is
+    // smaller), so the newest comes first in creation order.
     //
-    // 全要素が suffix で終わることは上の filter が保証しており、suffix は
-    // ASCII なので、末尾 suffix.len() バイトを落とす位置は必ず文字境界になる。
+    // The filter above guarantees every element ends with the suffix, and the suffix is ASCII, so
+    // the position that drops the trailing suffix.len() bytes is always a char boundary.
     let ext_len = suffix.len();
     names.sort_unstable_by(|a, b| {
         let a_stem = &a[..a.len() - ext_len];
         let b_stem = &b[..b.len() - ext_len];
-        // stem が同じになるのは拡張子の大文字小文字だけが違う場合。
-        // 並びを決定的にするため、その時は名前全体で決める。
+        // Equal stems only happen when the extensions differ just in case.
+        // In that case, decide by the whole name to keep the order deterministic.
         natural_cmp(b_stem, a_stem).then_with(|| b.cmp(a))
     });
     Ok(names)
 }
 
-/// 接続のクエリファイル一覧を返す (名前降順 = 新しいものが先頭)。
-/// アプリの一覧は list_query_file_entries (更新日時順) に移ったので、名前順の並びを
-/// テストで確かめるためだけに残している
+/// Return the query file list of a connection (descending by name = newest first).
+/// The app's list moved to list_query_file_entries (by modification time); this is kept only so
+/// tests can verify the name-based order.
 #[cfg(test)]
 pub fn list_query_files(
     sqlfiles_dir: &Path,
@@ -174,26 +177,27 @@ pub fn list_query_files(
     list_query_file_names(&connection_dir(sqlfiles_dir, connection)?, ext)
 }
 
-/// FILES ペインの 1 行 (ファイル名 + 更新日時 + サイズ)。
+/// One row of the FILES pane (file name + modification time + size).
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
 pub struct QueryFileEntry {
-    /// ファイル名 (拡張子付き)
+    /// File name (with extension)
     pub file_name: String,
-    /// 最終更新日時 (UNIX エポックからのミリ秒)。OS から取れなければ None
+    /// Last modification time (milliseconds since the UNIX epoch). None if the OS cannot provide it
     pub modified_ms: Option<i64>,
-    /// ファイルサイズ (バイト)
+    /// File size (bytes)
     pub size: u64,
 }
 
-/// FILES ペイン用の一覧。**更新日時の降順** (最近編集したものが先頭) で返す
-/// (CYBERNEURA-DEV-774)。
+/// List for the FILES pane. Returned in **descending modification time** (most recently edited
+/// first) (CYBERNEURA-DEV-774).
 ///
-/// 列挙条件 (隠しファイル・拡張子) は list_query_file_names と共有し、その名前順を
-/// 安定ソートの初期順にする。更新日時が同じもの (と取れないもの) はその中で名前順の
-/// ままになり、取れないものは末尾に回る。
+/// The enumeration criteria (hidden files, extension) are shared with list_query_file_names, and
+/// its name order is used as the initial order for a stable sort. Entries with equal modification
+/// time (and those whose time is unavailable) stay in name order within their group, and entries
+/// without a time go to the end.
 ///
-/// 検索 (search_query_files) と list_query_files は名前順のまま。保存のたびに
-/// 並びが変わってよいのは、日時を並べて見せる FILES ペインだけ。
+/// Search (search_query_files) and list_query_files stay in name order. Only the FILES pane,
+/// which shows the timestamps, is allowed to reorder on every save.
 pub fn list_query_file_entries(
     sqlfiles_dir: &Path,
     connection: &str,
@@ -202,7 +206,7 @@ pub fn list_query_file_entries(
     let dir = connection_dir(sqlfiles_dir, connection)?;
     let mut entries: Vec<QueryFileEntry> = list_query_file_names(&dir, ext)?
         .into_iter()
-        // 列挙と stat の間に消えたファイルは一覧に出さない (開けないため)
+        // Files that vanished between enumeration and stat are left out of the list (they cannot be opened)
         .filter_map(|file_name| {
             let meta = fs::metadata(dir.join(&file_name)).ok()?;
             let modified_ms = meta
@@ -217,31 +221,31 @@ pub fn list_query_file_entries(
             })
         })
         .collect();
-    // Option の順序は None < Some なので、降順にすると取れないものが末尾に来る。
-    // sort_by_key は安定ソートなので、同じ日時の中では名前順が保たれる
+    // Option orders None < Some, so descending puts entries without a time at the end.
+    // sort_by_key is a stable sort, so name order is preserved within the same time
     entries.sort_by_key(|e| std::cmp::Reverse(e.modified_ms));
     Ok(entries)
 }
 
-/// クエリファイル検索の 1 ヒット。
+/// One hit of a query file search.
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
 pub struct FileSearchHit {
-    /// ヒットしたファイル名 (拡張子付き)
+    /// Matched file name (with extension)
     pub file_name: String,
-    /// ファイル名が query に一致したか
+    /// Whether the file name matched the query
     pub name_match: bool,
-    /// 中身が一致した最初の行 (プレビュー用。名前のみ一致なら None)
+    /// First line whose content matched (for preview; None if only the name matched)
     pub content_preview: Option<String>,
 }
 
-/// プレビュー行の最大文字数 (これを超えたら末尾を省略記号にする)。
+/// Maximum number of characters in the preview line (anything longer is cut and ends with an ellipsis).
 const PREVIEW_MAX_CHARS: usize = 120;
 
-/// 検索結果の最大件数。名前降順 (新しい順) で先頭からこの数で打ち切る
-/// (モーダルの一覧を短く保ち、多数ファイル環境での読み取りコストも抑える)。
+/// Maximum number of search results. The search stops after this many from the top in descending
+/// name order (newest first) (keeps the modal list short and bounds read cost with many files).
 const MAX_SEARCH_HITS: usize = 50;
 
-/// プレビュー行を前後の空白除去 + 長さ制限で整形する。
+/// Format a preview line by trimming surrounding whitespace and limiting its length.
 fn truncate_preview(line: &str) -> String {
     let trimmed = line.trim();
     if trimmed.chars().count() <= PREVIEW_MAX_CHARS {
@@ -251,11 +255,12 @@ fn truncate_preview(line: &str) -> String {
     format!("{cut}…")
 }
 
-/// 接続のクエリファイルをファイル名・中身で検索する。
-/// 大文字小文字を区別しない部分一致。中身は最初に一致した行をプレビューとして返す。
-/// 名前降順 (新しい順) で、名前一致または中身一致したファイルのみ返す。
-/// (rg/grep のような外部プロセスは使わない。クエリファイルは少数のため
-///  純 Rust で読み取る方が堅牢で、外部依存・インジェクション面も持たない)
+/// Search a connection's query files by file name and content.
+/// Case-insensitive substring match. For content, the first matching line is returned as the
+/// preview. Only files whose name or content matched are returned, in descending name order
+/// (newest first).
+/// (No external process such as rg/grep is used. Query files are few, so reading them in pure
+/// Rust is more robust and has no external dependency or injection surface.)
 pub fn search_query_files(
     sqlfiles_dir: &Path,
     connection: &str,
@@ -272,7 +277,7 @@ pub fn search_query_files(
     let mut hits = Vec::new();
     for name in names {
         let name_match = name.to_lowercase().contains(&needle);
-        // 中身検索。読めないファイル (バイナリ等) はスキップし、名前一致だけで拾う
+        // Content search. Unreadable files (binary etc.) are skipped and picked up by name match only
         let content_preview = fs::read_to_string(dir.join(&name))
             .ok()
             .and_then(|content| {
@@ -287,7 +292,7 @@ pub fn search_query_files(
                 name_match,
                 content_preview,
             });
-            // 名前降順 (新しい順) で先頭から上限まで。以降のファイルは読まずに打ち切る
+            // Descending name order (newest first), up to the limit from the top. Later files are not read; stop here
             if hits.len() >= MAX_SEARCH_HITS {
                 break;
             }
@@ -296,13 +301,13 @@ pub fn search_query_files(
     Ok(hits)
 }
 
-/// クエリファイルの絶対パスを文字列で返す (「Copy full path」用)。
-/// パストラバーサル対策のため名前を検証・正規化してから組み立てる。
-/// 一覧に出ているファイルからのみ呼ばれるため存在チェックはしない。
-/// sqlfiles_dir が相対パスで設定されている場合、組み立てた path も相対になる。
-/// 「Copy full path」の名の通り常に絶対パスを返すため、相対のときは
-/// カレントディレクトリ基準で絶対化する (std::path::absolute は存在チェック
-/// もシンボリックリンク解決も伴わない字句的な絶対化)。
+/// Return the absolute path of a query file as a string (for "Copy full path").
+/// The name is validated and normalized before building the path, as a path-traversal defense.
+/// It is only called for files shown in the list, so no existence check is done.
+/// If sqlfiles_dir is configured as a relative path, the built path is relative too.
+/// Since "Copy full path" must always return an absolute path, a relative one is made absolute
+/// against the current directory (std::path::absolute is a lexical absolutization that neither
+/// checks existence nor resolves symlinks).
 pub fn query_file_path(
     sqlfiles_dir: &Path,
     connection: &str,
@@ -330,27 +335,27 @@ pub fn read_query_file(
     Ok(fs::read_to_string(&path)?)
 }
 
-/// 保存領域のディレクトリを作る。**Unix では自分が作った階層だけ**を 0700 にする。
+/// Create the storage directories. **On Unix only the levels created here** get mode 0700.
 ///
-/// クエリファイルには WHERE の実値・テーブル名・DDL が入り、同じ内容を保存する
-/// 実行履歴 (history.rs) は 0700 / 0600 で明示的に絞ってある。作成時のモードを
-/// 指定しないと umask 既定 (通常 0755 / 0644) になり、同一ホストの他ユーザーから
-/// 読めてしまう (CYBERNEURA-DEV-510)。Windows ではモードの概念が無く、ACL は
-/// 従来どおり親ディレクトリからの継承に任せる。
+/// Query files contain actual WHERE values, table names and DDL, and the execution history
+/// (history.rs), which stores the same content, is explicitly restricted to 0700 / 0600. Without
+/// specifying the mode at creation, the umask default (usually 0755 / 0644) applies and other
+/// users on the same host could read them (CYBERNEURA-DEV-510). Windows has no mode concept, and
+/// ACLs are left to inheritance from the parent directory as before.
 ///
-/// `create_dir_all` + `set_permissions` にしないのは 2 つの理由から:
-/// - `create_dir_all` は途中の階層 (保存ルート等) も作るが、モードを設定できるのは
-///   最終ディレクトリだけで、間の階層が umask 既定のまま残る
-/// - 「存在するか」を見てから作ると、その間に他プロセスが作ったディレクトリまで
-///   締め直してしまう (相手がより厳しく作っていた場合は逆に緩める)
+/// `create_dir_all` + `set_permissions` is not used, for two reasons:
+/// - `create_dir_all` also creates intermediate levels (the storage root etc.), but the mode can
+///   only be set on the final directory, leaving the levels in between with the umask default
+/// - If we check "does it exist" first and then create, we would also tighten a directory that
+///   another process created in between (or loosen it, if it had been created more strictly)
 ///
-/// 代わりに階層ごとに `create_dir` を使う。「無ければ作る」が 1 回のシステムコールで
-/// 完結し、既にあれば `AlreadyExists` が返るので、**自分が作った時だけ**モードを
-/// 設定できる。既存ディレクトリのモードは変えない (利用者が意図的に緩めた設定を
-/// 後から締め直さない。書き込み時に既存のパーミッションを引き継ぐ write_file_atomic と
-/// 同じ考え方)。
+/// Instead `create_dir` is used per level. "Create if missing" completes in one system call, and
+/// `AlreadyExists` is returned if it already exists, so the mode can be set **only when we created
+/// it**. The mode of an existing directory is not changed (a setting the user intentionally
+/// loosened is not tightened later; the same idea as write_file_atomic, which inherits existing
+/// permissions on write).
 fn ensure_dir_700(dir: &Path) -> Result<(), AppError> {
-    // 作る必要がある階層を、深い方から順に集める。
+    // Collect the levels that need creating, from the deepest one upward.
     let mut missing = Vec::new();
     let mut current = Some(dir);
     while let Some(path) = current {
@@ -361,11 +366,11 @@ fn ensure_dir_700(dir: &Path) -> Result<(), AppError> {
         current = path.parent();
     }
 
-    // 浅い方から作る。**作る時点で 0700 を指定する** (`DirBuilder::mode`)。
-    // 作ってから chmod する形だと、その間にクラッシュしたディレクトリが umask 既定の
-    // まま残り、次回以降は「既存」として扱われて締め直されない。
-    // umask は指定したモードからビットを落とすことしかできないので、作成時点で
-    // 他ユーザーに開くことはない。落とされた所有者ビットは直後に戻す。
+    // Create from the shallowest level. **Specify 0700 at creation time** (`DirBuilder::mode`).
+    // If we chmod after creating, a directory left behind by a crash in between would remain with the
+    // umask default and be treated as "existing" from then on, never tightened.
+    // The umask can only drop bits from the specified mode, so it never opens the directory to other
+    // users at creation. The owner bits it dropped are restored right afterward.
     for path in missing.iter().rev() {
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
@@ -381,7 +386,7 @@ fn ensure_dir_700(dir: &Path) -> Result<(), AppError> {
                     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
                 }
             }
-            // 競合して他プロセスが先に作った。モードは相手のものを尊重する。
+            // Another process won the race and created it first. Respect its mode.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e.into()),
         }
@@ -389,10 +394,10 @@ fn ensure_dir_700(dir: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-/// 新規作成するための共通オプション (`O_EXCL`)。**Unix ではモードを 600 にする。**
-///
-/// `create_new` なので既存は潰さない。history.rs の `open_options_600` と同じ意図で、
-/// 新規作成分のモードだけを絞る。Windows ではモード指定が効かず、ACL は従来どおり。
+/// Common options for creating a new file (`O_EXCL`). **On Unix the mode is 600.**
+/// `create_new` never clobbers an existing file. Same intent as `open_options_600` in history.rs:
+/// only the mode of newly created files is tightened. On Windows the mode has no effect and
+/// ACLs stay as before.
 fn create_new_options_600() -> fs::OpenOptions {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -404,19 +409,18 @@ fn create_new_options_600() -> fs::OpenOptions {
     options
 }
 
-/// `create_new_options_600` でファイルを新規作成する。
-///
-/// `mode` は umask でビットを落とされるため、所有者ビットまで落とす umask (0700 等) の
-/// 下では読み書きできない 000 のファイルが残る。作成直後に 0600 を設定して戻す
-/// (config.rs が config.yml を作る時と同じ形)。
+/// Create a new file with `create_new_options_600`.
+/// `mode` has bits dropped by the umask, so under a umask that drops even the owner bits (0700
+/// etc.) a 000 file that cannot be read or written would be left. Set 0600 right after creation
+/// to restore them (same form as config.rs when it creates config.yml).
 fn create_new_file_600(path: &Path) -> std::io::Result<fs::File> {
     let file = create_new_options_600().open(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        // モードを付けられないなら、作ったファイルを残さずに失敗させる。
-        // 中途半端に緩いファイルを置いていくくらいなら作成そのものを失敗させる方がよい
-        // (fchmod が拒否されるのは一部のネットワーク FS 等に限られる)。
+        // If the mode cannot be applied, fail without leaving the created file behind.
+        // Failing creation itself is better than leaving a half-permissive file
+        // (fchmod is refused only on some network filesystems etc.).
         if let Err(e) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
             drop(file);
             let _ = fs::remove_file(path);
@@ -426,32 +430,33 @@ fn create_new_file_600(path: &Path) -> std::io::Result<fs::File> {
     Ok(file)
 }
 
-/// 同一ディレクトリの一時ファイルへ書いてから rename で置き換える。
+/// Write to a temporary file in the same directory, then replace with rename.
 ///
-/// `fs::write` は宛先を truncate してから書き足すため、書いている途中の状態が
-/// ディスク上に見える。CLI (`queryfolio write`) は**アプリ本体とは別プロセス**なので、
-/// 同じファイルへの同時書き込みや、実行中インスタンスの外部変更ウォッチャによる
-/// 読み取りが書き込みと重なりうる。その窓では中途半端な内容が読まれたり、
-/// 2 つの書き手の内容が混ざった壊れたクエリが残ったりする。
-/// rename は同一ファイルシステム内では atomic なので、読み手には「書き込み前」か
-/// 「書き込み後」のどちらかしか見えない (書き手同士も最後の 1 つが丸ごと勝つ)。
+/// `fs::write` truncates the destination and then appends, so the intermediate state is visible
+/// on disk. The CLI (`queryfolio write`) is a **separate process from the app**, so concurrent
+/// writes to the same file, or reads by the running instance's external-change watcher, can
+/// overlap a write. In that window half-written content may be read, or a broken query mixing the
+/// contents of two writers may be left behind.
+/// rename is atomic within the same filesystem, so readers see either "before the write" or
+/// "after the write" (and among competing writers, the last one wins as a whole).
 ///
-/// 一時ファイルは**必ず同じディレクトリに置く** (別ファイルシステムだと rename が
-/// EXDEV で失敗する)。名前はドット始まり + `.tmp` 拡張子なので、一覧・検索
-/// (list_query_file_names) には出ない。
+/// The temporary file is **always placed in the same directory** (rename fails with EXDEV across
+/// filesystems). Its name starts with a dot and has a `.tmp` extension, so it does not show up in
+/// the list or search (list_query_file_names).
 ///
-/// Windows の `fs::rename` も `MOVEFILE_REPLACE_EXISTING` 相当で既存を置き換える
-/// (`move_query_file` が予約済みの空ファイルを rename で潰しているのと同じ前提)。
+/// Windows `fs::rename` also replaces an existing file, equivalent to `MOVEFILE_REPLACE_EXISTING`
+/// (the same premise as `move_query_file` crushing a reserved empty file with rename).
 fn write_file_atomic(path: &Path, content: &str) -> Result<(), AppError> {
-    /// 一時ファイル名が埋まっていた時に作り直す回数の上限。
-    /// 名前は pid + 連番なので通常は 1 回目で成功する (残骸やリンクがある時だけ進む)。
+    /// Upper limit on retries when the temporary file name is already taken.
+    /// The name is pid + sequence number, so the first attempt normally succeeds (it advances only
+    /// when there are leftovers or links).
     const MAX_TMP_FILE_ATTEMPTS: usize = 8;
 
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-    /// 同一プロセス内で同じファイルへ同時に書いた時に一時ファイル名が衝突しないようにする
-    /// (プロセス間は pid で分かれる)。
+    /// Keeps temporary file names from colliding when the same file is written concurrently within
+    /// one process (processes are separated by pid).
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
     let parent = path
@@ -461,10 +466,10 @@ fn write_file_atomic(path: &Path, content: &str) -> Result<(), AppError> {
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| AppError::QueryFile(format!("Invalid file name: {}", path.display())))?;
-    // 一時ファイルは `create_new` (`O_EXCL`) で作る。`File::create` はシンボリック
-    // リンクを辿って truncate するため、クラッシュで残った同名ファイルや、
-    // 事前に置かれたリンクがあると保存領域の外を壊しうる。名前が使われていたら
-    // 連番を進めて作り直す (同一プロセス内の同時書き込みや残骸との衝突)。
+    // The temporary file is created with `create_new` (`O_EXCL`). `File::create` follows symlinks
+    // and truncates, so a same-name file left by a crash or a link placed beforehand could corrupt
+    // files outside the storage area. If the name is in use, advance the sequence number and retry
+    // (collisions with concurrent writes in the same process or with leftovers).
     let mut tmp_path = PathBuf::new();
     let mut file = None;
     for _ in 0..MAX_TMP_FILE_ATTEMPTS {
@@ -491,16 +496,16 @@ fn write_file_atomic(path: &Path, content: &str) -> Result<(), AppError> {
     };
 
     let written = (|| -> std::io::Result<()> {
-        // 既存ファイルのパーミッションを引き継ぐ (rename は中身ごと属性を差し替えるため、
-        // 引き継がないと利用者が 600 に絞ったクエリファイルが umask 既定に戻ってしまう)。
+        // Inherit the permissions of the existing file (rename swaps the attributes along with the
+        // contents, so without this a query file the user tightened to 600 would revert to the umask default)
         #[cfg(unix)]
         if let Ok(meta) = fs::metadata(path) {
             use std::os::unix::fs::PermissionsExt;
             let _ = file.set_permissions(fs::Permissions::from_mode(meta.permissions().mode()));
         }
         file.write_all(content.as_bytes())?;
-        // rename の前に内容をディスクへ落とす (先に rename が耐久化されると、
-        // クラッシュ時に「名前はあるが中身が空」のファイルが残りうる)。
+        // Flush the contents to disk before the rename (if the rename became durable first, a crash
+        // could leave a file that "has a name but empty contents")
         file.sync_all()?;
         Ok(())
     })();
@@ -530,17 +535,17 @@ pub fn write_query_file(
     Ok(())
 }
 
-/// 楽観的排他つきの書き込み。呼び出し側が把握している base (expected_base) と、
-/// 書き込み直前に読んだディスクの現在内容が一致する時だけ書き込む。
-/// - 書き込めたら Ok(true)。
-/// - ファイルが存在するのに expected_base と食い違う (= アプリ外で変更された) 場合は
-///   書き込まず Ok(false) を返す (呼び出し側でマージ/衝突処理へ回すため)。
-/// - ファイルが存在しない場合は expected_base に関わらず (再) 作成して Ok(true)
-///   (外部で削除されたケースで手元の編集を確実に残す)。
+/// Write with optimistic locking. Writes only when the base the caller knows (expected_base)
+/// matches the current on-disk content read right before writing.
+/// - Returns Ok(true) if written.
+/// - If the file exists but differs from expected_base (= changed outside the app), nothing is
+///   written and Ok(false) is returned (so the caller can go to merge/conflict handling).
+/// - If the file does not exist, it is (re)created regardless of expected_base and Ok(true) is
+///   returned (so local edits are reliably kept when the file was deleted externally).
 ///
-/// 検査と書き込みを同一のバックエンド呼び出し内で隣接して行うことで、フロントとの
-/// 非同期往復ぶんの TOCTOU 窓を無くす (完全な OS レベル atomic ではないが、
-/// read→write の間隔を隣接システムコールまで詰める)。
+/// Doing the check and the write adjacently inside the same backend call removes the TOCTOU
+/// window of an asynchronous round trip with the frontend (not fully OS-level atomic, but the
+/// read->write gap is narrowed to adjacent system calls).
 pub fn write_query_file_if_unchanged(
     sqlfiles_dir: &Path,
     connection: &str,
@@ -553,12 +558,12 @@ pub fn write_query_file_if_unchanged(
     match fs::read_to_string(&path) {
         Ok(current) => {
             if current != expected_base {
-                // アプリ外で変更されている。上書きしない。
+                // Changed outside the app. Do not overwrite.
                 return Ok(false);
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // 外部で削除された等。下で再作成する。
+            // Deleted externally, etc. Recreate below.
         }
         Err(e) => return Err(e.into()),
     }
@@ -569,7 +574,7 @@ pub fn write_query_file_if_unchanged(
     Ok(true)
 }
 
-/// 空のクエリファイルを新規作成し、正規化されたファイル名を返す。
+/// Create a new empty query file and return the normalized file name.
 pub fn create_query_file(
     sqlfiles_dir: &Path,
     connection: &str,
@@ -586,16 +591,16 @@ pub fn create_query_file(
     if let Some(parent) = path.parent() {
         ensure_dir_700(parent)?;
     }
-    // `create_new` (`O_EXCL`) にすることで、上の存在確認と作成の間に他プロセスが
-    // 作ったファイルを潰さない (`fs::write` は既存を truncate する)。
+    // Using `create_new` (`O_EXCL`) avoids clobbering a file another process created between the
+    // existence check above and creation (`fs::write` truncates an existing file).
     create_new_file_600(&path)?;
     Ok(normalized)
 }
 
-/// `file` をシンボリックリンク解決込みで canonicalize し、`base` (これも
-/// canonicalize したもの) の配下に留まることを確かめる。保存領域外の実体を指す
-/// リンクを弾く多重防御。対象は既存ファイルのはずなので、canonicalize
-/// できない (存在しない等) 場合は拒否する。
+/// Canonicalize `file`, resolving symlinks, and verify that it stays under `base` (also
+/// canonicalized). A defense in depth that rejects links pointing to targets outside the storage
+/// area. The target should be an existing file, so if it cannot be canonicalized (does not exist
+/// etc.) it is rejected.
 pub fn verify_within_dir(base: &Path, file: &Path) -> Result<(), AppError> {
     let canonical_base = base.canonicalize().map_err(|e| {
         AppError::QueryFile(format!("Cannot resolve the query files directory: {e}"))
@@ -611,17 +616,17 @@ pub fn verify_within_dir(base: &Path, file: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-/// クエリファイルが無ければ空で作る (あれば内容はそのまま)。
-/// 正規化されたファイル名を返す。
+/// Create the query file empty if it does not exist (contents are left as is if it does).
+/// Return the normalized file name.
 ///
-/// `create_query_file` との違いは**既存を上書きも失敗もしない**こと。
-/// CLI (`queryfolio write <connection> <file-name>`) で内容を省略した時に使う:
-/// 「まだ無ければ作って開く / あればそのまま開く」が期待される挙動で、
-/// 既存の内容を空で潰してはいけない。
+/// The difference from `create_query_file` is that it **neither overwrites nor fails on an
+/// existing file**. Used when the CLI (`queryfolio write <connection> <file-name>`) omits the
+/// content: the expected behavior is "create and open if missing / open as is if present", and
+/// existing contents must not be wiped to empty.
 ///
-/// 作成は `create_new` (`O_EXCL`) で行い、存在確認と作成の間に他プロセスが
-/// 同名ファイルを作った場合も既存扱いにする (中身を消さない)。
-/// ただし既存が通常ファイルでない場合はエラーにする (下記参照)。
+/// Creation uses `create_new` (`O_EXCL`), and if another process creates a same-name file
+/// between the existence check and creation, it is treated as existing (contents are not erased).
+/// However, an error is returned if the existing one is not a regular file (see below).
 pub fn ensure_query_file(
     sqlfiles_dir: &Path,
     connection: &str,
@@ -636,12 +641,12 @@ pub fn ensure_query_file(
     match create_new_file_600(&path) {
         Ok(_) => Ok(normalized),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // `O_EXCL` は「通常ファイルが既にある」時だけでなく、ディレクトリ・
-            // 壊れたシンボリックリンク・FIFO 等が同名で存在する時も AlreadyExists を返す。
-            // そのまま成功として返すと、CLI (`queryfolio write`) は書き出しに成功したつもりで
-            // 起動を続け、実際の失敗はフロントの読み込み時まで遅れる = 呼び出したエージェントは
-            // 終了ステータスから失敗を判別できない。開けるクエリファイルが本当にあるかを
-            // ここで確かめる (metadata はリンクを辿るので、壊れたリンクは Err になる)。
+            // `O_EXCL` returns AlreadyExists not only when a "regular file already exists" but also when a
+            // directory, broken symlink, FIFO etc. with the same name exists.
+            // Returning success as is would make the CLI (`queryfolio write`) think the write succeeded and
+            // continue launching, with the real failure delayed until the frontend loads it = the calling
+            // agent cannot tell the failure from the exit status. Verify here that an openable query file
+            // really exists (metadata follows links, so a broken link gives Err).
             let meta = fs::metadata(&path).map_err(|e| {
                 AppError::QueryFile(format!(
                     "The existing entry cannot be opened as a query file: {} ({e})",
@@ -654,11 +659,11 @@ pub fn ensure_query_file(
                     path.display()
                 )));
             }
-            // `metadata` はリンクを辿るため、**保存領域の外にある通常ファイル**を
-            // 指すシンボリックリンクは上の is_file() を通ってしまう。実行中インスタンス
-            // 側は同じ対象を verify_within_dir で拒否するので、ここで通すと
-            // 「CLI は終了ステータス 0 なのにファイルは開かれない」になる。
-            // 開く側と同じ判定をここでも行い、成功の意味を揃える。
+            // `metadata` follows links, so a symlink pointing to a **regular file outside the storage area**
+            // passes the is_file() above. The running instance rejects the same target via
+            // verify_within_dir, so letting it through here yields "the CLI exits with status 0 but the file
+            // is not opened".
+            // Apply the same check as the opening side so that the meaning of success is consistent.
             verify_within_dir(sqlfiles_dir, &path)?;
             Ok(normalized)
         }
@@ -683,8 +688,8 @@ pub fn delete_query_file(
     Ok(())
 }
 
-/// クエリファイルをリネームし、正規化された新しいファイル名を返す。
-/// 新旧が同名 (正規化後) なら no-op で新名を返す。
+/// Rename a query file and return the normalized new file name.
+/// If old and new are the same name (after normalization) it is a no-op and returns the new name.
 pub fn rename_query_file(
     sqlfiles_dir: &Path,
     connection: &str,
@@ -704,9 +709,9 @@ pub fn rename_query_file(
             old_path.display()
         )));
     }
-    // 衝突判定は case-insensitive で行う (case-insensitive FS の実挙動と揃え、
-    // フロントの判定とも一致させる)。リネーム対象自身 (old) は除外するので、
-    // 大文字小文字だけを変える改名 (Test.sql -> test.sql) は許可される。
+    // Collision detection is case-insensitive (matches the real behavior of case-insensitive
+    // filesystems and agrees with the frontend's check). The rename target itself (old) is excluded,
+    // so a rename that only changes case (Test.sql -> test.sql) is allowed.
     let new_lower = new_normalized.to_ascii_lowercase();
     let dir = connection_dir(sqlfiles_dir, connection)?;
     if dir.exists() {
@@ -726,12 +731,12 @@ pub fn rename_query_file(
     Ok(new_normalized)
 }
 
-/// クエリファイルを別の接続のフォルダへ移動し、正規化されたファイル名を返す。
-/// 移動元と移動先が同じフォルダを指す場合は no-op で名前を返す
-/// (別々の接続でも folder_name が同じなら同じフォルダになりうる)。
+/// Move a query file to another connection's folder and return the normalized file name.
+/// If the source and destination point to the same folder, it is a no-op and returns the name
+/// (different connections can still share the same folder when folder_name is the same).
 ///
-/// 拡張子はエンジンごとに違うので、呼び出し側 (lib.rs) が移動元と移動先で
-/// 同じであることを確認してから呼ぶ。ここでは 1 つの ext として扱う。
+/// The extension differs per engine, so the caller (lib.rs) confirms the source and destination
+/// have the same one before calling. Here it is treated as a single ext.
 pub fn move_query_file(
     sqlfiles_dir: &Path,
     from_connection: &str,
@@ -743,8 +748,8 @@ pub fn move_query_file(
     let from_dir = connection_dir(sqlfiles_dir, from_connection)?;
     let to_dir = connection_dir(sqlfiles_dir, to_connection)?;
 
-    // 存在確認は同一フォルダの判定より先に行う。後にすると、存在しない
-    // ファイルの移動が「成功」として返ってしまう。
+    // The existence check is done before the same-folder check. Doing it afterward would make
+    // moving a nonexistent file return "success".
     let from_path = from_dir.join(&normalized);
     if !from_path.exists() {
         return Err(AppError::QueryFile(format!(
@@ -758,9 +763,9 @@ pub fn move_query_file(
 
     ensure_dir_700(&to_dir)?;
 
-    // 大文字小文字だけが違う同名ファイルを先に弾く (case-insensitive FS の実挙動
-    // と揃え、rename_query_file の判定とも一致させる)。列挙に失敗したら
-    // 「衝突なし」とはみなさずエラーにする (見落としたまま移動しない)。
+    // Reject a same-name file that differs only in case first (matches the real behavior of
+    // case-insensitive filesystems and agrees with rename_query_file's check). If enumeration fails,
+    // it is not treated as "no collision" but as an error (do not move after missing one).
     let lower = normalized.to_ascii_lowercase();
     for entry in fs::read_dir(&to_dir)? {
         let Ok(name) = entry?.file_name().into_string() else {
@@ -773,11 +778,11 @@ pub fn move_query_file(
         }
     }
 
-    // **移動先の名前を atomic に予約してから rename する。**
-    // Unix の rename は移動先が存在しても黙って置き換えるため、上の存在確認と
-    // rename の間に同名ファイルが作られると (並行した移動・外部からの作成)
-    // そのファイルを失う。O_EXCL の作成なら「無ければ作る」が atomic なので、
-    // 予約に成功した = その名前は自分のものだと確定できる。
+    // **Atomically reserve the destination name, then rename.**
+    // Unix rename silently replaces an existing destination, so if a same-name file is created
+    // between the existence check above and the rename (a concurrent move or external creation),
+    // that file would be lost. With an O_EXCL creation, "create if missing" is atomic, so a
+    // successful reservation means the name is certainly ours.
     let to_path = to_dir.join(&normalized);
     match create_new_file_600(&to_path) {
         Ok(_) => {}
@@ -789,11 +794,11 @@ pub fn move_query_file(
         Err(e) => return Err(e.into()),
     }
 
-    // 移動元・移動先とも sqlfiles_dir の直下なので同一ファイルシステムになり、
-    // rename が使える (EXDEV でのコピー + 削除のフォールバックは不要)。
-    // ここで置き換えられるのは自分が予約した空ファイルだけ。
+    // Source and destination are both directly under sqlfiles_dir, so they are on the same
+    // filesystem and rename works (no need for the EXDEV fallback of copy + delete).
+    // The only thing replaced here is the empty file we reserved.
     if let Err(e) = fs::rename(&from_path, &to_path) {
-        // 予約した空ファイルを残さない (残すと次の移動が衝突で失敗し続ける)
+        // Do not leave the reserved empty file behind (it would make the next move keep failing with a collision)
         let _ = fs::remove_file(&to_path);
         return Err(e.into());
     }
@@ -830,13 +835,13 @@ mod tests {
         assert_eq!(normalize_file_name("query.sql", "sql").unwrap(), "query.sql");
         assert_eq!(normalize_file_name("query.SQL", "sql").unwrap(), "query.SQL");
         assert!(normalize_file_name("../evil", "sql").is_err());
-        // エンジン別拡張子 (redis)
+        // Engine-specific extension (redis)
         assert_eq!(normalize_file_name("keys", "redis").unwrap(), "keys.redis");
         assert_eq!(
             normalize_file_name("keys.redis", "redis").unwrap(),
             "keys.redis"
         );
-        // 別エンジンの拡張子は付け直す (keys.sql は redis 接続では別名)
+        // Replace another engine's extension with this one (keys.sql is a different name on a redis connection)
         assert_eq!(
             normalize_file_name("keys.sql", "redis").unwrap(),
             "keys.sql.redis"
@@ -848,14 +853,14 @@ mod tests {
         let dir = test_dir().join("ensure");
         let connection = "conn";
 
-        // 無ければ空で作る (拡張子も補う)
+        // Create empty if missing (the extension is supplied too)
         assert_eq!(
             ensure_query_file(&dir, connection, "report", "sql").unwrap(),
             "report.sql"
         );
         assert_eq!(read_query_file(&dir, connection, "report", "sql").unwrap(), "");
 
-        // 既存の内容は消さない (create_query_file と違いエラーにもしない)
+        // Existing contents are not erased (unlike create_query_file, it is not an error either)
         write_query_file(&dir, connection, "report.sql", "SELECT 1;", "sql").unwrap();
         assert_eq!(
             ensure_query_file(&dir, connection, "report.sql", "sql").unwrap(),
@@ -866,14 +871,14 @@ mod tests {
             "SELECT 1;"
         );
 
-        // 不正な名前は作らずエラー
+        // An invalid name is not created; it is an error
         assert!(ensure_query_file(&dir, connection, "../evil", "sql").is_err());
 
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 同名でディレクトリ / 壊れたシンボリックリンクが居座っている時は、
-    /// 「既にあるので OK」ではなくエラーにする (開けるクエリファイルが無いため)。
+    /// When a directory / broken symlink with the same name is squatting there, it is an error
+    /// rather than "already exists, so OK" (because there is no openable query file).
     #[test]
     fn test_ensure_query_file_rejects_non_file() {
         let dir = test_dir().join("ensure-non-file");
@@ -881,11 +886,11 @@ mod tests {
         let conn_dir = connection_dir(&dir, connection).unwrap();
         fs::create_dir_all(&conn_dir).unwrap();
 
-        // ディレクトリ
+        // Directory
         fs::create_dir(conn_dir.join("dir-entry.sql")).unwrap();
         assert!(ensure_query_file(&dir, connection, "dir-entry", "sql").is_err());
 
-        // 壊れたシンボリックリンク (リンク先が無い)
+        // Broken symlink (the link target is missing)
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(
@@ -896,10 +901,10 @@ mod tests {
             assert!(ensure_query_file(&dir, connection, "dangling", "sql").is_err());
         }
 
-        // 保存領域の外にある**実在する通常ファイル**を指すリンク。
-        // metadata はリンクを辿るので is_file() は通ってしまうが、実行中
-        // インスタンス側は verify_within_dir で拒否する。ここで成功にすると
-        // 「CLI は 0 で終わったのにファイルは開かれない」になる。
+        // A link pointing to an **existing regular file** outside the storage area.
+        // metadata follows links, so is_file() passes, but the running instance rejects it via
+        // verify_within_dir. Succeeding here would give "the CLI exited with 0 but the file is not
+        // opened".
         #[cfg(unix)]
         {
             let outside = test_dir().join("ensure-non-file-outside");
@@ -909,8 +914,8 @@ mod tests {
             std::os::unix::fs::symlink(&target, conn_dir.join("escaping.sql")).unwrap();
             assert!(ensure_query_file(&dir, connection, "escaping", "sql").is_err());
 
-            // 保存領域の**中**を指すリンクは、開く側 (verify_within_dir) が
-            // 受け入れるのでこちらも受け入れる (判定を食い違わせない)。
+            // A link pointing **inside** the storage area is accepted by the opening side
+            // (verify_within_dir), so accept it here too (do not let the checks disagree).
             let inside = conn_dir.join("inside.sql");
             fs::write(&inside, "SELECT 1;").unwrap();
             std::os::unix::fs::symlink(&inside, conn_dir.join("linked.sql")).unwrap();
@@ -922,8 +927,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 新規作成分のパーミッションを 0600 / ディレクトリを 0700 に絞る
-    /// (CYBERNEURA-DEV-510)。同じ内容を保存する history.rs と水準を揃える。
+    /// Newly created items are restricted to 0600 for files / 0700 for directories
+    /// (CYBERNEURA-DEV-510). Aligned with history.rs, which stores the same content.
     #[cfg(unix)]
     #[test]
     fn test_new_query_files_are_not_world_readable() {
@@ -934,7 +939,7 @@ mod tests {
 
         let mode_of = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
 
-        // create_query_file (空ファイルの新規作成)。保存ルートごと未作成の状態から始める
+        // create_query_file (new empty file). Starts from a state where even the storage root is not created yet
         assert!(!dir.exists());
         create_query_file(&dir, connection, "created", "sql").unwrap();
         let conn_dir = connection_dir(&dir, connection).unwrap();
@@ -946,15 +951,15 @@ mod tests {
         assert_eq!(mode_of(&conn_dir), 0o700, "接続ディレクトリは 0700");
         assert_eq!(mode_of(&conn_dir.join("created.sql")), 0o600);
 
-        // ensure_query_file (CLI が「無ければ作る」に使う経路)
+        // ensure_query_file (the path the CLI uses for "create if missing")
         ensure_query_file(&dir, connection, "ensured", "sql").unwrap();
         assert_eq!(mode_of(&conn_dir.join("ensured.sql")), 0o600);
 
-        // write_query_file (一時ファイル + rename。新規作成なので引き継ぐ元が無い)
+        // write_query_file (temporary file + rename. A new creation, so there is nothing to inherit from)
         write_query_file(&dir, connection, "written", "SELECT 1;", "sql").unwrap();
         assert_eq!(mode_of(&conn_dir.join("written.sql")), 0o600);
 
-        // 既存ディレクトリのモードは変えない (利用者が緩めた設定を勝手に締め直さない)
+        // The mode of an existing directory is not changed (a setting the user loosened is not tightened back on its own)
         fs::set_permissions(&conn_dir, fs::Permissions::from_mode(0o755)).unwrap();
         write_query_file(&dir, connection, "second", "SELECT 2;", "sql").unwrap();
         assert_eq!(
@@ -966,8 +971,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 書き込みは一時ファイル + rename で行い、宛先を途中の状態で晒さない。
-    /// 一時ファイルを残さないこと・既存のパーミッションを引き継ぐことも確認する。
+    /// Writes use a temporary file + rename and do not expose the destination in an intermediate
+    /// state. Also verifies that no temporary file is left and that existing permissions are inherited.
     #[test]
     fn test_write_query_file_is_atomic() {
         let dir = test_dir().join("atomic");
@@ -994,7 +999,7 @@ mod tests {
             if cfg!(unix) { "SELECT 2;" } else { "SELECT 1;" }
         );
 
-        // 一時ファイルが残っていない (残ると一覧・検索には出ないがゴミになる)
+        // No temporary file is left (if one remained it would not show in list/search, but would be garbage)
         let leftovers: Vec<String> = fs::read_dir(&conn_dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1015,7 +1020,7 @@ mod tests {
         let connection = "redis-conn";
 
         create_query_file(&dir, connection, "commands", "redis").unwrap();
-        // 手動配置された別拡張子のファイルは一覧に出ない
+        // A manually placed file with a different extension does not appear in the list
         fs::write(
             connection_dir(&dir, connection).unwrap().join("other.sql"),
             "SELECT 1;",
@@ -1036,18 +1041,18 @@ mod tests {
 
     #[test]
     fn test_natural_cmp() {
-        // 数字列は数値として比較する (桁数が違っても作成順どおり)
+        // Digit runs are compared as numbers (creation order even with different digit counts)
         assert_eq!(natural_cmp("a-9", "a-10"), Ordering::Less);
         assert_eq!(natural_cmp("a-10", "a-9"), Ordering::Greater);
         assert_eq!(natural_cmp("a-100", "a-99"), Ordering::Greater);
-        // 先頭ゼロがあっても値で比較する。値が同じなら桁数の少ない方を先に
+        // Digit runs are compared numerically even with leading zeros. With equal values, the one with fewer digits comes first
         assert_eq!(natural_cmp("a-02", "a-9"), Ordering::Less);
         assert_eq!(natural_cmp("a-2", "a-02"), Ordering::Less);
-        // 数字以外は通常の文字比較。前方一致する短い方が小さい
+        // Non-digits use ordinary character comparison. The shorter prefix-match is smaller
         assert_eq!(natural_cmp("20260102-1200", "20260102-1200-2"), Ordering::Less);
         assert_eq!(natural_cmp("report", "report"), Ordering::Equal);
         assert_eq!(natural_cmp("apple", "banana"), Ordering::Less);
-        // 日付部分も数値として比較される (桁数が同じなので辞書順と一致する)
+        // The date part is also compared as a number (same digit count, so it agrees with lexicographic order)
         assert_eq!(natural_cmp("20260102-1200", "20260315-1830"), Ordering::Less);
     }
 
@@ -1083,7 +1088,7 @@ mod tests {
                 .iter()
                 .map(|e| e.file_name.as_str())
                 .collect::<Vec<_>>(),
-            // 同じ日時の 2 つは名前順 (降順) のまま
+            // Two with the same time stay in name order (descending)
             vec![
                 "a-new.sql",
                 "c-mid.sql",
@@ -1095,7 +1100,7 @@ mod tests {
         assert_eq!(entries[0].modified_ms, Some(1_800_000_000_000));
         assert_eq!(entries[1].size, "select 1;".len() as u64);
         assert_eq!(entries[0].size, 0);
-        // 名前順の一覧 (検索と共有) は変わらない
+        // The name-ordered list (shared with search) is unchanged
         assert_eq!(
             list_query_files(&dir, connection, "sql").unwrap(),
             vec![
@@ -1113,11 +1118,12 @@ mod tests {
         let dir = test_dir().join("order");
         let connection = "order-conn";
 
-        // 既定のファイル名は YYYYMMDD-HHMM なので、名前の降順 = 新しい順になる。
-        // 作成順と無関係に並ぶことを見るため、わざと時系列とズラして作る。
-        // 末尾の -2 / -10 は同一分内に複数作った時の連番 (FilesPane)。
-        // 拡張子を含めて比較すると無印 (最も古い) が連番より前に来てしまい、
-        // 辞書順で比較すると -2 が -10 より前に来てしまう。その両方の退行を見る。
+        // The default file name is YYYYMMDD-HHMM, so descending name order = newest first.
+        // To check that the order is independent of creation order, files are deliberately created out of
+        // chronological order. The trailing -2 / -10 are sequence numbers for several files created in
+        // the same minute (FilesPane).
+        // This covers both regressions: comparing with the extension puts the un-numbered (oldest) one
+        // before the numbered ones, and lexicographic comparison puts -2 before -10.
         create_query_file(&dir, connection, "20260101-0900", "sql").unwrap();
         create_query_file(&dir, connection, "20260315-1830", "sql").unwrap();
         create_query_file(&dir, connection, "20260102-1200", "sql").unwrap();
@@ -1133,7 +1139,7 @@ mod tests {
         ];
         assert_eq!(list_query_files(&dir, connection, "sql").unwrap(), expected);
 
-        // 検索結果も同じ並び (列挙を list_query_file_names で共有しているため)
+        // Search results have the same order (the enumeration is shared via list_query_file_names)
         let hits = search_query_files(&dir, connection, "2026", "sql").unwrap();
         assert_eq!(
             hits.iter().map(|h| h.file_name.as_str()).collect::<Vec<_>>(),
@@ -1156,7 +1162,7 @@ mod tests {
         let name = create_query_file(&dir, connection, "my query", "sql").unwrap();
         assert_eq!(name, "my query.sql");
 
-        // 同名の再作成はエラー
+        // Recreating the same name is an error
         assert!(create_query_file(&dir, connection, "my query", "sql").is_err());
 
         write_query_file(&dir, connection, &name, "SELECT 1;", "sql").unwrap();
@@ -1176,7 +1182,7 @@ mod tests {
             Vec::<String>::new()
         );
 
-        // 後始末
+        // Cleanup
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1186,22 +1192,22 @@ mod tests {
         let connection = "test-conn";
         let name = "q.sql";
 
-        // ファイルが無ければ expected_base に関わらず作成する (外部削除からの復帰)。
+        // If the file does not exist, create it regardless of expected_base (recovery from external deletion)
         assert_eq!(
             write_query_file_if_unchanged(&dir, connection, name, "V1", "", "sql").unwrap(),
             true
         );
         assert_eq!(read_query_file(&dir, connection, name, "sql").unwrap(), "V1");
 
-        // base が現在のディスク内容と一致すれば書き込む。
+        // Write if base matches the current on-disk content.
         assert_eq!(
             write_query_file_if_unchanged(&dir, connection, name, "V2", "V1", "sql").unwrap(),
             true
         );
         assert_eq!(read_query_file(&dir, connection, name, "sql").unwrap(), "V2");
 
-        // アプリ外で "EXTERNAL" に変更されたのに、こちらの base が古い ("V2") 場合は
-        // 書き込まず false を返す (外部変更を黙って上書きしない)。
+        // If it was changed to "EXTERNAL" outside the app while our base is stale ("V2"), nothing is
+        // written and false is returned (external changes are not silently overwritten).
         write_query_file(&dir, connection, name, "EXTERNAL", "sql").unwrap();
         assert_eq!(
             write_query_file_if_unchanged(&dir, connection, name, "MINE", "V2", "sql").unwrap(),
@@ -1209,7 +1215,7 @@ mod tests {
         );
         assert_eq!(read_query_file(&dir, connection, name, "sql").unwrap(), "EXTERNAL");
 
-        // base を現在値に合わせれば再び書ける。
+        // Once base is set to the current value, writing works again.
         assert_eq!(
             write_query_file_if_unchanged(&dir, connection, name, "MINE", "EXTERNAL", "sql")
                 .unwrap(),
@@ -1217,7 +1223,7 @@ mod tests {
         );
         assert_eq!(read_query_file(&dir, connection, name, "sql").unwrap(), "MINE");
 
-        // 後始末
+        // Cleanup
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1226,7 +1232,7 @@ mod tests {
         let dir = test_dir().join("fullpath");
         let connection = "test-conn";
 
-        // .sql 補完・接続フォルダ・ディレクトリが連結された絶対パスが返る
+        // The absolute path is returned with .sql appended, the connection folder, and the directory joined
         let path = query_file_path(&dir, connection, "report", "sql").unwrap();
         let expected = dir
             .join(connection)
@@ -1235,11 +1241,11 @@ mod tests {
             .into_owned();
         assert_eq!(path, expected);
 
-        // 既に .sql 付きの名前は二重付与しない
+        // A name already ending in .sql does not get a second one
         let path = query_file_path(&dir, connection, "report.sql", "sql").unwrap();
         assert_eq!(path, expected);
 
-        // パストラバーサルは拒否
+        // Path traversal is rejected
         assert!(query_file_path(&dir, connection, "../evil", "sql").is_err());
         assert!(query_file_path(&dir, connection, "a/b", "sql").is_err());
     }
@@ -1252,7 +1258,7 @@ mod tests {
         create_query_file(&dir, connection, "old", "sql").unwrap();
         write_query_file(&dir, connection, "old", "SELECT 1;", "sql").unwrap();
 
-        // リネーム成功 (内容は保持される)
+        // Rename succeeds (contents are kept)
         let renamed = rename_query_file(&dir, connection, "old", "new", "sql").unwrap();
         assert_eq!(renamed, "new.sql");
         assert_eq!(
@@ -1264,24 +1270,24 @@ mod tests {
             "SELECT 1;"
         );
 
-        // 既存名への変更は拒否
+        // Renaming to an existing name is rejected
         create_query_file(&dir, connection, "other", "sql").unwrap();
         assert!(rename_query_file(&dir, connection, "new", "other", "sql").is_err());
 
-        // 同名 (正規化後) への変更は no-op
+        // Renaming to the same name (after normalization) is a no-op
         assert_eq!(
             rename_query_file(&dir, connection, "new", "new.sql", "sql").unwrap(),
             "new.sql"
         );
 
-        // 存在しないファイルのリネームはエラー
+        // Renaming a nonexistent file is an error
         assert!(rename_query_file(&dir, connection, "missing", "x", "sql").is_err());
 
-        // 不正な新名は拒否 (パストラバーサル)
+        // An invalid new name is rejected (path traversal)
         assert!(rename_query_file(&dir, connection, "new", "../evil", "sql").is_err());
         assert!(rename_query_file(&dir, connection, "new", "a/b", "sql").is_err());
 
-        // 大文字小文字違いの別ファイルへの改名は拒否 (case-insensitive 判定)
+        // Renaming to a file differing only in case is rejected (case-insensitive check)
         assert!(rename_query_file(&dir, connection, "new", "OTHER", "sql").is_err());
 
         let _ = fs::remove_dir_all(&dir);
@@ -1295,7 +1301,7 @@ mod tests {
         create_query_file(&dir, connection, "Report", "sql").unwrap();
         write_query_file(&dir, connection, "Report", "SELECT 2;", "sql").unwrap();
 
-        // 自分自身の大文字小文字だけを変える改名は許可される
+        // A rename that only changes the file's own case is allowed
         let renamed =
             rename_query_file(&dir, connection, "Report", "report", "sql").unwrap();
         assert_eq!(renamed, "report.sql");
@@ -1303,8 +1309,8 @@ mod tests {
             read_query_file(&dir, connection, "report", "sql").unwrap(),
             "SELECT 2;"
         );
-        // case-insensitive FS では 1 ファイルのまま、case-sensitive FS でも
-        // 旧名は残らない (rename 済み)
+        // On a case-insensitive FS it stays one file; on a case-sensitive FS too
+        // the old name does not remain (it was renamed).
         let files = list_query_files(&dir, connection, "sql").unwrap();
         assert!(files.iter().any(|f| f.eq_ignore_ascii_case("report.sql")));
         assert!(!files.contains(&"Report.sql".to_string()));
@@ -1321,7 +1327,7 @@ mod tests {
         create_query_file(&dir, from, "report", "sql").unwrap();
         write_query_file(&dir, from, "report", "SELECT 1;", "sql").unwrap();
 
-        // 移動先フォルダがまだ無くても作られる。内容は保持される
+        // The destination folder is created even if it does not exist yet. Contents are kept
         assert_eq!(
             move_query_file(&dir, from, to, "report", "sql").unwrap(),
             "report.sql"
@@ -1333,24 +1339,24 @@ mod tests {
             "SELECT 1;"
         );
 
-        // 移動元に無いファイルはエラー (同一フォルダ指定でも成功にしない)
+        // A file missing from the source is an error (not a success even for the same folder)
         assert!(move_query_file(&dir, from, to, "report", "sql").is_err());
         assert!(move_query_file(&dir, from, from, "report", "sql").is_err());
 
-        // 移動先に同名があればエラー (移動元は残る)
+        // If the destination has a same-name file it is an error (the source remains)
         create_query_file(&dir, from, "report", "sql").unwrap();
         assert!(move_query_file(&dir, from, to, "report", "sql").is_err());
         assert_eq!(
             list_query_files(&dir, from, "sql").unwrap(),
             vec!["report.sql"]
         );
-        // 大文字小文字違いも同名扱い (移動元と移動先は別フォルダなので、
-        // case-insensitive な FS でも両方を作れる)
+        // A name differing only in case also counts as the same name (source and destination are
+        // different folders, so both can be created even on a case-insensitive FS)
         create_query_file(&dir, from, "Sales", "sql").unwrap();
         create_query_file(&dir, to, "sales", "sql").unwrap();
         assert!(move_query_file(&dir, from, to, "Sales", "sql").is_err());
 
-        // 同じフォルダへの移動は no-op (別接続でも folder_name が同じことがある)
+        // Moving to the same folder is a no-op (different connections can have the same folder_name)
         assert_eq!(
             move_query_file(&dir, from, from, "report", "sql").unwrap(),
             "report.sql"
@@ -1360,7 +1366,7 @@ mod tests {
             ""
         );
 
-        // パストラバーサルは拒否
+        // Path traversal is rejected
         assert!(move_query_file(&dir, from, "../evil", "report", "sql").is_err());
         assert!(move_query_file(&dir, "../evil", to, "report", "sql").is_err());
         assert!(move_query_file(&dir, from, to, "../evil", "sql").is_err());
@@ -1392,18 +1398,18 @@ mod tests {
         )
         .unwrap();
 
-        // 空クエリは空
+        // An empty query returns empty
         assert!(search_query_files(&dir, connection, "  ", "sql").unwrap().is_empty());
 
-        // ファイル名一致 (大文字小文字を区別しない)
+        // File name match (case-insensitive)
         let hits = search_query_files(&dir, connection, "USERS", "sql").unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].file_name, "users report.sql");
         assert!(hits[0].name_match);
-        // "users" は中身にもあるのでプレビューが付く
+        // "users" is also in the contents, so a preview is attached
         assert!(hits[0].content_preview.as_deref().unwrap().contains("users"));
 
-        // 中身のみ一致 (ファイル名は "orders" だが中身に total がある)
+        // Content-only match (the file name is "orders" but the contents contain total)
         let hits = search_query_files(&dir, connection, "total", "sql").unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].file_name, "orders.sql");
@@ -1413,12 +1419,12 @@ mod tests {
             Some("SELECT id, total FROM orders;")
         );
 
-        // どちらにも無い語は 0 件
+        // A word in neither gives 0 results
         assert!(search_query_files(&dir, connection, "zzz", "sql").unwrap().is_empty());
 
-        // 手動配置された隠し .sql は検索対象外 (中身プレビューを漏らさない)。
-        // validate_component が dot 始まりを拒否するため create 経由では作れないので
-        // 直接ファイルを書き込んで再現する
+        // A manually placed hidden .sql is excluded from search (its content preview must not leak).
+        // validate_component rejects dot-prefixed names, so it cannot be made via create; reproduce it by
+        // writing the file directly
         fs::write(
             connection_dir(&dir, connection).unwrap().join(".secret.sql"),
             "SELECT secret_total FROM vault;",
@@ -1432,7 +1438,7 @@ mod tests {
             .iter()
             .any(|f| f.starts_with('.')));
 
-        // 存在しない接続ディレクトリは 0 件
+        // A nonexistent connection directory gives 0 results
         assert!(search_query_files(&dir, "no-such-conn", "users", "sql")
             .unwrap()
             .is_empty());
@@ -1445,7 +1451,7 @@ mod tests {
         assert_eq!(truncate_preview("  SELECT 1  "), "SELECT 1");
         let long = "x".repeat(200);
         let out = truncate_preview(&long);
-        assert_eq!(out.chars().count(), PREVIEW_MAX_CHARS + 1); // +1 は省略記号
+        assert_eq!(out.chars().count(), PREVIEW_MAX_CHARS + 1); // +1 is for the ellipsis
         assert!(out.ends_with('…'));
     }
 }

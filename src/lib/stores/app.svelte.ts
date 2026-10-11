@@ -21,92 +21,93 @@ import { buildEngineHelpContext } from "$lib/help";
 
 const AUTO_SAVE_DELAY_MS = 1000;
 
-/// 開いているクエリファイルがアプリ外で変更されていないか調べる間隔 (ms)。
+/// Interval (ms) for checking whether the open query file was changed outside the app.
 const FILE_WATCH_INTERVAL_MS = 2500;
-/// FILES ペインの一覧 (更新日時・サイズ) を取り直す間隔。開いていないファイルの外部変更や
-/// 同じ内容での書き直し (mtime だけが変わる) はタブの内容比較では検知できないため、
-/// ウォッチャの tick のついでに一覧そのものを定期的に取り直す (CYBERNEURA-DEV-774)
+/// Interval for re-fetching the FILES pane list (modified time / size). External changes to files
+/// that are not open, and rewrites with identical content (only mtime changes), cannot be detected
+/// by comparing tab contents, so alongside the watcher ticks we also periodically re-fetch the list itself (CYBERNEURA-DEV-774)
 const FILE_LIST_REFRESH_INTERVAL_MS = 10_000;
 
-/// 結果タブの上限。超過時は最も古い非ピン留めタブを破棄する
+/// Maximum number of result tabs. When exceeded, the oldest non-pinned tab is discarded.
 const MAX_RESULT_TABS = 10;
 
-/// 結果ペインの 1 タブ分の状態。結果セットに加えて
-/// 「何を・どこで・いつ実行したか」を保持し、タブから再実行できるようにする
+/// State of one tab in the results pane. In addition to the result set, it keeps
+/// "what was run, where, and when" so the tab can be re-executed.
 export interface ResultTab {
   id: number;
   pinned: boolean;
   sql: string;
   connection: string;
   schema: string | null;
-  /// 実行開始時刻 (epoch ms)
+  /// Execution start time (epoch ms)
   executedAt: number;
   result: QueryResult | null;
   error: string | null;
-  /// キャンセル要求で実行が中断された (エラーとは別の見た目で表示する)
+  /// Execution was aborted by a cancel request (shown differently from an error)
   cancelled: boolean;
   running: boolean;
-  /// AI にエラー修正案を問い合わせ中 (スピナー表示・二重実行防止)
+  /// Asking the AI for an error fix suggestion (spinner shown, prevents duplicate runs)
   fixing: boolean;
-  /// AI が返した修正案の SQL (無ければ null)。自動実行はせず、
-  /// ユーザーの Apply でエディタに挿入する
+  /// Fix suggestion SQL returned by the AI (null if none). It is never run automatically;
+  /// the user inserts it into the editor with Apply.
   fixSuggestion: string | null;
 }
 
-/// AI チャットペインに表示する 1 メッセージ。
-/// LLM へ送るのは role / content だけで、それ以外は表示用の付随情報。
+/// One message shown in the AI chat pane.
+/// Only role / content are sent to the LLM; everything else is auxiliary information for display.
 export interface ChatMessage {
   id: number;
   role: "user" | "assistant";
   content: string;
-  /// この応答を作る過程でエージェントが実行した読み取りクエリ (assistant のみ)
+  /// Read queries the agent ran while producing this response (assistant only)
   toolCalls?: ChatToolCall[];
-  /// 応答の取得に失敗した (エラー文言を content に入れて赤く表示する)
+  /// Fetching the response failed (the error text goes in content and is shown in red)
   failed?: boolean;
 }
 
-/// タブの SQL が EXPLAIN 由来かを判定する (Analyze with AI ボタンの表示用)。
-/// Explain ボタンで組み立てた SQL は必ず EXPLAIN で始まるため、
-/// 先頭キーワードの一致で判定する (手入力の EXPLAIN も対象になる)
+/// Determines whether the tab's SQL comes from EXPLAIN (used to show the Analyze with AI button).
+/// SQL built by the Explain button always starts with EXPLAIN, so we decide by matching
+/// the leading keyword (a hand-typed EXPLAIN also qualifies).
 export const isExplainSql = (sql: string): boolean =>
   sql.trimStart().toLowerCase().startsWith("explain");
 
-/// 1 つの開いているエディタタブ。タブはグローバル (全接続横断) に一列で並び、
-/// 各タブが自分の接続を保持する。タブをアクティブにすると、その接続へ切り替わる
-/// (engine / スキーマ / 補完 / 実行はすべてアクティブタブの接続で駆動される)。
+/// One open editor tab. Tabs are global (across all connections) and lined up in a single row,
+/// and each tab holds its own connection. Activating a tab switches to that connection
+/// (engine / schema / completion / execution are all driven by the active tab's connection).
 export interface EditorTab {
   id: number;
   connection: string;
   file: string;
   content: string;
-  /// 未保存の編集があるか (自動保存で false に戻る)
+  /// Whether there are unsaved edits (goes back to false on autosave)
   dirty: boolean;
-  /// ディスク上にあると分かっている内容 (読込時 = 読んだ内容、保存時 = 書いた内容)。
-  /// 外部変更の検知 (この値と実ファイルを突き合わせる) と 3-way マージの base に使う。
+  /// Content known to be on disk (on load = what was read, on save = what was written).
+  /// Used to detect external changes (compare this value with the actual file) and as the base for the 3-way merge.
   diskContent: string;
-  /// 外部変更と手元の未保存編集が自動マージ不能な衝突状態にあるか。true の間は
-  /// 「閉じる」「アプリ終了」等での自動保存を抑止し、手元の編集で外部変更を黙って
-  /// 上書きするのを防ぐ (警告文の "reopen the file to discard" を実挙動と一致させる)。
-  /// ユーザーが編集を続けるか明示保存すれば false に戻り、通常の上書き保存に従う。
+  /// Whether an external change and the local unsaved edits are in a conflict that cannot be auto-merged.
+  /// While true, autosave on "close", "quit the app", etc. is suppressed so that local edits
+  /// do not silently overwrite the external change (matching the warning text "reopen the file to discard"
+  /// to the actual behavior).
+  /// If the user keeps editing or saves explicitly, it goes back to false and normal overwrite-save applies.
   conflicted?: boolean;
 }
 
 let connections = $state<ConnectionInfo[]>([]);
 let selectedConnection = $state<string | null>(null);
-/// Writable スイッチ。false (既定) の間は SELECT/SHOW 等の副作用の無い
-/// 文しか実行できない (バックエンドが強制)。事故防止のためセッションごとに
-/// OFF から始め、永続化しない (再起動で勝手に書き込み可にはしない)。
+/// Writable switch. While false (the default), only side-effect-free statements such as
+/// SELECT/SHOW can be run (enforced by the backend). To prevent accidents it starts OFF
+/// in every session and is not persisted (a restart never silently makes it writable).
 let writable = $state(false);
-/// FILES ペインの一覧 (更新日時の降順。日時とサイズ付き)
+/// List for the FILES pane (descending by modified time, with timestamps and sizes)
 let fileEntries = $state<api.QueryFileEntry[]>([]);
-/// fileEntries を書き換えるたびに進める。後から解決した古い取得結果で新しい一覧を
-/// 上書きしないため (refreshFileEntries は投げっぱなしで重なりうる)
+/// Advanced every time fileEntries is rewritten. Prevents a stale fetch result that resolves later
+/// from overwriting a newer list (refreshFileEntries is fire-and-forget and calls can overlap).
 let fileEntriesVersion = 0;
 const setFileEntries = (entries: api.QueryFileEntry[]) => {
   fileEntriesVersion++;
   fileEntries = entries;
 };
-/// 一覧のファイル名だけ (存在確認・連番の採番用。並びは fileEntries と同じ)
+/// File names only from the list (for existence checks / numbering; same order as fileEntries)
 const files = $derived(fileEntries.map((e) => e.file_name));
 let editorTabs = $state<EditorTab[]>([]);
 let activeEditorTabId = $state<number | null>(null);
@@ -116,100 +117,100 @@ let errorMessage = $state<string | null>(null);
 let loadingConnections = $state(false);
 let schemas = $state<string[]>([]);
 let activeSchema = $state<string | null>(null);
-/// AI 設定の情報 (未取得・取得失敗時は null)
+/// AI settings info (null if not yet fetched or the fetch failed)
 let aiInfo = $state<AiInfo | null>(null);
-/// AI 設定の解決エラー (不明 provider 等。ボタンの title で案内する)
+/// AI settings resolution error (unknown provider etc.; shown via the button's title)
 let aiError = $state<string | null>(null);
-/// AI で SQL 生成中 (ボタンのスピナー表示・二重送信防止)
+/// Generating SQL with AI (button spinner, prevents double submit)
 let aiGenerating = $state(false);
-/// AI で実行計画を解説中 (ボタンのスピナー表示・二重送信防止)
+/// Explaining the execution plan with AI (button spinner, prevents double submit)
 let aiAnalyzing = $state(false);
-/// AI による実行計画解説の Markdown (モーダル表示中のみ非 null)
+/// Markdown of the AI execution plan explanation (non-null only while the modal is shown)
 let aiAnalysis = $state<string | null>(null);
-/// AI で選択 SQL を解説中 (ボタンのスピナー表示・二重送信防止)
+/// Explaining the selected SQL with AI (button spinner, prevents double submit)
 let aiExplaining = $state(false);
-/// AI による選択 SQL 解説の Markdown (モーダル表示中のみ非 null)
+/// Markdown of the AI explanation of the selected SQL (non-null only while the modal is shown)
 let aiExplanation = $state<string | null>(null);
-/// AI チャット (右ペイン) の表示中メッセージ。
-/// 接続ごとにスキーマが変わるため、接続を切り替えたら破棄する。
+/// Messages currently shown in the AI chat (right pane).
+/// The schema differs per connection, so discard them when the connection changes.
 let chatMessages = $state<ChatMessage[]>([]);
-/// 応答待ちの往復が属するチャット世代 (待機中でなければ null)。
-/// 会話を破棄した後も古い往復のスピナーが新しい会話に残らないよう、
-/// 表示上の「送信中」は現在の世代と一致する時だけとする (chatSending)。
+/// Chat generation that the in-flight round trip belongs to (null when not waiting).
+/// So that the spinner of an old round trip does not linger in a new conversation after the
+/// conversation is discarded, "sending" in the UI is shown only when it matches the current generation (chatSending).
 let chatSendingGen = $state<number | null>(null);
-/// 応答待ちの往復を実行している接続 → その往復のリクエスト ID の集合。
-/// クエリ実行と同じく「実行中の接続」として扱い、エディタタブが無いだけで
-/// トンネル / プールが切られる (maybeDisconnectIfIdle) のを防ぐ。
-/// 会話を破棄すると古い往復が走ったまま次の送信を許すため、同じ接続で
-/// 複数本が同時に走りうる。どれを中断するかを指定できるよう、本数ではなく
-/// ID の集合で持つ (Map は毎回作り直して反応性を保つ)。
+/// Connection running an in-flight round trip -> set of that round trip's request IDs.
+/// Treated as a "running connection" just like query execution, so that the tunnel / pool is not
+/// torn down (maybeDisconnectIfIdle) merely because there is no editor tab.
+/// Discarding the conversation lets the next send happen while an old round trip is still running,
+/// so several can run on the same connection at once. To be able to specify which one to abort,
+/// we keep a set of IDs rather than a count (the Map is rebuilt each time to keep reactivity).
 let chatRunningConnections = $state<Map<string, Set<string>>>(new Map());
 
-/// チャットの往復に付ける ID の採番 (プロセス内で一意なら十分)。
+/// Numbering of IDs attached to chat round trips (unique within the process is enough).
 let nextChatRequestSeq = 1;
 
-/// 進行中の「会話の破棄 → 中断の到達待ち → バックエンドの切替」の本数。
-/// この間は新しい送信を受け付けない: 中断要求は「その時点の実行中 ID」を
-/// 対象にするため、待っている隙に送られた往復は中断されないまま、
-/// 切替後のプールを古いプロンプトで使ってしまう。
-/// 真偽値だと、遷移が重なった時 (スキーマを続けて切り替えた等) に先に
-/// 終わった方が後続の分まで解除してしまうためカウンタで持つ。
+/// Number of in-progress "discard conversation -> wait for abort to arrive -> switch backend" transitions.
+/// New sends are not accepted during this time: an abort request targets "the IDs running at that
+/// moment", so a round trip sent while we are waiting would not be aborted and would use the
+/// post-switch pool with the old prompt.
+/// A boolean would let the one that finishes first also release the later ones when transitions overlap
+/// (e.g. schemas switched in succession), so we use a counter.
 let chatTransitions = $state(0);
-/// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得・取得失敗は null)
+/// Map of table name -> column name list for SQL completion (null if not fetched or the fetch failed)
 let schemaMap = $state<Record<string, string[]> | null>(null);
-/// 危険な文 (allow_dangerous_statements 有効な接続) の実行前確認ダイアログ。
-/// 非 null の間モーダルを表示し、ユーザーの応答を resolve へ渡す
+/// Confirmation dialog before running a dangerous statement (connection with allow_dangerous_statements enabled).
+/// The modal is shown while non-null, and the user's response is passed to resolve.
 let dangerousConfirm = $state<{
   reason: string;
   resolve: (ok: boolean) => void;
 } | null>(null);
 
-// 結果タブ ID の連番 (セッション内で一意なら十分なので永続化しない)
+// Sequence number for result tab IDs (unique within the session is enough, so not persisted)
 let nextTabId = 1;
-// エディタタブ ID の連番
+// Sequence number for editor tab IDs
 let nextEditorTabId = 1;
-/// 接続ごとに最後にアクティブだったエディタタブ ID を覚え、接続へ戻った時に復元する
+/// Remember the editor tab ID last active for each connection and restore it when returning to the connection
 const lastActiveTabByConnection = new Map<string, number>();
 
-/// エディタタブを最後にアクティブにした順 (先頭 = 直近)。Ctrl+Tab の巡回順に使う。
-/// 表示順ではなく履歴順で辿るため、タブの並びとは独立に持つ。
-/// $state ではない: UI はこれを描画しないので、リアクティブにする必要が無い。
+/// Order in which editor tabs were last activated (head = most recent). Used for the Ctrl+Tab cycling order.
+/// Kept independently of the tab layout because it follows history order, not display order.
+/// Not $state: the UI does not render it, so it does not need to be reactive.
 let tabMruOrder: number[] = [];
 
-/// Ctrl を押したまま Tab を連打している間の巡回状態 (null = 巡回していない)。
-/// order は巡回開始時点の MRU 順のスナップショット。
+/// Cycling state while Tab is pressed repeatedly with Ctrl held down (null = not cycling).
+/// order is a snapshot of the MRU order at the start of the cycle.
 ///
-/// **巡回中は MRU を書き換えない**のが要点。1 回ごとに繰り上げると、直近 2 タブの
-/// 間を往復するだけになり「押した分だけ進む」にならない。Ctrl を離した時点
-/// (endEditorTabCycle) で、選んだタブを 1 度だけ先頭へ繰り上げる。これにより
-/// Ctrl+Tab を単発で 2 回打つと 2 タブを交互に行き来する (一般的な MRU 切替と同じ)。
+/// The key point is that **the MRU is not rewritten during cycling**. Promoting on every press would
+/// just bounce between the two most recent tabs instead of "advancing as many times as pressed".
+/// When Ctrl is released (endEditorTabCycle), the selected tab is promoted to the head exactly once. This
+/// way, pressing Ctrl+Tab twice as single presses alternates between two tabs (same as ordinary MRU switching).
 let tabCycle: { order: number[]; index: number } | null = null;
 
-/// 巡回の直列化キュー。1 ステップが接続切替を await するため、Ctrl+Tab を速く
-/// 連打すると複数ステップが並行して走り、完了順によって「最後に見えているタブ」と
-/// tabCycle.index がズレうる。順に流して、そのズレを構造的に無くす。
-/// 確定 (endEditorTabCycle) も同じキューに積むので、キー入力が処理し切られた
-/// 後の状態で MRU が確定する。
+/// Serialization queue for cycling. Each step awaits a connection switch, so pressing Ctrl+Tab
+/// rapidly runs several steps concurrently, and depending on completion order the "last visible tab"
+/// and tabCycle.index can drift apart. Feeding steps through in order removes that drift structurally.
+/// The commit (endEditorTabCycle) is queued in the same queue as well, so the MRU is settled in the
+/// state after the key input has been fully processed.
 let tabCycleChain: Promise<void> = Promise.resolve();
 const queueTabCycleStep = (step: () => void | Promise<void>): Promise<void> => {
   tabCycleChain = tabCycleChain.then(step).catch(() => {});
   return tabCycleChain;
 };
 
-/// 巡回の世代。打ち切るたびに進める。**キューに積んだ時点の世代を控え、実行の
-/// 直前に照合する**: 打ち切りは `tabCycle` を null にするだけなので、それだけだと
-/// 既にキューに並んでいたステップが後から走って巡回を作り直してしまう
-/// (ユーザーが明示的に選んだタブから離れる)。
+/// Cycle generation. Advanced each time a cycle is aborted. **Remember the generation when queuing and
+/// check it just before running**: aborting only sets `tabCycle` to null, so on its own a step that was
+/// already queued would run later and recreate the cycle
+/// (moving away from the tab the user explicitly chose).
 let tabCycleGeneration = 0;
 
-/// 進行中の巡回を打ち切る (タブのクリック・ファイルを開く・タブを閉じる等、
-/// 巡回以外の移動が起きた時)。
+/// Abort the cycle in progress (when a move other than cycling happens: tab click, opening a file,
+/// closing a tab, etc.).
 const cancelTabCycle = () => {
   tabCycle = null;
   tabCycleGeneration++;
 };
 
-/// タブを MRU の先頭へ繰り上げる。巡回中は呼ばない (上記の理由)。
+/// Promote a tab to the head of the MRU. Not called during cycling (for the reason above).
 const touchTabMru = (id: number) => {
   tabMruOrder = touchMru(tabMruOrder, id);
 };
@@ -217,32 +218,32 @@ const touchTabMru = (id: number) => {
 const getActiveEditorTab = (): EditorTab | null =>
   editorTabs.find((t) => t.id === activeEditorTabId) ?? null;
 
-/// 実行中の loadSchemaMap の世代番号。接続・スキーマの連続切替で
-/// 古い応答が後から解決しても、最新の要求の結果だけを反映するために使う
+/// Generation number of the running loadSchemaMap. Used so that, on successive connection / schema
+/// switches, only the result of the latest request is applied even if an old response resolves later.
 let schemaMapGeneration = 0;
 
-/// 実行中の applyConnectionContext の世代番号。接続の連続切替で、遅い接続の
-/// 応答が後から解決して新しい接続の files / schemas / activeSchema を上書き
-/// しないよう、コミット前に最新世代かを検査する (schemaMapGeneration と同趣旨)
+/// Generation number of the running applyConnectionContext. On successive connection switches, checks
+/// before commit whether this is the latest generation, so that the response of a slow connection resolving later
+/// does not overwrite the new connection's files / schemas / activeSchema (same intent as schemaMapGeneration)
 let connectionContextGeneration = 0;
 
-/// ファイル/タブのナビゲーション世代。ファイルを開く (selectFile) / タブをアクティブに
-/// する (activateEditorTab) たびに進める。await を挟む処理が、その間にユーザーが別の
-/// ファイル/タブへ移動していないかを検査するのに使う (connectionContextGeneration は
-/// 接続切替しか捕捉しないため、同一接続内のファイル移動はこちらで見る)。
+/// File / tab navigation generation. Advanced each time a file is opened (selectFile) or a tab is activated
+/// (activateEditorTab). Used by processing that awaits to check whether the user navigated to another
+/// file / tab in the meantime (connectionContextGeneration only catches connection switches, so
+/// moves between files within the same connection are covered by this one).
 let navigationGeneration = 0;
 
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
-/// 自動保存が予約されているエディタタブ ID (デバウンス中の対象)
+/// ID of the editor tab with an autosave scheduled (the target while debouncing)
 let autoSavePendingTabId: number | null = null;
 
 const toErrorMessage = (e: unknown): string =>
   typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
 
-/// 指定接続に対する実効 Writable。Writable スイッチはツールバーに 1 つで、
-/// 現在選択中の接続の状態を表すため、別接続 (別接続タブの再実行など) では
-/// 常に false (読み取り専用) になる。実行ガードと危険文確認の両方でこの値を使い、
-/// 「トグルが示す接続にだけ書き込みを許可する」意味を一貫させる。
+/// Effective Writable for the given connection. The Writable switch is a single one in the toolbar and
+/// represents the state of the currently selected connection, so for another connection (e.g. re-running
+/// from another connection's tab) it is always false (read-only). Both the execution guard and the
+/// dangerous statement confirmation use this value, keeping "writes are allowed only on the connection the toggle shows" consistent.
 const effectiveWritable = (connection: string): boolean =>
   connection === selectedConnection && writable;
 
@@ -251,8 +252,8 @@ const loadConnections = async () => {
   errorMessage = null;
   try {
     connections = await api.getConnections();
-    // 接続設定の解決結果はバックエンドにキャッシュ済みなので、
-    // AI 設定の取得はここでは軽い (取得コマンドの再実行は起きない)
+    // The resolved connection config is already cached in the backend, so
+    // fetching the AI settings is cheap here (the fetch command is not re-run)
     await loadAiInfo();
   } catch (e) {
     errorMessage = toErrorMessage(e);
@@ -262,9 +263,9 @@ const loadConnections = async () => {
   }
 };
 
-/// AI 設定の情報 (configured / model) を取得する。
-/// 未設定は configured: false で返り、設定の解決エラー
-/// (不明 provider 等) は aiError に入れて AI ボタンの title で案内する。
+/// Fetch the AI settings info (configured / model).
+/// Unconfigured returns configured: false, and a config resolution error
+/// (unknown provider etc.) goes into aiError and is explained in the AI button's title.
 const loadAiInfo = async () => {
   try {
     aiInfo = await api.getAiInfo();
@@ -275,15 +276,15 @@ const loadAiInfo = async () => {
   }
 };
 
-/// 接続設定を再読込する (プール・SSH トンネルも破棄される)。
-/// 旧設定の選択状態を残さないよう一旦クリアし、同名の接続が
-/// まだ存在する場合のみ再選択する (ファイル一覧も新設定で再取得される)。
-/// 失敗した場合は false を返す (errorMessage 設定済み)。
+/// Reload the connection settings (pools and SSH tunnels are discarded too).
+/// Clear the selection state of the old settings first, and reselect only if a connection with
+/// the same name still exists (the file list is also re-fetched with the new settings).
+/// Returns false on failure (errorMessage has been set).
 const reloadConnections = async (): Promise<boolean> => {
-  // リロードは全エディタタブを破棄する。衝突タブは saveAllDirtyTabs で保存されない
-  // (外部変更を黙って上書きしないため) ので、そのまま進めると手元の編集が保存も
-  // 明示的な破棄もされないまま失われる。衝突が残っている間はリロードを中断し、
-  // ユーザーに解消 (保存で上書き / reopen で破棄) を促す。
+  // A reload discards all editor tabs. Conflicted tabs are not saved by saveAllDirtyTabs
+  // (so external changes are not silently overwritten), so proceeding as is would lose local edits
+  // without saving or an explicit discard. While a conflict remains, abort the reload and
+  // ask the user to resolve it (overwrite by saving / discard by reopening).
   const conflicted = editorTabs.find((t) => t.conflicted);
   if (conflicted) {
     errorMessage =
@@ -292,14 +293,13 @@ const reloadConnections = async (): Promise<boolean> => {
       `editor toolbar, then reload.`;
     return false;
   }
-  // タブを破棄するので、pending だけでなく全ての未保存タブを先に保存する
+  // Tabs are discarded, so save all unsaved tabs first, not just the pending one
   if (!(await saveAllDirtyTabs())) {
     return false;
   }
-  // 応答待ちのチャットは resetConnections の**前に**中断し、要求が届くまで
-  // 待つ。後回し / 投げっぱなしだと、リロード前の接続設定を握ったままの
-  // エージェントが破棄済みのプールを開き直し、古い認証情報 / スキーマで
-  // ツール実行を続けうる
+  // Abort a chat awaiting a response **before** resetConnections and wait until the request
+  // arrives. If deferred / fire-and-forget, an agent still holding the pre-reload connection config
+  // could reopen the discarded pool and keep running tools with stale credentials / schema.
   await clearChatAndWait();
   try {
     await api.resetConnections();
@@ -308,37 +308,37 @@ const reloadConnections = async (): Promise<boolean> => {
     errorMessage = toErrorMessage(e);
     return false;
   }
-  // バックエンドの入れ替えは済んだので、チャットの遷移は終わり
-  // (以降に送られる往復は新しい設定で動く)
+  // The backend swap is done, so the chat transition is over
+  // (round trips sent from now on run with the new settings)
   endChatTransition();
   const previousConnection = selectedConnection;
   selectedConnection = null;
-  // 設定リロードで接続が入れ替わるため、Writable も安全側 (OFF) へ戻す
+  // The connections are replaced by the settings reload, so also return Writable to the safe side (OFF)
   writable = false;
   setFileEntries([]);
-  // 設定が丸ごと入れ替わるため、開いているエディタタブを全て破棄する
+  // The settings are replaced wholesale, so discard all open editor tabs
   if (autoSaveTimer) {
     clearTimeout(autoSaveTimer);
     autoSaveTimer = null;
   }
   autoSavePendingTabId = null;
-  // reset 前後に接続切替 (applyConnectionContext) が in-flight でも、その古い
-  // 応答が後から commit して stale な接続を復活させないよう世代を進める
+  // Even if a connection switch (applyConnectionContext) is in flight before/after the reset, advance the
+  // generation so that its old response cannot commit later and revive a stale connection
   connectionContextGeneration++;
   editorTabs = [];
   activeEditorTabId = null;
   lastActiveTabByConnection.clear();
   tabMruOrder = [];
   cancelTabCycle();
-  // 設定リロードでバックエンドは全プール/トンネルを破棄する (resetConnections)。
-  // 確立済みフラグもクリアし、次の契機で張り直せるようにする。
+  // A settings reload makes the backend discard all pools / tunnels (resetConnections).
+  // Also clear the established flags so they can be re-established at the next opportunity.
   resourcesLoaded.clear();
-  // リロードは全接続のプールを破棄するため、in-flight のスキーマ取り込みが (どの接続の
-  // ものであれ) 破棄済みプールを「確立済み」として復活登録しないよう、全体リセット世代を
-  // 進める。接続個別の世代 (connectionLifecycleGen) では選択中でない接続の in-flight を
-  // 取りこぼすため、リセットは全接続共通のこの世代で見る。
+  // A reload discards the pools of all connections, so advance the global reset generation so that an
+  // in-flight schema import (of any connection) does not re-register a discarded pool as "established".
+  // The per-connection generation (connectionLifecycleGen) would miss in-flight work of a connection
+  // that is not selected, so resets are detected with this generation shared by all connections.
   connectionsResetGen++;
-  // 設定が丸ごと入れ替わるため、ピン留め含め全タブを破棄する
+  // The settings are replaced wholesale, so discard all tabs including pinned ones
   resultTabs = [];
   activeTabId = null;
   schemas = [];
@@ -347,8 +347,8 @@ const reloadConnections = async (): Promise<boolean> => {
   aiError = null;
   aiAnalysis = null;
   aiExplanation = null;
-  // チャットの中断と破棄は resetConnections の前に済ませてある (clearChat)
-  // 実行中の取得が後から古いマップを書き込まないよう世代を進めて破棄する
+  // Chat abort and discard were done before resetConnections (clearChat)
+  // Advance the generation and discard so that an in-flight fetch cannot later write an old map
   schemaMapGeneration++;
   schemaMap = null;
   await loadConnections();
@@ -364,8 +364,8 @@ const reloadConnections = async (): Promise<boolean> => {
   return true;
 };
 
-/// SQL 補完用のスキーママップをバックグラウンドで再取得する。
-/// 補完はあくまで補助機能のため、失敗しても通知せず補完なしで続行する。
+/// Re-fetch the schema map for SQL completion in the background.
+/// Completion is only an aid, so on failure continue without completion and do not notify.
 const loadSchemaMap = async () => {
   const connection = selectedConnection;
   const generation = ++schemaMapGeneration;
@@ -373,21 +373,21 @@ const loadSchemaMap = async () => {
     schemaMap = null;
     return;
   }
-  // 取得中に古いスキーマの候補を出さないよう先にクリアする
+  // Clear first so that candidates from the old schema are not offered while fetching
   schemaMap = null;
   try {
     const map = await api.getSchemaMap(connection);
-    // より新しい要求が始まっていたら、古い応答は捨てる
+    // If a newer request has started, discard the old response
     if (generation === schemaMapGeneration) {
       schemaMap = map;
     }
   } catch {
-    // 補完なしで黙って続行 (toast も errorMessage も出さない)
+    // Continue silently without completion (neither toast nor errorMessage)
   }
 };
 
-// 保留中の自動保存を確定させる。保存に失敗した場合は false を返す。
-// 呼び出し元は false の時に画面遷移を中断し、未保存の編集を守ること。
+// Commit the pending autosave. Returns false if saving fails.
+// The caller should abort screen navigation on false, to protect unsaved edits.
 const flushPendingSave = async (): Promise<boolean> => {
   if (autoSaveTimer) {
     clearTimeout(autoSaveTimer);
@@ -395,9 +395,9 @@ const flushPendingSave = async (): Promise<boolean> => {
   }
   const pendingId = autoSavePendingTabId;
   autoSavePendingTabId = null;
-  // デバウンス予約のタブ (= 直近まで編集していたタブ) だけを確定させる。
-  // 他タブの保存失敗でナビゲーションを巻き込まないよう、対象は 1 タブに限る
-  // (エディタタブは接続をまたいで残るため、切替で内容が失われることはない)。
+  // Commit only the debounce-scheduled tab (= the tab edited until just now).
+  // So that another tab's save failure does not drag the navigation down, the target is limited to one tab
+  // (editor tabs persist across connections, so switching does not lose their content).
   if (pendingId == null) {
     return true;
   }
@@ -408,9 +408,9 @@ const flushPendingSave = async (): Promise<boolean> => {
   return true;
 };
 
-/// 全ての dirty なエディタタブを保存する (best-effort)。全て成功したら true。
-/// タブを破棄する前 (reloadConnections) に呼び、未保存の編集を失わないようにする。
-/// 自動保存に失敗して pending が外れた dirty タブもここで確実に対象になる。
+/// Save all dirty editor tabs (best-effort). Returns true if all succeed.
+/// Called before discarding tabs (reloadConnections) so unsaved edits are not lost.
+/// A dirty tab whose pending flag was cleared by an autosave failure is reliably included here too.
 const saveAllDirtyTabs = async (): Promise<boolean> => {
   if (autoSaveTimer) {
     clearTimeout(autoSaveTimer);
@@ -419,8 +419,8 @@ const saveAllDirtyTabs = async (): Promise<boolean> => {
   autoSavePendingTabId = null;
   let ok = true;
   for (const tab of editorTabs) {
-    // 衝突タブは保存しない (外部変更を手元の編集で黙って上書きしないため)。
-    // ユーザーが編集継続 / 明示保存で衝突を解いた場合のみ通常の dirty として保存される。
+    // Do not save conflicted tabs (so external changes are not silently overwritten by local edits).
+    // Only when the user resolves the conflict by continuing to edit / saving explicitly is it saved as a normal dirty tab.
     if (tab.dirty && !tab.conflicted) {
       if (!(await saveEditorTab(tab))) {
         ok = false;
@@ -430,18 +430,18 @@ const saveAllDirtyTabs = async (): Promise<boolean> => {
   return ok;
 };
 
-/// 指定した接続のファイル一覧・スキーマ・補完マップを読み込み、接続コンテキストを
-/// 切り替える (エディタタブには触れない)。接続選択・タブアクティブ化の両方から使う。
+/// Load the file list, schema and completion map of the given connection and switch the connection
+/// context (does not touch editor tabs). Used by both connection selection and tab activation.
 ///
-/// 重要: `selectedConnection` は読み込みを終えてから **最後にまとめて** 反映する。
-/// 先に `selectedConnection = name` すると、await 中は「接続は新 (name) だがエディタは
-/// まだ旧タブの SQL を表示中」というズレが生じ、その窓で Run すると旧 SQL が新接続で
-/// 走ってしまう (DB クライアントとして致命的)。呼び出し側の `activeEditorTabId` 反映は
-/// この関数の resolve 直後の同一マイクロタスクで行われるため、コミット〜タブ反映の間に
-/// ユーザー操作 (マクロタスク) は割り込めず、接続とタブは常に整合する。
+/// Important: reflect `selectedConnection` **all at once at the end**, after loading finishes.
+/// If `selectedConnection = name` is set first, during the await there is a mismatch of "the connection is
+/// new (name) but the editor is still showing the old tab's SQL", and pressing Run in that window
+/// would run the old SQL on the new connection (fatal for a DB client). The caller's update of
+/// `activeEditorTabId` happens in the same microtask right after this function resolves, so no user
+/// action (macrotask) can interrupt between the commit and the tab update, and the connection and tab always stay consistent.
 ///
-/// コミットできたら true。連続切替でより新しい要求に追い越された場合は、何も反映せず
-/// false を返す (呼び出し側は activeEditorTabId を触らずに中断する)。
+/// Returns true if committed. If overtaken by a newer request during successive switches, nothing is
+/// reflected and false is returned (the caller aborts without touching activeEditorTabId).
 const applyConnectionContext = async (name: string): Promise<boolean> => {
   const generation = ++connectionContextGeneration;
   const defaultSchema = connections.find((c) => c.name === name)?.schema ?? null;
@@ -452,68 +452,68 @@ const applyConnectionContext = async (name: string): Promise<boolean> => {
   } catch (e) {
     filesError = toErrorMessage(e);
   }
-  // await の間により新しい切替が始まっていたら、この応答は捨てる (上書き防止)
+  // If a newer switch started during the await, discard this response (prevents overwriting)
   if (generation !== connectionContextGeneration) {
     return false;
   }
-  // アクティブスキーマの取得は接続を張らない (schema_override か設定値を返すだけ)
-  // ため選択時に行ってよい。スキーマ一覧 (listSchemas) は接続を張るので、
-  // ここでは取得しない (「選択した瞬間にトンネルが開く」のを避ける)。
+  // Fetching the active schema does not open a connection (it only returns schema_override or the config
+  // value), so it is fine to do on selection. The schema list (listSchemas) opens a connection,
+  // so it is not fetched here (to avoid "the tunnel opens the moment it is selected").
   let schema = defaultSchema;
   try {
     schema = (await api.getActiveSchema(name)) ?? schema;
   } catch {
-    // getActiveSchema は接続を張らないが、念のため失敗時は既定スキーマのままにする
+    // getActiveSchema does not open a connection, but just in case keep the default schema on failure
   }
   if (generation !== connectionContextGeneration) {
     return false;
   }
-  // ここから resolve まで await を挟まず、接続コンテキストを一括反映する。
-  // 別の接続へ切り替わったら Writable を安全側 (OFF) へ戻す。ある接続で
-  // 書き込みを許可したまま別接続 (本番など) に移り、誤って書き込む事故を防ぐ。
-  // 同一接続の再選択 (同接続のエディタタブ切替など) では維持する。
+  // From here to resolve, reflect the connection context in one go without awaiting.
+  // When switching to another connection, return Writable to the safe side (OFF). This prevents the accident
+  // of moving to another connection (e.g. production) with writes still allowed on one and writing by mistake.
+  // Keep it on re-selecting the same connection (e.g. switching editor tabs of the same connection).
   if (selectedConnection !== name) {
     writable = false;
-    // AI チャットの会話も破棄し、走っているエージェントを中断する。
-    // system prompt に載るスキーマが接続ごとに違うため会話は引き継げず、
-    // 破棄するだけではバックエンドが切替前の接続でツール実行を続ける
+    // Also discard the AI chat conversation and abort the running agent.
+    // The schema in the system prompt differs per connection so the conversation cannot carry over, and
+    // merely discarding it would let the backend keep running tools on the pre-switch connection
     clearChat();
   }
   selectedConnection = name;
   errorMessage = filesError;
   setFileEntries(filesError ? [] : loadedFiles);
   activeSchema = schema;
-  // スキーマ一覧・補完マップは接続を張るため、選択時点では取得しない
-  // (「選択した瞬間にトンネルが開く」のを避ける)。プルダウンは現在のスキーマのみを
-  // 出しておき、ファイルをエディタに読み込んだ時 / スキーマブラウザを開いた時に
-  // ensureConnectionResources で全一覧・補完マップを取り込む。
+  // The schema list / completion map open a connection, so they are not fetched at selection time
+  // (to avoid "the tunnel opens the moment it is selected"). Leave only the current schema in the dropdown, and
+  // import the full list and completion map via ensureConnectionResources when a file is loaded into the
+  // editor / the schema browser is opened.
   schemas = schema ? [schema] : [];
-  // 補完候補は新接続向けに一旦クリアする (世代も進め、古い取得の後追い書き込みを防ぐ)
+  // Clear the completion candidates for the new connection (also advance the generation to prevent a late write from an old fetch)
   schemaMapGeneration++;
   schemaMap = null;
   if (resourcesLoaded.has(name)) {
-    // 既に確立済みの接続を選び直した場合、トンネルは開いたままなので、上でリセットした
-    // スキーマ一覧・補完マップを取り直して UI (プルダウン / 補完) を復元する。新規に
-    // トンネルを開くわけではない (「選択した瞬間に開く」方針には反しない)。
-    // resourcesLoaded は外さない — 外して非同期で再登録すると、その隙に別接続へ
-    // 切り替えた時に切断判定 (maybeDisconnectIfIdle) や再登録と競合し、エディタタブの
-    // 無いトンネルが貼りっぱなしになりうるため。確立状態は保ったまま UI だけ取り直す。
+    // When an already established connection is re-selected, the tunnel is still open, so re-fetch the schema
+    // list / completion map reset above and restore the UI (dropdown / completion). This does not newly open
+    // a tunnel (it does not violate the "do not open at selection" policy).
+    // Do not clear resourcesLoaded — clearing it and re-registering asynchronously would race with the disconnect
+    // check (maybeDisconnectIfIdle) and re-registration if another connection is switched to in that gap, and a
+    // tunnel with no editor tab could be left open. Keep the established state and re-fetch only the UI.
     void loadConnectionSchemaResources(name);
   }
   return true;
 };
 
-/// 接続を確立済み (トンネル/プールを開き、スキーマ一覧・補完マップを取り込み済み)
-/// の接続名。ensureConnectionResources で登録し、disconnect / reset で外す。
-/// これを接続状態の真実として使い、キャッシュ (schemas 等) の有無で代用しない
-/// (切断後もキャッシュは残るため、代用すると再オープンの契機を取りこぼす)。
+/// Names of connections that are established (tunnel/pool opened, schema list and completion map imported).
+/// Registered in ensureConnectionResources and removed on disconnect / reset.
+/// Use this as the source of truth for the connection state and do not substitute the presence of a cache (schemas etc.)
+/// (the cache remains after disconnect, so substituting would miss the trigger to reopen).
 const resourcesLoaded = new Set<string>();
 
-/// 接続ごとの「切断 / リセットが起きた回数」。スキーマ取り込み (listSchemas は非同期で
-/// その間にトンネルが張られる) を待つ間に、その接続が切断されたかを検知するために使う。
-/// 取り込み開始時の値を控え、完了後に値が変わっていたら「待っている間に切断された」と分かる
-/// (状態 (selectedConnection / editorTabs) だけでは、選択中のまま最後のタブを閉じて切断された
-/// 接続と、スキーマブラウザだけで生きている選択中の接続を区別できないため、イベント回数で見る)。
+/// Per connection, "the number of times a disconnect / reset happened". Used to detect whether the connection was
+/// disconnected while waiting for the schema import (listSchemas is async and the tunnel is opened in the meantime).
+/// Remember the value at the start of the import, and if it changed after completion we know "it was disconnected while waiting"
+/// (state (selectedConnection / editorTabs) alone cannot distinguish a selected connection whose last tab was closed
+/// and disconnected from a selected connection kept alive only by the schema browser, so we count events).
 const connectionLifecycleGen = new Map<string, number>();
 const bumpConnectionLifecycle = (connection: string) => {
   connectionLifecycleGen.set(
@@ -522,19 +522,19 @@ const bumpConnectionLifecycle = (connection: string) => {
   );
 };
 
-/// 設定リロード (reloadConnections → resetConnections) は全接続のプール/トンネルを一括
-/// 破棄する。個別接続の世代では「選択中でない接続の in-flight 取り込み」を取りこぼすため、
-/// リセットは全接続共通のこの世代で検知する。取り込み開始時に控え、完了後に進んでいれば
-/// 「待っている間に全体リセットされた」と分かる。
+/// A settings reload (reloadConnections -> resetConnections) discards the pools/tunnels of all connections at once.
+/// The per-connection generation would miss "in-flight imports of non-selected connections", so
+/// resets are detected with this generation shared by all connections. Remember it at the start of the import,
+/// and if it advanced after completion we know "a global reset happened while waiting".
 let connectionsResetGen = 0;
 
-/// 接続のスキーマ一覧・補完マップを取り込んで UI (プルダウン / 補完) へ反映する。
-/// listSchemas がプールを取得する (= トンネルを張る) 契機。listSchemas が成功し、かつ
-/// 取り込み中に切断が挟まらなかった場合に true を返す (呼び出し側の resourcesLoaded 管理に
-/// 使う)。取り込み中に別接続へ切り替わっていたら反映はスキップする (selectedConnection
-/// ガード)。resourcesLoaded 自体はここでは触らない — 「確立済みか」の判定と「取り込み中か」を
-/// 分離し、再取り込み中に切替が走ってもライフサイクル管理 (maybeDisconnectIfIdle) と
-/// 競合しないようにするため。
+/// Import the connection's schema list / completion map and reflect them in the UI (dropdown / completion).
+/// This is the point where listSchemas acquires the pool (= opens the tunnel). Returns true if listSchemas
+/// succeeded and no disconnect intervened during the import (used by the caller to manage resourcesLoaded).
+/// If another connection was switched to during the import, skip reflecting (selectedConnection guard).
+/// resourcesLoaded itself is not touched here — to separate the "is it established" decision from
+/// "is it importing", so that a switch during a re-import does not conflict with lifecycle management
+/// (maybeDisconnectIfIdle).
 const loadConnectionSchemaResources = async (
   connection: string,
 ): Promise<boolean> => {
@@ -544,14 +544,14 @@ const loadConnectionSchemaResources = async (
   try {
     loaded = await api.listSchemas(connection);
   } catch {
-    // 接続失敗などは致命的でない。プルダウンは現在値のみのままにし、次の契機で再試行。
+    // A connection failure etc. is not fatal. Keep only the current value in the dropdown and retry at the next opportunity.
     return false;
   }
-  // 取り込みを待つ間に切断 (最後のエディタタブを閉じた / 別接続へ切替) や設定リロードが
-  // 挟まっていたら、この接続はもう生きていない。listSchemas がトンネルを開き直している
-  // 場合に備えて閉じ直し (アイドルなら)、UI 反映も確立済み登録もしない。これがないと
-  // アイドルな接続が「確立済み」として残り、遅延ライフサイクルが崩れる。切断は接続個別の
-  // 世代で、設定リロード (全接続破棄) は全体リセット世代で検知する。
+  // If a disconnect (closing the last editor tab / switching to another connection) or a settings reload
+  // intervened while waiting for the import, this connection is no longer alive. In case listSchemas
+  // reopened the tunnel, close it again (if idle), and do neither the UI reflection nor the registration as established.
+  // Without this, an idle connection would remain "established" and the lazy lifecycle would break. Disconnects are detected by
+  // the per-connection generation, and a settings reload (discarding all connections) by the global reset generation.
   if (
     (connectionLifecycleGen.get(connection) ?? 0) !== gen ||
     connectionsResetGen !== resetGen
@@ -561,37 +561,37 @@ const loadConnectionSchemaResources = async (
   }
   if (selectedConnection === connection) {
     schemas = loaded;
-    // 補完マップも取り込む (同じプールを使うので追加のトンネルは張らない。
-    // 失敗しても補完なしで続行)。
+    // Also import the completion map (it uses the same pool, so no additional tunnel is opened.
+    // On failure continue without completion).
     void loadSchemaMap();
   }
   return true;
 };
 
-/// トンネル / 接続を実際に開くべき契機 (エディタにファイルを読み込んだ時・
-/// スキーマブラウザを開いた時) で呼ぶ。接続を確立してスキーマ一覧と補完マップを
-/// 取り込む。接続選択だけでは呼ばない (選択した瞬間にトンネルが開くのを避ける)。
-/// 既に確立済み (resourcesLoaded) なら何もしない。切断されると外れるため、
-/// 全エディタを閉じて切断した後に再度開けば、ここで確実に張り直す。
+/// Call at the moment the tunnel / connection should actually be opened (when a file is loaded into the editor,
+/// when the schema browser is opened). Establish the connection and import the schema list and completion map.
+/// Not called by connection selection alone (to avoid opening the tunnel the moment it is selected).
+/// Does nothing if already established (resourcesLoaded). It is cleared on disconnect, so after closing
+/// all editors and disconnecting, opening again re-establishes it here reliably.
 const ensureConnectionResources = async (connection: string) => {
   if (connection !== selectedConnection || resourcesLoaded.has(connection)) {
     return;
   }
-  // 成功前に登録すると、失敗接続を「確立済み」と誤認して再試行を取りこぼすため、
-  // listSchemas (これが接続を張る) が成功してから登録する。取り込み中に切断が挟まった
-  // 場合は loadConnectionSchemaResources が false を返す (+ 開き直したトンネルを閉じ直す)
-  // ので、その時は登録しない — アイドルな接続を「確立済み」と誤認しない。
+  // Registering before success would mistake a failed connection for "established" and miss retries, so
+  // register after listSchemas (which opens the connection) succeeds. If a disconnect intervened during the import,
+  // loadConnectionSchemaResources returns false (and closes the reopened tunnel again),
+  // so do not register in that case — do not mistake an idle connection for "established".
   if (await loadConnectionSchemaResources(connection)) {
     resourcesLoaded.add(connection);
   }
 };
 
-/// この接続がもう不要 (エディタタブが 1 つも無く、実行中のクエリ / セル編集も無い)
-/// なら、SSH トンネル / プールを破棄する。エディタタブを閉じた時とクエリ完了時に
-/// 呼ぶ。実行中のクエリがある間は破棄しない (トンネルを途中で切ると実行中クエリの
-/// コネクションが壊れるため)。schema_override はバックエンドに残るので、張り直し後も
-/// 同じアクティブスキーマで繋がる。次にファイルを開く / スキーマブラウザを開く /
-/// クエリを実行した時に自動で張り直される。
+/// Destroy the SSH tunnel / pool if this connection is no longer needed (no editor tab, and no running
+/// query / cell edit). Called when an editor tab is closed and when a query completes. It is not
+/// destroyed while a query is running (cutting the tunnel midway would break the running query's connection).
+/// schema_override remains in the backend, so after reopening it connects with the same active schema.
+/// It is reopened automatically the next time a file is opened / the schema browser is opened /
+/// a query is run.
 const maybeDisconnectIfIdle = (connection: string) => {
   if (editorTabs.some((t) => t.connection === connection)) {
     return;
@@ -600,16 +600,16 @@ const maybeDisconnectIfIdle = (connection: string) => {
     return;
   }
   resourcesLoaded.delete(connection);
-  // 切断イベントを記録する。この接続のスキーマ取り込みが in-flight なら、完了時に
-  // 「待っている間に切断された」と検知して確立済み登録を防ぐ (defeat lazy lifecycle の回避)。
+  // Record the disconnect event. If this connection's schema import is in flight, detect on completion that
+  // "it was disconnected while waiting" and prevent registration as established (avoids defeating the lazy lifecycle).
   bumpConnectionLifecycle(connection);
-  // fire-and-forget。失敗しても致命的でない (次に接続を張り直す時に上書きされる) ため
-  // 未処理 rejection にしないよう握り潰す。
+  // fire-and-forget. A failure is not fatal (it is overwritten the next time the connection is reopened), so
+  // swallow it to avoid an unhandled rejection.
   void api.disconnect(connection).catch(() => {});
 };
 
-/// 接続に紐づくエディタタブのうち、アクティブに復元すべきものを選ぶ。
-/// 直近にアクティブだったタブを優先し、無ければ最後に開いたタブ、無ければ null。
+/// Pick, among the editor tabs tied to the connection, the one to restore as active.
+/// Prefer the most recently active tab, else the last opened tab, else null.
 const pickTabForConnection = (name: string): number | null => {
   const remembered = lastActiveTabByConnection.get(name);
   if (
@@ -628,50 +628,50 @@ const pickTabForConnection = (name: string): number | null => {
 
 const selectConnection = async (name: string) => {
   if (name === selectedConnection) {
-    // 現在の接続を再選択したら、進行中の別接続への切替 (applyConnectionContext は
-    // commit まで selectedConnection を変えないため、その最中は現接続が選択中に
-    // 見える) をキャンセルする。世代を進めておくと in-flight の切替は commit されず、
-    // 「今の接続に留まる」という操作の意図どおりになる。
+    // Re-selecting the current connection cancels an in-progress switch to another connection (since
+    // applyConnectionContext does not change selectedConnection until commit, the current connection appears
+    // selected during it). Advancing the generation keeps the in-flight switch from committing,
+    // matching the intent of the operation, "stay on the current connection".
     connectionContextGeneration++;
     return;
   }
   const previous = selectedConnection;
-  // 未保存タブは best-effort で保存するが、保存失敗でも切替は止めない。
-  // エディタタブは接続をまたいで残るため、切替で内容が失われることはない
-  // (書込不可などで保存に失敗しても、dirty のままタブに保持される)。
+  // Unsaved tabs are saved best-effort, but a save failure does not stop the switch.
+  // Editor tabs persist across connections, so switching does not lose their content
+  // (even if saving fails, e.g. not writable, they stay dirty in the tab).
   await flushPendingSave();
-  // 結果タブ・エディタタブは接続をまたいで残す (接続切替では破棄しない)。
-  // より新しい切替に追い越されたら、タブ選択を触らず中断する。
+  // Result tabs and editor tabs persist across connections (not discarded on connection switch).
+  // If overtaken by a newer switch, abort without touching the tab selection.
   if (!(await applyConnectionContext(name))) {
     return;
   }
-  // 接続を明示的に選ぶのは巡回とは別の操作。巡回中 (Ctrl を押したまま接続を
-  // クリックした等) なら、ここで巡回を打ち切ってから通常の移動として扱う
-  // (打ち切らないと、以降のステップが古い順序スナップショットで動く)。
+  // Explicitly choosing a connection is a separate operation from cycling. If cycling is in progress
+  // (e.g. the connection was clicked with Ctrl held), abort the cycle here and treat it as a normal move
+  // (otherwise later steps would run on the old order snapshot).
   cancelTabCycle();
-  // この接続で最後に開いていたタブを復元する (無ければエディタは空表示)
+  // Restore the tab last open on this connection (the editor shows empty if none)
   activeEditorTabId = pickTabForConnection(name);
   if (activeEditorTabId != null) {
-    // activateEditorTab を通らない経路なので、MRU はここで自分で更新する
+    // This path does not go through activateEditorTab, so update the MRU here ourselves
     touchTabMru(activeEditorTabId);
   }
-  // 切替元の接続が「エディタタブを 1 つも持たない」なら、その接続はもう不要と判断して
-  // トンネル / プールを閉じる。スキーマブラウザ (TABLES) を開いただけの接続は
-  // エディタタブを持たず removeEditorTab / executeTab を通らないため、ここで閉じないと
-  // 張りっぱなしになる。エディタタブを持つ接続は maybeDisconnectIfIdle が no-op になり、
-  // 切替後も開いたまま残る (「作ったトンネルは貼りっぱなし」の方針どおり)。
+  // If the connection switched from has "no editor tab at all", judge it no longer needed and close the
+  // tunnel / pool. A connection where only the schema browser (TABLES) was opened has no editor tab and
+  // does not go through removeEditorTab / executeTab, so if not closed here it stays open.
+  // A connection with editor tabs makes maybeDisconnectIfIdle a no-op and stays open after the switch
+  // (per the policy "a tunnel once made stays open").
   if (previous) {
     maybeDisconnectIfIdle(previous);
   }
 };
 
-/// エディタタブをアクティブにする。タブの接続が現在の接続と違えば、その接続へ
-/// 切り替える (files / スキーマ / 補完もタブの接続のものに揃える)。
+/// Activate an editor tab. If the tab's connection differs from the current one, switch to
+/// that connection (files / schema / completion are aligned to the tab's connection too).
 ///
-/// @param viaCycle - Ctrl+Tab の巡回から呼ばれたか。巡回以外の経路 (タブの
-///   クリック等) は、進行中の巡回を打ち切って通常の移動として扱う。Ctrl を
-///   押したままタブをクリックされた時に、そのタブを MRU へ載せないまま古い
-///   巡回位置から進み続けるのを防ぐ。
+/// @param viaCycle - Whether it was called from Ctrl+Tab cycling. For paths other than cycling (tab
+///   click etc.), abort the cycle in progress and treat it as a normal move. This prevents, when a
+///   tab is clicked with Ctrl held, continuing from the old cycle position without putting that tab
+///   on the MRU.
 const activateEditorTab = async (id: number, viaCycle = false) => {
   if (!viaCycle) {
     cancelTabCycle();
@@ -683,29 +683,29 @@ const activateEditorTab = async (id: number, viaCycle = false) => {
   if (!tab) {
     return;
   }
-  // タブのアクティブ化もナビゲーション。await を挟む処理が「その後にユーザーが
-  // 別タブへ移動した」ことを検知できるよう世代を進める。
+  // Activating a tab is navigation too. Advance the generation so that processing that awaits can
+  // detect that "the user then moved to another tab".
   const navGen = ++navigationGeneration;
-  // 未保存タブは best-effort で保存するが、保存失敗でもアクティブ化は止めない。
-  // (書込不可などで保存に失敗しても未保存 SQL を閲覧・コピーできるようにする。
-  //  タブは残るので内容は失われない)
+  // Unsaved tabs are saved best-effort, but a save failure does not stop activation.
+  // (so that unsaved SQL can still be viewed / copied even if saving fails, e.g. not writable.
+  //  The tab remains, so the content is not lost)
   await flushPendingSave();
   const previous = selectedConnection;
   if (tab.connection !== selectedConnection) {
-    // より新しい切替に追い越されたら、このタブをアクティブにしない
+    // If overtaken by a newer switch, do not activate this tab
     if (!(await applyConnectionContext(tab.connection))) {
       return;
     }
-    // タブのアクティブ化も接続を切り替える経路。切替元がスキーマブラウザだけで開いた
-    // (エディタタブの無い) 接続なら、selectConnection と同様にここでも閉じる。
-    // このパスを塞がないと、TABLES だけ開いた接続のトンネルが貼りっぱなしになる。
+    // Activating a tab is also a path that switches the connection. If the connection switched from was opened only via the schema browser
+    // (no editor tab), close it here too, as selectConnection does.
+    // Without closing this path, the tunnel of a connection where only TABLES was opened would be left open.
     if (previous) {
       maybeDisconnectIfIdle(previous);
     }
   }
-  // await の間にユーザーが別のタブ / ファイルへ移動していたら、ここで
-  // activeEditorTabId を書くとその移動を上書きしてしまう。接続切替を伴う
-  // 巡回ステップは特に長く、その最中のクリックがこれに当たる。
+  // If the user moved to another tab / file during the await, writing
+  // activeEditorTabId here would overwrite that move. A cycling step that involves a connection switch
+  // is especially long, and a click during it hits this.
   if (navGen !== navigationGeneration) {
     return;
   }
@@ -716,12 +716,12 @@ const activateEditorTab = async (id: number, viaCycle = false) => {
   }
 };
 
-/// Ctrl+Tab / Ctrl+Shift+Tab で、履歴 (MRU) 順に 1 つ進む / 戻る。
-/// Ctrl を押しっぱなしで連打すると、その分だけ奥へ進む。
-/// 連打しても順に処理されるよう、ステップはキューに積む。
+/// Move one step forward / back in history (MRU) order with Ctrl+Tab / Ctrl+Shift+Tab.
+/// Pressing repeatedly with Ctrl held advances that many steps deeper.
+/// Steps are queued so they are processed in order even when pressed rapidly.
 const cycleEditorTab = (direction: 1 | -1): Promise<void> => {
-  // キーを押した時点の世代。実行までの間に打ち切られていたら、このステップは
-  // 無かったことにする。
+  // Generation at the time the key was pressed. If the cycle was aborted before execution, this step
+  // is treated as if it never happened.
   const generation = tabCycleGeneration;
   return queueTabCycleStep(() => {
     if (generation !== tabCycleGeneration) {
@@ -741,10 +741,10 @@ const cycleEditorTabStep = async (direction: 1 | -1) => {
       editorTabs.map((t) => t.id),
     );
     const current = activeEditorTabId == null ? -1 : order.indexOf(activeEditorTabId);
-    // アクティブなタブが無い状態 (タブを持たない接続を選んでいる時など) は、
-    // 「先頭の 1 つ手前」から始めて最初の Ctrl+Tab が履歴の先頭に当たるようにする。
-    // 逆方向なら「末尾の 1 つ次」= 0 から始めて末尾に当たる。0 で始めてしまうと
-    // 直近のタブを飛ばして 2 番目に移ってしまう。
+    // When there is no active tab (e.g. a connection with no tabs is selected), start from
+    // "one before the head" so that the first Ctrl+Tab lands on the head of the history.
+    // In the reverse direction, start from "one after the tail" = 0 so it lands on the tail. Starting at 0
+    // would skip the most recent tab and move to the second one.
     tabCycle = {
       order,
       index: current >= 0 ? current : direction === 1 ? -1 : 0,
@@ -758,9 +758,9 @@ const cycleEditorTabStep = async (direction: 1 | -1) => {
   await activateEditorTab(cycle.order[cycle.index], true);
 };
 
-/// Ctrl を離した (または window がフォーカスを失った) 時に巡回を終える。
-/// ここで初めて、いま見ているタブを MRU の先頭へ繰り上げる。
-/// 未処理のステップの後ろに積むので、確定は必ず最後の移動の後になる。
+/// End the cycle when Ctrl is released (or the window loses focus).
+/// Only now is the tab currently being viewed promoted to the head of the MRU.
+/// It is queued after pending steps, so the commit always comes after the last move.
 const endEditorTabCycle = (): Promise<void> =>
   queueTabCycleStep(() => {
     if (!tabCycle) {
@@ -772,47 +772,47 @@ const endEditorTabCycle = (): Promise<void> =>
     }
   });
 
-// アクティブスキーマ (database) を切り替える。成功したら true。
+// Switch the active schema (database). Returns true on success.
 const changeActiveSchema = async (schema: string): Promise<boolean> => {
   const connection = selectedConnection;
   if (!connection || schema === activeSchema) {
     return true;
   }
-  // 未保存タブは best-effort で保存 (失敗してもスキーマ切替は止めない)
+  // Save unsaved tabs best-effort (a failure does not stop the schema switch)
   await flushPendingSave();
-  // AI チャットの会話は切替の**前に**破棄し、中断が届くまで待つ。
-  // system prompt に載るスキーマが変わるため会話は引き継げず、切替が
-  // 先行すると応答待ちの往復が古いプロンプトのまま新しいスキーマの
-  // プールでクエリを実行してしまう
+  // Discard the AI chat conversation **before** the switch and wait until the abort arrives.
+  // The schema in the system prompt changes so the conversation cannot carry over, and if the switch
+  // came first, a round trip awaiting a response would run queries on the new schema's pool
+  // with the old prompt
   await clearChatAndWait();
   try {
     await api.setActiveSchema(connection, schema);
-    // 切替中に別接続へ移っていたら、そのスキーマ表示を新接続に適用しない
+    // If we moved to another connection during the switch, do not apply that schema display to the new connection
     if (selectedConnection !== connection) {
       return false;
     }
     activeSchema = schema;
     errorMessage = null;
-    // 切替先スキーマの補完候補をバックグラウンドで取得する (待たない)
+    // Fetch the completion candidates of the target schema in the background (do not wait)
     void loadSchemaMap();
     return true;
   } catch (e) {
     errorMessage = toErrorMessage(e);
     return false;
   } finally {
-    // 成否によらず遷移を終える (失敗時に入力が塞がったままにならないように)
+    // End the transition regardless of success (so that input does not stay blocked on failure)
     endChatTransition();
   }
 };
 
-/// ファイルを開く。既に開いているタブがあればアクティブにし、無ければ
-/// 内容を読み込んで新しいタブを作りアクティブにする (FilesPane から呼ばれる)。
+/// Open a file. If a tab is already open, activate it; otherwise load the
+/// content, create a new tab and activate it (called from FilesPane).
 const selectFile = async (fileName: string) => {
-  // このファイルオープンをナビゲーション世代として記録する (await 中に別ファイル/タブへ
-  // 移動されたかを後で検査するため)。
+  // Record this file open as a navigation generation (to later check whether we moved to another file / tab
+  // during the await).
   const navGen = ++navigationGeneration;
-  // 読み込み先の接続を await 前に固定する。読込中に接続が切り替わっても、
-  // タブは必ず「内容を読んだ接続」に紐づける (誤った接続への実行/保存を防ぐ)。
+  // Fix the connection to load from before the await. Even if the connection switches while loading,
+  // the tab is always tied to "the connection the content was read from" (prevents running / saving on the wrong connection).
   const connection = selectedConnection;
   if (!connection) {
     return;
@@ -821,8 +821,8 @@ const selectFile = async (fileName: string) => {
     (t) => t.connection === connection && t.file === fileName,
   );
   if (existing) {
-    // 衝突状態のタブを開き直した場合は、警告文 "reopen the file to discard them" に
-    // 従い手元の編集を破棄してディスクの内容を読み直す (best-effort。失敗時は現状維持)。
+    // When reopening a conflicted tab, follow the warning text "reopen the file to discard them":
+    // discard local edits and re-read the disk content (best-effort. On failure keep the current state).
     if (existing.conflicted) {
       let disk: string | undefined;
       try {
@@ -830,11 +830,11 @@ const selectFile = async (fileName: string) => {
       } catch (e) {
         errorMessage = toErrorMessage(e);
       }
-      // 読込 await 中にユーザーが別接続へ移動、または同一接続内で別ファイル/タブへ
-      // 移動していたら、この結果でタブを書き換えず、フォーカスも奪わない (遅い読込が
-      // 新しいナビゲーションを巻き戻さないようにする。未着タブ生成パスの stale-read
-      // ガードと同方針)。同一接続内のファイル移動は connection 比較では捕まらないため
-      // ナビゲーション世代で検査する。
+      // If the user moved to another connection during the load await, or to another file / tab within the same
+      // connection, do not rewrite the tab with this result and do not steal focus (so a slow load does
+      // not roll back newer navigation; same policy as the stale-read guard on the path that creates a not-yet-arrived tab).
+      // A file move within the same connection is not caught by comparing the connection, so it is checked
+      // with the navigation generation.
       if (selectedConnection !== connection || navigationGeneration !== navGen) {
         return;
       }
@@ -849,17 +849,17 @@ const selectFile = async (fileName: string) => {
       }
     }
     await activateEditorTab(existing.id);
-    // ファイルをエディタで開いた = 接続を使う契機。トンネル/接続を張り直す
-    // (全エディタを閉じて切断した後に再度開いた場合もここで復帰する)。
+    // Opening a file in the editor = an opportunity to use the connection. Re-establish the tunnel / connection
+    // (this also recovers when reopened after closing all editors and disconnecting).
     void ensureConnectionResources(connection);
     return;
   }
-  // 未保存タブは best-effort で保存 (失敗してもファイルオープンは止めない)
+  // Save unsaved tabs best-effort (a failure does not stop the file open)
   await flushPendingSave();
   try {
     const content = await api.readQueryFile(connection, fileName);
-    // 読込中に別接続へ切り替わっていたら、この読込結果は捨てる
-    // (ユーザーはもうその接続を見ていないので、開かない)
+    // If the connection switched during the load, discard this load result
+    // (the user is no longer looking at that connection, so do not open it)
     if (selectedConnection !== connection) {
       return;
     }
@@ -872,28 +872,28 @@ const selectFile = async (fileName: string) => {
       diskContent: content,
     };
     editorTabs = [...editorTabs, tab];
-    // 新しいタブを開くのは明示的な移動。activateEditorTab を通らない経路なので、
-    // 進行中の巡回はここで打ち切る (打ち切らないと、次の Ctrl+Tab がこのタブを
-    // 含まない古いスナップショットの続きから進む)。
+    // Opening a new tab is an explicit move. This path does not go through activateEditorTab, so abort
+    // the cycle in progress here (otherwise the next Ctrl+Tab would continue from an old snapshot
+    // that does not include this tab).
     cancelTabCycle();
     activeEditorTabId = tab.id;
     lastActiveTabByConnection.set(connection, tab.id);
     touchTabMru(tab.id);
     errorMessage = null;
-    // ファイルをエディタに読み込んだ = 接続を使う契機。ここでトンネル/接続を張り、
-    // スキーマ一覧と補完マップを取り込む (接続選択時点では張っていない)。
+    // Loading a file into the editor = an opportunity to use the connection. Open the tunnel / connection here
+    // and import the schema list and completion map (they were not opened at connection selection).
     void ensureConnectionResources(connection);
   } catch (e) {
     errorMessage = toErrorMessage(e);
   }
 };
 
-/// deep link (`queryfolio://open/<path>`) / CLI で指定されたファイルを開く。
-/// 対象接続へ切り替えてからそのファイルを開く。接続が設定に無ければエラー表示。
-/// (バックエンドが保存領域配下かを検証済みの connection / fileName を受け取る)
+/// Open the file specified by a deep link (`queryfolio://open/<path>`) / the CLI.
+/// Switch to the target connection and then open the file. If the connection is not in the settings, show an error.
+/// (receives the connection / fileName already verified by the backend to be under the storage area)
 const openFileByTarget = async (connection: string, fileName: string) => {
-  // 実行中インスタンスへの deep link は、まれに接続一覧の初回ロード完了前に
-  // 届き得る。空のまま「接続が無い」と捨てないよう、未ロードなら先に読み込む。
+  // A deep link to a running instance can, rarely, arrive before the initial load of the connection list
+  // completes. So as not to discard it as "no such connection" while still empty, load first if not loaded.
   if (connections.length === 0) {
     await loadConnections();
   }
@@ -901,17 +901,17 @@ const openFileByTarget = async (connection: string, fileName: string) => {
     errorMessage = `Connection '${connection}' is not defined in the config`;
     return;
   }
-  // selectConnection は同じ接続なら no-op (files は既に読込済み)、別接続なら
-  // 切り替えてファイル一覧を読み込む。追い越された場合は selectedConnection が
-  // 変わるため、下のガードで開かない。
+  // selectConnection is a no-op for the same connection (files are already loaded), and for a different
+  // connection it switches and loads the file list. If overtaken, selectedConnection changes,
+  // so the guard below does not open.
   await selectConnection(connection);
   if (selectedConnection !== connection) {
     return;
   }
-  // 一覧に無いファイルなら FILES ペインを取り直す。CLI の
-  // `queryfolio write <connection> <file-name>` は実行中インスタンスの外で
-  // ファイルを作るため、その接続が既に選択済み (= selectConnection が no-op)
-  // だと、エディタでは開けるのに一覧には現れないままになる。
+  // If the file is not in the list, re-fetch the FILES pane. The CLI's
+  // `queryfolio write <connection> <file-name>` creates files outside the running instance, so
+  // if that connection is already selected (= selectConnection is a no-op), the file can be opened
+  // in the editor yet never appears in the list.
   if (!files.includes(fileName)) {
     try {
       const latest = await api.listQueryFiles(connection);
@@ -919,33 +919,33 @@ const openFileByTarget = async (connection: string, fileName: string) => {
         setFileEntries(latest);
       }
     } catch {
-      // 一覧の更新に失敗してもファイルは開ける (表示だけの問題)。
-      // 次にこの接続を選び直した時に取り直される。
+      // The file can be opened even if refreshing the list fails (only a display issue).
+      // It will be re-fetched the next time this connection is selected.
     }
-    // 取得を待つ間に別接続へ移っていたら、その接続の一覧も開く対象も
-    // 触らない (selectFile は「今の選択接続」で開くため、切替先の同名
-    // ファイルを開いてしまう)。
+    // If we moved to another connection during the fetch wait, touch neither that connection's list nor
+    // the open target (selectFile opens on "the currently selected connection", so it would open
+    // a same-named file on the switched-to connection).
     if (selectedConnection !== connection) {
       return;
     }
   } else {
-    // 一覧にあるファイルでも、CLI の write が中身を書き換えていれば更新日時とサイズが
-    // 変わっている。開くのは待たせない (表示だけの問題)
+    // Even for a file in the list, if the CLI's write rewrote its content, the modified time and size
+    // have changed. Do not make opening wait for this (only a display issue)
     refreshFileEntries(connection);
   }
-  // 既に開いているタブなら、アクティブにする前にディスクの内容と突き合わせる。
-  // CLI の `queryfolio write` はこのプロセスの外でファイルを書き換えるため、
-  // 外部変更ポーリング (FILE_WATCH_INTERVAL_MS) を待つと、書き換えたはずの
-  // クエリを開いたのに**古い SQL が最大 2.5 秒表示され、そのまま実行できてしまう**。
-  // 判定は通常のポーリングと同じ経路を使う (手元の未保存編集は衝突として扱い、
-  // 黙って捨てない)。
+  // If the tab is already open, compare with the disk content before activating it.
+  // The CLI's `queryfolio write` rewrites files outside this process, so waiting for the external change
+  // polling (FILE_WATCH_INTERVAL_MS) would, even though you opened a query that was rewritten, **show the old SQL
+  // for up to 2.5 seconds and let it be run as is**.
+  // The check uses the same path as normal polling (local unsaved edits are treated as a conflict and
+  // are not silently discarded).
   const opened = editorTabs.find(
     (t) => t.connection === connection && t.file === fileName,
   );
   if (opened) {
     await checkTabForExternalChange(opened.id);
-    // 突き合わせを待つ間に別接続へ移っていたら、開く対象を触らない
-    // (上の一覧取り直しと同じガード)。
+    // If we moved to another connection while waiting for the comparison, do not touch the open target
+    // (same guard as the list re-fetch above).
     if (selectedConnection !== connection) {
       return;
     }
@@ -953,18 +953,18 @@ const openFileByTarget = async (connection: string, fileName: string) => {
   await selectFile(fileName);
 };
 
-/// エディタタブを閉じる。未保存なら閉じる前に保存する (best-effort)。
-/// アクティブタブを閉じたら右隣 (無ければ左隣) をアクティブにする。
+/// Close an editor tab. If unsaved, save before closing (best-effort).
+/// When the active tab is closed, activate the right neighbor (or the left one if none).
 const removeEditorTab = async (id: number, save: boolean) => {
   const tab = editorTabs.find((t) => t.id === id);
   if (!tab) {
     return;
   }
-  // 衝突タブ (外部変更 vs 手元の未保存編集) を閉じる時は、どちらかを黙って失わない。
-  // 通常の dirty タブは閉じる前に保存されるが、衝突タブを保存すると外部変更を黙って
-  // 上書きし、逆に破棄すると手元の編集を黙って失う。どちらを捨てるかはユーザーの
-  // 明示操作 (保存で上書き / reopen で破棄) に委ねるべきなので、閉じる操作はブロックし
-  // トーストで解消を促す。save=false (ファイル削除で閉じる等) は保存も上書きもしないため対象外。
+  // When closing a conflicted tab (external change vs local unsaved edits), do not silently lose either.
+  // A normal dirty tab is saved before closing, but saving a conflicted tab would silently overwrite the external
+  // change, and conversely discarding would silently lose the local edits. Which one to throw away should be left to
+  // the user's explicit action (overwrite by saving / discard by reopening), so block the close and
+  // prompt for resolution with a toast. save=false (closing because the file was deleted etc.) neither saves nor overwrites, so it is excluded.
   if (save && tab.conflicted) {
     toast.warning(
       `"${tab.file}" has unsaved edits conflicting with an external change`,
@@ -975,7 +975,7 @@ const removeEditorTab = async (id: number, save: boolean) => {
     );
     return;
   }
-  // このタブの自動保存予約が残っていれば解除する (閉じた後に走らせない)
+  // If an autosave is still scheduled for this tab, cancel it (so it does not run after closing)
   if (autoSavePendingTabId === id) {
     if (autoSaveTimer) {
       clearTimeout(autoSaveTimer);
@@ -983,29 +983,29 @@ const removeEditorTab = async (id: number, save: boolean) => {
     }
     autoSavePendingTabId = null;
   }
-  // 通常の dirty タブは閉じる前に保存する (衝突タブは上でブロック済みなのでここには
-  // 到達しない)。
+  // A normal dirty tab is saved before closing (a conflicted tab was already blocked above, so it
+  // does not reach here).
   if (save && tab.dirty) {
-    // 保存に失敗したら閉じない (未保存内容をメモリごと失わないため)
+    // If saving fails, do not close (so unsaved content is not lost along with memory)
     if (!(await saveEditorTab(tab))) {
       return;
     }
-    // 保存 await の間にさらに編集された場合、saveEditorTab は dirty を残す。
-    // その編集を失わないよう close を中断する (自動保存タイマーが後で確定させる)
+    // If edited further during the save await, saveEditorTab leaves dirty set.
+    // Abort the close so that edit is not lost (the autosave timer will commit it later)
     if (tab.dirty) {
       return;
     }
   }
-  // 保存 await 中に配列が変わっている可能性があるため、位置は取り直す
+  // The array may have changed during the save await, so re-obtain the position
   const index = editorTabs.findIndex((t) => t.id === id);
   if (index < 0) {
     return;
   }
   editorTabs = editorTabs.filter((t) => t.id !== id);
   tabMruOrder = forgetMru(tabMruOrder, id);
-  // 巡回中に (Ctrl を押したまま) タブを閉じられた場合、順序スナップショットに
-  // 消えた ID が残る。そのまま進むと存在しないタブを選んで 1 回分が空振りするので、
-  // 巡回自体を打ち切る (次の Ctrl+Tab は現在のタブ構成で組み直される)。
+  // If a tab is closed during cycling (with Ctrl held), the order snapshot is left
+  // with a vanished ID. Proceeding as is would select a nonexistent tab and waste one step,
+  // so abort the cycle itself (the next Ctrl+Tab is rebuilt from the current tab layout)
   if (tabCycle) {
     cancelTabCycle();
   }
@@ -1013,14 +1013,14 @@ const removeEditorTab = async (id: number, save: boolean) => {
     lastActiveTabByConnection.delete(tab.connection);
   }
   if (activeEditorTabId === id) {
-    // filter 後、元 index の位置には右隣タブが繰り上がっている
+    // After filter, the right-hand neighbor has moved up into the original index position
     const neighbor = editorTabs[index] ?? editorTabs[index - 1] ?? null;
     activeEditorTabId = null;
     if (neighbor) {
       await activateEditorTab(neighbor.id);
     }
   }
-  // この接続のエディタタブが全て閉じられたら、SSH トンネル / プールを閉じる。
+  // When all of this connection's editor tabs are closed, close the SSH tunnel / pool
   maybeDisconnectIfIdle(tab.connection);
 };
 
@@ -1035,7 +1035,7 @@ const createFile = async (fileName: string) => {
   }
   try {
     const normalized = await api.createQueryFile(connection, fileName);
-    // 作成中に別接続へ切り替わっていたら、新接続の一覧を汚さず開かない
+    // If the connection switched to another during creation, do not pollute the new connection's list and do not open
     if (selectedConnection !== connection) {
       return;
     }
@@ -1053,14 +1053,14 @@ const deleteFile = async (fileName: string) => {
   }
   try {
     await api.deleteQueryFile(connection, fileName);
-    // 削除したファイルの開いているタブを閉じる (ファイルは消えたので保存しない)
+    // Close the open tab of the deleted file (the file is gone, so do not save)
     const victims = editorTabs.filter(
       (t) => t.connection === connection && t.file === fileName,
     );
     for (const v of victims) {
       await removeEditorTab(v.id, false);
     }
-    // タブを閉じる過程で接続が切り替わっていなければ一覧を更新する
+    // Update the list unless the connection switched in the course of closing the tab
     if (selectedConnection === connection) {
       setFileEntries(await api.listQueryFiles(connection));
     }
@@ -1069,19 +1069,19 @@ const deleteFile = async (fileName: string) => {
   }
 };
 
-// ファイルをリネームする。成功したら正規化後の新ファイル名、失敗したら null。
-// 対象ファイルを開いているタブがあればリネーム前に保存し、成功後は追従する。
+// Rename a file. Returns the normalized new file name on success, null on failure.
+// If a tab has the target file open, save before renaming and follow it after success.
 const renameFile = async (
   oldName: string,
   newName: string,
 ): Promise<string | null> => {
-  // await をまたぐ間に接続が切り替わっても、リネームは開始時の接続に対して
-  // 行う (flushPendingSave 中の接続切替による取り違えを防ぐ)
+  // Even if the connection switches across awaits, do the rename against the connection at the start
+  // (prevents mix-ups from a connection switch during flushPendingSave)
   const connection = selectedConnection;
   if (!connection) {
     return null;
   }
-  // 対象ファイルを開いているタブがあれば未保存内容を先に確定させる
+  // If a tab has the target file open, commit its unsaved content first
   const opened = editorTabs.some(
     (t) => t.connection === connection && t.file === oldName,
   );
@@ -1090,11 +1090,11 @@ const renameFile = async (
   }
   try {
     const normalized = await api.renameQueryFile(connection, oldName, newName);
-    // リネーム中に接続が切り替わっていたら、旧接続の一覧で上書きしない
+    // If the connection switched during the rename, do not overwrite with the old connection's list
     if (selectedConnection === connection) {
       setFileEntries(await api.listQueryFiles(connection));
     }
-    // 開いているタブのファイル名を追従させる
+    // Make the open tab's file name follow
     for (const t of editorTabs) {
       if (t.connection === connection && t.file === oldName) {
         t.file = normalized;
@@ -1108,12 +1108,12 @@ const renameFile = async (
   }
 };
 
-// クエリファイルを別の接続のフォルダへ移動する (FILES から CONNECTIONS への
-// ドラッグ & ドロップ)。成功したら true、失敗したら errorMessage を設定して false。
+// Move a query file to another connection's folder (drag & drop from FILES to CONNECTIONS).
+// Returns true on success; on failure sets errorMessage and returns false.
 //
-// 移動元 (fromConnection) は**ドラッグを開始した時点の接続**を呼び出し側から
-// 受け取る。selectedConnection を見に行くと、ドラッグ中に接続が切り替わった時に
-// 別接続の同名ファイルを移動してしまう。
+// The source (fromConnection) is received from the caller as **the connection at the time the drag started**.
+// If we looked at selectedConnection, a connection switch during the drag would move a
+// same-named file of another connection.
 const moveFileToConnection = async (
   fileName: string,
   fromConnection: string,
@@ -1122,16 +1122,15 @@ const moveFileToConnection = async (
   if (fromConnection === toConnection) {
     return false;
   }
-  // 対象ファイルを開いているタブは、**移動する前に**保存して閉じる。順序が要点:
-  // - 移動してから保存すると、移動元のパスにファイルが作り直されてしまう。
-  // - 保存だけして開いたままにすると、移動の I/O を待つ間に打った文字が
-  //   「移動後のファイルにも UI にも無い」状態で消える。閉じてしまえばその窓が無い。
+  // Save and close the tab that has the target file open **before moving**. The order is the key point:
+  // - If we save after moving, the file is recreated at the source path.
+  // - If we only save and leave it open, characters typed while waiting for the move I/O vanish in a state of
+  //   "neither in the moved file nor in the UI". If we close it, that window does not exist.
   //
-  // removeEditorTab(save=true) は、保存に失敗した場合と保存中にさらに編集された
-  // 場合にタブを閉じずに戻る (自動保存の予約解除も中でやる)。閉じ切れなかったら
-  // 移動そのものを中止する。移動先の接続で開き直すのはユーザーに委ねる —
-  // タブの接続を差し替えると、プール / SSH トンネルの参照 (maybeDisconnectIfIdle)
-  // と噛み合わなくなる。
+  // removeEditorTab(save=true) returns without closing the tab if saving fails or if it was edited further during
+  // the save (it also cancels the autosave schedule inside). If it could not be fully closed, abort
+  // the move itself. Reopening on the destination connection is left to the user —
+  // swapping the tab's connection would stop matching the pool / SSH tunnel references (maybeDisconnectIfIdle).
   const openedTabs = editorTabs.filter(
     (t) => t.connection === fromConnection && t.file === fileName,
   );
@@ -1149,10 +1148,10 @@ const moveFileToConnection = async (
     await api.moveQueryFile(fromConnection, toConnection, fileName);
   } catch (e) {
     errorMessage = toErrorMessage(e);
-    // 移動が拒否される経路がある (移動先に同名がある / 拡張子が違うエンジン /
-    // 保存フォルダを共有している)。ファイルは移動元に残っているので、閉じた
-    // タブを開き直して編集中の状態へ戻す (内容は閉じる前に保存済み)。
-    // 失敗しても元のエラーを上書きしないよう、errorMessage は最後に入れ直す。
+    // There are paths where the move is rejected (a same-named file exists at the destination / an engine with a different extension /
+    // they share a save folder). The file remains at the source, so reopen the closed
+    // tab and return to the editing state (the content was saved before closing).
+    // So as not to overwrite the original error even on failure, put errorMessage back last.
     const moveError = errorMessage;
     if (openedTabs.length > 0) {
       await openFileByTarget(fromConnection, fileName);
@@ -1160,10 +1159,10 @@ const moveFileToConnection = async (
     errorMessage = moveError;
     return false;
   }
-  // 今表示している一覧が移動元・移動先のどちらであっても最新化する
-  // (移動元からは消え、移動先には現れる)。タブを閉じた時に隣のタブが
-  // アクティブになって選択接続が移動先へ変わっていることがあるため、
-  // 移動元だけを見ると移動したファイルが一覧に出てこない。
+  // Refresh the list currently shown whether it is the source or the destination
+  // (it disappears from the source and appears at the destination). When a tab is closed, the neighboring tab can become
+  // active and the selected connection can change to the destination, so looking only at the source
+  // would leave the moved file out of the list.
   const shown = selectedConnection;
   if (shown === fromConnection || shown === toConnection) {
     setFileEntries(await api.listQueryFiles(shown));
@@ -1172,8 +1171,8 @@ const moveFileToConnection = async (
   return true;
 };
 
-// クエリファイルの絶対パスをクリップボードへコピーする。成功したら true。
-// 失敗時は errorMessage を設定して false を返す。
+// Copy the absolute path of a query file to the clipboard. Returns true on success.
+// On failure, sets errorMessage and returns false.
 const copyFilePath = async (fileName: string): Promise<boolean> => {
   const connection = selectedConnection;
   if (!connection) {
@@ -1190,30 +1189,30 @@ const copyFilePath = async (fileName: string): Promise<boolean> => {
   }
 };
 
-// エディタタブの内容を保存する。成功したら true。
-// 失敗時は dirty を保持したまま errorMessage を設定する。
+// Save the content of an editor tab. Returns true on success.
+// On failure, sets errorMessage while keeping dirty.
 //
-// force=false (既定): 暗黙の保存 (自動保存・閉じる前保存等)。バックエンドの
-//   write_query_file_if_unchanged で、把握している base (diskContent) とディスクの
-//   現在内容が一致する時だけ書く (楽観的排他)。食い違えば書かず、外部変更処理
-//   (自動マージ or 衝突検知) に委ねる。マージが clean に通ってタブが保存済みになれば
-//   true、衝突が残れば false を返す。検査と書き込みをバックエンドの単一呼び出しで
-//   隣接させることで、フロント往復ぶんの TOCTOU をなくす。
-// force=true: ユーザーの明示的な上書き (Overwrite ボタン)。ディスクの現在内容が
-//   何であれ手元の内容で置き換える意思なので、検査せず書き込む。
-//   (自動マージの書き戻しは force ではなく expectedBase=disk の CAS を直接使う。)
+// force=false (default): an implicit save (autosave, save before closing, etc.). With the backend's
+//   write_query_file_if_unchanged, write only when the known base (diskContent) matches the current
+//   disk content (optimistic locking). If they differ, do not write and leave it to external change handling
+//   (auto-merge or conflict detection). Returns true if the merge goes through cleanly and the tab becomes saved, false
+//   if a conflict remains. Putting the check and the write adjacent in a single backend call
+//   eliminates the TOCTOU of a frontend round trip.
+// force=true: the user's explicit overwrite (Overwrite button). The intent is to replace the disk content
+//   with the local content whatever it is, so write without checking.
+//   (The auto-merge write-back does not use force but the CAS with expectedBase=disk directly.)
 const saveEditorTab = async (
   tab: EditorTab,
   opts: { force?: boolean } = {},
 ): Promise<boolean> => {
-  // 書き込み中にさらに編集された場合、その古い保存完了で新しい編集の dirty を
-  // 消してはならない (lost update 防止)。保存した内容を控え、完了時に内容が
-  // 変わっていない時だけ dirty を下ろす。
+  // If edited further during the write, that stale save completion must not
+  // clear the dirty of the new edit (prevents lost updates). Remember the saved content and clear dirty on completion
+  // only if the content has not changed.
   const saved = tab.content;
   const expectedBase = tab.diskContent;
   try {
     if (!opts.force) {
-      // バックエンドで CAS 書き込み。書けなければ外部変更あり。
+      // CAS write in the backend. If it cannot write, there is an external change.
       let wrote: boolean;
       try {
         wrote = await api.writeQueryFileIfUnchanged(
@@ -1227,15 +1226,15 @@ const saveEditorTab = async (
         return false;
       }
       if (!wrote) {
-        // ディスクが base と食い違う = 外部変更あり。黙って上書きせず、外部変更処理
-        // (自動マージ / 衝突検知) に委ねる。自動マージが clean に通れば tab は保存済み
-        // (dirty=false) になるので、その実際の結果を返す (close/reload/rename が
-        // マージ成功を「保存失敗」と誤認して中断しないように)。
+        // The disk differs from the base = there is an external change. Do not silently overwrite; leave it to external change handling
+        // (auto-merge / conflict detection). If the auto-merge goes through cleanly the tab becomes saved
+        // (dirty=false), so return that actual result (so that close / reload / rename do not mistake
+        // a successful merge for a "save failure" and abort).
         await checkTabForExternalChange(tab.id);
         const after = editorTabs.find((t) => t.id === tab.id);
         return !!after && !after.dirty && !after.conflicted;
       }
-      // 書けた → 状態確定。
+      // Wrote it -> state settled.
       tab.diskContent = saved;
       tab.conflicted = false;
       if (tab.content === saved) {
@@ -1245,11 +1244,11 @@ const saveEditorTab = async (
       return true;
     }
     await api.writeQueryFile(tab.connection, tab.file, saved);
-    // 自分が書いた内容をディスクの既知内容として控える。これにより外部変更
-    // ウォッチャが「自分の保存」を外部変更と誤検知しない。
+    // Remember the content we wrote as the known disk content. This keeps the external change
+    // watcher from mistaking "our own save" for an external change.
     tab.diskContent = saved;
-    // 明示保存 / 自動マージ保存が通った = 手元の内容がディスクに反映された。
-    // 衝突状態は解消したので自動保存の抑止を外す。
+    // An explicit save / auto-merge save went through = the local content has been reflected on the disk.
+    // The conflict state is resolved, so lift the autosave suppression.
     tab.conflicted = false;
     if (tab.content === saved) {
       tab.dirty = false;
@@ -1262,24 +1261,24 @@ const saveEditorTab = async (
   }
 };
 
-// 保存や外部変更でファイルの更新日時とサイズが変わるので、その接続の一覧を表示中なら
-// 取り直す (FILES ペインは更新日時の降順で日時とサイズを出している。CYBERNEURA-DEV-774)。
-// 表示だけの問題なので失敗は無視し、待たせない (保存の成否とは切り離す)。
+// A save or external change alters the file's modified time and size, so if that connection's list is being shown,
+// re-fetch it (the FILES pane shows time and size in descending order of modified time. CYBERNEURA-DEV-774).
+// It is only a display issue, so ignore failures and do not make callers wait (separate from whether the save succeeded).
 const refreshFileEntries = (connection: string) => {
   if (selectedConnection !== connection) {
     return;
   }
-  // 取得を始めた時点の版。解決までに一覧が書き換わっていたら (後から始めた取得や
-  // ファイル作成・削除など)、この古い結果では上書きしない
+  // Version at the time the fetch started. If the list was rewritten before resolution (a later-started fetch,
+  // file creation / deletion, etc.), do not overwrite with this stale result
   const version = ++fileEntriesVersion;
   void api
     .listQueryFiles(connection)
     .then((latest) => {
-      // 取得を待つ間に別接続へ移っていたら、その一覧も上書きしない
+      // If we moved to another connection while waiting for the fetch, do not overwrite that list either
       if (selectedConnection !== connection || version !== fileEntriesVersion) {
         return;
       }
-      // 定期取得でほとんどは変化が無いので、同じなら書き換えない (再描画させない)
+      // Most periodic fetches show no change, so do not rewrite if identical (avoids re-rendering)
       const same =
         latest.length === fileEntries.length &&
         latest.every(
@@ -1295,7 +1294,7 @@ const refreshFileEntries = (connection: string) => {
     .catch(() => {});
 };
 
-// アクティブなエディタタブを保存する (Toolbar 等から明示保存する場合用)。
+// Save the active editor tab (for explicit saves from the Toolbar etc.)
 const saveCurrentFile = async (): Promise<boolean> => {
   const tab = getActiveEditorTab();
   if (!tab) {
@@ -1304,10 +1303,10 @@ const saveCurrentFile = async (): Promise<boolean> => {
   return saveEditorTab(tab);
 };
 
-/// アクティブな衝突タブについて、手元の未保存編集を破棄してディスクの内容を読み直す。
-/// 警告文の "reopen the file to discard" と同じ効果を、常に到達可能な UI (ツールバー)
-/// から明示的に呼べるようにするための手段 (選択中ファイルの再クリックが Rename に
-/// なる等で reopen 経路に到達できないケースの逃げ道)。
+/// For the active conflicted tab, discard the local unsaved edits and re-read the disk content.
+/// A means to explicitly invoke, from an always-reachable UI (the toolbar), the same effect as the warning text's
+/// "reopen the file to discard" (an escape hatch for cases where the reopen path is unreachable, e.g. clicking the
+/// selected file again becomes Rename).
 const discardActiveFileConflict = async (): Promise<void> => {
   const tab = getActiveEditorTab();
   if (!tab || !tab.conflicted) {
@@ -1321,8 +1320,8 @@ const discardActiveFileConflict = async (): Promise<void> => {
     errorMessage = toErrorMessage(e);
     return;
   }
-  // 読込 await 中にタブが閉じられた / 別接続へ移動した / ファイル名が変わった場合は
-  // 適用しない (古い読込で現在の状態を壊さない)。
+  // If the tab was closed / moved to another connection / the file name changed during the load await
+  // do not apply (an old load must not break the current state).
   const cur = editorTabs.find((t) => t.id === id);
   if (
     !cur ||
@@ -1341,8 +1340,8 @@ const discardActiveFileConflict = async (): Promise<void> => {
   toast.info(`Reloaded "${file}" (discarded unsaved edits)`);
 };
 
-/// アクティブな衝突タブについて、手元の編集でディスクを上書き保存する (ユーザーの
-/// 明示的な上書き意思)。CAS を通さず force で書くため、外部変更を意図的に置き換える。
+/// For the active conflicted tab, overwrite the disk with the local edits (the user's
+/// explicit intent to overwrite). It writes with force, bypassing the CAS, so it intentionally replaces the external change.
 const overwriteActiveFileConflict = async (): Promise<boolean> => {
   const tab = getActiveEditorTab();
   if (!tab) {
@@ -1351,8 +1350,8 @@ const overwriteActiveFileConflict = async (): Promise<boolean> => {
   return saveEditorTab(tab, { force: true });
 };
 
-/// 指定タブのデバウンス自動保存を (張り直して) 予約する。既存の予約は解除される
-/// (自動保存は一度に 1 タブのみを対象にする既存仕様に合わせる)。
+/// Schedule (re-arm) the debounced autosave for the given tab. Any existing schedule is cancelled
+/// (matching the existing spec that autosave targets only one tab at a time).
 const scheduleAutoSave = (tabId: number) => {
   autoSavePendingTabId = tabId;
   if (autoSaveTimer) {
@@ -1363,17 +1362,17 @@ const scheduleAutoSave = (tabId: number) => {
     const id = autoSavePendingTabId;
     autoSavePendingTabId = null;
     const target = editorTabs.find((t) => t.id === id);
-    // 衝突タブは暗黙保存しない (saveEditorTab の CAS でも守られるが、無駄な read を
-    // 避けるためここでも弾く)。saveEditorTab は force 無しなので、debounce 中に
-    // 外部書き込みが入っていれば書き込み前の CAS で検知し、上書きせず衝突検知へ委ねる。
+    // Do not implicitly save a conflicted tab (the CAS in saveEditorTab protects this too, but to avoid a useless read
+    // reject it here as well). saveEditorTab has no force, so if an external write came in during
+    // the debounce, the CAS before writing detects it and, without overwriting, leaves it to conflict detection.
     if (target && target.dirty && !target.conflicted) {
       void saveEditorTab(target);
     }
   }, AUTO_SAVE_DELAY_MS);
 };
 
-/// エディタからの変更通知。アクティブタブの内容を更新し、自動保存を
-/// デバウンスして予約する。予約は編集中のタブを対象にする。
+/// Change notification from the editor. Updates the active tab's content and schedules
+/// a debounced autosave. The schedule targets the tab being edited.
 const updateEditorContent = (content: string) => {
   const tab = getActiveEditorTab();
   if (!tab || content === tab.content) {
@@ -1381,33 +1380,33 @@ const updateEditorContent = (content: string) => {
   }
   tab.content = content;
   tab.dirty = true;
-  // 衝突中は暗黙の自動保存を予約しない (外部変更を黙って上書きしないため)。
-  // 編集は反映するが、解消はユーザーの明示操作 (ツールバーの Overwrite / Discard) に
-  // 委ねる。編集の結果ディスク内容と一致すれば、次のウォッチャ tick が衝突を自動解消する。
+  // Do not schedule an implicit autosave during a conflict (so external changes are not silently overwritten).
+  // The edit is reflected, but resolution is left to the user's explicit action (toolbar Overwrite / Discard).
+  // If the edit makes the content match the disk, the next watcher tick resolves the conflict automatically.
   if (!tab.conflicted) {
     scheduleAutoSave(tab.id);
   }
 };
 
-/// `-- 📝` の結果ログを、実行後に**非アクティブになったタブ**へ書き戻す
-/// (CYBERNEURA-DEV-858)。アクティブなタブへの書き戻しは SqlEditor.writeRunLog が
-/// 行う (編集中のカーソルを保つため CodeMirror の変更として入れる)。
+/// Write the `-- 📝` result log back to a tab that **became inactive** after execution
+/// (CYBERNEURA-DEV-858). Writing back to the active tab is done by SqlEditor.writeRunLog
+/// (as a CodeMirror change to keep the cursor while editing).
 ///
-/// エディタを経由せずタブの本文 (tab.content) を直接書き換える。判定はエディタ経路と
-/// 同じ planRunLogWrite (範囲の照合・ラベルの取り直し) に加えて:
-/// - タブが閉じられている / 別接続へ移っている → 書かない (stale)
-/// - 実行した接続のアクティブスキーマが実行開始時から変わっている → 書かない
-///   (別接続を開いている間は activeSchema が別接続のものなので、バックエンドに訊く)
-/// - 外部変更と衝突中のタブ → 書かない (conflicted)。解消はユーザーの明示操作に委ねる
+/// Rewrites the tab body (tab.content) directly without going through the editor. The decision uses the same
+/// planRunLogWrite as the editor path (range matching, re-fetching the label), and in addition:
+/// - The tab was closed / moved to another connection -> do not write (stale)
+/// - The executed connection's active schema changed since execution started -> do not write
+///   (while another connection is open, activeSchema belongs to that other connection, so ask the backend)
+/// - A tab in conflict with an external change -> do not write (conflicted). Resolution is left to the user's explicit action
 ///
-/// 未編集の CRLF ファイルは tab.content が CRLF のままだが、CodeMirror は LF に
-/// 正規化した位置で target を作るので、照合の前に LF へ揃える。
+/// An unedited CRLF file keeps tab.content as CRLF, but CodeMirror builds the target at positions
+/// normalized to LF, so align to LF before matching.
 ///
-/// スキーマの問い合わせを待つ間にそのタブがアクティブに戻ったら "active" を返す
-/// (呼び出し側がエディタ経路で書き直す。表示中の本文を丸ごと差し替えない)。
+/// If the tab becomes active again while waiting for the schema query, return "active"
+/// (the caller rewrites via the editor path; the displayed body is not replaced wholesale).
 ///
-/// 書いたら即座に保存する。自動保存の予約は 1 タブ分しか持てないので、ここで
-/// 予約すると編集中の別タブの予約を奪ってしまう。
+/// Save right after writing. Autosave can hold a schedule for only one tab, so scheduling here
+/// would steal the schedule of another tab being edited.
 const writeRunLogToInactiveTab = async (
   tabId: number,
   connection: string,
@@ -1422,7 +1421,7 @@ const writeRunLogToInactiveTab = async (
   }
   let schema: string | null = activeSchema;
   if (selectedConnection !== connection) {
-    // applyConnectionContext と同じ解決 (override が無ければ設定の既定値)
+    // Same resolution as applyConnectionContext (the config default if there is no override)
     const defaultSchema =
       connections.find((c) => c.name === connection)?.schema ?? null;
     try {
@@ -1430,7 +1429,7 @@ const writeRunLogToInactiveTab = async (
     } catch {
       return "stale";
     }
-    // 待つ間にその接続へ戻っていれば、フロントの値が最新
+    // If we returned to that connection while waiting, the frontend's value is the latest
     if (selectedConnection === connection) {
       schema = activeSchema;
     }
@@ -1448,8 +1447,8 @@ const writeRunLogToInactiveTab = async (
   if (tab.conflicted) {
     return "conflicted";
   }
-  // CodeMirror と同じく改行を LF に揃えてから照合する (target の位置は LF 基準)。
-  // エディタ経路で書いた場合も doc.toString() が LF で返るので、結果は同じになる
+  // As with CodeMirror, normalize line breaks to LF before matching (target positions are LF-based).
+  // Even when written via the editor path, doc.toString() returns LF, so the result is the same
   const doc = tab.content.replace(/\r\n?/g, "\n");
   const write = planRunLogWrite(doc, target, buildBlock);
   if (typeof write === "string") {
@@ -1457,17 +1456,17 @@ const writeRunLogToInactiveTab = async (
   }
   tab.content = doc.slice(0, write.from) + write.insert + doc.slice(write.to);
   tab.dirty = true;
-  // このタブに古い予約が残っていれば外す (下で今の内容を保存するので重複になる)
+  // If a stale schedule remains for this tab, remove it (we save the current content below, so it would be redundant)
   cancelPendingSaveFor(tabId);
-  // CAS 保存。失敗しても dirty のままタブに残り、errorMessage で知らせる
+  // CAS save. Even on failure it stays in the tab as dirty, and errorMessage reports it
   void saveEditorTab(tab);
   return "written";
 };
 
-/// 履歴パネル・スキーマブラウザからの SQL 断片の挿入。
-/// 開いているファイルの末尾に追記する (既存の編集内容を上書きしないよう、
-/// 置換ではなく追記にする)。実行はしない。挿入できたら true を返す。
-/// エディタへの反映は SqlEditor 側の $effect が行う。
+/// Insert a SQL snippet from the history panel / schema browser.
+/// Append to the end of the open file (append rather than replace, so as not to
+/// overwrite existing edits). Does not execute. Returns true if inserted.
+/// Reflection into the editor is done by the $effect on the SqlEditor side.
 const insertSqlSnippet = (sql: string): boolean => {
   if (!selectedConnection) {
     toast.warning("Select a connection first");
@@ -1483,9 +1482,9 @@ const insertSqlSnippet = (sql: string): boolean => {
   return true;
 };
 
-/// 自然言語の指示から AI で SQL を生成し、エディタに挿入する
-/// (自動実行はしない。ユーザーが内容を確認してから実行する)。
-/// 成功したら true を返す (入力欄を閉じる判定に使う)。
+/// Generate SQL with AI from a natural-language instruction and insert it into the editor
+/// (not run automatically. The user runs it after reviewing the content).
+/// Returns true on success (used to decide whether to close the input field).
 const generateSql = async (instruction: string): Promise<boolean> => {
   if (!selectedConnection) {
     toast.warning("Select a connection first");
@@ -1509,8 +1508,8 @@ const generateSql = async (instruction: string): Promise<boolean> => {
       toast.warning("The AI returned an empty response");
       return false;
     }
-    // 生成中に接続・ファイルの選択が外れた場合は挿入されない
-    // (insertSqlSnippet が warning を出す) ため、成功時のみ通知する
+    // If the connection / file selection is lost during generation, nothing is inserted
+    // (insertSqlSnippet shows a warning), so notify only on success
     if (!insertSqlSnippet(sql)) {
       return false;
     }
@@ -1526,25 +1525,25 @@ const generateSql = async (instruction: string): Promise<boolean> => {
   }
 };
 
-/// タブに記録された SQL とエラーメッセージから、AI に修正案を問い合わせて
-/// タブへ書き込む (自動実行はしない。ユーザーが Apply でエディタに挿入する)。
+/// From the SQL and error message recorded in the tab, ask the AI for a fix suggestion and
+/// write it to the tab (not run automatically. The user inserts it into the editor with Apply).
 const fixSqlWithAi = async (tabId: number) => {
   const tab = resultTabs.find((t) => t.id === tabId);
   if (!tab || !tab.error || !tab.sql.trim()) {
     return;
   }
-  // 二重実行防止 (ボタンも disabled にしているが防御的にガードする)
+  // Prevent double execution (the button is disabled too, but guard defensively)
   if (tab.fixing) {
     return;
   }
-  // 問い合わせ中に Re-run されて別の実行結果になった場合に、
-  // 古いエラーへの修正案を書き込まないよう実行時刻を控えておく
+  // If Re-run during the query produces a different execution result, keep the execution time
+  // so we do not write a fix suggestion for the old error
   const requestedExecutedAt = tab.executedAt;
   tab.fixing = true;
   try {
     const fixed = await api.aiFixSql(tab.connection, tab.sql, tab.error);
-    // 問い合わせ中に設定再読込などでタブが破棄された・再実行で
-    // 結果が入れ替わった場合は、古い修正案を捨てる
+    // If the tab was discarded during the query (settings reload etc.) or the result was
+    // replaced by a re-run, discard the old fix suggestion
     const current = resultTabs.find((t) => t.id === tabId);
     if (!current || current.executedAt !== requestedExecutedAt) {
       return;
@@ -1563,15 +1562,15 @@ const fixSqlWithAi = async (tabId: number) => {
   }
 };
 
-/// AI の修正案をエディタに挿入して提案表示を閉じる (実行はしない)。
-/// 挿入できなかった場合 (接続・ファイル未選択・接続の切替) は提案を残す。
+/// Insert the AI's fix suggestion into the editor and close the suggestion display (does not execute).
+/// If it could not be inserted (no connection / file selected, connection switched), keep the suggestion.
 const applyFixSuggestion = (tabId: number) => {
   const tab = resultTabs.find((t) => t.id === tabId);
   if (!tab?.fixSuggestion) {
     return;
   }
-  // 結果タブは接続をまたいで残るため、提案表示中に接続を切り替えると
-  // 別接続 (別方言) のファイルに挿入されてしまう。誤挿入を防ぐ
+  // Result tabs persist across connections, so switching connections while a suggestion is displayed
+  // would insert into a file of another connection (another dialect). Prevent the wrong insertion
   if (selectedConnection !== tab.connection) {
     toast.warning(
       `This suggestion is for '${tab.connection}'. Switch back to that connection to apply it.`,
@@ -1584,7 +1583,7 @@ const applyFixSuggestion = (tabId: number) => {
   }
 };
 
-/// AI の修正案を破棄して提案表示を閉じる。
+/// Discard the AI's fix suggestion and close the suggestion display.
 const dismissFixSuggestion = (tabId: number) => {
   const tab = resultTabs.find((t) => t.id === tabId);
   if (tab) {
@@ -1592,32 +1591,32 @@ const dismissFixSuggestion = (tabId: number) => {
   }
 };
 
-/// セル編集を適用中 (run_statements 実行中) の接続。クエリ実行と同様に
-/// 同一接続の並列実行を抑止するため isConnectionRunning に含める。
+/// Connections applying cell edits (running run_statements). Included in isConnectionRunning
+/// to suppress parallel execution on the same connection, as with query execution.
 let applyingConnections = $state(new Set<string>());
 
-/// 指定した接続でクエリ実行中のタブがあるかを返す。
-/// バックエンドのキャンセルレジストリは接続単位で最後の実行しか
-/// 管理しないため、同一接続の並列実行はフロント側で抑止する
-/// (許すとキャンセル対象の取り違えや取りこぼしが起きる)。
-/// セル編集の適用中 (applyingConnections) も実行中として扱う。
+/// Return whether any tab is running a query on the given connection.
+/// The backend's cancel registry manages only the last execution per connection,
+/// so parallel execution on the same connection is suppressed on the frontend side
+/// (allowing it would mix up or miss cancel targets).
+/// Cell-edit application (applyingConnections) is also treated as running.
 const isConnectionRunning = (connection: string): boolean =>
   resultTabs.some((t) => t.running && t.connection === connection) ||
   applyingConnections.has(connection) ||
-  // AI チャットのツール実行もこの接続のプールを使う。実行中に切られると
-  // 途中のコネクションが壊れ、次のツール往復が追跡されないトンネルを
-  // 開き直してしまう
+  // AI chat tool execution also uses this connection's pool. If it is cut during execution,
+  // the in-flight connection breaks and the next tool round trip would reopen an
+  // untracked tunnel
   chatRunningConnections.has(connection);
 
-/// 実行結果の書き込み先タブを決める。
-/// アクティブな非ピン留めタブがあれば使い回し、無ければ新規タブを作る。
-/// 上限到達時は最も古い非ピン留めタブを破棄する。
-/// 全タブがピン留めで空きを作れない場合は null を返す (toast で通知済み)。
+/// Decide the tab to write the execution result to.
+/// If there is an active non-pinned tab, reuse it; otherwise create a new tab.
+/// On reaching the limit, discard the oldest non-pinned tab.
+/// Returns null when all tabs are pinned and no room can be made (already notified by toast).
 const prepareTargetTab = (): ResultTab | null => {
   const current = resultTabs.find((t) => t.id === activeTabId);
   if (current && !current.pinned) {
-    // 同じタブへの二重書き込みを防ぐ (Cmd+Enter 連打対策)
-    // タブ管理系の通知は結果ペインを覆わないよう toast で出す
+    // Prevent double writes to the same tab (against rapid Cmd+Enter presses)
+    // Tab management notifications use toast so they do not cover the results pane
     if (current.running) {
       toast.warning("A query is already running in this tab.");
       return null;
@@ -1654,21 +1653,21 @@ const prepareTargetTab = (): ResultTab | null => {
     fixSuggestion: null,
   };
   resultTabs = [...resultTabs, tab];
-  // 生のオブジェクトではなく $state プロキシ経由の参照を返す
-  // (生の参照を書き換えてもリアクティブに反映されないため)
+  // Return a reference via the $state proxy, not the raw object
+  // (rewriting a raw reference is not reflected reactively)
   return resultTabs[resultTabs.length - 1];
 };
 
-/// タブに記録された接続・SQL でクエリを実行し、結果をタブへ書き込む。
-/// 成功した場合はその結果を返す (エラー・キャンセル・タブ破棄では null)。
-/// 呼び出し側が結果を後処理する (📝 マーカーのログ書き戻し等) のに使う
+/// Run a query with the connection / SQL recorded in the tab and write the result to the tab.
+/// On success returns that result (null on error, cancel, or tab discard).
+/// Used by the caller to post-process the result (writing back the 📝 marker log etc.)
 const executeTab = async (tab: ResultTab): Promise<QueryResult | null> => {
   tab.running = true;
-  // 失敗時に前回の結果を誤認・誤エクスポートしないよう、実行前にクリアする
+  // Clear before running so a failure does not lead to mistaking or wrongly exporting the previous result
   tab.result = null;
   tab.error = null;
   tab.cancelled = false;
-  // 前回エラーへの修正案は再実行で古くなるため破棄する
+  // A fix suggestion for the previous error becomes stale on re-run, so discard it
   tab.fixSuggestion = null;
   tab.executedAt = Date.now();
   activeTabId = tab.id;
@@ -1684,7 +1683,7 @@ const executeTab = async (tab: ResultTab): Promise<QueryResult | null> => {
     );
   } catch (e) {
     const message = toErrorMessage(e);
-    // キャンセルによる中断はエラーではなく「Query cancelled」として表示する
+    // An abort by cancel is not an error; show it as "Query cancelled"
     if (message === api.CANCELLED_ERROR_MESSAGE) {
       cancelled = true;
     } else {
@@ -1692,50 +1691,50 @@ const executeTab = async (tab: ResultTab): Promise<QueryResult | null> => {
     }
   }
   tab.running = false;
-  // 実行中に設定再読込などでタブが破棄されていた場合は、
-  // 存在しないタブ (detached なオブジェクト) へ書き込まず結果を捨てる
+  // If the tab was discarded during execution (settings reload etc.),
+  // discard the result instead of writing to a nonexistent tab (a detached object)
   if (!resultTabs.some((t) => t.id === tab.id)) {
     return null;
   }
   tab.result = result;
   tab.error = error;
   tab.cancelled = cancelled;
-  // \c でアクティブスキーマが切り替わっていたら表示を追従させる
-  // (切替自体はバックエンドで完了済み)
+  // If `\c` switched the active schema, make the display follow
+  // (the switch itself is already done in the backend)
   if (result?.switched_schema) {
-    // 確認クエリは切替後の database で実行されているので、
-    // タブが記録するスキーマもそちらに合わせる
+    // The check query ran on the post-switch database,
+    // so align the schema recorded in the tab with it too
     tab.schema = result.switched_schema;
     applySwitchedSchema(tab.connection, result.switched_schema);
   }
-  // 実行中クエリの間はトンネルを切れないため、エディタタブを全て閉じた後に
-  // クエリだけ走り続けていた場合は、完了したこのタイミングで切断を再判定する。
+  // The tunnel cannot be cut while a query is running, so if only the query kept running after
+  // all editor tabs were closed, re-evaluate the disconnect at this point, when it completes.
   maybeDisconnectIfIdle(tab.connection);
   return result;
 };
 
-/// `\c` によるスキーマ切替をフロントの状態へ反映する。
-/// スキーマブラウザは activeSchema の変化を購読しているので自動で追従し、
-/// SQL 補完のスキーママップはここで取り直す。
+/// Reflect a schema switch via `\c` into the frontend state.
+/// The schema browser subscribes to changes of activeSchema so it follows automatically, and
+/// the SQL completion schema map is re-fetched here.
 const applySwitchedSchema = (connection: string, schema: string) => {
-  // 実行中に別接続へ移っていたら、そのスキーマ表示を新接続に適用しない
+  // If we moved to another connection during execution, do not apply that schema display to the new connection
   if (selectedConnection !== connection || activeSchema === schema) {
     return;
   }
   activeSchema = schema;
-  // changeActiveSchema と同じ理由で AI チャットの会話は破棄する。
-  // ただし `\c` はクエリの実行そのものが切替なので、切替の前に中断する
-  // ことはできない (実行後に結果として知る)。中断要求が届くまでの短い間、
-  // 応答待ちのエージェントが切替後のスキーマを読みうる
+  // Discard the AI chat conversation for the same reason as changeActiveSchema.
+  // However, with `\c` the query execution itself is the switch, so we cannot abort before the
+  // switch (we learn of it as a result after execution). In the short time until the abort request arrives,
+  // an agent awaiting a response may read the post-switch schema
   clearChat();
-  // 補完候補は切替先のものを取り直す (待たない)
+  // Re-fetch the completion candidates of the switch target (do not wait)
   void loadSchemaMap();
   toast.success(`Switched to ${schema}`);
 };
 
-/// タブで実行中のクエリのキャンセルを要求する。
-/// 実際の中断はバックエンドが行い、実行中の runQuery が
-/// 「Query cancelled」で返ることで executeTab 側がタブに反映する。
+/// Request cancellation of the query running in a tab.
+/// The backend does the actual abort, and when the running runQuery returns with
+/// "Query cancelled", executeTab reflects it in the tab.
 const cancelQuery = async (id: number) => {
   const tab = resultTabs.find((t) => t.id === id);
   if (!tab || !tab.running) {
@@ -1743,7 +1742,7 @@ const cancelQuery = async (id: number) => {
   }
   try {
     const requested = await api.cancelQuery(tab.connection);
-    // 実行が直前に完了していた等でキャンセル対象が無かった場合の通知
+    // Notification for when there was no cancel target, e.g. execution had just completed
     if (!requested) {
       toast.info("No running query to cancel. It may have just finished.");
     }
@@ -1754,8 +1753,8 @@ const cancelQuery = async (id: number) => {
   }
 };
 
-/// 危険な文の実行確認を求め、ユーザーの応答 (true=実行) を待つ。
-/// 直前の未応答の確認が残っていれば却下してから差し替える
+/// Ask for confirmation to run a dangerous statement and wait for the user's response (true = run).
+/// If an unanswered earlier confirmation remains, reject it and then replace it
 const requestDangerousConfirm = (reason: string): Promise<boolean> =>
   new Promise((resolve) => {
     if (dangerousConfirm) {
@@ -1764,7 +1763,7 @@ const requestDangerousConfirm = (reason: string): Promise<boolean> =>
     dangerousConfirm = { reason, resolve };
   });
 
-/// 確認ダイアログの応答 (モーダルから呼ぶ)。ok=true で実行を続行する
+/// Response of the confirmation dialog (called from the modal). ok=true continues the execution
 const resolveDangerousConfirm = (ok: boolean) => {
   if (!dangerousConfirm) {
     return;
@@ -1774,20 +1773,20 @@ const resolveDangerousConfirm = (ok: boolean) => {
   resolve(ok);
 };
 
-/// allow_dangerous_statements が有効な接続で、危険な文なら実行前に確認を出す。
-/// 実行してよければ true、キャンセルなら false を返す。
-/// 無効な接続では常に true を返し (バックエンドの run_query が拒否する)、
-/// 危険判定の呼び出し失敗時も true を返して実行に委ねる (allow が意図のため)。
+/// On a connection with allow_dangerous_statements enabled, show a confirmation before execution for a dangerous statement.
+/// Returns true if it may run, false if cancelled.
+/// Always returns true on a connection where it is disabled (the backend's run_query rejects it),
+/// and also returns true when the danger-check call fails, leaving it to execution (since allow is the intent).
 const confirmIfDangerous = async (
   connection: string,
   sql: string,
 ): Promise<boolean> => {
   const info = connections.find((c) => c.name === connection);
-  // 読み取り専用が効いている間 (config readonly、またはこの接続に対する実効
-  // Writable が OFF) は、書き込み系の文をバックエンドが Read-only として拒否する。
-  // 破壊的操作の確認は実際に実行され得る文にだけ意味があるため、ここでは確認を
-  // 出さず実行へ委ねる (バックエンドが明快な Read-only エラーを返す)。実効 Writable
-  // を使うので、別接続のタブ再実行 (常に読み取り専用扱い) でも無駄な確認を出さない。
+  // While read-only is in effect (config readonly, or the effective Writable for this connection
+  // is OFF), the backend rejects write statements as Read-only.
+  // A confirmation for destructive operations only makes sense for statements that can actually run, so here we
+  // show no confirmation and leave it to execution (the backend returns a clear Read-only error). Since the effective
+  // Writable is used, a re-run of a tab on another connection (always treated as read-only) also shows no needless confirmation.
   if (info?.readonly || !effectiveWritable(connection)) {
     return true;
   }
@@ -1798,8 +1797,8 @@ const confirmIfDangerous = async (
   try {
     reason = await api.checkDangerousStatement(connection, sql);
   } catch (e) {
-    // 判定に失敗しても実行に委ねる (allow が意図)。ただし本当のバグを
-    // 握り潰さないよう、失敗自体はコンソールに残す
+    // Even if the check fails, leave it to execution (allow is the intent). But so as not to
+    // swallow a real bug, leave the failure itself in the console
     console.warn("checkDangerousStatement failed; running without confirm", e);
     return true;
   }
@@ -1809,24 +1808,24 @@ const confirmIfDangerous = async (
   return await requestDangerousConfirm(reason);
 };
 
-/// Copy / Export で全件を取り直す時の行数上限。
-/// 設定の default_limit は無視するが、無制限に読むとメモリを使い切るため
-/// クライアント側の安全網は残す。打ち切った場合は truncated が立つ。
+/// Row limit when re-fetching everything for Copy / Export.
+/// The config's default_limit is ignored, but reading without limit would exhaust memory, so
+/// a client-side safety net remains. When cut off, truncated is set.
 const EXPORT_MAX_ROWS = 1_000_000;
 
-/// Copy / Export 用に、アクティブタブの SQL を default_limit 抜きで実行し直す。
+/// For Copy / Export, re-run the active tab's SQL without default_limit.
 ///
-/// 取り直すのは、表示中の結果が絞られている場合だけ:
-/// - `applied_limit` が付いている (LIMIT 無しの SELECT に default_limit を付与した)
-/// - `truncated` が立っている (SQL 自身の LIMIT が大きく、表示用の行数上限で切った)
+/// Re-fetch only when the displayed result is narrowed:
+/// - `applied_limit` is present (default_limit was added to a SELECT without LIMIT)
+/// - `truncated` is set (the SQL's own LIMIT is large and was cut by the display row limit)
 ///
-/// **書き込みを伴う文は再実行しない。** 判定はバックエンドの
-/// `can_rerun_for_output` (AI エージェント経路と同じ厳しい読み取り専用判定) に任せる。
-/// `truncated` は INSERT ... RETURNING のような書き込み文でも立ちうるため、
-/// applied_limit の有無だけでは安全性を担保できない。
+/// **Statements involving writes are not re-run.** The decision is left to the backend's
+/// `can_rerun_for_output` (the same strict read-only check as the AI agent path).
+/// `truncated` can be set even for write statements such as INSERT ... RETURNING, so
+/// the presence of applied_limit alone cannot guarantee safety.
 ///
-/// 取り直しが不要・できない場合は null を返し、呼び出し側が表示中の結果を使う
-/// (その場合の打ち切りは呼び出し側がトーストで警告する)。
+/// Returns null when re-fetching is unnecessary or impossible, and the caller uses the displayed result
+/// (in that case the caller warns about the cutoff with a toast).
 const fetchResultWithoutDefaultLimit = async (
   tab: ResultTab,
 ): Promise<QueryResult | null> => {
@@ -1841,21 +1840,21 @@ const fetchResultWithoutDefaultLimit = async (
     tab.connection,
     tab.sql,
     EXPORT_MAX_ROWS,
-    // 元の実行と同じ権限で実行する (読み取り専用と判定済みなので書き込みは起きない)
+    // Run with the same privileges as the original execution (judged read-only, so no writes happen)
     effectiveWritable(tab.connection),
     false,
   );
 };
 
-/// エディタから SQL を実行する。成功した場合はその結果を返す
-/// (実行しなかった場合・失敗・キャンセルは null)。
-/// 呼び出し側は返り値を見て 📝 マーカーのログ書き戻しを判断する
+/// Run SQL from the editor. Returns its result on success
+/// (null if not run, failed, or cancelled).
+/// The caller looks at the return value to decide on writing back the 📝 marker log
 const runQuery = async (sql: string): Promise<QueryResult | null> => {
-  // 実行先の接続を await 前に固定する。以降の await (保存・危険文の確認モーダル) の
-  // 間に接続が切り替わっても、確認した接続と実行する接続が食い違わないようにする
-  // (旧 SQL を新 DB で実行してしまう事故を防ぐ)。
+  // Fix the target connection before the await. Even if the connection switches during later awaits (save,
+  // dangerous-statement confirmation modal), the confirmed connection and the executing connection must not diverge
+  // (prevents the accident of running old SQL on the new DB).
   const connection = selectedConnection;
-  // 実行前ガードの通知は、既存の結果タブを覆わないよう toast で出す
+  // Notifications from pre-execution guards use toast so they do not cover existing result tabs
   if (!connection) {
     toast.warning("Select a connection first");
     return null;
@@ -1864,21 +1863,21 @@ const runQuery = async (sql: string): Promise<QueryResult | null> => {
     toast.warning("There is no SQL statement to run");
     return null;
   }
-  // 同一接続の並列実行を抑止する (別タブで実行中でも拒否)
+  // Suppress parallel execution on the same connection (rejected even if running in another tab)
   if (isConnectionRunning(connection)) {
     toast.warning(
       "A query is already running on this connection. Cancel it or wait for it to finish.",
     );
     return null;
   }
-  // 未保存タブは best-effort で保存 (失敗しても実行は止めない。SQL はメモリ上の値)
+  // Save unsaved tabs best-effort (a failure does not stop execution. The SQL is the in-memory value)
   await flushPendingSave();
-  // 危険な文 (WHERE 無し UPDATE/DELETE、DROP/TRUNCATE) は、実行を許可した
-  // 接続でも実行前に確認する。キャンセルされたら何もしない
+  // Dangerous statements (UPDATE/DELETE without WHERE, DROP/TRUNCATE) are confirmed before execution even on
+  // a connection that allows execution. If cancelled, do nothing
   if (!(await confirmIfDangerous(connection, sql))) {
     return null;
   }
-  // 確認モーダルの間に接続が切り替わっていたら、別 DB で実行しないよう中止する
+  // If the connection switched during the confirmation modal, abort so as not to run on another DB
   if (selectedConnection !== connection) {
     return null;
   }
@@ -1893,9 +1892,9 @@ const runQuery = async (sql: string): Promise<QueryResult | null> => {
   return await executeTab(tab);
 };
 
-/// カーソル位置の文にエンジン別の EXPLAIN プレフィックスを付けて実行する。
-/// プレフィックスの組み立てと対象判定 (SELECT / WITH のみ) はバックエンドの
-/// build_explain_sql が行い、対象外の文は toast で断る。
+/// Run the statement at the cursor with an engine-specific EXPLAIN prefix.
+/// Building the prefix and the target decision (SELECT / WITH only) are done by the backend's
+/// build_explain_sql, and statements out of scope are declined with a toast.
 const explainQuery = async (sql: string) => {
   if (!selectedConnection) {
     toast.warning("Select a connection first");
@@ -1905,20 +1904,20 @@ const explainQuery = async (sql: string) => {
     toast.warning("There is no SQL statement to explain");
     return;
   }
-  // 変数名は module 直下の explainSql アクションと被らないよう別名にする
+  // Use a different name so it does not clash with the module-level explainSql action
   let explainStatement: string;
   try {
     explainStatement = await api.buildExplainSql(selectedConnection, sql);
   } catch (e) {
-    // 対象外の文 (DML 等) や不明エンジン。実行前の断りなので warning にする
+    // A statement out of scope (DML etc.) or unknown engine. It is a refusal before execution, so make it a warning
     toast.warning(toErrorMessage(e));
     return;
   }
   await runQuery(explainStatement);
 };
 
-/// EXPLAIN 結果を AI に渡すテキストに整形する (ヘッダ + タブ区切り行)。
-/// 渡すのは実行計画テキストのみ (EXPLAIN 出力なので結果データではない)
+/// Format the EXPLAIN result into text to hand to the AI (header + tab-separated rows).
+/// Only the execution plan text is passed (it is EXPLAIN output, not result data)
 const formatPlanText = (result: QueryResult): string => {
   const cellText = (value: unknown): string =>
     value === null || value === undefined
@@ -1930,7 +1929,7 @@ const formatPlanText = (result: QueryResult): string => {
   return [result.columns.join("\t"), ...lines].join("\n");
 };
 
-/// EXPLAIN 結果のタブを AI に解説させ、Markdown をモーダルに表示する
+/// Have the AI explain the EXPLAIN result tab and show the Markdown in a modal
 const analyzeExplainTab = async (id: number) => {
   const tab = resultTabs.find((t) => t.id === id);
   if (!tab || !tab.result || aiAnalyzing) {
@@ -1957,14 +1956,14 @@ const analyzeExplainTab = async (id: number) => {
   }
 };
 
-/// AI 解説モーダルを閉じる
+/// Close the AI explanation modal
 const closeAiAnalysis = () => {
   aiAnalysis = null;
 };
 
-/// カーソル位置の SQL 文を AI に平易に解説させ、Markdown をモーダルに
-/// 表示する (実行はしない)。LLM に送るのは SQL とスキーマ情報のみで、
-/// クエリの結果データは送らない (バックエンドの ai_explain_sql 参照)
+/// Have the AI explain the SQL statement at the cursor in plain terms and show the Markdown in a modal
+/// (does not execute). Only the SQL and schema info are sent to the LLM;
+/// query result data is not sent (see the backend's ai_explain_sql)
 const explainSql = async (sql: string) => {
   if (!selectedConnection) {
     toast.warning("Select a connection first");
@@ -1974,7 +1973,7 @@ const explainSql = async (sql: string) => {
     toast.warning("There is no SQL statement to explain");
     return;
   }
-  // 二重実行防止 (ボタンも disabled にしているが防御的にガードする)
+  // Prevent double execution (the button is disabled too, but guard defensively)
   if (aiExplaining) {
     return;
   }
@@ -1995,32 +1994,32 @@ const explainSql = async (sql: string) => {
   }
 };
 
-/// AI による選択 SQL 解説のモーダルを閉じる
+/// Close the modal of the AI explanation of the selected SQL
 const closeAiExplanation = () => {
   aiExplanation = null;
 };
 
-/// チャットメッセージの ID 採番 (表示用の key。バックエンドへは送らない)
+/// Numbering of chat message IDs (a key for display. Not sent to the backend)
 let nextChatMessageId = 1;
 
-/// チャットの世代。会話を破棄するたびに進める
-/// (接続切替・スキーマ切替・Clear・設定リロード)。
-/// 応答待ちの間に会話が破棄されたかを、接続名の比較だけでなくこの世代でも見る:
-/// 設定リロードは同じ名前の接続を作り直すため、名前だけでは「リロードを挟んだ
-/// 古い接続の応答」を弾けない (バックエンドはリロード前の接続設定・スキーマの
-/// まま応答を返す)。スキーマ切替も接続名は変わらないため同様。
+/// Chat generation. Advanced every time the conversation is discarded
+/// (connection switch, schema switch, Clear, settings reload).
+/// Whether the conversation was discarded while awaiting a response is checked with this generation, not just by comparing connection names:
+/// a settings reload recreates a connection of the same name, so the name alone cannot reject "a response of an
+/// old connection across a reload" (the backend returns the response still with the pre-reload connection config and schema).
+/// A schema switch does not change the connection name either, so likewise.
 let chatGeneration = $state(0);
 
-/// チャットの往復の開始を記録する。
+/// Record the start of a chat round trip.
 const retainChatRequest = (connection: string, requestId: string) => {
   const next = new Map(chatRunningConnections);
   next.set(connection, new Set(next.get(connection)).add(requestId));
   chatRunningConnections = next;
 };
 
-/// チャットの往復の終了を記録する。
-/// その接続で走っている最後の 1 本だった場合だけ true を返す
-/// (切断の再判定は最後の 1 本の完了時にだけ行う)。
+/// Record the end of a chat round trip.
+/// Returns true only if it was the last one running on that connection
+/// (the disconnect re-evaluation is done only when the last one completes).
 const releaseChatRequest = (connection: string, requestId: string): boolean => {
   const next = new Map(chatRunningConnections);
   const ids = new Set(next.get(connection));
@@ -2034,8 +2033,8 @@ const releaseChatRequest = (connection: string, requestId: string): boolean => {
   return ids.size === 0;
 };
 
-/// AI チャット (右ペイン) にユーザーの発言を積み、応答を 1 往復もらう。
-/// 会話履歴は毎回まるごとバックエンドへ送る (会話状態はフロントが持つ)。
+/// Add the user's message to the AI chat (right pane) and get one round trip of response.
+/// The entire conversation history is sent to the backend each time (the frontend holds the conversation state).
 const sendChatMessage = async (text: string) => {
   const message = text.trim();
   if (!message) {
@@ -2045,12 +2044,12 @@ const sendChatMessage = async (text: string) => {
     toast.warning("Select a connection first");
     return;
   }
-  // 二重送信防止 (送信ボタンも disabled にしているが防御的にガードする)。
-  // 破棄済みの往復が残っている間は送信を許す (新しい会話を待たせない)
+  // Prevent double sending (the send button is disabled too, but guard defensively).
+  // Sending is allowed while discarded round trips remain (do not make the new conversation wait)
   if (chatSendingGen !== null && chatSendingGen === chatGeneration) {
     return;
   }
-  // 接続 / スキーマ切替・設定リロードの遷移中は受け付けない
+  // Not accepted during a connection / schema switch or settings reload transition
   if (chatTransitions > 0) {
     return;
   }
@@ -2060,15 +2059,15 @@ const sendChatMessage = async (text: string) => {
     ...chatMessages,
     { id: nextChatMessageId++, role: "user", content: message },
   ];
-  // 失敗した応答は履歴に残すが LLM へは送らない (エラー文言を会話の一部と
-  // 誤解させないため)
+  // Keep a failed response in the history but do not send it to the LLM (so the error text
+  // is not mistaken for part of the conversation)
   const history: ChatTurn[] = chatMessages
     .filter((m) => !m.failed)
     .map((m) => ({ role: m.role, content: m.content }));
-  // エンジン固有の書き方をモデルに渡す (CYBERNEURA-DEV-407)。ヘルプペインと同じ本文。
-  // 画面には出さず送信ペイロードにだけ載せるので、chatMessages には入れない。
-  // 付けるのは**最後の発言**。バックエンドが履歴を直近 N 件に切り詰めるため、
-  // 先頭に置くと会話が伸びた時点で落ちる。
+  // Pass engine-specific writing conventions to the model (CYBERNEURA-DEV-407). Same text as the help pane.
+  // It is not shown on screen and goes only into the send payload, so it is not put in chatMessages.
+  // Attach it to the **last message**. The backend truncates the history to the most recent N entries,
+  // so placing it at the head would drop it once the conversation grows.
   const helpContext = buildEngineHelpContext(
     connections.find((c) => c.name === connection)?.engine,
   );
@@ -2080,21 +2079,21 @@ const sendChatMessage = async (text: string) => {
     };
   }
   chatSendingGen = generation;
-  // 中断はこの ID を指定して行う (同じ接続で複数の往復が走りうる)
+  // Abort by specifying this ID (several round trips can run on the same connection)
   const requestId = `chat-${nextChatRequestSeq++}`;
-  // エージェントのツール実行中はこの接続を「実行中」として扱い、
-  // エディタタブが無いだけでトンネル / プールを切られないようにする
+  // While the agent is running tools, treat this connection as "running" so that the tunnel / pool
+  // is not cut merely because there is no editor tab
   retainChatRequest(connection, requestId);
   try {
     const reply = await api.aiChat(connection, history, requestId);
-    // 応答待ちの間に会話が破棄されていたら捨てる (接続切替・Clear・設定
-    // リロード)。設定リロードは同名の接続を作り直すため、接続名の比較だけ
-    // では弾けない
+    // If the conversation was discarded while awaiting the response, discard it (connection switch, Clear, settings
+    // reload). A settings reload recreates a connection of the same name, so comparing connection
+    // names alone cannot reject it
     if (selectedConnection !== connection || chatGeneration !== generation) {
       return;
     }
-    // 失敗した往復も (reject ではなく) error 付きで返る。実行した
-    // クエリは成功時と同じく表示する
+    // A failed round trip also returns (not as a reject) with an error. The queries that were run
+    // are displayed just as on success
     chatMessages = [
       ...chatMessages,
       {
@@ -2119,21 +2118,21 @@ const sendChatMessage = async (text: string) => {
       },
     ];
   } finally {
-    // より新しい往復が始まっていたら、その待機状態を消さない
+    // If a newer round trip has started, do not clear its waiting state
     if (chatSendingGen === generation) {
       chatSendingGen = null;
     }
-    // クエリ実行と同じく、実行が終わった時点で切断を再判定する
-    // (実行中は切れないので、他の接続へ移った後もトンネルが残っている)。
-    // 同じ接続で別の往復がまだ走っているなら判定しない
+    // As with query execution, re-evaluate the disconnect when the run finishes
+    // (it cannot be cut while running, so the tunnel remains even after moving to another connection).
+    // Do not evaluate if another round trip is still running on the same connection
     if (releaseChatRequest(connection, requestId)) {
       maybeDisconnectIfIdle(connection);
     }
   }
 };
 
-/// 走っているエージェントに中断を要求し、要求がバックエンドに届くまで待つ。
-/// 中断要求の失敗で呼び出し側の処理を止めない (実行はいずれ終わる)。
+/// Request the running agents to abort, and wait until the request reaches the backend.
+/// A failure of the abort request does not stop the caller's processing (the run will end eventually).
 const requestChatCancel = async () => {
   await Promise.all(
     [...chatRunningConnections.entries()].map(([connection, ids]) =>
@@ -2142,77 +2141,77 @@ const requestChatCancel = async () => {
   );
 };
 
-/// 応答待ちのエージェントを止める (Stop ボタン)。会話は残すので、
-/// 中断されたことは失敗メッセージとして会話に出る。
+/// Stop the agent awaiting a response (Stop button). The conversation is kept, so
+/// the abort appears in the conversation as a failure message.
 const stopChat = () => {
   void requestChatCancel();
 };
 
-/// AI チャットの会話を捨てる
-/// (Clear ボタン / 接続切替 / スキーマ切替 / 設定リロード)。
-/// 世代を進めて、応答待ちの往復が破棄後の会話へ書き込むのを防ぐ。
-/// 待機表示 (chatSending) も世代で判定するため、破棄と同時に消える。
+/// Discard the AI chat conversation
+/// (Clear button / connection switch / schema switch / settings reload).
+/// Advance the generation to prevent round trips awaiting a response from writing into the post-discard conversation.
+/// The waiting display (chatSending) is also judged by the generation, so it disappears at the same time as the discard.
 ///
-/// 応答を捨てるだけではバックエンドのエージェントは走り続け、重いクエリや
-/// 次のツール往復 (切替後のスキーマを読む) がそのまま実行されてしまうため、
-/// 実行中の接続には中断も要求する。
+/// Merely discarding the response would let the backend agent keep running, and heavy queries or
+/// the next tool round trip (which would read the post-switch schema) would be executed as is, so
+/// an abort is also requested for the running connections.
 const clearChat = () => {
   chatGeneration++;
   chatMessages = [];
   void requestChatCancel();
 };
 
-/// 会話を破棄し、中断要求がバックエンドに届くまで待つ。
-/// バックエンドの状態を書き換える操作 (スキーマ切替・設定リロード) の
-/// **前**に使う: 投げっぱなしだと、中断カウンタが進む前に切替が先行し、
-/// 古いエージェントが新しいスキーマ / プールでツール実行を続けうる。
+/// Discard the conversation and wait until the abort request reaches the backend.
+/// Use **before** operations that rewrite backend state (schema switch / settings reload):
+/// if fire-and-forget, the switch could precede the abort counter advancing, and an old agent
+/// could keep running tools on the new schema / pool.
 const clearChatAndWait = async () => {
   chatGeneration++;
   chatMessages = [];
-  // 中断の到達を待つ間に新しい往復を始めさせない (始まってしまうと、
-  // その往復は中断対象に入らないまま切替後のプールを使う)。
-  // 呼び出し側は切替の完了後に endChatTransition() を呼ぶ
+  // Do not let a new round trip start while waiting for the abort to arrive (if one started,
+  // it would use the post-switch pool without being included in the abort targets).
+  // The caller calls endChatTransition() after the switch completes
   chatTransitions++;
   await requestChatCancel();
 };
 
-/// clearChatAndWait で始めた遷移の終了 (成否によらず必ず 1 回だけ呼ぶ)。
+/// End of a transition started with clearChatAndWait (call exactly once regardless of success).
 const endChatTransition = () => {
   chatTransitions = Math.max(0, chatTransitions - 1);
 };
 
-/// タブに記録された SQL を同じ接続で再実行する
+/// Re-run the SQL recorded in the tab on the same connection
 const rerunTab = async (id: number) => {
   const tab = resultTabs.find((t) => t.id === id);
   if (!tab || tab.running || !tab.sql.trim()) {
     return;
   }
-  // 同一接続の並列実行を抑止する (別タブで実行中でも拒否)
+  // Suppress parallel execution on the same connection (rejected even if running in another tab)
   if (isConnectionRunning(tab.connection)) {
     toast.warning(
       "A query is already running on this connection. Cancel it or wait for it to finish.",
     );
     return;
   }
-  // 再実行でも危険な文は確認する (通常実行と同じガード)
+  // Confirm dangerous statements on re-run too (same guard as normal execution)
   if (!(await confirmIfDangerous(tab.connection, tab.sql))) {
     return;
   }
   errorMessage = null;
-  // 接続のアクティブスキーマは実行時点から変わっている可能性があるため、
-  // 表示が実際の実行先とずれないよう再取得する (失敗しても実行は続ける)
+  // The connection's active schema may have changed since the time of execution, so
+  // re-fetch it so the display does not diverge from the actual target (continue the run even on failure)
   try {
     tab.schema = (await api.getActiveSchema(tab.connection)) ?? tab.schema;
   } catch {
-    // 取得失敗時は記録済みのスキーマ表示を維持する
+    // If the fetch fails, keep the recorded schema display
   }
   await executeTab(tab);
 };
 
-/// 結果グリッドのセル編集 (UPDATE 群) を 1 トランザクションで適用する。
-/// 適用は「アクティブ接続かつ Writable ON」の時だけ (UI でも抑止しているが、
-/// 別接続タブの誤適用や無駄な往復を防ぐためここでもガードする)。成功したら
-/// 表示値を実際の DB 状態に合わせるため再実行し、true を返す。
+/// Apply the result grid's cell edits (a batch of UPDATEs) in one transaction.
+/// Applied only when "the active connection and Writable ON" (also suppressed in the UI, but guarded here too to
+/// prevent mistaken application on another connection's tab and wasted round trips). On success,
+/// re-run to align the displayed values with the actual DB state, and return true.
 const submitCellEdits = async (
   tabId: number,
   statements: string[],
@@ -2227,18 +2226,18 @@ const submitCellEdits = async (
     );
     return false;
   }
-  // 生成 UPDATE はスキーマ未修飾で「接続の現在のアクティブスキーマ」に走るため、
-  // 編集後にスキーマを切り替えていると別スキーマの同名テーブルを更新し得る。
-  // タブの実行時スキーマと現在のアクティブスキーマが違えば適用しない
-  // (UI の canEditActiveConnection は新規編集のみ抑止するので、Submit 側でも防ぐ)。
+  // The generated UPDATE is schema-unqualified and runs on "the connection's current active schema", so
+  // if the schema was switched after editing, it could update a same-named table in another schema.
+  // Do not apply if the tab's execution-time schema differs from the current active schema
+  // (the UI's canEditActiveConnection suppresses only new edits, so guard on the Submit side too).
   if (tab.schema !== activeSchema) {
     toast.warning(
       "The active schema changed since these edits were made. Cancel them and re-run the query.",
     );
     return false;
   }
-  // 同一接続で実行中 (クエリまたは別の適用) なら適用しない
-  // (キャンセル対象の取り違え防止・Submit 連打防止。runQuery と同じ不変条件)
+  // Do not apply if running on the same connection (a query or another apply)
+  // (prevents mixing up cancel targets and repeated Submit presses. Same invariant as runQuery)
   if (isConnectionRunning(tab.connection)) {
     toast.warning(
       "A query is already running on this connection. Wait for it to finish.",
@@ -2246,7 +2245,7 @@ const submitCellEdits = async (
     return false;
   }
   const connection = tab.connection;
-  // 適用中は接続を「実行中」に登録し、並列実行・二重 Submit を抑止する
+  // While applying, register the connection as "running" to suppress parallel execution and double Submit
   applyingConnections = new Set(applyingConnections).add(connection);
   let affected: number;
   try {
@@ -2261,13 +2260,13 @@ const submitCellEdits = async (
     });
     return false;
   } finally {
-    // rerunTab は isConnectionRunning を見て早期 return するため、再取得の前に外す
+    // rerunTab returns early by looking at isConnectionRunning, so remove it before re-fetching
     const next = new Set(applyingConnections);
     next.delete(connection);
     applyingConnections = next;
   }
   toast.success(`Applied ${affected} row change${affected === 1 ? "" : "s"}`);
-  // 表示を DB の実際の値に合わせるため再取得する (適用自体は成功済み)
+  // Re-fetch to align the display with the DB's actual values (the apply itself has already succeeded)
   await rerunTab(tabId);
   return true;
 };
@@ -2283,15 +2282,15 @@ const closeResultTab = (id: number) => {
   if (index < 0) {
     return;
   }
-  // 実行中のタブを閉じると in-flight のクエリ状態が UI から消えてしまうため拒否する
-  // (閉じるボタンも disabled にしているが、防御的にここでもガードする)
+  // Closing a running tab would make the in-flight query state vanish from the UI, so reject it
+  // (the close button is disabled too, but guard defensively here as well)
   if (resultTabs[index].running) {
     toast.warning("Cannot close a tab while its query is running.");
     return;
   }
   resultTabs = resultTabs.filter((t) => t.id !== id);
   if (activeTabId === id) {
-    // 閉じたタブの右隣 (無ければ左隣) をアクティブにする
+    // Activate the right neighbor of the closed tab (or the left one if none)
     const neighbor = resultTabs[index] ?? resultTabs[index - 1] ?? null;
     activeTabId = neighbor?.id ?? null;
   }
@@ -2304,21 +2303,21 @@ const toggleResultTabPin = (id: number) => {
   }
 };
 
-/// ===== 外部ファイル変更のウォッチャ =====
-/// 開いているクエリファイルがアプリ外 (別エディタ・git・他プロセス) で変更された時に、
-/// 未編集なら自動リロードし、編集中なら 3-way マージを試み、衝突時は警告する。
-/// クエリファイルの読込はローカル FS のみ (DB / SSH トンネルには触れない) ため、
-/// バックグラウンドで定期的に読み直しても接続を開いてしまうことはない。
+/// ===== Watcher for external file changes =====
+/// When an open query file is changed outside the app (another editor, git, another process),
+/// auto-reload it if unedited, try a 3-way merge if being edited, and warn on conflict.
+/// Reading query files is local FS only (does not touch the DB / SSH tunnel), so
+/// re-reading periodically in the background never opens a connection.
 
 let fileWatchTimer: ReturnType<typeof setInterval> | null = null;
-/// tick の多重実行を防ぐ (ファイル読込は非同期のため)。
+/// Prevent overlapping ticks (file reading is async).
 let fileWatchTicking = false;
-/// タブごとに「既に衝突を警告したディスク内容」を覚え、同じ状態で毎 tick 警告を
-/// 繰り返さないようにする。解消・タブクローズでエントリを消す。
+/// Remember per tab "the disk content for which a conflict was already warned", so the same state does not
+/// repeat the warning on every tick. The entry is removed on resolution / tab close.
 const conflictNotified = new Map<number, string>();
 
-/// このタブの保留中の自動保存予約を解除する (外部変更を取り込んだ後に、古い
-/// エディタ内容で上書き保存し直されるのを防ぐ)。
+/// Cancel this tab's pending autosave schedule (to prevent re-saving over the disk
+/// with the old editor content after taking in an external change).
 const cancelPendingSaveFor = (tabId: number) => {
   if (autoSavePendingTabId === tabId) {
     if (autoSaveTimer) {
@@ -2329,45 +2328,45 @@ const cancelPendingSaveFor = (tabId: number) => {
   }
 };
 
-/// 1 つのエディタタブについて外部変更を調べて反映する。
+/// Check one editor tab for external changes and reflect them.
 const checkTabForExternalChange = async (tabId: number) => {
   const before = editorTabs.find((t) => t.id === tabId);
   if (!before) {
     return;
   }
   const { connection, file } = before;
-  // 読込前の base を控える。読込中に自動保存が完了して diskContent が進むと、
-  // 古い read 結果を新しい base への外部変更と誤認しかねないため、読込後に
-  // base が変わっていたらこの tick は見送る (次の tick で最新状態を見る)。
+  // Remember the base before reading. If an autosave completes during the read and diskContent advances,
+  // the old read result could be mistaken for an external change to the new base, so if
+  // the base changed after reading, skip this tick (the next tick sees the latest state).
   const baseAtStart = before.diskContent;
   let disk: string;
   try {
     disk = await api.readQueryFile(connection, file);
   } catch {
-    // 読めない (外部で削除された等) 場合は何もしない。次の契機に委ねる。
+    // If it cannot be read (deleted externally, etc.), do nothing. Leave it to the next opportunity.
     return;
   }
-  // await の間にタブが閉じられた / ファイル名が変わった可能性があるので取り直す。
+  // The tab may have been closed / the file name changed during the await, so re-obtain it.
   const tab = editorTabs.find((t) => t.id === tabId);
   if (!tab || tab.connection !== connection || tab.file !== file) {
     return;
   }
-  // 読込中に保存が回り込んで base (diskContent) が変わっていたら、この read は
-  // 古い可能性があるので判定しない。
+  // If a save slipped in during the read and the base (diskContent) changed, this read may be
+  // stale, so make no decision.
   if (tab.diskContent !== baseAtStart) {
     return;
   }
 
   const base = tab.diskContent;
   if (disk === base) {
-    // 外部変更なし。過去の衝突警告が残っていればクリアする。
+    // No external change. Clear any past conflict warning that remains.
     conflictNotified.delete(tabId);
-    // 衝突を起こした外部変更が元に戻り disk が base と一致した場合、衝突は解消。
-    // conflicted を残すと、外部変更が無いのに dirty タブが衝突扱いのままとなり、
-    // 閉じる/リロード時に手元の編集が破棄されてしまう。フラグを下ろし、まだ dirty
-    // なら通常のデバウンス自動保存を張り直して編集を確実に永続化する
-    // (衝突検知時に cancelPendingSaveFor で予約を外しているため、張り直さないと
-    //  次の編集まで自動保存されない)。
+    // If the external change that caused the conflict was reverted and the disk matches the base, the conflict is resolved.
+    // Leaving conflicted set would keep a dirty tab treated as conflicted although there is no external change,
+    // and local edits would be discarded on close / reload. Lower the flag, and if still dirty
+    // re-arm the normal debounced autosave to persist the edits reliably
+    // (cancelPendingSaveFor removed the schedule when the conflict was detected, so without re-arming
+    //  they would not be autosaved until the next edit).
     if (tab.conflicted) {
       tab.conflicted = false;
       if (tab.dirty) {
@@ -2376,9 +2375,9 @@ const checkTabForExternalChange = async (tabId: number) => {
     }
     return;
   }
-  // ここに来た = ディスクが最後に把握した内容と異なる (外部変更あり)。
+  // Reaching here = the disk differs from the last known content (there is an external change).
   if (tab.content === base) {
-    // 手元に未保存の編集が無い → 外部の内容をそのまま採用してリロードする。
+    // No unsaved local edits -> adopt the external content as is and reload.
     tab.content = disk;
     tab.diskContent = disk;
     tab.dirty = false;
@@ -2390,35 +2389,35 @@ const checkTabForExternalChange = async (tabId: number) => {
     return;
   }
   if (tab.content === disk) {
-    // 手元の編集が結果的にディスクと一致 (保存が回り込んだ等)。表示は変えず基準だけ更新。
+    // The local edits happen to match the disk (a save slipped in, etc.). Do not change the display; only update the base.
     tab.diskContent = disk;
     tab.dirty = false;
     tab.conflicted = false;
     conflictNotified.delete(tabId);
-    // 内容が同じでも書き直されていれば更新日時は変わっている
+    // Even if the content is the same, the modified time has changed if it was rewritten
     refreshFileEntries(connection);
     return;
   }
-  // base / local / remote が三者三様 → 3-way マージを試みる。
-  // マージに使った手元の内容を控える (書き込み await 中にユーザーが更に打鍵した場合、
-  // その新しい編集を merged で黙って上書きしないため)。
+  // base / local / remote are all different -> try a 3-way merge.
+  // Remember the local content used for the merge (so that if the user types more during the write await,
+  // that new edit is not silently overwritten by merged).
   const localSnapshot = tab.content;
   const { merged, conflict } = merge3(base, localSnapshot, disk);
   if (!conflict) {
-    // 別々の箇所への変更なので自動マージできる。結果をディスクへ書き戻す。
-    // ただし force で無条件に書くと、この tick の read (disk) 〜 書き込み完了の間に
-    // さらに別プロセスが保存した場合、古い disk を基にした merged で新しい外部保存を
-    // 黙って上書きしてしまう。マージの基にした disk スナップショットとディスクが
-    // まだ一致する時だけ書く CAS にする (expectedBase=disk)。食い違っていたら書かず、
-    // 次 tick で最新内容に対して改めてマージ/衝突判定させる。
+    // The changes are to separate places, so they can be auto-merged. Write the result back to the disk.
+    // But writing unconditionally with force would, if another process saved between this tick's read (disk) and the write
+    // completing, silently overwrite that newer external save with merged based on the old disk.
+    // So use a CAS that writes only when the disk snapshot the merge was based on still matches the disk
+    // (expectedBase=disk). If they differ, do not write, and have the next tick
+    // redo the merge / conflict decision against the latest content.
     let wrote = false;
     try {
       wrote = await api.writeQueryFileIfUnchanged(connection, file, merged, disk);
     } catch (e) {
       errorMessage = `Failed to save the file: ${toErrorMessage(e)}`;
     }
-    // 書き込み await 中にタブが閉じられた / 別ファイルになった / base が進んだ場合は
-    // この結果を反映しない (次 tick で最新状態を見る)。
+    // If the tab was closed / became another file / the base advanced during the write await,
+    // do not reflect this result (the next tick sees the latest state).
     const t2 = editorTabs.find((t) => t.id === tabId);
     if (
       !t2 ||
@@ -2429,38 +2428,38 @@ const checkTabForExternalChange = async (tabId: number) => {
       return;
     }
     if (wrote) {
-      // マージ結果をディスクへ反映できた。ディスクは今 merged。
+      // The merge result could be reflected to the disk. The disk is now merged.
       refreshFileEntries(connection);
       t2.diskContent = merged;
       t2.conflicted = false;
       conflictNotified.delete(tabId);
       if (t2.content === localSnapshot) {
-        // 書き込み中に追加編集は無い → エディタもマージ結果に確定する。
+        // No additional edits during the write -> settle the editor on the merge result too.
         t2.content = merged;
         t2.dirty = false;
         cancelPendingSaveFor(tabId);
         toast.info(`Merged external changes into "${file}"`);
       } else {
-        // await 中にさらに打鍵された → その新しい編集は捨てず dirty のまま残す。
-        // 基準 (diskContent) は merged に進めたので、次 tick / 予約済み自動保存が
-        // 新編集を merged を base として保存/マージする (予約はそのまま活かす)。
+        // Typed more during the await -> do not discard that new edit; leave it dirty.
+        // The base (diskContent) has advanced to merged, so the next tick / the scheduled autosave
+        // saves / merges the new edit with merged as the base (the schedule is kept as is).
       }
     } else {
-      // マージ中にさらに外部書き込みが入った。今回は反映せず (手元の編集はそのまま)、
-      // dedup キーを消して次 tick で最新ディスク内容に対して再判定させる。
+      // Another external write came in during the merge. Do not reflect this time (local edits stay as they are),
+      // and clear the dedup key to have the next tick re-decide against the latest disk content.
       conflictNotified.delete(tabId);
     }
     return;
   }
-  // 同じ箇所を双方が別々に変更 → 自動マージ不可。未保存の編集は保持し、警告する。
-  // 保留中の自動保存は解除する (残すと衝突中のタブに対して debounce 保存が走りかねない)。
+  // Both sides changed the same place -> cannot auto-merge. Keep the unsaved edits and warn.
+  // Cancel the pending autosave (leaving it could let a debounced save run on a conflicted tab).
   cancelPendingSaveFor(tabId);
-  // 衝突中は自動保存 (閉じる・アプリ終了・reloadConnections) を抑止し、手元の編集で
-  // 外部変更を黙って上書きするのを防ぐ。解消はユーザーの明示操作 (ツールバーの
-  // Overwrite で上書き / Discard で破棄) に委ねる。なお暗黙の自動保存自体も
-  // saveEditorTab の CAS で外部変更を上書きしないよう二重に守られている。
+  // During a conflict, suppress autosave (close, quitting the app, reloadConnections) to prevent local edits from
+  // silently overwriting the external change. Resolution is left to the user's explicit action (toolbar
+  // Overwrite to overwrite / Discard to discard). Implicit autosave itself is also doubly protected by
+  // the CAS in saveEditorTab so it does not overwrite external changes.
   tab.conflicted = true;
-  // 同じディスク状態で毎 tick 警告しないよう既通知を記録する。
+  // Record that we have notified, so we do not warn on every tick for the same disk state.
   if (conflictNotified.get(tabId) !== disk) {
     conflictNotified.set(tabId, disk);
     toast.warning(`"${file}" was changed on disk, but you have unsaved edits`, {
@@ -2478,7 +2477,7 @@ const fileWatchTick = async () => {
   }
   fileWatchTicking = true;
   try {
-    // 開始時点の id スナップショットで回す (処理中に配列が変わっても安全)。
+    // Iterate over a snapshot of ids at the start (safe even if the array changes during processing).
     const ids = editorTabs.map((t) => t.id);
     for (const id of ids) {
       await checkTabForExternalChange(id);
@@ -2490,7 +2489,7 @@ const fileWatchTick = async () => {
       lastFileListRefreshAt = Date.now();
       refreshFileEntries(selectedConnection);
     }
-    // 閉じられたタブの通知記録を掃除する。
+    // Clean up the notification records of closed tabs.
     const alive = new Set(editorTabs.map((t) => t.id));
     for (const id of [...conflictNotified.keys()]) {
       if (!alive.has(id)) {
@@ -2502,7 +2501,7 @@ const fileWatchTick = async () => {
   }
 };
 
-/// 外部ファイル変更のポーリングを開始する (+page の onMount から呼ぶ)。
+/// Start polling for external file changes (called from +page's onMount).
 const startFileWatcher = () => {
   if (fileWatchTimer) {
     return;
@@ -2513,7 +2512,7 @@ const startFileWatcher = () => {
   );
 };
 
-/// ポーリングを停止する (+page の onDestroy から呼ぶ)。
+/// Stop polling (called from +page's onDestroy).
 const stopFileWatcher = () => {
   if (fileWatchTimer) {
     clearInterval(fileWatchTimer);
@@ -2529,31 +2528,31 @@ export default {
   get selectedConnection() {
     return selectedConnection;
   },
-  /// Writable スイッチの状態。false の間は書き込み系の文を実行できない
+  /// State of the Writable switch. While false, write statements cannot be run
   get writable() {
     return writable;
   },
-  /// 選択中の接続が config で readonly: true か (スイッチでは解除できない)。
-  /// 接続未選択なら false。トグルのロック表示に使う
+  /// Whether the selected connection is readonly: true in config (cannot be lifted by the switch).
+  /// false if no connection is selected. Used for the toggle's lock display
   get selectedConnectionReadonly() {
     return (
       connections.find((c) => c.name === selectedConnection)?.readonly ?? false
     );
   },
-  /// Writable スイッチを切り替える。config readonly 接続では書き込みは
-  /// バックエンドが拒否するが、状態自体は接続横断のセッション設定として保持する
+  /// Toggle the Writable switch. For a config-readonly connection the backend rejects writes,
+  /// but the state itself is kept as a session setting across connections
   toggleWritable() {
     writable = !writable;
   },
-  /// 選択中の接続のエンジン能力宣言 (未選択なら null)。
-  /// TABLES ペインの表示可否やクエリファイル拡張子の決定に使う
+  /// The selected connection's engine capability declaration (null if none selected).
+  /// Used to decide whether to show the TABLES pane and the query file extension
   get selectedCapabilities() {
     return (
       connections.find((c) => c.name === selectedConnection)?.capabilities ??
       null
     );
   },
-  /// 選択中の接続のクエリファイル拡張子 (ドット無し。未選択なら "sql")
+  /// The selected connection's query file extension (without dot; "sql" if none selected)
   get selectedFileExtension() {
     return this.selectedCapabilities?.file_extension ?? "sql";
   },
@@ -2563,18 +2562,18 @@ export default {
   get fileEntries() {
     return fileEntries;
   },
-  /// 開いているエディタタブ (全接続横断・多段表示)
+  /// Open editor tabs (across all connections, multi-row display)
   get editorTabs() {
     return editorTabs;
   },
   get activeEditorTabId() {
     return activeEditorTabId;
   },
-  /// アクティブなエディタタブのファイル名 (無ければ null)
+  /// File name of the active editor tab (null if none)
   get selectedFile() {
     return getActiveEditorTab()?.file ?? null;
   },
-  /// アクティブなエディタタブの内容 (無ければ空文字)
+  /// Content of the active editor tab (empty string if none)
   get editorContent() {
     return getActiveEditorTab()?.content ?? "";
   },
@@ -2584,25 +2583,25 @@ export default {
   get activeTabId() {
     return activeTabId;
   },
-  /// アクティブな結果タブ (無ければ null)
+  /// The active result tab (null if none)
   get activeResultTab() {
     return resultTabs.find((t) => t.id === activeTabId) ?? null;
   },
   get errorMessage() {
     return errorMessage;
   },
-  /// いずれかのタブでクエリ実行中なら true (Run ボタンの無効化などに使う)
+  /// True if a query is running in any tab (used to disable the Run button, etc.)
   get running() {
     return resultTabs.some((t) => t.running);
   },
   get loadingConnections() {
     return loadingConnections;
   },
-  /// アクティブなエディタタブに未保存の編集があるか
+  /// Whether the active editor tab has unsaved edits
   get dirty() {
     return getActiveEditorTab()?.dirty ?? false;
   },
-  /// アクティブなエディタタブが外部変更との衝突状態か (ツールバーの解消 UI 表示に使う)
+  /// Whether the active editor tab is in conflict with an external change (used to show the toolbar's resolution UI)
   get activeFileConflicted() {
     return getActiveEditorTab()?.conflicted ?? false;
   },
@@ -2624,40 +2623,40 @@ export default {
   get aiAnalyzing() {
     return aiAnalyzing;
   },
-  /// AI による実行計画解説の Markdown (モーダル表示中のみ非 null)
+  /// Markdown of the AI execution plan explanation (non-null only while the modal is shown)
   get aiAnalysis() {
     return aiAnalysis;
   },
   get aiExplaining() {
     return aiExplaining;
   },
-  /// AI による選択 SQL 解説の Markdown (モーダル表示中のみ非 null)
+  /// Markdown of the AI explanation of the selected SQL (non-null only while the modal is shown)
   get aiExplanation() {
     return aiExplanation;
   },
-  /// AI チャット (右ペイン) の表示中メッセージ
+  /// Messages currently shown in the AI chat (right pane)
   get chatMessages() {
     return chatMessages;
   },
-  /// AI チャットの応答待ち (破棄済みの往復は待機扱いにしない)。
-  /// 切替の遷移中も入力を塞ぐため true にする
+  /// Waiting for the AI chat's response (discarded round trips are not treated as waiting).
+  /// Set to true during a switch transition too, to block input
   get chatSending() {
     return (
       chatTransitions > 0 ||
       (chatSendingGen !== null && chatSendingGen === chatGeneration)
     );
   },
-  /// SQL 補完用のテーブル名 → カラム名リストのマップ (未取得なら null)
+  /// Map of table name -> column name list for SQL completion (null if not fetched)
   get schemaMap() {
     return schemaMap;
   },
-  /// 危険な文の実行確認ダイアログに表示する理由 (非表示中は null)
+  /// Reason shown in the confirmation dialog before running a dangerous statement (null when hidden)
   get dangerousConfirmReason() {
     return dangerousConfirm?.reason ?? null;
   },
-  /// 確認ダイアログで「実行する」を選んだ
+  /// "Run" was chosen in the confirmation dialog
   confirmDangerous: () => resolveDangerousConfirm(true),
-  /// 確認ダイアログで「キャンセル」を選んだ
+  /// "Cancel" was chosen in the confirmation dialog
   cancelDangerous: () => resolveDangerousConfirm(false),
   loadConnections,
   loadAiInfo,

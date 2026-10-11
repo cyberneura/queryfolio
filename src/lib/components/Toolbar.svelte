@@ -5,10 +5,10 @@
     onRunCurrent: () => void;
     onOpenSearch: () => void;
     onOpenSettings: () => void;
-    /// AI チャットペイン (右) の表示状態と切り替え
+    /// Visibility state and toggle of the AI chat pane (right)
     chatOpen: boolean;
     onToggleChat: () => void;
-    /// ヘルプペイン (最も右) の表示状態と切り替え
+    /// Visibility state and toggle of the help pane (rightmost)
     helpOpen: boolean;
     onToggleHelp: () => void;
   }
@@ -23,8 +23,8 @@
     onToggleHelp,
   }: Props = $props();
 
-  // 実行中は Run ボタンを Cancel ボタンに切り替え、
-  // 実行中のタブ (接続単位で 1 つ) のクエリをキャンセルする
+  // While running, switch the Run button to a Cancel button,
+  // which cancels the query of the running tab (one per connection)
   const cancelRunningQuery = () => {
     const running = appStore.resultTabs.find((t) => t.running);
     if (running) {
@@ -47,7 +47,7 @@
   {/if}
 
   <span class="ml-auto flex items-center gap-2">
-    <!-- 検索 (接続・クエリファイル)。Cmd+K でも開く -->
+    <!-- Search (connections / query files). Also opens with Cmd+K -->
     <button
       class="flex items-center gap-1 rounded border border-zinc-600 px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-800"
       title="Search connections and query files (Cmd+K)"
@@ -59,9 +59,9 @@
       <span class="text-zinc-500">⌘K</span>
     </button>
     <!--
-      Writable スイッチ。OFF (既定) では SELECT/SHOW 等の副作用の無い文しか
-      実行できない (バックエンドが強制)。config で readonly: true の接続では
-      スイッチでは解除できないためロック表示にする。
+      Writable switch. When OFF (default), only side-effect-free statements such as SELECT/SHOW
+      can be run (enforced by the backend). For connections with readonly: true in the config,
+      the switch cannot unlock it, so it is shown as locked.
     -->
     {#if appStore.selectedConnectionReadonly}
       <span
@@ -111,7 +111,7 @@
         <i class="bi bi-play-fill" aria-hidden="true"></i> Run
       </button>
     {/if}
-    <!-- AI チャットペイン (右) の開閉 -->
+    <!-- Toggle the AI chat pane (right) -->
     <button
       class="flex items-center gap-1 rounded border px-2 py-1 text-xs transition-colors {chatOpen
         ? 'border-blue-500 bg-blue-600/20 text-blue-300 hover:bg-blue-600/30'
@@ -124,7 +124,7 @@
     >
       <i class="bi bi-chat-dots" aria-hidden="true"></i> Chat
     </button>
-    <!-- ヘルプペイン (最も右) の開閉 -->
+    <!-- Toggle the help pane (rightmost) -->
     <button
       class="flex items-center gap-1 rounded border px-2 py-1 text-xs transition-colors {helpOpen
         ? 'border-blue-500 bg-blue-600/20 text-blue-300 hover:bg-blue-600/30'

@@ -5,7 +5,7 @@
   import { formatFileSize, formatModifiedAt, formatRelativeTime } from "$lib/fileMeta";
 
   interface Props {
-    /// HISTORY / TABLES タブへの切り替え (タブ状態は +page.svelte が持つ)
+    /// Switch to the HISTORY / TABLES tab (the tab state is held by +page.svelte)
     onShowHistory: () => void;
     onShowTables: () => void;
   }
@@ -14,17 +14,17 @@
 
   let creating = $state(false);
   let newFileName = $state("");
-  /// 3 点メニューを開いているファイル
+  /// The file whose three-dot menu is open
   let openMenuFile = $state<string | null>(null);
-  /// メニュー内で Delete の確認待ちになっているファイル
+  /// The file waiting for Delete confirmation in the menu
   let confirmingDelete = $state<string | null>(null);
-  /// リネーム入力中のファイルと入力値
+  /// The file being renamed and the input value
   let renamingFile = $state<string | null>(null);
   let renameValue = $state("");
-  /// CONNECTIONS ペインへドラッグ中のファイル (ドラッグ元を薄く表示するため)
+  /// The file being dragged to the CONNECTIONS pane (to show the drag source dimmed)
   let draggingFile = $state<string | null>(null);
 
-  /// 相対表記 (`3 days ago`) の基準時刻。開きっぱなしでも表記が古びないよう 1 分ごとに進める
+  /// Reference time for relative notation (`3 days ago`). Advanced every minute so the notation does not go stale even if left open
   let clock = $state(Date.now());
   $effect(() => {
     const timer = setInterval(() => {
@@ -33,34 +33,35 @@
     return () => clearInterval(timer);
   });
 
-  /// ファイル名の下に出す 1 行 (`2026-09-15 17:30 · 3 days ago · 4 KB`)。
-  /// 更新日時が取れないファイルはサイズだけ
+  /// One line shown under the file name (`2026-09-15 17:30 · 3 days ago · 4 KB`).
+  /// For a file whose modified time is unavailable, only the size
   const metaLine = (modifiedMs: number | null, size: number) =>
     modifiedMs === null
       ? formatFileSize(size)
       : `${formatModifiedAt(modifiedMs)} · ${formatRelativeTime(modifiedMs, clock)} · ${formatFileSize(size)}`;
 
-  /// エンジン別のクエリファイル拡張子 (ドット付き。例 ".sql" / ".redis")
+  /// Query file extension per engine (with the dot, e.g. ".sql" / ".redis")
   const fileSuffix = $derived(`.${appStore.selectedFileExtension}`);
 
-  // デフォルトのファイル名: YYYYMMDD-HHMM (拡張子はバックエンドが付与)。
-  // 日付が先頭にあると名前でも時系列が分かり探しやすい。一覧そのものは更新日時の
-  // 降順 (query_files.rs の list_query_file_entries) だが、検索結果は名前の降順
-  // (list_query_file_names) なので、名前でも新しいファイルほど上に出るようにしておく。
-  // 同一分内の連続作成で衝突しないよう、既存ファイルと重複する場合は
-  // -2, -3 ... を付けて一意化する。ゼロ埋めはしないが、一覧側が数字を数値として
-  // 比較するため -9 と -10 の並びも作成順どおりになる。
+  // Default file name: YYYYMMDD-HHMM (the extension is added by the backend).
+  // With the date first, the chronological order is visible from the name too and files are easy to find.
+  // The list itself is in descending order of modified time (list_query_file_entries in query_files.rs),
+  // but search results are in descending order of name (list_query_file_names), so make newer files
+  // come first by name as well.
+  // To avoid collisions for consecutive creations within the same minute, make the name unique by
+  // appending -2, -3 ... if it duplicates an existing file. No zero padding is used, but the list side
+  // compares digits as numbers, so -9 and -10 also stay in creation order.
   //
-  // 番号は**空きを埋めず常に既存の最大値 + 1** を採る。一覧は降順なので、
-  // 削除された若い番号 (や無印) を再利用すると、新しく作ったファイルが同じ分の
-  // 古いファイルより下に出てしまう。
+  // The number is **always the existing maximum + 1, without filling gaps**. The list is in descending
+  // order, so reusing a deleted smaller number (or the unnumbered one) would make a newly created file
+  // appear below an older file from the same minute.
   const defaultFileName = () => {
     const now = new Date();
     const pad = (n: number) => String(n).padStart(2, "0");
     const date = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
     const time = `${pad(now.getHours())}${pad(now.getMinutes())}`;
     const base = `${date}-${time}`;
-    // 0 = 同じ分のファイルがまだ無い / 1 = 無印だけある / n = -n まである
+    // 0 = no file from the same minute yet / 1 = only the unnumbered one exists / n = exists up to -n
     let maxSeq = appStore.files.includes(`${base}${fileSuffix}`) ? 1 : 0;
     for (const fileName of appStore.files) {
       if (!fileName.startsWith(`${base}-`) || !fileName.endsWith(fileSuffix)) {
@@ -70,7 +71,7 @@
         base.length + 1,
         fileName.length - fileSuffix.length,
       );
-      // 連番以外のもの ("20260804-1200-draft") は無視する
+      // Ignore anything that is not a sequence number ("20260804-1200-draft")
       if (!/^\d+$/.test(seq)) {
         continue;
       }
@@ -95,7 +96,7 @@
     confirmingDelete = null;
   };
 
-  // 名前を正規化する (エンジン別拡張子を保証)。同名判定をバックエンドと揃えるため。
+  // Normalize the name (guarantee the engine-specific extension). To match the same-name check with the backend.
   const normalize = (name: string) => {
     const trimmed = name.trim();
     return trimmed.toLowerCase().endsWith(fileSuffix)
@@ -106,7 +107,7 @@
   const startRename = (fileName: string) => {
     closeMenu();
     renamingFile = fileName;
-    // 拡張子を隠さずそのまま編集させる (ユーザーが .sql を意識できる)
+    // Let the user edit with the extension shown as is (so the user stays aware of .sql)
     renameValue = fileName;
   };
 
@@ -115,15 +116,15 @@
     renameValue = "";
   };
 
-  // Enter でのみ確定する。無効な入力は理由をトーストで示し入力を開いたままにする。
-  // フォーカスアウト (blur) は commit せずキャンセルする (誤コミット防止)。
+  // Commit only with Enter. For invalid input, show the reason in a toast and keep the input open.
+  // Focus-out (blur) cancels without committing (to prevent accidental commits).
   const submitRename = async () => {
     const oldName = renamingFile;
     if (!oldName) {
       return;
     }
     const raw = renameValue.trim();
-    // 空・変更なしは黙ってキャンセル
+    // Empty or unchanged: cancel silently
     if (!raw || normalize(raw) === normalize(oldName)) {
       cancelRename();
       return;
@@ -133,7 +134,7 @@
       return;
     }
     const normalized = normalize(raw);
-    // リネーム対象自身は除外する (大文字小文字だけを変える改名を許可)
+    // Exclude the rename target itself (allow a rename that changes only the letter case)
     if (
       appStore.files.some(
         (f) => f !== oldName && f.toLowerCase() === normalized.toLowerCase(),
@@ -152,16 +153,16 @@
     }
   };
 
-  // 入力段階で使えない文字 (/ \) を取り除く。.. 等の先頭ドットは送信時に弾く。
+  // Strip characters that cannot be used at the input stage (/ \). A leading dot such as .. is rejected on submit.
   const sanitizeRenameInput = (value: string) => {
     renameValue = value.replace(/[/\\]/g, "");
   };
 
-  // CONNECTIONS ペインへドラッグして別サーバーへ移動する。移動そのものは
-  // ドロップ先 (ConnectionsPane) が appStore.moveFileToConnection で行う。
+  // Drag to the CONNECTIONS pane to move to another server. The move itself is done by the
+  // drop target (ConnectionsPane) with appStore.moveFileToConnection.
   const startDrag = (e: DragEvent, fileName: string) => {
-    // リネーム入力中は draggable を外してあるが、念のため二重で防ぐ
-    // (入力欄のテキスト選択をドラッグ扱いにしない)
+    // draggable is removed while renaming, but prevent it twice just in case
+    // (so text selection in the input is not treated as a drag)
     if (!e.dataTransfer || renamingFile === fileName) {
       return;
     }
@@ -171,12 +172,12 @@
     }
     setFileDragPayload(e.dataTransfer, { connection, fileName });
     draggingFile = fileName;
-    // ドラッグ中はメニューを閉じる (ドロップ後も開いたまま残るのを防ぐ)
+    // Close the menu while dragging (to prevent it from staying open after the drop)
     closeMenu();
   };
 
   const handleNameClick = (fileName: string) => {
-    // 既に開いている (選択中) ファイルの名前を再クリックしたらリネームに入る
+    // Clicking the name of an already open (selected) file again enters rename
     if (appStore.selectedFile === fileName) {
       startRename(fileName);
     } else {
@@ -213,7 +214,7 @@
     >
       HISTORY
     </button>
-    <!-- テーブルの概念が無いエンジン (redis 等) では TABLES を出さない -->
+    <!-- Do not show TABLES for engines without a table concept (redis, etc.) -->
     {#if appStore.selectedCapabilities?.supports_tables ?? true}
       <button
         class="text-xs font-semibold tracking-wide text-zinc-600 hover:text-zinc-300"
@@ -270,8 +271,8 @@
           Click + to create a query file
         </p>
       {/if}
-      <!-- ドラッグ & ドロップのハンドラを持つ行に正しい ARIA ロールを与えるため、
-           一覧部分だけを role="list" で包む (作成フォームや空メッセージは含めない) -->
+      <!-- To give the rows with drag & drop handlers a proper ARIA role,
+                 wrap only the list part with role="list" (the create form and empty message are not included) -->
       <div role="list">
         {#each appStore.fileEntries as { file_name: fileName, modified_ms, size } (fileName)}
           <div
@@ -352,7 +353,7 @@
             {/if}
 
             {#if openMenuFile === fileName}
-              <!-- メニュー外クリックで閉じる透明バックドロップ -->
+              <!-- Transparent backdrop that closes the menu when clicking outside it -->
               <button
                 class="fixed inset-0 z-20 cursor-default"
                 tabindex="-1"

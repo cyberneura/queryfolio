@@ -1,6 +1,6 @@
-// 行単位の一括置換。template 内の %%% を入力の各行で置換して 1 行ずつ出力する。
-// 空行・# 始まり・// 始まりの行はスキップする (t.ytyng.com/line-replace 互換)。
-// 主な用途: SHOW FULL PROCESSLIST の ID 一覧を `KILL %%%;` に一括変換する等。
+// Line-by-line bulk replacement. Replaces %%% in the template with each input line and outputs one line per input line.
+// Blank lines and lines starting with # or // are skipped (compatible with t.ytyng.com/line-replace).
+// Main use: bulk-converting a list of IDs from SHOW FULL PROCESSLIST into `KILL %%%;`, etc.
 export const PLACEHOLDER = "%%%";
 
 export const generateLineReplace = (
@@ -13,13 +13,13 @@ export const generateLineReplace = (
     if (line === "" || line.startsWith("#") || line.startsWith("//")) {
       continue;
     }
-    // %%% の全出現を置換する。split/join なので正規表現の特殊文字を気にしない
+    // Replace every occurrence of %%%. split/join is used so regex special characters are not a concern
     out.push(template.split(PLACEHOLDER).join(line));
   }
   return out.join("\n");
 };
 
-// 出力行数 (プレビューの「N lines」表示用)。空入力では 0
+// Number of output lines (for the preview "N lines" display). 0 for empty input
 export const countLineReplaceResults = (
   lines: string,
   template: string,

@@ -3,14 +3,15 @@ fn main() {
     tauri_build::build()
 }
 
-/// `--version` が出す番号を `tauri.conf.json` から取り、`QUERYFOLIO_VERSION` として埋め込む。
+/// Reads the number that `--version` prints from `tauri.conf.json` and embeds it as
+/// `QUERYFOLIO_VERSION`.
 ///
-/// **Cargo.toml の version は使えない。** リリースの版番号は
-/// `src-tauri/tauri.conf.json` の `version` で決まり (`.github/workflows/release.yml` が
-/// そこを読んでタグと Release を作る)、Cargo.toml の方は追随していない。
-/// `CARGO_PKG_VERSION` を出すと、配布物が 0.1.4 でも `--version` は 0.1.0 と答える。
+/// **The Cargo.toml version cannot be used.** The release version is determined by `version`
+/// in `src-tauri/tauri.conf.json` (`.github/workflows/release.yml` reads it to create the tag
+/// and the Release), and Cargo.toml does not follow it. Printing `CARGO_PKG_VERSION` would make
+/// `--version` answer 0.1.0 even when the distributed build is 0.1.4.
 ///
-/// 読めなければ**ビルドを失敗させる** (取り違えた番号を黙って埋め込まないため)。
+/// If it cannot be read, **the build fails** (so a wrong number is never embedded silently).
 fn emit_app_version() {
     println!("cargo:rerun-if-changed=tauri.conf.json");
 

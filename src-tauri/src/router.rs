@@ -1,90 +1,91 @@
-//! `queryfolio://` URI と CLI 引数を解釈する共通ルーター。
+//! Common router that interprets `queryfolio://` URIs and CLI arguments.
 //!
-//! URI (deep link) と CLI サブコマンドの両方をここで [`Route`] に落とし、
-//! lib.rs 側が [`Route`] をディスパッチする。今後アクションを増やす時は
-//! ここに variant とパースを足すだけで URI / CLI の両方に対応できる
-//! (「queryfolio:// と同様のルートで機能を追加していけるように」の要)。
+//! Both URIs (deep links) and CLI subcommands are turned into a [`Route`] here, and
+//! lib.rs dispatches the [`Route`]. To add a new action later, just add a variant and
+//! its parsing here and it works for both URI and CLI (this is the point of "make it
+//! possible to keep adding features through routes like queryfolio://").
 //!
-//! ただし**書き込みを伴うアクション (`write`) は CLI 専用**で、URI からは
-//! 受け付けない (`parse_uri` は UnknownAction にする)。`queryfolio://` URL は
-//! Web ページからでも開かせられるため、URI で書き込みを許すと閲覧中のページが
-//! 任意の SQL をユーザーのクエリファイルとして置けてしまう (ユーザーが後から
-//! それを実行する危険がある)。CLI は起動する本人の操作なのでこの経路は無い。
+//! However, **the write action (`write`) is CLI-only** and is not accepted from a URI
+//! (`parse_uri` returns UnknownAction). A `queryfolio://` URL can be opened from a web
+//! page, so allowing writes via URI would let a page being viewed plant arbitrary SQL as
+//! a user's query file (and the user might run it later). The CLI is an action by the
+//! person launching it, so this path does not exist there.
 //!
-//! パス解決 ([`resolve_open_target`]) はセキュリティ上重要なので Tauri に依存
-//! させず純粋な std だけで書き、単体テストで境界を固める。開けるのは
-//! 「クエリファイル保存ディレクトリ (`sqlfiles_dir`) 直下の接続フォルダにある
-//! クエリファイル (拡張子は [`ALLOWED_EXTENSIONS`]: `.sql` / `.redis` / `.es`)」だけで、
-//! `..` によるトラバーサルや保存領域外のパスは拒否する。拡張子が接続エンジンの
-//! ものと一致するかは、接続を解決できる lib.rs (resolve_route_target) 側が
-//! 追加で検証する。
+//! Path resolution ([`resolve_open_target`]) is security-critical, so it is written with
+//! plain std only, without depending on Tauri, and its boundaries are pinned down by unit
+//! tests. The only thing that can be opened is "a query file in a connection folder
+//! directly under the query file storage directory (`sqlfiles_dir`) (extensions are
+//! [`ALLOWED_EXTENSIONS`]: `.sql` / `.redis` / `.es`)"; traversal via `..` and paths
+//! outside the storage area are rejected. Whether the extension matches the connection's
+//! engine is verified additionally by lib.rs (resolve_route_target), which can resolve
+//! the connection.
 
 use std::path::{Component, Path, PathBuf};
 
-/// URI スキーム名 (`queryfolio://...`)。
+/// URI scheme name (`queryfolio://...`).
 pub const URI_SCHEME: &str = "queryfolio";
 
-/// 既存ファイルをパス指定で開く CLI サブコマンド。
+/// CLI subcommand that opens an existing file by path.
 const OPEN_SUBCOMMAND: &str = "open";
 
-/// 接続フォルダにクエリファイルを書き出して開く CLI サブコマンド。
+/// CLI subcommand that writes a query file into a connection folder and opens it.
 const WRITE_SUBCOMMAND: &str = "write";
 
-/// URI / CLI から解釈されたアクション (まだ検証していない生の入力を保持する)。
+/// An action interpreted from a URI / CLI (holds the raw, not yet validated input).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
-    /// クエリファイルをパス指定で開く。`path` は未検証の生パス
-    /// (`resolve_open_target` で保存領域配下かを検証してから使う)。
+    /// Open a query file by path. `path` is an unvalidated raw path
+    /// (validate with `resolve_open_target` that it is under the storage area before use).
     OpenFile { path: String },
-    /// 接続 (SQL サーバー設定) の名前とファイル名を指定してクエリファイルを開く。
-    /// `content` があればその内容で書き出してから開く (CLI 専用。下記参照)。
+    /// Open a query file by specifying the connection (SQL server config) name and the file name.
+    /// If `content` is present, write that content first and then open (CLI-only; see below).
     ///
-    /// **書き出し自体はこの Route の解決では行わない**。CLI プロセスが
-    /// Tauri を起動する前に書き終えてから、この Route を「開く」指示として
-    /// 実行中インスタンス (または自プロセス) に渡す。標準入力の内容は
-    /// single-instance プラグインが転送する argv には載らないため、
-    /// 書き出しを起動側で完結させないと転送経路で失われる。
-    /// そのため解決側 (lib.rs) は `content` を参照しない。
+    /// **The write itself is not performed when resolving this Route.** The CLI process
+    /// finishes writing before launching Tauri, and then hands this Route to the running
+    /// instance (or its own process) as an "open" instruction. Stdin content is not included
+    /// in the argv forwarded by the single-instance plugin, so if the write were not
+    /// completed on the launching side it would be lost on the forwarding path.
+    /// For that reason the resolving side (lib.rs) does not look at `content`.
     WriteFile {
-        /// 接続名 (`ServerConfig::name`)。未検証。
+        /// Connection name (`ServerConfig::name`). Unvalidated.
         connection: String,
-        /// ファイル名。未検証 (拡張子はエンジンのものが補われる)。
+        /// File name. Unvalidated (the engine's extension is added if missing).
         file_name: String,
-        /// 書き出す内容 (省略時は既存ファイルをそのまま開く)。
+        /// Content to write (if omitted, the existing file is opened as is).
         content: Option<String>,
     },
 }
 
-/// 開く対象のクエリファイルを、接続名と (正規化済み) ファイル名で表す。
-/// フロントエンドはこの接続を選択してこのファイルを開く。
+/// Identifies the query file to open by connection name and (normalized) file name.
+/// The frontend selects this connection and opens this file.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenTarget {
-    /// 対象ファイルが属する接続の名前 (`ServerConfig::name`)。
+    /// Name of the connection the target file belongs to (`ServerConfig::name`).
     pub connection: String,
-    /// 開くファイル名 (拡張子付き。接続フォルダ内の 1 要素)。
+    /// File name to open (with extension; one component inside the connection folder).
     pub file_name: String,
 }
 
-/// ルーティング・パス解決のエラー。フロントへは Display の文字列で伝える
-/// (アプリ内メッセージなので英語)。
+/// Routing / path resolution errors. Passed to the frontend as the Display string
+/// (English, since it is an in-app message).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteError {
-    /// `queryfolio://` で始まっていない。
+    /// Does not start with `queryfolio://`.
     NotQueryfolioUri,
-    /// 未知のアクション (`open` 以外)。
+    /// Unknown action (anything other than `open`).
     UnknownAction(String),
-    /// 開くパスが空。
+    /// The path to open is empty.
     EmptyPath,
-    /// クエリファイル保存ディレクトリの外を指している。
+    /// Points outside the query file storage directory.
     OutsideSqlfilesDir,
-    /// 保存ディレクトリ直下の「接続フォルダ / ファイル」の形になっていない。
+    /// Not in the form "connection folder / file" directly under the storage directory.
     NotUnderConnectionFolder,
-    /// どの接続のフォルダにも一致しないフォルダ名。
+    /// A folder name that matches no connection's folder.
     UnknownFolder(String),
-    /// 同じフォルダに複数の接続が対応していて、どの接続で開くか一意に決められない。
+    /// Multiple connections map to the same folder, so which connection to open with cannot be determined uniquely.
     AmbiguousFolder(String),
-    /// ファイル名が不正 (既知のクエリファイル拡張子でない・ドット始まり等)。
+    /// Invalid file name (not a known query file extension, starts with a dot, etc.).
     InvalidFileName(String),
 }
 
@@ -121,21 +122,21 @@ impl std::fmt::Display for RouteError {
 
 impl std::error::Error for RouteError {}
 
-/// `queryfolio://open/<path>` 形式の URI を [`Route`] に解釈する。
+/// Interprets a URI of the form `queryfolio://open/<path>` into a [`Route`].
 ///
-/// 受け付けるアクションは `open` のみ。`write` は書き込みを伴うため URI からは
-/// 受け付けない (モジュールドキュメント参照)。
+/// The only accepted action is `open`. `write` involves writing, so it is not accepted
+/// from a URI (see the module documentation).
 ///
-/// アクションは `queryfolio://` の直後、最初の `/` までを取る。残りが開く対象の
-/// パス (パーセントエンコードされていればデコードする)。絶対パスが渡ると
-/// `queryfolio://open//abs/path.sql` のように `/` が重なるが、`open` を取り出した
-/// 残り `/abs/path.sql` がそのままパスになる。
+/// The action is taken from right after `queryfolio://` up to the first `/`. The rest is
+/// the path to open (percent-decoded if encoded). When an absolute path is passed the `/`
+/// doubles up, as in `queryfolio://open//abs/path.sql`, but after extracting `open` the
+/// remaining `/abs/path.sql` becomes the path as is.
 pub fn parse_uri(uri: &str) -> Result<Route, RouteError> {
     let scheme_prefix = format!("{URI_SCHEME}://");
     let rest = uri
         .strip_prefix(&scheme_prefix)
         .ok_or(RouteError::NotQueryfolioUri)?;
-    // アクションは最初の `/` まで。`/` が無ければパス無し (= 空パス)。
+    // The action runs up to the first `/`. If there is no `/`, there is no path (= empty path).
     let (action, raw_path) = match rest.split_once('/') {
         Some((action, raw)) => (action, raw),
         None => (rest, ""),
@@ -152,28 +153,29 @@ pub fn parse_uri(uri: &str) -> Result<Route, RouteError> {
     }
 }
 
-/// CLI 引数列から [`Route`] を解釈する。
+/// Interprets a CLI argument list into a [`Route`].
 ///
-/// 扱うのは次の 2 形式:
+/// Two forms are handled:
 ///
-/// - `open <path>` — 保存済みのクエリファイルをパス指定で開く
-/// - `write <connection> <file-name> [content]` — 接続のフォルダにクエリファイルを
-///   書き出して開く (`content` 省略時は呼び出し側が標準入力を読む。読めなければ
-///   既存ファイルをそのまま開く)
+/// - `open <path>` — open a saved query file by path
+/// - `write <connection> <file-name> [content]` — write a query file into the
+///   connection's folder and open it (if `content` is omitted the caller reads stdin;
+///   if it cannot be read, the existing file is opened as is)
 ///
-/// 引数列にはプログラム名が含まれることがある (single-instance が転送する argv は
-/// argv[0] 込み) ため、先頭固定ではなく**最初に現れたサブコマンド語**を起点にする。
+/// The argument list may include the program name (the argv forwarded by single-instance
+/// includes argv[0]), so the starting point is the **first subcommand word that appears**
+/// rather than a fixed leading position.
 ///
-/// `queryfolio://` URL 引数は deep-link プラグインが処理するため `open` のパスとしては
-/// 受け取らない (二重処理防止)。**引数列全体からの除去はしない** — 除去すると
-/// `write` の内容が URL だった時 (`write prod a.sql 'queryfolio://open/x'`) にその
-/// 内容ごと消えてしまうため。URL 引数はサブコマンド語と一致しないので、起点探索の
-/// 邪魔にもならない。
+/// `queryfolio://` URL arguments are handled by the deep-link plugin, so they are not
+/// accepted as the path of `open` (to prevent double handling). **They are not removed
+/// from the whole argument list** — removing them would drop the content itself when the
+/// `write` content is a URL (`write prod a.sql 'queryfolio://open/x'`). URL arguments never
+/// match a subcommand word, so they do not interfere with finding the starting point either.
 pub fn route_from_cli_args<S: AsRef<str>>(args: &[S]) -> Option<Route> {
     let scheme_prefix = format!("{URI_SCHEME}://");
     let args: Vec<&str> = args.iter().map(|s| s.as_ref()).collect();
-    // open / write のどちらか先に現れた方を採用する (両方を別々に探すと、
-    // 後ろのサブコマンドの引数に紛れた語を拾ってしまう)。
+    // Take whichever of open / write appears first (searching for both separately would
+    // pick up a word buried in the arguments of the later subcommand)
     let pos = args
         .iter()
         .position(|a| *a == OPEN_SUBCOMMAND || *a == WRITE_SUBCOMMAND)?;
@@ -193,8 +195,8 @@ pub fn route_from_cli_args<S: AsRef<str>>(args: &[S]) -> Option<Route> {
             if connection.trim().is_empty() || file_name.trim().is_empty() {
                 return None;
             }
-            // 内容は省略可 (省略時は標準入力、それも無ければ書き出さない)。
-            // 空文字を明示的に渡した場合は「空で書く」意図として Some("") を保つ。
+            // Content is optional (stdin if omitted; if there is none either, nothing is written).
+            // If an empty string is passed explicitly, keep Some("") as the intent of "write it empty".
             Some(Route::WriteFile {
                 connection: (*connection).to_string(),
                 file_name: (*file_name).to_string(),
@@ -205,22 +207,24 @@ pub fn route_from_cli_args<S: AsRef<str>>(args: &[S]) -> Option<Route> {
     }
 }
 
-/// 生パスを、保存ディレクトリ配下の接続フォルダにあるクエリファイルとして解決する。
+/// Resolves a raw path as a query file in a connection folder under the storage directory.
 ///
-/// - `sqlfiles_dir`: クエリファイル保存ディレクトリ。**呼び出し側で絶対パスに
-///   しておくこと** (相対だと `cwd` の基準が生パスと食い違う: 生パスは deep link /
-///   CLI の起動元 cwd で解決するが、保存ディレクトリはアプリプロセスの cwd で
-///   I/O される。両者を混同しないよう base の絶対化は呼び出し側の責務とする)。
-/// - `folders`: `(フォルダ名, 接続名)` の対応表 (設定順)。フォルダ名は
-///   `ServerConfig::sqlfiles_folder_name()` が返すもの。
-/// - `raw_path`: 開く対象の生パス (`~` / 相対パスは `home` / `cwd` で展開)。
-/// - `home`: `~` 展開に使うホームディレクトリ (無ければ `~` は展開しない)。
-/// - `cwd`: 相対パスの基準ディレクトリ (無ければ相対パスはそのまま)。
+/// - `sqlfiles_dir`: the query file storage directory. **The caller must make it an
+///   absolute path** (if relative, the `cwd` base would disagree with the raw path: the
+///   raw path is resolved against the cwd of the deep link / CLI origin, while the storage
+///   directory is accessed relative to the app process's cwd. To avoid mixing the two,
+///   making base absolute is the caller's responsibility).
+/// - `folders`: a `(folder name, connection name)` table (in config order). The folder
+///   name is what `ServerConfig::sqlfiles_folder_name()` returns.
+/// - `raw_path`: the raw path of the target to open (`~` / relative paths are expanded with `home` / `cwd`).
+/// - `home`: home directory used for `~` expansion (if absent, `~` is not expanded).
+/// - `cwd`: base directory for relative paths (if absent, relative paths are left as is).
 ///
-/// 成功条件: 展開・字句正規化したパスが `sqlfiles_dir/<フォルダ>/<name>.sql` の形
-/// (ちょうど 2 階層) で、`<フォルダ>` が `folders` に存在し、`<name>.sql` が
-/// 妥当なファイル名であること。`..` によるトラバーサルは字句正規化で潰れ、
-/// 保存領域外に出れば `OutsideSqlfilesDir` になる (ファイルシステムには触れない)。
+/// Success condition: the expanded, lexically normalized path has the form
+/// `sqlfiles_dir/<folder>/<name>.sql` (exactly 2 levels), `<folder>` exists in `folders`,
+/// and `<name>.sql` is a valid file name. Traversal via `..` is collapsed by lexical
+/// normalization, and going outside the storage area yields `OutsideSqlfilesDir`
+/// (the filesystem is not touched).
 pub fn resolve_open_target(
     sqlfiles_dir: &Path,
     folders: &[(String, String)],
@@ -229,7 +233,7 @@ pub fn resolve_open_target(
     cwd: Option<&Path>,
 ) -> Result<OpenTarget, RouteError> {
     let expanded = expand_path(raw_path, home, cwd);
-    // base (sqlfiles_dir) は呼び出し側が絶対化済み。生パスだけ cwd で解決する。
+    // base (sqlfiles_dir) has already been made absolute by the caller. Only the raw path is resolved against cwd.
     let normalized = lexical_normalize(&expanded);
     let base = lexical_normalize(sqlfiles_dir);
 
@@ -237,7 +241,7 @@ pub fn resolve_open_target(
         .strip_prefix(&base)
         .map_err(|_| RouteError::OutsideSqlfilesDir)?;
 
-    // 保存ディレクトリ直下は「接続フォルダ / ファイル」のちょうど 2 要素。
+    // Directly under the storage directory there are exactly 2 components: "connection folder / file".
     let components: Vec<&std::ffi::OsStr> = relative
         .components()
         .map(|c| c.as_os_str())
@@ -248,10 +252,11 @@ pub fn resolve_open_target(
     let folder = components[0].to_string_lossy().into_owned();
     let file_name = components[1].to_string_lossy().into_owned();
 
-    // 同じフォルダに複数の接続が対応している場合 (同一 folder_name や、生成される
-    // host/engine/schema/user フォルダが偶然一致) は、どの接続で開くか一意に
-    // 決められない。先頭を黙って選ぶと別 DB / 別 readonly ポリシーの接続で開いて
-    // しまう恐れがあるため、曖昧としてエラーにする。
+    // If multiple connections map to the same folder (the same folder_name, or the generated
+    // host/engine/schema/user folders happen to coincide), which connection to open with
+    // cannot be determined uniquely. Silently picking the first might open it with a
+    // connection to a different DB / different readonly policy, so treat it as ambiguous
+    // and return an error.
     let mut matches = folders.iter().filter(|(f, _)| *f == folder);
     let connection = match (matches.next(), matches.next()) {
         (None, _) => return Err(RouteError::UnknownFolder(folder)),
@@ -267,20 +272,21 @@ pub fn resolve_open_target(
     })
 }
 
-/// クエリファイルとして開ける拡張子 (エンジン別。engines::EngineCapabilities の
-/// file_extension と対応させること)。
+/// Extensions that can be opened as query files (per engine; keep in sync with
+/// file_extension in engines::EngineCapabilities).
 const ALLOWED_EXTENSIONS: &[&str] = &["sql", "redis", "es"];
 
-/// クエリファイル名として妥当かを検証する
-/// (query_files.rs の validate_component / normalize_file_name と同じ方針: 空・
-/// ドット始まり・区切り文字を拒否し、拡張子が既知のクエリファイル拡張子で
-/// あることを要求する)。
+/// Validates that a name is valid as a query file name
+/// (same policy as validate_component / normalize_file_name in query_files.rs: reject
+/// empty names, names starting with a dot and separator characters, and require the
+/// extension to be a known query file extension).
 fn validate_sql_file_name(name: &str) -> Result<(), RouteError> {
-    // 前後に空白がある名前は拒否する。query_files.rs の normalize_file_name は
-    // 読み込み時に名前を trim するため、空白付きを許すと「検証したパス
-    // (verify_within_dir が canonicalize したパス)」と「実際に開くパス (trim 後)」が
-    // 食い違い、検証を通した別ファイル (symlink 等) を開けてしまう。ここで拒否して
-    // 検証対象と開く対象を必ず同一にする。
+    // Reject names with leading or trailing whitespace. normalize_file_name in
+    // query_files.rs trims the name on load, so allowing whitespace would make the "validated
+    // path (the path canonicalized by verify_within_dir)" differ from the "path actually
+    // opened (after trim)", letting a different file that passed validation (e.g. via a
+    // symlink) be opened. Rejecting here guarantees the validated target and the opened
+    // target are always the same.
     let lower = name.to_ascii_lowercase();
     let invalid = name.is_empty()
         || name != name.trim()
@@ -297,7 +303,7 @@ fn validate_sql_file_name(name: &str) -> Result<(), RouteError> {
     Ok(())
 }
 
-/// `~` / 相対パスを展開する (ファイルシステムには触れない字句的展開)。
+/// Expands `~` / relative paths (lexical expansion that does not touch the filesystem).
 fn expand_path(raw: &str, home: Option<&Path>, cwd: Option<&Path>) -> PathBuf {
     let raw = raw.trim();
     if let Some(home) = home {
@@ -318,15 +324,15 @@ fn expand_path(raw: &str, home: Option<&Path>, cwd: Option<&Path>) -> PathBuf {
     }
 }
 
-/// パスの `.` / `..` を字句的に解決する (シンボリックリンクは辿らない)。
-/// `..` は 1 つ前の通常要素を取り除く。ルートより上には遡れない。
+/// Resolves `.` / `..` in a path lexically (symlinks are not followed).
+/// `..` removes the previous normal component. It cannot go above the root.
 fn lexical_normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                // 直前の通常要素を取り除く。ルート直下ではこれ以上遡らない。
+                // Remove the previous normal component. Directly under the root, it goes no further up.
                 out.pop();
             }
             other => out.push(other.as_os_str()),
@@ -335,8 +341,8 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     out
 }
 
-/// パーセントエンコード (`%XX`) をデコードする。不完全な `%` はそのまま残す。
-/// deep link 経由のパスは空白等がエンコードされ得るため、URI パスに使う。
+/// Decodes percent-encoding (`%XX`). An incomplete `%` is left as is.
+/// Paths coming through a deep link may have spaces etc. encoded, so this is used for URI paths.
 fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -357,7 +363,7 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// 16 進 1 桁を数値へ (それ以外は None)。
+/// One hex digit to a number (None for anything else).
 fn hex_value(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -380,7 +386,7 @@ mod tests {
 
     #[test]
     fn test_parse_uri_open_absolute() {
-        // 絶対パスはスキームの後に `/` が重なる形になる
+        // An absolute path ends up with `/` doubled after the scheme
         assert_eq!(
             parse_uri("queryfolio://open//home/u/.config/queryfolio/sqlfiles/reporting/a.sql"),
             Ok(Route::OpenFile {
@@ -418,21 +424,21 @@ mod tests {
                 path: "/tmp/a.sql".to_string(),
             })
         );
-        // queryfolio:// URL 引数は無視する (deep-link が処理する)
+        // Ignore the queryfolio:// URL argument (deep-link handles it)
         assert_eq!(
             route_from_cli_args(&["queryfolio://open//tmp/a.sql"]),
             None
         );
-        // open の後ろに URL が来ても、それをパスとしては受け取らない
+        // Even if a URL comes after open, it is not accepted as the path
         assert_eq!(
             route_from_cli_args(&["open", "queryfolio://open//tmp/a.sql"]),
             None
         );
-        // open の後にパスが無ければ None
+        // None if there is no path after open
         assert_eq!(route_from_cli_args(&["open"]), None);
-        // 無関係な引数だけなら None
+        // None if there are only unrelated arguments
         assert_eq!(route_from_cli_args(&["--flag", "value"]), None);
-        // argv[0] (プログラムパス) が混ざっていても拾える
+        // Can be picked up even if argv[0] (the program path) is mixed in
         assert_eq!(
             route_from_cli_args(&["/Applications/Queryfolio.app/queryfolio", "open", "/tmp/a.sql"]),
             Some(Route::OpenFile {
@@ -443,7 +449,7 @@ mod tests {
 
     #[test]
     fn test_route_from_cli_args_write() {
-        // 内容つき
+        // With content
         assert_eq!(
             route_from_cli_args(&["write", "prod", "report.sql", "select 1"]),
             Some(Route::WriteFile {
@@ -452,7 +458,7 @@ mod tests {
                 content: Some("select 1".to_string()),
             })
         );
-        // 内容省略 (標準入力または「開くだけ」)
+        // Content omitted (stdin or "just open")
         assert_eq!(
             route_from_cli_args(&["write", "prod", "report"]),
             Some(Route::WriteFile {
@@ -461,7 +467,7 @@ mod tests {
                 content: None,
             })
         );
-        // 空文字の内容は「空で書く」意図として保つ (None に潰さない)
+        // Keep empty-string content as the intent of "write it empty" (do not collapse it to None)
         assert_eq!(
             route_from_cli_args(&["write", "prod", "report.sql", ""]),
             Some(Route::WriteFile {
@@ -470,8 +476,8 @@ mod tests {
                 content: Some(String::new()),
             })
         );
-        // 内容が queryfolio:// URL でもそのまま内容として扱う
-        // (URL 引数の除去で内容を落とさない)
+        // Content is treated as content even if it is a queryfolio:// URL
+        // (removing URL arguments must not drop the content)
         assert_eq!(
             route_from_cli_args(&["write", "prod", "a.sql", "queryfolio://open/x"]),
             Some(Route::WriteFile {
@@ -480,7 +486,7 @@ mod tests {
                 content: Some("queryfolio://open/x".to_string()),
             })
         );
-        // 引数が足りない / 空白だけなら None
+        // None if arguments are missing / whitespace only
         assert_eq!(route_from_cli_args(&["write", "prod"]), None);
         assert_eq!(route_from_cli_args(&["write"]), None);
         assert_eq!(route_from_cli_args(&["write", " ", "a.sql"]), None);
@@ -489,8 +495,8 @@ mod tests {
 
     #[test]
     fn test_route_from_cli_args_first_subcommand_wins() {
-        // 先に現れたサブコマンドを採用する。write の内容に "open" という語が
-        // 入っていても open サブコマンドとして誤解釈しない。
+        // Use the subcommand that appears first. Even if the word "open" appears in the
+        // content of write, it is not misinterpreted as the open subcommand.
         assert_eq!(
             route_from_cli_args(&["write", "prod", "a.sql", "open /etc/passwd"]),
             Some(Route::WriteFile {
@@ -509,8 +515,8 @@ mod tests {
 
     #[test]
     fn test_parse_uri_rejects_write() {
-        // 書き込みアクションは URI からは受け付けない (Web ページから
-        // queryfolio:// を開かせられるため)
+        // Write actions are not accepted from a URI (a web page can
+        // open a queryfolio:// URL)
         assert_eq!(
             parse_uri("queryfolio://write/prod/a.sql"),
             Err(RouteError::UnknownAction("write".to_string()))
@@ -540,8 +546,8 @@ mod tests {
     #[test]
     fn test_resolve_open_target_tilde_and_relative() {
         let home = Path::new("/home/u");
-        let base = Path::new("~/.config/queryfolio/sqlfiles"); // base も展開される
-        // base に ~ が入っていても展開して比較する
+        let base = Path::new("~/.config/queryfolio/sqlfiles"); // base is expanded too
+        // Expand and compare even if base contains ~
         let target = resolve_open_target(
             &expand_path("~/.config/queryfolio/sqlfiles", Some(home), None),
             &folders(),
@@ -556,7 +562,7 @@ mod tests {
 
     #[test]
     fn test_resolve_open_target_relative_raw_path_with_cwd() {
-        // base は絶対 (呼び出し側が絶対化する契約)。相対の入力パスは cwd 基準で解決。
+        // base is absolute (a contract that the caller makes it absolute). Relative input paths are resolved against cwd.
         let cwd = Path::new("/work");
         let base = Path::new("/work/queries");
         let target = resolve_open_target(
@@ -574,7 +580,7 @@ mod tests {
     #[test]
     fn test_resolve_open_target_traversal_rejected() {
         let base = Path::new("/data/sqlfiles");
-        // .. で保存領域の外に出ようとするパスは拒否
+        // Reject paths that try to go outside the storage area with ..
         let err = resolve_open_target(
             base,
             &folders(),
@@ -615,7 +621,7 @@ mod tests {
     #[test]
     fn test_resolve_open_target_ambiguous_folder() {
         let base = Path::new("/data/sqlfiles");
-        // 同じフォルダ名に 2 つの接続が対応する場合は曖昧としてエラー
+        // When two connections map to the same folder name, return an error as ambiguous
         let dup = vec![
             ("shared".to_string(), "conn-a".to_string()),
             ("shared".to_string(), "conn-b".to_string()),
@@ -630,7 +636,7 @@ mod tests {
     #[test]
     fn test_resolve_open_target_too_deep() {
         let base = Path::new("/data/sqlfiles");
-        // 接続フォルダの下にサブディレクトリがある = 2 階層でない
+        // A subdirectory under the connection folder = not 2 levels
         assert_eq!(
             resolve_open_target(
                 base,
@@ -642,7 +648,7 @@ mod tests {
             .unwrap_err(),
             RouteError::NotUnderConnectionFolder
         );
-        // 保存ディレクトリ直下のファイル (フォルダ無し) も拒否
+        // Also reject a file directly under the storage directory (no folder)
         assert_eq!(
             resolve_open_target(base, &folders(), "/data/sqlfiles/a.sql", None, None)
                 .unwrap_err(),
@@ -664,7 +670,7 @@ mod tests {
             .unwrap_err(),
             RouteError::InvalidFileName("notes.txt".to_string())
         );
-        // ドット始まりの隠しファイルも拒否
+        // Also reject hidden files starting with a dot
         assert_eq!(
             resolve_open_target(
                 base,
@@ -676,8 +682,8 @@ mod tests {
             .unwrap_err(),
             RouteError::InvalidFileName(".secret.sql".to_string())
         );
-        // 前後に空白のある名前は拒否 (trim で別ファイルに化けるのを防ぐ)。
-        // expand_path がパス全体を trim するため末尾空白は落ち、先頭空白が残る。
+        // Reject names with leading/trailing whitespace (prevents them from turning into a different file via trim).
+        // expand_path trims the whole path, so trailing whitespace is dropped and leading whitespace remains.
         assert_eq!(
             resolve_open_target(
                 base,

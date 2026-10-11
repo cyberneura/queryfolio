@@ -1,12 +1,12 @@
 import { StreamLanguage } from "@codemirror/language";
 
-/// Redis コマンドエディタの簡易シンタックスハイライト。
-/// 1 行 = 1 コマンドの前提で、行頭のコマンド名 (既知なら keyword) と
-/// サブコマンド・文字列・数値・コメント (#) を色分けする。
-/// lezer 文法を書くほどの構造は無いため StreamLanguage で実装する。
+/// Simple syntax highlighting for the Redis command editor.
+/// Assumes 1 line = 1 command; colors the leading command name (keyword if known),
+/// subcommands, strings, numbers and comments (#).
+/// The grammar is too simple to justify a lezer grammar, so this uses StreamLanguage.
 
-/// 既知のコマンド名 (大文字)。ハイライト用なので網羅でなくてよい
-/// (未知のコマンドも実行自体はできる。バックエンドの readonly 判定とは独立)。
+/// Known command names (uppercase). This is only for highlighting, so it need not be exhaustive
+/// (unknown commands can still be executed; independent of the backend's readonly check).
 const REDIS_COMMANDS = new Set([
   // string / generic
   "GET", "SET", "SETNX", "SETEX", "PSETEX", "MGET", "MSET", "MSETNX", "APPEND",
@@ -49,17 +49,17 @@ const REDIS_COMMANDS = new Set([
   "LOLWUT", "WAIT",
 ]);
 
-/// 行頭コマンドに続く 2 語目のサブコマンド (CONFIG GET / CLIENT LIST 等) も
-/// キーワード扱いにするコマンド。
+/// Commands whose second word, a subcommand (CONFIG GET / CLIENT LIST etc.), after the leading
+/// command is also treated as a keyword.
 const SUBCOMMAND_PARENTS = new Set([
   "CONFIG", "CLIENT", "OBJECT", "MEMORY", "XINFO", "COMMAND", "SLOWLOG",
   "DEBUG",
 ]);
 
 interface RedisStreamState {
-  /// 現在の行でトークンをいくつ読んだか (行頭判定用)
+  /// How many tokens have been read on the current line (to detect the line start)
   tokenIndex: number;
-  /// 行頭コマンドがサブコマンドを取るものだったか
+  /// Whether the leading command takes a subcommand
   expectSubcommand: boolean;
 }
 
@@ -74,12 +74,12 @@ export const redisLanguage = StreamLanguage.define<RedisStreamState>({
     if (stream.eatSpace()) {
       return null;
     }
-    // コメント行 (# 始まり)。バックエンドの parse_input も同じ規則でスキップする
+    // Comment line (starts with #). The backend's parse_input skips them by the same rule
     if (state.tokenIndex === 0 && stream.peek() === "#") {
       stream.skipToEnd();
       return "comment";
     }
-    // 文字列 ("..." / '...')。行内で閉じない場合は行末まで文字列扱い
+    // String ("..." / '...'). If not closed within the line, it runs to the end of the line
     const quote = stream.peek();
     if (quote === '"' || quote === "'") {
       stream.next();
@@ -97,7 +97,7 @@ export const redisLanguage = StreamLanguage.define<RedisStreamState>({
       state.tokenIndex++;
       return "string";
     }
-    // 通常トークン (空白まで)
+    // Normal token (up to whitespace)
     let word = "";
     while (!stream.eol() && !/\s/.test(stream.peek() ?? " ")) {
       word += stream.next();

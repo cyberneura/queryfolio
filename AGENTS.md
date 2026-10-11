@@ -295,7 +295,9 @@ icns を扱う道具は astragal に集約してあり、このリポジトリ�
   なお **バンドル内の実行バイナリ名は `productName` ではなく crate 名** (小文字の
   `queryfolio`)。tauri は `mainBinaryName` を指定しない限り cargo の出力をそのまま使う。
 
-- **アプリ内メッセージ (UI ラベル・トースト・placeholder・エラーメッセージ・自動生成される設定ファイルのコメント) はすべて英語で書く**。Rust の AppError 等、フロントに表示される文字列も対象。コードコメントは日本語でよい。
+- **アプリ内メッセージ (UI ラベル・トースト・placeholder・エラーメッセージ・自動生成される設定ファイルのコメント) はすべて英語で書く**。Rust の AppError 等、フロントに表示される文字列も対象。
+- **コードコメントも英語で書く** (CYBERNEURA-DEV-1006 で既存のコメントをすべて英語にした)。Rust / TypeScript / Svelte / CSS / シェル / YAML / TOML のコメントすべてが対象。
+- **PR に書くコメント (PR 本文・レビューへの返信・PR コメント) も英語で書く**。
 - **`skills/queryfolio/SKILL.md` は実装の事実を複製しているので、該当箇所を変えたら一緒に直す** (`npx skills add cyberneura/queryfolio` で配布され、エージェントがこれを読んで行動する)。特に Run and Log の定数 (`RUN_LOG_CONFIRM_ROWS` / `MAX_BODY_CHARS` / `MAX_CELL_CHARS` / 注記の文言)、クエリファイルのパーミッションと並び順、`--list-servers` の列の決め方、`resolve_write_content` の stdin の扱い、外部変更ウォッチャの挙動。**散文は実行されないので陳腐化しても CI が落ちない** — 実際、このスキルの元にした旧版は 5 箇所が実装とズレていた (確認ダイアログの閾値 500 → 200、`sqlfiles/` のパーミッション、`config.yml` の 600 化、外部変更の 3-way マージ、一覧の並び順)。
 - ユーザーアクションを受ける要素には `data-annotate="<識別子>"` を付ける (E2E テスト用)。
 - `window.prompt` / `alert` / `confirm` は使わない (ブラウザ自動化がブロックされる + UX)。

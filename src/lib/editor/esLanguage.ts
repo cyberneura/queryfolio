@@ -1,19 +1,19 @@
 import { StreamLanguage } from "@codemirror/language";
 
-/// Elasticsearch (Kibana Console 風) エディタの簡易シンタックスハイライト。
-/// - 行頭の HTTP メソッド (GET/POST/PUT/DELETE/HEAD/PATCH) → keyword、
-///   同じ行の残り (パス) → string
-/// - `#` 始まりの行 → comment (バックエンドの parse_input と同じ規則)
-/// - それ以外の行は JSON body として文字列 / プロパティ名 / 数値 /
-///   true・false・null / 括弧を色分けする
-/// lezer 文法を書くほどの構造は無いため StreamLanguage で実装する。
+/// Simple syntax highlighting for the Elasticsearch (Kibana Console style) editor.
+/// - An HTTP method at the start of a line (GET/POST/PUT/DELETE/HEAD/PATCH) -> keyword,
+///   and the rest of the same line (the path) -> string
+/// - A line starting with `#` -> comment (same rule as the backend's parse_input)
+/// - Any other line is treated as a JSON body, coloring strings / property names / numbers /
+///   true, false, null / brackets
+/// There is not enough structure to justify writing a lezer grammar, so this is implemented with StreamLanguage.
 
 const METHOD_RE = /^(GET|POST|PUT|DELETE|HEAD|PATCH)(?=\s|$)/i;
 
 interface EsStreamState {
-  /// 現在の行でトークンをいくつ読んだか (行頭判定用)
+  /// How many tokens have been read on the current line (for detecting the line start)
   tokenIndex: number;
-  /// 現在の行がメソッド行で、残り (パス) をまだ読んでいない
+  /// The current line is a method line and the rest (the path) has not been read yet
   inMethodLine: boolean;
 }
 
@@ -28,12 +28,12 @@ export const esLanguage = StreamLanguage.define<EsStreamState>({
     if (stream.eatSpace()) {
       return null;
     }
-    // コメント行 (# 始まり)
+    // Comment line (starts with #)
     if (state.tokenIndex === 0 && stream.peek() === "#") {
       stream.skipToEnd();
       return "comment";
     }
-    // メソッド行: 行頭トークンが HTTP メソッドなら keyword、残りはパス
+    // Method line: if the first token is an HTTP method it is a keyword, and the rest is the path
     if (state.tokenIndex === 0 && stream.match(METHOD_RE)) {
       state.tokenIndex++;
       state.inMethodLine = true;
@@ -59,7 +59,7 @@ export const esLanguage = StreamLanguage.define<EsStreamState>({
           break;
         }
       }
-      // 直後 (空白を挟んで) に ":" が続くならプロパティ名
+      // If ":" follows immediately (possibly after whitespace), it is a property name
       return stream.match(/^\s*:/, false) ? "propertyName" : "string";
     }
     if (stream.match(/^-?\d+(\.\d+)?([eE][+-]?\d+)?/)) {

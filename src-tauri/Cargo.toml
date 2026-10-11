@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "A SQL client desktop app"
 authors = ["ytyng"]
 license = "MIT"
-# crates.io には出さない。cargo-about が自分自身を一覧に載せないための印でもある (about.toml の private)
+# Not published to crates.io. Also a marker so that cargo-about does not list this crate itself (private in about.toml)
 publish = false
 edition = "2021"
 
@@ -19,7 +19,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-# build.rs が tauri.conf.json から version を読むため (tauri-build の依存でもある)
+# Because build.rs reads the version from tauri.conf.json (also a dependency of tauri-build)
 serde_json = "1"
 
 [dependencies]
@@ -47,32 +47,32 @@ uuid = { version = "1", features = ["serde"] }
 dirs = "6"
 glob = "0.3"
 shlex = "1"
-# AI (OpenAI API) 呼び出し用。openssl 依存を避けるため rustls を使う
+# For AI (OpenAI API) calls. Use rustls to avoid the openssl dependency
 reqwest = { version = "0.12", default-features = false, features = [
   "json",
   "rustls-tls",
 ] }
 thiserror = "2"
-# Redis エンジン用クライアント (tokio ランタイムで任意コマンドを実行する)
-# tokio-rustls-comp: tls: true の接続で TcpTls を使うために必要
-# (rustls 系。openssl は増やさない)。無いと ConnectionAddr::TcpTls が
-# 実行時に「TLS feature が無効」で失敗する
+# Client for the Redis engine (runs arbitrary commands on the tokio runtime)
+# tokio-rustls-comp: required to use TcpTls for connections with tls: true
+# (rustls-based; we do not add openssl). Without it, ConnectionAddr::TcpTls
+# fails at runtime with "TLS feature is disabled"
 redis = { version = "1.4", default-features = false, features = [
     "tokio-comp",
     "tokio-rustls-comp",
 ] }
-# DuckDB エンジン用クライアント (sqlx に DuckDB ドライバが無いため独自結線)。
-# bundled で C++ ソースを静的リンクする (Homebrew の libduckdb を動的リンクすると
-# ssh2 と同じく Developer ID 署名アプリの library validation で起動できないため)。
-# 同期 API のため実行は spawn_blocking で包む (engines/duckdb.rs)。
-# バージョンは 7 日ルールで 1 つ前の安定版に固定 (1.10505.0 は 2026-07-22 リリース)
+# Client for the DuckDB engine (wired up by hand because sqlx has no DuckDB driver).
+# bundled statically links the C++ sources (dynamically linking Homebrew's libduckdb would
+# prevent a Developer ID signed app from launching due to library validation, as with ssh2).
+# The API is synchronous, so execution is wrapped in spawn_blocking (engines/duckdb.rs).
+# Pinned to the previous stable release per the 7-day rule (1.10505.0 was released on 2026-07-22)
 duckdb = { version = "=1.10504.0", features = ["bundled"] }
-# DynamoDB エンジン用の AWS SDK (PartiQL を ExecuteStatement API で実行する)。
-# AWS SDK はほぼ毎日リリースされるため、7 日ルールに合わせて = で固定する
-# (キャレット指定だと cargo が当日リリースへ解決してしまう)。
-# default-features = false: 既定の HTTPS クライアント (rustls + aws-lc) を使わず、
-# 既存依存 (reqwest / rustls) と同じ ring ベースのクライアントを明示的に組む
-# (aws-lc-sys のネイティブビルドを増やさない。engines/dynamodb.rs 参照)。
+# AWS SDK for the DynamoDB engine (runs PartiQL through the ExecuteStatement API).
+# The AWS SDK releases almost daily, so pin with = to follow the 7-day rule
+# (with a caret requirement, cargo would resolve to a release from the same day).
+# default-features = false: do not use the default HTTPS client (rustls + aws-lc); build
+# a ring-based client explicitly, the same as the existing dependencies (reqwest / rustls)
+# (avoids adding a native build of aws-lc-sys; see engines/dynamodb.rs).
 aws-config = { version = "=1.9.0", default-features = false, features = [
   "behavior-version-latest",
   "rt-tokio",
@@ -84,35 +84,35 @@ aws-sdk-dynamodb = { version = "=1.117.0", default-features = false, features = 
 aws-smithy-http-client = { version = "=1.2.0", default-features = false, features = [
   "rustls-ring",
 ] }
-# Microsoft SQL Server エンジン用クライアント (TDS プロトコルの pure Rust 実装。
-# sqlx に MSSQL ドライバが無いため独自結線する。engines/mssql.rs)。
-# default-features = false で TLS バックエンドを選ぶ:
-# - 既定の native-tls は使えない。tiberius の README が「macOS の Security
-#   Framework は SQL Server の TLS 設定と動かない」と明記しており、配布物の
-#   主なターゲットが macOS。
-# - rustls は tokio-rustls を既定 feature (aws_lc_rs) で引き、aws-lc-sys の
-#   ネイティブビルド (cmake / NASM) を CI に増やすため使わない (dynamodb が
-#   ring を明示して避けているもの)。
-# - vendored-openssl (opentls): OpenSSL を静的リンクする。ssh2 の vendored-openssl
-#   と同じ openssl-src なので、ネイティブビルドは増えない。
-# tds73 で date / time / datetime2 / datetimeoffset を扱い、chrono / rust_decimal
-# で既存の値変換 (db.rs) と同じ型へ落とす。
+# Client for the Microsoft SQL Server engine (pure Rust implementation of the TDS protocol.
+# Wired up by hand because sqlx has no MSSQL driver; engines/mssql.rs).
+# default-features = false to choose the TLS backend:
+# - The default native-tls cannot be used. tiberius's README states that "the macOS Security
+#     Framework does not work with SQL Server's TLS configuration", and the main target of
+#     the distributed builds is macOS.
+# - rustls is not used: it pulls in tokio-rustls with the default feature (aws_lc_rs), which
+#     would add a native build of aws-lc-sys (cmake / NASM) to CI (dynamodb avoids this by
+#     explicitly choosing ring).
+# - vendored-openssl (opentls): statically links OpenSSL. It is the same openssl-src as
+#     ssh2's vendored-openssl, so it adds no native build.
+# tds73 handles date / time / datetime2 / datetimeoffset, and chrono / rust_decimal map them
+# to the same types as the existing value conversion (db.rs).
 tiberius = { version = "0.13", default-features = false, features = [
   "tds73",
   "vendored-openssl",
   "chrono",
   "rust_decimal",
 ] }
-# tiberius は futures の AsyncRead / AsyncWrite を取るため、tokio の TcpStream を
-# compat で包む (tiberius 自身も optional で引いている crate)
+# tiberius takes futures' AsyncRead / AsyncWrite, so wrap tokio's TcpStream with
+# compat (a crate tiberius itself also pulls in as optional)
 tokio-util = { version = "0.7", features = ["compat"] }
-# vendored-openssl: OpenSSL を静的リンクする。Homebrew の libssl を動的リンクすると
-# Developer ID 署名アプリで library validation により起動時 abort するため
-# (異なる Team ID の dylib はロード不可)。副次的に Homebrew 未導入環境でも動く。
+# vendored-openssl: statically links OpenSSL. Dynamically linking Homebrew's libssl would abort
+# at startup in a Developer ID signed app because of library validation
+# (dylibs with a different Team ID cannot be loaded). As a side effect it also works without Homebrew.
 ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 base64 = "0.22"
-# エクスポート時の文字コード変換 (CP932 / EUC-JP)。Excel 等の
-# UTF-8 を前提としないツール向け
+# Character encoding conversion on export (CP932 / EUC-JP). For tools such as Excel
+# that do not assume UTF-8
 encoding_rs = "0.8"
 futures = "0.3"
 tauri-plugin-clipboard-manager = "2.3.2"
