@@ -26,7 +26,7 @@
   // While running, switch the Run button to a Cancel button,
   // which cancels the query of the running tab (one per connection)
   const cancelRunningQuery = () => {
-    const running = appStore.resultTabs.find((t) => t.running);
+    const running = appStore.selectedConnectionRunningTab;
     if (running) {
       void appStore.cancelQuery(running.id);
     }
@@ -90,7 +90,7 @@
         {/if}
       </button>
     {/if}
-    {#if appStore.running}
+    {#if appStore.selectedConnectionRunningTab}
       <button
         class="rounded bg-red-800 px-3 py-1 text-xs text-white hover:bg-red-700"
         title="Cancel the running query"

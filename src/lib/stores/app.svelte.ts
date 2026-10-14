@@ -1591,6 +1591,11 @@ const dismissFixSuggestion = (tabId: number) => {
   }
 };
 
+/// Number of query executions that have finished (any connection, success or not).
+/// HistoryPane reloads on its change: queries on different connections run in parallel,
+/// so "is any query running" may stay true across a finished query and cannot be the trigger
+let queryCompletions = $state(0);
+
 /// Connections applying cell edits (running run_statements). Included in isConnectionRunning
 /// to suppress parallel execution on the same connection, as with query execution.
 let applyingConnections = $state(new Set<string>());
@@ -1609,30 +1614,29 @@ const isConnectionRunning = (connection: string): boolean =>
   chatRunningConnections.has(connection);
 
 /// Decide the tab to write the execution result to.
-/// If there is an active non-pinned tab, reuse it; otherwise create a new tab.
-/// On reaching the limit, discard the oldest non-pinned tab.
-/// Returns null when all tabs are pinned and no room can be made (already notified by toast).
+/// If there is an active non-pinned tab that is not running, reuse it; otherwise create a new tab.
+/// On reaching the limit, discard the oldest non-pinned tab that is not running.
+/// Returns null when no room can be made (already notified by toast).
 const prepareTargetTab = (): ResultTab | null => {
   const current = resultTabs.find((t) => t.id === activeTabId);
-  if (current && !current.pinned) {
-    // Prevent double writes to the same tab (against rapid Cmd+Enter presses)
-    // Tab management notifications use toast so they do not cover the results pane
-    if (current.running) {
-      toast.warning("A query is already running in this tab.");
-      return null;
-    }
+  // A running tab is not reused: queries on different connections run in parallel, so
+  // the active tab may still be running another connection's query. Reusing it would
+  // overwrite that query's result, so the new query gets its own tab
+  if (current && !current.pinned && !current.running) {
     return current;
   }
   if (resultTabs.length >= MAX_RESULT_TABS) {
+    // A running tab is not discarded either (its result would be thrown away on completion)
     const oldest = resultTabs
-      .filter((t) => !t.pinned)
+      .filter((t) => !t.pinned && !t.running)
       .reduce<ResultTab | null>(
         (acc, t) => (acc === null || t.executedAt < acc.executedAt ? t : acc),
         null,
       );
+    // Tab management notifications use toast so they do not cover the results pane
     if (!oldest) {
       toast.warning(
-        "All result tabs are pinned. Unpin or close a tab to run a new query.",
+        "All result tabs are pinned or running. Unpin or close a tab to run a new query.",
       );
       return null;
     }
@@ -1691,6 +1695,7 @@ const executeTab = async (tab: ResultTab): Promise<QueryResult | null> => {
     }
   }
   tab.running = false;
+  queryCompletions += 1;
   // If the tab was discarded during execution (settings reload etc.),
   // discard the result instead of writing to a nonexistent tab (a detached object)
   if (!resultTabs.some((t) => t.id === tab.id)) {
@@ -1879,6 +1884,14 @@ const runQuery = async (sql: string): Promise<QueryResult | null> => {
   }
   // If the connection switched during the confirmation modal, abort so as not to run on another DB
   if (selectedConnection !== connection) {
+    return null;
+  }
+  // Check again after the awaits: a second Cmd+Enter pressed while the first was saving /
+  // confirming passes the check above too, and would otherwise run in parallel on this connection
+  if (isConnectionRunning(connection)) {
+    toast.warning(
+      "A query is already running on this connection. Cancel it or wait for it to finish.",
+    );
     return null;
   }
   errorMessage = null;
@@ -2204,6 +2217,13 @@ const rerunTab = async (id: number) => {
     tab.schema = (await api.getActiveSchema(tab.connection)) ?? tab.schema;
   } catch {
     // If the fetch fails, keep the recorded schema display
+  }
+  // Check again after the awaits (another run may have started on this connection meanwhile)
+  if (tab.running || isConnectionRunning(tab.connection)) {
+    toast.warning(
+      "A query is already running on this connection. Cancel it or wait for it to finish.",
+    );
+    return;
   }
   await executeTab(tab);
 };
@@ -2590,9 +2610,19 @@ export default {
   get errorMessage() {
     return errorMessage;
   },
-  /// True if a query is running in any tab (used to disable the Run button, etc.)
-  get running() {
-    return resultTabs.some((t) => t.running);
+  /// Number of finished query executions (the history reload trigger)
+  get queryCompletions() {
+    return queryCompletions;
+  },
+  /// The result tab running a query on the selected connection (null if none).
+  /// Queries on different connections run in parallel, so the Run / Cancel button and
+  /// Explain look only at the selected connection
+  get selectedConnectionRunningTab() {
+    return (
+      resultTabs.find(
+        (t) => t.running && t.connection === selectedConnection,
+      ) ?? null
+    );
   },
   get loadingConnections() {
     return loadingConnections;
