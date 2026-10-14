@@ -246,7 +246,7 @@
         data-annotate="button-explain"
         title="Run EXPLAIN for the SELECT statement under the cursor"
         aria-label="Run EXPLAIN for the SELECT statement under the cursor"
-        disabled={appStore.running}
+        disabled={appStore.selectedConnectionRunningTab !== null}
         onclick={onExplain}
       >
         <i class="bi bi-diagram-3" aria-hidden="true"></i> Explain

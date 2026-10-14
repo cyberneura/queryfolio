@@ -68,11 +68,18 @@ pub struct QueryResult {
 }
 
 /// Manager that holds the pool and SSH tunnel for each connection name.
-/// This is a single-user desktop app, so the whole pool acquisition is
-/// serialized with one tokio Mutex to prevent double creation.
+///
+/// The maps are guarded by one tokio Mutex (`inner`), but establishing a pool
+/// (SSH tunnel + DB handshake, which can take seconds or hang until a timeout)
+/// is done outside it, under a per-connection lock (`connecting`). Holding
+/// `inner` across the connect would make a slow connection block queries on
+/// every other connection. The per-connection lock still prevents creating the
+/// same connection's pool / tunnel twice.
 #[derive(Default)]
 pub struct DbManager {
     inner: tokio::sync::Mutex<DbManagerInner>,
+    /// Per-connection lock held while a pool / tunnel is being established
+    connecting: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 #[derive(Default)]
@@ -82,78 +89,151 @@ struct DbManagerInner {
     /// Per-connection override of the active schema (database).
     /// Present only while switched to a database different from the schema in the config.
     schema_overrides: HashMap<String, String>,
+    /// Bumped by reset(). Together with `generations` it tells get_pool that the
+    /// state it read before connecting is stale (see still_current).
+    reset_epoch: u64,
+    /// Per-connection counter bumped whenever its pool / tunnel / schema override
+    /// is dropped or replaced (disconnect, schema switch, rollback)
+    generations: HashMap<String, u64>,
+}
+
+impl DbManagerInner {
+    fn generation(&self, connection: &str) -> (u64, u64) {
+        (
+            self.reset_epoch,
+            self.generations.get(connection).copied().unwrap_or(0),
+        )
+    }
+
+    /// Whether a pool / tunnel established from the state read at `generation` can
+    /// still be cached. Ok(false) = the connection was disconnected / its schema was
+    /// switched meanwhile, so connect again from the current state. Err = the config
+    /// was reloaded meanwhile: the caller's ServerConfig itself may be stale, so
+    /// retrying with it would cache a pool built from the old host / credentials
+    fn still_current(&self, connection: &str, generation: (u64, u64)) -> Result<bool, AppError> {
+        let current = self.generation(connection);
+        if current.0 != generation.0 {
+            return Err(AppError::Config(
+                "The configuration was reloaded while connecting. Run the query again.".into(),
+            ));
+        }
+        Ok(current == generation)
+    }
+
+    fn bump_generation(&mut self, connection: &str) {
+        *self.generations.entry(connection.to_string()).or_insert(0) += 1;
+    }
 }
 
 impl DbManager {
+    fn connect_lock(&self, connection: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.connecting
+            .lock()
+            .unwrap()
+            .entry(connection.to_string())
+            .or_default()
+            .clone()
+    }
+
     pub async fn get_pool(&self, server: &ServerConfig) -> Result<DbPool, AppError> {
-        let mut inner = self.inner.lock().await;
-        if let Some(pool) = inner.pools.get(&server.name) {
+        if let Some(pool) = self.inner.lock().await.pools.get(&server.name) {
             return Ok(pool.clone());
         }
+        // Only one task establishes a given connection at a time. Others wait
+        // here and then pick up the pool it cached
+        let connect_lock = self.connect_lock(&server.name);
+        let _connecting = connect_lock.lock().await;
 
-        // If the active schema has been switched, replace the target database
-        let mut server = server.clone();
-        if let Some(schema) = inner.schema_overrides.get(&server.name) {
-            server.schema = Some(schema.clone());
+        loop {
+            // Snapshot the state needed to connect, then release `inner` so that
+            // other connections are not blocked while this one connects
+            let (server, tunnel_port, generation) = {
+                let inner = self.inner.lock().await;
+                if let Some(pool) = inner.pools.get(&server.name) {
+                    return Ok(pool.clone());
+                }
+                // If the active schema has been switched, replace the target database
+                let mut server = server.clone();
+                if let Some(schema) = inner.schema_overrides.get(&server.name) {
+                    server.schema = Some(schema.clone());
+                }
+                let tunnel_port = inner.tunnels.get(&server.name).map(|t| t.local_port);
+                let generation = inner.generation(&server.name);
+                (server, tunnel_port, generation)
+            };
+            let server = &server;
+
+            let engine = parse_engine(&server.engine)?;
+
+            // If an SSH tunnel is needed, establish it first and replace the target with the local port
+            let (host, port) = match (&server.ssh_tunnel, engine) {
+                // Tunnels are meaningless for file-based engines
+                (Some(_), Engine::Sqlite) => {
+                    return Err(AppError::Config(
+                        "ssh_tunnel cannot be used with sqlite".into(),
+                    ));
+                }
+                (Some(_), Engine::DuckDb) => {
+                    return Err(AppError::Config(
+                        "ssh_tunnel cannot be used with duckdb".into(),
+                    ));
+                }
+                // DynamoDB connects directly to the HTTPS AWS endpoint (SigV4 signing
+                // requires the regional endpoint). Tunnels are not supported
+                (Some(_), Engine::DynamoDb) => {
+                    return Err(AppError::Config(
+                        "ssh_tunnel cannot be used with dynamodb".into(),
+                    ));
+                }
+                (Some(tunnel_config), _) => {
+                    // If only the pool was dropped (e.g. by a schema switch), the existing tunnel
+                    // points to the same target host, so it is reused as is
+                    let local_port = match tunnel_port {
+                        Some(local_port) => local_port,
+                        None => {
+                            let target_host =
+                                server.host.clone().unwrap_or_else(|| "localhost".into());
+                            let target_port = server.port.unwrap_or(default_port(engine));
+                            let tunnel_config = tunnel_config.clone();
+                            // ssh2 is blocking, so run it with spawn_blocking
+                            let tunnel = tokio::task::spawn_blocking(move || {
+                                SshTunnel::start(&tunnel_config, &target_host, target_port)
+                            })
+                            .await
+                            .map_err(|e| {
+                                AppError::SshTunnel(format!("SSH tunnel task failed: {e}"))
+                            })??;
+                            let local_port = tunnel.local_port;
+                            // Cache the tunnel right away (even if the DB connect below
+                            // fails, the next attempt reuses it), unless the connection
+                            // was disconnected / reset meanwhile
+                            let mut inner = self.inner.lock().await;
+                            if !inner.still_current(&server.name, generation)? {
+                                continue;
+                            }
+                            inner.tunnels.insert(server.name.clone(), tunnel);
+                            local_port
+                        }
+                    };
+                    ("127.0.0.1".to_string(), local_port)
+                }
+                (None, _) => (
+                    server.host.clone().unwrap_or_else(|| "localhost".into()),
+                    server.port.unwrap_or(default_port(engine)),
+                ),
+            };
+
+            let pool = connect(server, engine, &host, port).await?;
+            let mut inner = self.inner.lock().await;
+            // A disconnect / schema switch happened while connecting: this pool may
+            // point at a dropped tunnel or the old database, so discard it and
+            // connect again from the current state (a reload is an error, see still_current)
+            if !inner.still_current(&server.name, generation)? {
+                continue;
+            }
+            inner.pools.insert(server.name.clone(), pool.clone());
+            return Ok(pool);
         }
-        let server = &server;
-
-        let engine = parse_engine(&server.engine)?;
-
-        // If an SSH tunnel is needed, establish it first and replace the target with the local port
-        let (host, port) = match (&server.ssh_tunnel, engine) {
-            // Tunnels are meaningless for file-based engines
-            (Some(_), Engine::Sqlite) => {
-                return Err(AppError::Config(
-                    "ssh_tunnel cannot be used with sqlite".into(),
-                ));
-            }
-            (Some(_), Engine::DuckDb) => {
-                return Err(AppError::Config(
-                    "ssh_tunnel cannot be used with duckdb".into(),
-                ));
-            }
-            // DynamoDB connects directly to the HTTPS AWS endpoint (SigV4 signing
-            // requires the regional endpoint). Tunnels are not supported
-            (Some(_), Engine::DynamoDb) => {
-                return Err(AppError::Config(
-                    "ssh_tunnel cannot be used with dynamodb".into(),
-                ));
-            }
-            (Some(tunnel_config), _) => {
-                // If only the pool was dropped (e.g. by a schema switch), the existing tunnel
-                // points to the same target host, so it is reused as is
-                let local_port = match inner.tunnels.get(&server.name) {
-                    Some(tunnel) => tunnel.local_port,
-                    None => {
-                        let target_host =
-                            server.host.clone().unwrap_or_else(|| "localhost".into());
-                        let target_port = server.port.unwrap_or(default_port(engine));
-                        let tunnel_config = tunnel_config.clone();
-                        // ssh2 is blocking, so run it with spawn_blocking
-                        let tunnel = tokio::task::spawn_blocking(move || {
-                            SshTunnel::start(&tunnel_config, &target_host, target_port)
-                        })
-                        .await
-                        .map_err(|e| {
-                            AppError::SshTunnel(format!("SSH tunnel task failed: {e}"))
-                        })??;
-                        let local_port = tunnel.local_port;
-                        inner.tunnels.insert(server.name.clone(), tunnel);
-                        local_port
-                    }
-                };
-                ("127.0.0.1".to_string(), local_port)
-            }
-            (None, _) => (
-                server.host.clone().unwrap_or_else(|| "localhost".into()),
-                server.port.unwrap_or(default_port(engine)),
-            ),
-        };
-
-        let pool = connect(server, engine, &host, port).await?;
-        inner.pools.insert(server.name.clone(), pool.clone());
-        Ok(pool)
     }
 
     /// Drops all pools and tunnels. Called when the config is reloaded.
@@ -162,6 +242,7 @@ impl DbManager {
         inner.pools.clear();
         inner.tunnels.clear();
         inner.schema_overrides.clear();
+        inner.reset_epoch += 1;
     }
 
     /// Drops the pool and SSH tunnel of the given connection.
@@ -175,6 +256,7 @@ impl DbManager {
         let mut inner = self.inner.lock().await;
         inner.pools.remove(connection);
         inner.tunnels.remove(connection);
+        inner.bump_generation(connection);
     }
 
     /// Switches the active schema (database) of a connection.
@@ -199,6 +281,7 @@ impl DbManager {
             }
         }
         inner.pools.remove(connection);
+        inner.bump_generation(connection);
     }
 
     /// When switching fails (e.g. a nonexistent database was specified), restores
@@ -230,6 +313,7 @@ impl DbManager {
             }
         }
         inner.pools.remove(connection);
+        inner.bump_generation(connection);
         true
     }
 
@@ -2703,6 +2787,103 @@ mod tests {
         // Disconnecting a nonexistent connection does not panic (safe no matter how many times it is called).
         manager.disconnect("no-such-conn").await;
         manager.disconnect("conn").await;
+    }
+
+    /// A connection that is still connecting (here: a server that accepts TCP but
+    /// never answers the handshake) must not block other connections. Establishing
+    /// a pool used to hold the manager-wide lock, so every other connection's
+    /// queries waited until the slow one connected or timed out.
+    #[tokio::test]
+    async fn test_slow_connect_does_not_block_other_connections() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let slow: ServerConfig = serde_yaml::from_str(&format!(
+            "{{name: slow, engine: postgres, host: 127.0.0.1, port: {port}, ssl_mode: disable}}"
+        ))
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fast.db");
+        std::fs::File::create(&path).unwrap();
+        let fast: ServerConfig = serde_yaml::from_str(&format!(
+            "{{name: fast, engine: sqlite, schema: {}}}",
+            serde_json::to_string(&path.to_string_lossy()).unwrap()
+        ))
+        .unwrap();
+
+        let manager = Arc::new(DbManager::default());
+        let slow_task = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.get_pool(&slow).await.map(|_| ()) })
+        };
+        // Let the slow connection start connecting first
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!slow_task.is_finished());
+
+        let pool = tokio::time::timeout(std::time::Duration::from_secs(5), manager.get_pool(&fast))
+            .await
+            .expect("the fast connection waited for the slow one")
+            .unwrap();
+        let result = run_query(&pool, "SELECT 1 AS one", 10, None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(result.row_count, 1);
+        assert!(!slow_task.is_finished());
+
+        slow_task.abort();
+        accept.abort();
+    }
+
+    /// What get_pool does when the state changes while it is connecting.
+    #[test]
+    fn test_still_current_distinguishes_reset_from_disconnect() {
+        let mut inner = DbManagerInner::default();
+        let generation = inner.generation("conn");
+        assert!(inner.still_current("conn", generation).unwrap());
+
+        // Another connection changing does not invalidate this one
+        inner.bump_generation("other");
+        assert!(inner.still_current("conn", generation).unwrap());
+
+        // Disconnect / schema switch of this connection: retry from the current state
+        inner.bump_generation("conn");
+        assert!(!inner.still_current("conn", generation).unwrap());
+
+        // Config reload: the caller's ServerConfig may be stale, so it is an error
+        // (retrying would cache a pool built from the old config)
+        let generation = inner.generation("conn");
+        inner.reset_epoch += 1;
+        assert!(inner.still_current("conn", generation).is_err());
+    }
+
+    /// Concurrent get_pool calls for the same connection share one pool
+    /// (the per-connection lock prevents establishing it twice).
+    #[tokio::test]
+    async fn test_concurrent_get_pool_creates_one_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.db");
+        std::fs::File::create(&path).unwrap();
+        let server: ServerConfig = serde_yaml::from_str(&format!(
+            "{{name: shared, engine: sqlite, schema: {}}}",
+            serde_json::to_string(&path.to_string_lossy()).unwrap()
+        ))
+        .unwrap();
+        let manager = DbManager::default();
+        let (a, b) = tokio::join!(manager.get_pool(&server), manager.get_pool(&server));
+        match (a.unwrap(), b.unwrap()) {
+            (DbPool::Sqlite(a), DbPool::Sqlite(b)) => {
+                // Both handles refer to the same pool: closing one closes the other
+                a.close().await;
+                assert!(b.is_closed());
+            }
+            _ => panic!("expected sqlite pools"),
+        }
     }
 
     #[tokio::test]
