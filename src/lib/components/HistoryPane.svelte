@@ -44,12 +44,12 @@
   };
 
   // Reload when the connection or search term changes (also runs on first mount).
-  // Also subscribe to query execution completion (changes in running) to pick up the history just after execution.
+  // Also subscribe to query execution completion (queryCompletions) to pick up the history just after execution.
   // Search is incremental, so debounce it to limit the number of calls.
   $effect(() => {
     const connection = appStore.selectedConnection;
     const searchText = search.trim();
-    void appStore.running;
+    void appStore.queryCompletions;
     const timer = setTimeout(() => {
       void load(connection, searchText);
     }, SEARCH_DEBOUNCE_MS);

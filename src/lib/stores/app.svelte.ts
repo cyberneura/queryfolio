@@ -1591,6 +1591,11 @@ const dismissFixSuggestion = (tabId: number) => {
   }
 };
 
+/// Number of query executions that have finished (any connection, success or not).
+/// HistoryPane reloads on its change: queries on different connections run in parallel,
+/// so "is any query running" may stay true across a finished query and cannot be the trigger
+let queryCompletions = $state(0);
+
 /// Connections applying cell edits (running run_statements). Included in isConnectionRunning
 /// to suppress parallel execution on the same connection, as with query execution.
 let applyingConnections = $state(new Set<string>());
@@ -1690,6 +1695,7 @@ const executeTab = async (tab: ResultTab): Promise<QueryResult | null> => {
     }
   }
   tab.running = false;
+  queryCompletions += 1;
   // If the tab was discarded during execution (settings reload etc.),
   // discard the result instead of writing to a nonexistent tab (a detached object)
   if (!resultTabs.some((t) => t.id === tab.id)) {
@@ -2604,9 +2610,9 @@ export default {
   get errorMessage() {
     return errorMessage;
   },
-  /// True if a query is running in any tab (on any connection)
-  get running() {
-    return resultTabs.some((t) => t.running);
+  /// Number of finished query executions (the history reload trigger)
+  get queryCompletions() {
+    return queryCompletions;
   },
   /// The result tab running a query on the selected connection (null if none).
   /// Queries on different connections run in parallel, so the Run / Cancel button and
