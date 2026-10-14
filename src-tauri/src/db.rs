@@ -113,9 +113,7 @@ impl DbManagerInner {
     fn still_current(&self, connection: &str, generation: (u64, u64)) -> Result<bool, AppError> {
         let current = self.generation(connection);
         if current.0 != generation.0 {
-            return Err(AppError::Config(
-                "The configuration was reloaded while connecting. Run the query again.".into(),
-            ));
+            return Err(reloaded_while_connecting());
         }
         Ok(current == generation)
     }
@@ -123,6 +121,10 @@ impl DbManagerInner {
     fn bump_generation(&mut self, connection: &str) {
         *self.generations.entry(connection.to_string()).or_insert(0) += 1;
     }
+}
+
+fn reloaded_while_connecting() -> AppError {
+    AppError::Config("The configuration was reloaded while connecting. Run the query again.".into())
 }
 
 impl DbManager {
@@ -136,9 +138,16 @@ impl DbManager {
     }
 
     pub async fn get_pool(&self, server: &ServerConfig) -> Result<DbPool, AppError> {
-        if let Some(pool) = self.inner.lock().await.pools.get(&server.name) {
-            return Ok(pool.clone());
-        }
+        // Note the reset epoch the caller's ServerConfig belongs to before waiting
+        // on the per-connection lock: a reload while waiting (e.g. behind another
+        // caller that is connecting) must not let this stale config be cached
+        let entry_epoch = {
+            let inner = self.inner.lock().await;
+            if let Some(pool) = inner.pools.get(&server.name) {
+                return Ok(pool.clone());
+            }
+            inner.reset_epoch
+        };
         // Only one task establishes a given connection at a time. Others wait
         // here and then pick up the pool it cached
         let connect_lock = self.connect_lock(&server.name);
@@ -159,6 +168,9 @@ impl DbManager {
                 }
                 let tunnel_port = inner.tunnels.get(&server.name).map(|t| t.local_port);
                 let generation = inner.generation(&server.name);
+                if generation.0 != entry_epoch {
+                    return Err(reloaded_while_connecting());
+                }
                 (server, tunnel_port, generation)
             };
             let server = &server;
@@ -2860,6 +2872,33 @@ mod tests {
         let generation = inner.generation("conn");
         inner.reset_epoch += 1;
         assert!(inner.still_current("conn", generation).is_err());
+    }
+
+    /// A caller queued behind another connect of the same connection must not
+    /// cache its (stale) config when a reload happens while it waits.
+    #[tokio::test]
+    async fn test_reload_while_waiting_for_connect_lock_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queued.db");
+        std::fs::File::create(&path).unwrap();
+        let server: ServerConfig = serde_yaml::from_str(&format!(
+            "{{name: queued, engine: sqlite, schema: {}}}",
+            serde_json::to_string(&path.to_string_lossy()).unwrap()
+        ))
+        .unwrap();
+        let manager = Arc::new(DbManager::default());
+        // Stand in for another caller that is connecting
+        let lock = manager.connect_lock("queued");
+        let held = lock.lock().await;
+        let queued = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.get_pool(&server).await.map(|_| ()) })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        manager.reset().await;
+        drop(held);
+        assert!(queued.await.unwrap().is_err());
+        assert!(manager.inner.lock().await.pools.is_empty());
     }
 
     /// Concurrent get_pool calls for the same connection share one pool
