@@ -235,8 +235,20 @@ impl DbManager {
                 ),
             };
 
-            let pool = connect(server, engine, &host, port).await?;
+            let connected = connect(server, engine, &host, port).await;
             let mut inner = self.inner.lock().await;
+            // The handshake itself may fail *because* of the change (a disconnect
+            // kills the tunnel it was using), so look at the generation before
+            // reporting the error
+            let pool = match connected {
+                Ok(pool) => pool,
+                Err(e) => {
+                    if inner.still_current(&server.name, generation)? {
+                        return Err(e);
+                    }
+                    continue;
+                }
+            };
             // A disconnect / schema switch happened while connecting: this pool may
             // point at a dropped tunnel or the old database, so discard it and
             // connect again from the current state (a reload is an error, see still_current)
