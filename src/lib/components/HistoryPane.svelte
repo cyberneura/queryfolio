@@ -88,11 +88,11 @@
     {#if appStore.selectedCapabilities?.supports_tables ?? true}
       <button
         class="text-xs font-semibold tracking-wide text-zinc-600 hover:text-zinc-300"
-        title="Show tables"
+        title={appStore.tablesPaneListsSchemas ? "Show schemas" : "Show tables"}
         data-annotate="tab-tables"
         onclick={onShowTables}
       >
-        TABLES
+        {appStore.tablesPaneListsSchemas ? "SCHEMAS" : "TABLES"}
       </button>
     {/if}
     <button

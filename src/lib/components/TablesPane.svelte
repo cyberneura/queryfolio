@@ -27,6 +27,18 @@
   }
 
   let tables = $state<TableInfo[]>([]);
+  /// Database list shown instead of the tables while no database is chosen
+  /// (appStore.tablesPaneListsSchemas)
+  let schemaNames = $state<string[]>([]);
+  /// Connection the schemaNames were fetched from. The list stays on screen while the next
+  /// connection's list loads, and choosing from it then would apply the old connection's
+  /// database name to the new connection, so only the current connection's list is shown
+  let schemaNamesConnection = $state<string | null>(null);
+  const currentSchemaNames = $derived(
+    schemaNamesConnection === appStore.selectedConnection ? schemaNames : [],
+  );
+  /// Name of the schema being switched to from the list (disables the list meanwhile)
+  let choosingSchema = $state<string | null>(null);
   let loading = $state(false);
   let loadError = $state<string | null>(null);
   let expanded = $state<Record<string, ExpandedEntry>>({});
@@ -41,23 +53,42 @@
   const toErrorMessage = (e: unknown): string =>
     typeof e === "string" ? e : String(e);
 
-  const load = async (connection: string | null, refresh = false) => {
+  /// listSchemas = true loads the database list (SCHEMAS) instead of the tables
+  const load = async (
+    connection: string | null,
+    listSchemas: boolean,
+    refresh = false,
+  ) => {
     const generation = ++loadGeneration;
     // When the connection or schema changes, the expanded state loses meaning, so reset it
     expanded = {};
     if (!connection) {
       tables = [];
+      schemaNames = [];
       loadError = null;
+      // An in-flight load is now stale and will not clear the flag itself
+      loading = false;
       return;
     }
     loading = true;
     try {
-      const result = await api.listTables(connection, refresh);
-      // If a newer load has started, discard the old response
-      if (generation !== loadGeneration) {
-        return;
+      if (listSchemas) {
+        const result = await api.listSchemas(connection);
+        // If a newer load has started, discard the old response
+        if (generation !== loadGeneration) {
+          return;
+        }
+        schemaNames = result;
+        schemaNamesConnection = connection;
+        tables = [];
+      } else {
+        const result = await api.listTables(connection, refresh);
+        if (generation !== loadGeneration) {
+          return;
+        }
+        tables = result;
+        schemaNames = [];
       }
-      tables = result;
       loadError = null;
       // Opening the schema browser = a moment to use the connection. The tunnel is already
       // open from listTables, so also load the schema list and completion map now
@@ -69,6 +100,7 @@
       }
       loadError = toErrorMessage(e);
       tables = [];
+      schemaNames = [];
     } finally {
       if (generation === loadGeneration) {
         loading = false;
@@ -80,21 +112,44 @@
   /// updates the schema map for SQL completion (the refresh of list_tables also discards
   /// the backend column cache, so the re-fetch reflects it)
   const reload = async () => {
-    await load(appStore.selectedConnection, true);
+    await load(
+      appStore.selectedConnection,
+      appStore.tablesPaneListsSchemas,
+      true,
+    );
     void appStore.loadSchemaMap();
   };
 
   // Reload when the connection or active schema changes (also runs on first mount).
-  // The tree update after a schema switch (changeActiveSchema) is also done via this subscription.
+  // The tree update after a schema switch (changeActiveSchema) is also done via this subscription,
+  // and so is the move from SCHEMAS to TABLES once a database is chosen.
   // activeSchema changes several times right after a connection is selected, so debounce.
   $effect(() => {
     const connection = appStore.selectedConnection;
+    const listSchemas = appStore.tablesPaneListsSchemas;
     void appStore.activeSchema;
     const timer = setTimeout(() => {
-      void load(connection);
+      void load(connection, listSchemas);
     }, RELOAD_DEBOUNCE_MS);
     return () => clearTimeout(timer);
   });
+
+  /// Choosing a database in SCHEMAS mode makes it the active schema (same as the toolbar's
+  /// schema selector). The pane then follows activeSchema and shows its tables
+  const chooseSchema = async (schema: string) => {
+    if (
+      choosingSchema ||
+      schemaNamesConnection !== appStore.selectedConnection
+    ) {
+      return;
+    }
+    choosingSchema = schema;
+    try {
+      await appStore.changeActiveSchema(schema);
+    } finally {
+      choosingSchema = null;
+    }
+  };
 
   /// Lazy loading of tree expansion: fetch columns for the first time when expanded
   const toggleExpand = async (table: TableInfo) => {
@@ -195,11 +250,15 @@
     >
       HISTORY
     </button>
-    <span class="text-xs font-semibold tracking-wide text-zinc-400">TABLES</span>
+    <span class="text-xs font-semibold tracking-wide text-zinc-400">
+      {appStore.tablesPaneListsSchemas ? "SCHEMAS" : "TABLES"}
+    </span>
     <button
       class="ml-auto rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
-      title="Reload tables"
-      aria-label="Reload tables"
+      title={appStore.tablesPaneListsSchemas ? "Reload schemas" : "Reload tables"}
+      aria-label={appStore.tablesPaneListsSchemas
+        ? "Reload schemas"
+        : "Reload tables"}
       data-annotate="button-reload-tables"
       disabled={!appStore.selectedConnection || loading}
       onclick={() => void reload()}
@@ -212,6 +271,29 @@
       <p class="px-3 py-2 text-xs text-zinc-500">Select a connection</p>
     {:else if loadError}
       <p class="px-3 py-2 text-xs text-red-400">{loadError}</p>
+    {:else if appStore.tablesPaneListsSchemas}
+      {#if currentSchemaNames.length === 0}
+        <p class="px-3 py-2 text-xs text-zinc-500">
+          {loading ? "Loading..." : "No schemas found"}
+        </p>
+      {:else}
+        <p class="px-3 pb-1 pt-2 text-[10px] text-zinc-500">
+          No database is set for this connection. Choose one to show its tables.
+        </p>
+        {#each currentSchemaNames as schema (schema)}
+          <button
+            class="flex w-full min-w-0 items-center gap-1.5 px-3 py-1 text-left text-sm text-zinc-200 hover:bg-zinc-800 disabled:opacity-40"
+            title="Use this schema and show its tables"
+            data-annotate="button-schema-{schema}"
+            disabled={choosingSchema !== null}
+            onclick={() => void chooseSchema(schema)}
+          >
+            <i class="bi bi-database shrink-0 text-xs text-zinc-500" aria-hidden="true"
+            ></i>
+            <span class="truncate">{schema}</span>
+          </button>
+        {/each}
+      {/if}
     {:else if tables.length === 0}
       <p class="px-3 py-2 text-xs text-zinc-500">
         {loading ? "Loading..." : "No tables found"}

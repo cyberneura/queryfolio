@@ -31,6 +31,11 @@ pub struct EngineCapabilities {
     pub supports_schemas: bool,
     /// Whether the schema browser (TABLES pane) is supported
     pub supports_tables: bool,
+    /// Whether the table list only makes sense once a database is chosen (server engines
+    /// such as MySQL, where no database is selected unless the config names one).
+    /// When true and no schema is active, the TABLES pane lists the databases (SCHEMAS)
+    /// instead, and shows the tables once one is chosen
+    pub tables_need_schema: bool,
     /// Whether EXPLAIN (execution plan) is supported
     pub supports_explain: bool,
     /// Whether the editor's Format (pretty-print) is supported
@@ -47,6 +52,7 @@ const SQL_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     file_extension: "sql",
     supports_schemas: true,
     supports_tables: true,
+    tables_need_schema: true,
     supports_explain: true,
     supports_format: true,
     supports_editable_cells: true,
@@ -60,6 +66,7 @@ const REDIS_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     // A connection has the concept of switching with SELECT, so listing and switching are provided
     supports_schemas: true,
     supports_tables: false,
+    tables_need_schema: false,
     supports_explain: false,
     supports_format: false,
     supports_editable_cells: false,
@@ -73,6 +80,7 @@ const ELASTICSEARCH_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     file_extension: "es",
     supports_schemas: false,
     supports_tables: true,
+    tables_need_schema: false,
     supports_explain: false,
     supports_format: false,
     supports_editable_cells: false,
@@ -83,6 +91,8 @@ const ELASTICSEARCH_CAPABILITIES: EngineCapabilities = EngineCapabilities {
 /// sqlx, so only supports_editable_cells is set to false.
 const DUCKDB_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_editable_cells: false,
+    // The "schema" is the database file itself, so there is nothing to choose
+    tables_need_schema: false,
     ..SQL_CAPABILITIES
 };
 
@@ -92,9 +102,16 @@ const DUCKDB_CAPABILITIES: EngineCapabilities = EngineCapabilities {
 /// The TABLES pane shows the table list plus key schema and attribute definitions.
 const DYNAMODB_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_schemas: false,
+    tables_need_schema: false,
     supports_explain: false,
     supports_editable_cells: false,
     supports_ai: false,
+    ..SQL_CAPABILITIES
+};
+
+/// SQLite: the "schema" is the database file itself, so there is nothing to choose.
+const SQLITE_CAPABILITIES: EngineCapabilities = EngineCapabilities {
+    tables_need_schema: false,
     ..SQL_CAPABILITIES
 };
 
@@ -111,7 +128,8 @@ const MSSQL_CAPABILITIES: EngineCapabilities = EngineCapabilities {
 
 pub fn capabilities(engine: Engine) -> EngineCapabilities {
     match engine {
-        Engine::MySql | Engine::Postgres | Engine::Sqlite => SQL_CAPABILITIES.clone(),
+        Engine::MySql | Engine::Postgres => SQL_CAPABILITIES.clone(),
+        Engine::Sqlite => SQLITE_CAPABILITIES.clone(),
         Engine::MsSql => MSSQL_CAPABILITIES.clone(),
         Engine::Redis => REDIS_CAPABILITIES.clone(),
         Engine::Elasticsearch => ELASTICSEARCH_CAPABILITIES.clone(),
@@ -140,6 +158,13 @@ mod tests {
         assert_eq!(sql.editor_language, "sql");
         assert_eq!(sql.file_extension, "sql");
         assert!(sql.supports_tables);
+        assert!(sql.tables_need_schema);
+        assert!(capabilities_for_name("postgres").tables_need_schema);
+        assert!(capabilities_for_name("mssql").tables_need_schema);
+        // File-based engines have nothing to choose
+        assert!(!capabilities_for_name("sqlite").tables_need_schema);
+        assert!(!capabilities_for_name("duckdb").tables_need_schema);
+        assert!(capabilities_for_name("sqlite").supports_editable_cells);
 
         let redis = capabilities_for_name("redis");
         assert_eq!(redis.editor_language, "redis");

@@ -375,6 +375,9 @@ impl AppState {
         {
             return Ok(map);
         }
+        if mysql_without_database(server, schema_key) {
+            return Ok(Default::default());
+        }
         let pool = self.db.get_pool(server).await?;
         let all = schema_info::fetch_all_columns(&pool).await?;
         let map = all
@@ -980,6 +983,16 @@ async fn disconnect(
     Ok(())
 }
 
+/// Whether this is a MySQL connection with no database selected (neither in the config nor
+/// by a schema switch). The schema browser queries filter on `TABLE_SCHEMA = DATABASE()`,
+/// which matches nothing then, yet on some servers it still walks information_schema for
+/// every database and takes long enough that the TABLES pane never leaves "Loading...".
+/// The answer is known to be empty, so do not ask the server at all
+fn mysql_without_database(server: &ServerConfig, schema_key: &str) -> bool {
+    matches!(db::parse_engine(&server.engine), Ok(db::Engine::MySql))
+        && schema_key.trim().is_empty()
+}
+
 /// Returns the list of tables / views on the connection (with cache).
 /// With refresh = true, discards the cache and fetches again (for the reload button).
 #[tauri::command]
@@ -998,6 +1011,9 @@ async fn list_tables(
             .await;
     } else if let Some(tables) = state.schema_cache.get_tables(&connection, &schema_key).await {
         return Ok(tables);
+    }
+    if mysql_without_database(&server, &schema_key) {
+        return Ok(vec![]);
     }
     let pool = state.db.get_pool(&server).await?;
     let tables = schema_info::fetch_tables(&pool).await?;
