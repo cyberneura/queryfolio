@@ -28,6 +28,10 @@
   }
 
   let tables = $state<TableInfo[]>([]);
+  /// Connection and database the `tables` were loaded from. The list stays on screen while the
+  /// next one loads, so a dump started from a row must use these, not the current selection
+  let tablesConnection = $state<string | null>(null);
+  let tablesDatabase = $state<string | null>(null);
   /// Database list shown instead of the tables while no database is chosen
   /// (appStore.tablesPaneListsSchemas)
   let schemaNames = $state<string[]>([]);
@@ -50,6 +54,7 @@
   interface ContextMenu {
     x: number;
     y: number;
+    connection: string;
     /// null = the active schema
     database: string | null;
     table: DumpTable | null;
@@ -64,21 +69,46 @@
 
   const canDump = $derived(appStore.selectedCapabilities?.supports_dump === true);
 
-  const openContextMenu = (
-    event: MouseEvent,
-    database: string | null,
-    table: DumpTable | null,
-  ) => {
+  /// Right-click on a database row (SCHEMAS mode; only the current connection's list is shown)
+  const openSchemaMenu = (event: MouseEvent, schema: string) => {
+    const connection = appStore.selectedConnection;
+    if (!canDump || !connection) {
+      return;
+    }
+    event.preventDefault();
+    contextMenu = { x: event.clientX, y: event.clientY, connection, database: schema, table: null };
+  };
+
+  /// Right-click on a table row. The row may still belong to the previous connection / database
+  /// while the next list loads, so the dump targets where the list came from, and is not offered
+  /// at all when that is no longer the selection
+  const openTableMenu = (event: MouseEvent, table: TableInfo) => {
     if (!canDump) {
       return;
     }
     event.preventDefault();
-    contextMenu = { x: event.clientX, y: event.clientY, database, table };
+    if (
+      !tablesConnection ||
+      tablesConnection !== appStore.selectedConnection ||
+      tablesDatabase !== (appStore.activeSchema || null)
+    ) {
+      return;
+    }
+    contextMenu = {
+      x: event.clientX,
+      y: event.clientY,
+      connection: tablesConnection,
+      database: tablesDatabase,
+      table: { schema: table.schema, name: table.name },
+    };
   };
 
-  const openDump = (database: string | null, table: DumpTable | null) => {
+  const openDump = (
+    connection: string | null,
+    database: string | null,
+    table: DumpTable | null,
+  ) => {
     contextMenu = null;
-    const connection = appStore.selectedConnection;
     if (connection) {
       dumpTarget = { connection, database, table };
     }
@@ -110,6 +140,7 @@
       return;
     }
     loading = true;
+    const databaseAtLoad = appStore.activeSchema || null;
     try {
       if (listSchemas) {
         const result = await api.listSchemas(connection);
@@ -126,6 +157,8 @@
           return;
         }
         tables = result;
+        tablesConnection = connection;
+        tablesDatabase = databaseAtLoad;
         schemaNames = [];
       }
       loadError = null;
@@ -299,7 +332,7 @@
         aria-label="Dump database"
         data-annotate="button-dump-database"
         disabled={!appStore.selectedConnection}
-        onclick={() => openDump(null, null)}
+        onclick={() => openDump(appStore.selectedConnection, null, null)}
       >
         <i class="bi bi-download" aria-hidden="true"></i>
       </button>
@@ -339,7 +372,7 @@
             data-annotate="button-schema-{schema}"
             disabled={choosingSchema !== null}
             onclick={() => void chooseSchema(schema)}
-            oncontextmenu={(e) => openContextMenu(e, schema, null)}
+            oncontextmenu={(e) => openSchemaMenu(e, schema)}
           >
             <i class="bi bi-database shrink-0 text-xs text-zinc-500" aria-hidden="true"
             ></i>
@@ -356,8 +389,7 @@
         <div
           class="group flex items-center hover:bg-zinc-800"
           role="presentation"
-          oncontextmenu={(e) =>
-            openContextMenu(e, null, { schema: table.schema, name: table.name })}
+          oncontextmenu={(e) => openTableMenu(e, table)}
         >
           <button
             class="shrink-0 px-1.5 py-1 text-[10px] text-zinc-500 hover:text-zinc-200"
@@ -451,7 +483,7 @@
           data-annotate="menu-dump-table"
           onclick={(e) => {
             e.stopPropagation();
-            openDump(menu.database, menu.table);
+            openDump(menu.connection, menu.database, menu.table);
           }}
         >
           <i class="bi bi-download" aria-hidden="true"></i>
@@ -464,7 +496,7 @@
         data-annotate="menu-dump-database"
         onclick={(e) => {
           e.stopPropagation();
-          openDump(menu.database, null);
+          openDump(menu.connection, menu.database, null);
         }}
       >
         <i class="bi bi-database-down" aria-hidden="true"></i>
