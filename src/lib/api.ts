@@ -20,6 +20,9 @@ export interface EngineCapabilities {
   supports_schemas: boolean;
   /// Whether the schema browser (TABLES pane) is supported
   supports_tables: boolean;
+  /// Whether tables can only be listed once a database is chosen (mysql / postgres / mssql).
+  /// With no active schema, the TABLES pane lists the databases (SCHEMAS) instead
+  tables_need_schema: boolean;
   supports_explain: boolean;
   supports_format: boolean;
   /// Whether cell editing in the result grid (UPDATE generation) is supported

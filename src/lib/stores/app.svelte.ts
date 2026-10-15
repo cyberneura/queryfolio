@@ -2572,6 +2572,17 @@ export default {
       null
     );
   },
+  /// Whether the TABLES pane shows the database list (SCHEMAS) instead of the tables:
+  /// the engine needs a database to list tables, and none is chosen yet (not in the config
+  /// and not switched to). Choosing one sets activeSchema, which turns the pane back to TABLES
+  get tablesPaneListsSchemas() {
+    const capabilities = this.selectedCapabilities;
+    return (
+      !!capabilities?.supports_schemas &&
+      !!capabilities.tables_need_schema &&
+      !activeSchema?.trim()
+    );
+  },
   /// The selected connection's query file extension (without dot; "sql" if none selected)
   get selectedFileExtension() {
     return this.selectedCapabilities?.file_extension ?? "sql";
