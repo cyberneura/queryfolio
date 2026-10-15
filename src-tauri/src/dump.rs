@@ -431,12 +431,14 @@ pub fn mysqldump_args(
 
 /// TLS options of the mysql client for the connection's ssl_mode.
 /// MySQL's client has --ssl-mode; MariaDB's does not and uses --ssl / --skip-ssl /
-/// --ssl-verify-server-cert. `prefer` (the default) passes nothing and leaves it to the client's
-/// default, which is the same "try TLS" behavior.
+/// --ssl-verify-server-cert. For `prefer` (the default), MySQL's client already tries TLS by
+/// default, so nothing is passed; MariaDB's client before 11.4 does not (its default is
+/// plaintext), so `--ssl` asks it to try TLS like the app's own connection does.
 fn mysql_tls_args(server: &ServerConfig, mariadb: bool) -> Result<Vec<String>, AppError> {
     let mode = server.sql_ssl_mode()?;
     let mut args: Vec<String> = match (mode, mariadb) {
-        (SqlSslMode::Prefer, _) => vec![],
+        (SqlSslMode::Prefer, false) => vec![],
+        (SqlSslMode::Prefer, true) => vec!["--ssl".into()],
         (SqlSslMode::Disable, false) => vec!["--ssl-mode=DISABLED".into()],
         (SqlSslMode::Require, false) => vec!["--ssl-mode=REQUIRED".into()],
         (SqlSslMode::VerifyCa, false) => vec!["--ssl-mode=VERIFY_CA".into()],
@@ -1097,6 +1099,7 @@ mod tests {
     fn mysql_tls_flags_follow_ssl_mode_and_client() {
         let mut s = server("mysql");
         assert!(mysql_tls_args(&s, false).unwrap().is_empty());
+        assert_eq!(mysql_tls_args(&s, true).unwrap(), vec!["--ssl"]);
         s.ssl_mode = Some("require".into());
         assert_eq!(
             mysql_tls_args(&s, false).unwrap(),
