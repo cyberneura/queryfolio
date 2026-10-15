@@ -1,7 +1,8 @@
 <script lang="ts">
   import * as api from "$lib/api";
-  import type { ColumnInfo, TableInfo } from "$lib/api";
+  import type { ColumnInfo, DumpTable, TableInfo } from "$lib/api";
   import appStore from "$lib/stores/app.svelte";
+  import DumpModal from "./DumpModal.svelte";
 
   interface Props {
     /// Switch to the FILES / HISTORY tab (tab state is held by +page.svelte)
@@ -44,6 +45,44 @@
   let expanded = $state<Record<string, ExpandedEntry>>({});
 
   let clickTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /// Right-click menu of a table / database row (only for engines that can dump)
+  interface ContextMenu {
+    x: number;
+    y: number;
+    /// null = the active schema
+    database: string | null;
+    table: DumpTable | null;
+  }
+  let contextMenu = $state<ContextMenu | null>(null);
+  /// Open dump dialog (the connection is fixed when it opens)
+  let dumpTarget = $state<{
+    connection: string;
+    database: string | null;
+    table: DumpTable | null;
+  } | null>(null);
+
+  const canDump = $derived(appStore.selectedCapabilities?.supports_dump === true);
+
+  const openContextMenu = (
+    event: MouseEvent,
+    database: string | null,
+    table: DumpTable | null,
+  ) => {
+    if (!canDump) {
+      return;
+    }
+    event.preventDefault();
+    contextMenu = { x: event.clientX, y: event.clientY, database, table };
+  };
+
+  const openDump = (database: string | null, table: DumpTable | null) => {
+    contextMenu = null;
+    const connection = appStore.selectedConnection;
+    if (connection) {
+      dumpTarget = { connection, database, table };
+    }
+  };
 
   /// Generation number of the running load. Used so that only the result of the latest load
   /// is applied even if an old response resolves later, during consecutive connection /
@@ -253,8 +292,21 @@
     <span class="text-xs font-semibold tracking-wide text-zinc-400">
       {appStore.tablesPaneListsSchemas ? "SCHEMAS" : "TABLES"}
     </span>
+    {#if canDump && !appStore.tablesPaneListsSchemas}
+      <button
+        class="ml-auto rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
+        title="Dump this database (right-click a table to dump only that table)"
+        aria-label="Dump database"
+        data-annotate="button-dump-database"
+        disabled={!appStore.selectedConnection}
+        onclick={() => openDump(null, null)}
+      >
+        <i class="bi bi-download" aria-hidden="true"></i>
+      </button>
+    {/if}
     <button
-      class="ml-auto rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
+      class="rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
+      class:ml-auto={!canDump || appStore.tablesPaneListsSchemas}
       title={appStore.tablesPaneListsSchemas ? "Reload schemas" : "Reload tables"}
       aria-label={appStore.tablesPaneListsSchemas
         ? "Reload schemas"
@@ -287,6 +339,7 @@
             data-annotate="button-schema-{schema}"
             disabled={choosingSchema !== null}
             onclick={() => void chooseSchema(schema)}
+            oncontextmenu={(e) => openContextMenu(e, schema, null)}
           >
             <i class="bi bi-database shrink-0 text-xs text-zinc-500" aria-hidden="true"
             ></i>
@@ -300,7 +353,12 @@
       </p>
     {:else}
       {#each tables as table (table.qualified_name)}
-        <div class="group flex items-center hover:bg-zinc-800">
+        <div
+          class="group flex items-center hover:bg-zinc-800"
+          role="presentation"
+          oncontextmenu={(e) =>
+            openContextMenu(e, null, { schema: table.schema, name: table.name })}
+        >
           <button
             class="shrink-0 px-1.5 py-1 text-[10px] text-zinc-500 hover:text-zinc-200"
             title={expanded[table.qualified_name]
@@ -360,3 +418,71 @@
     {/if}
   </div>
 </div>
+
+<svelte:window
+  onkeydown={(e) => {
+    if (contextMenu && e.key === "Escape") {
+      contextMenu = null;
+    }
+  }}
+/>
+
+{#if contextMenu}
+  {@const menu = contextMenu}
+  <!-- Full-screen layer: any click or right-click outside the menu closes it -->
+  <div
+    class="fixed inset-0 z-20"
+    role="presentation"
+    onclick={() => (contextMenu = null)}
+    oncontextmenu={(e) => {
+      e.preventDefault();
+      contextMenu = null;
+    }}
+  >
+    <div
+      class="fixed min-w-44 rounded border border-zinc-700 bg-zinc-800 py-1 text-xs text-zinc-200 shadow-xl"
+      style="left: {Math.min(menu.x, window.innerWidth - 240)}px; top: {Math.min(menu.y, window.innerHeight - 72)}px"
+      role="menu"
+    >
+      {#if menu.table}
+        <button
+          class="flex w-full items-center gap-2 px-3 py-1 text-left hover:bg-zinc-700"
+          role="menuitem"
+          data-annotate="menu-dump-table"
+          onclick={(e) => {
+            e.stopPropagation();
+            openDump(menu.database, menu.table);
+          }}
+        >
+          <i class="bi bi-download" aria-hidden="true"></i>
+          Dump table "{menu.table.name}"...
+        </button>
+      {/if}
+      <button
+        class="flex w-full items-center gap-2 px-3 py-1 text-left hover:bg-zinc-700"
+        role="menuitem"
+        data-annotate="menu-dump-database"
+        onclick={(e) => {
+          e.stopPropagation();
+          openDump(menu.database, null);
+        }}
+      >
+        <i class="bi bi-database-down" aria-hidden="true"></i>
+        Dump database{menu.database
+          ? ` "${menu.database}"`
+          : appStore.activeSchema
+            ? ` "${appStore.activeSchema}"`
+            : ""}...
+      </button>
+    </div>
+  </div>
+{/if}
+
+{#if dumpTarget}
+  <DumpModal
+    connection={dumpTarget.connection}
+    database={dumpTarget.database}
+    table={dumpTarget.table}
+    onClose={() => (dumpTarget = null)}
+  />
+{/if}

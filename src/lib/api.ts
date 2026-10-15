@@ -29,6 +29,8 @@ export interface EngineCapabilities {
   supports_editable_cells: boolean;
   /// Whether AI features (SQL generation / explanation) are supported
   supports_ai: boolean;
+  /// Whether the database / tables can be dumped (mysqldump / pg_dump)
+  supports_dump: boolean;
 }
 
 export interface ConnectionInfo {
@@ -428,3 +430,69 @@ export const writeExportFile = (
   contents: string,
   encoding: ExportEncoding = "utf-8",
 ) => invoke<void>("write_export_file", { path, contents, encoding });
+
+/// Dump tool of a connection (corresponds to dump::DumpTool in the backend)
+export type DumpTool = "mysqldump" | "pg_dump";
+
+export interface DetectedDumpTool {
+  path: string;
+  /// First line of `--version` (null if it could not be run)
+  version: string | null;
+}
+
+export interface DumpInfo {
+  tool: DumpTool;
+  /// Binaries found on this machine, the recommended one first
+  tools: DetectedDumpTool[];
+  /// Database dumped when the request names none (the active schema)
+  default_database: string | null;
+  via_ssh_tunnel: boolean;
+}
+
+export interface DumpTable {
+  /// Owning schema (PostgreSQL), unquoted
+  schema: string | null;
+  /// Table name, unquoted
+  name: string;
+}
+
+export interface DumpRequest {
+  toolPath: string;
+  database: string | null;
+  table: DumpTable | null;
+  content: "all" | "schema" | "data";
+  format: "plain" | "custom";
+  singleTransaction: boolean;
+  routines: boolean;
+  addDrop: boolean;
+  noOwner: boolean;
+  extraArgs: string;
+  outputPath: string;
+}
+
+export interface DumpOutcome {
+  path: string;
+  bytes: number;
+  /// The tool's stderr on success (warnings). Empty if none
+  warnings: string;
+}
+
+export interface DumpProgress {
+  dumpId: string;
+  bytes: number;
+}
+
+export const getDumpInfo = (connection: string) =>
+  invoke<DumpInfo>("get_dump_info", { connection });
+
+export const previewDumpCommand = (connection: string, request: DumpRequest) =>
+  invoke<string>("preview_dump_command", { connection, request });
+
+export const runDump = (
+  connection: string,
+  dumpId: string,
+  request: DumpRequest,
+) => invoke<DumpOutcome>("run_dump", { connection, dumpId, request });
+
+export const cancelDump = (dumpId: string) =>
+  invoke<boolean>("cancel_dump", { dumpId });

@@ -582,7 +582,7 @@ pub fn parse_engine(engine: &str) -> Result<Engine, AppError> {
     }
 }
 
-fn default_port(engine: Engine) -> u16 {
+pub(crate) fn default_port(engine: Engine) -> u16 {
     match engine {
         Engine::MySql => 3306,
         Engine::Postgres => 5432,
