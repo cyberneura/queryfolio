@@ -344,7 +344,10 @@ fn split_extra_args(tool: DumpTool, extra: &str) -> Result<Vec<String>, AppError
     };
     for arg in &args {
         let redirects = if let Some(name) = arg.strip_prefix("--") {
-            let name = name.split('=').next().unwrap_or_default();
+            // The mysql client treats `_` and `-` alike and accepts a `loose-` prefix
+            // (`--loose-result_file=x`); normalizing for pg_dump only rejects more
+            let name = name.split('=').next().unwrap_or_default().replace('_', "-");
+            let name = name.strip_prefix("loose-").unwrap_or(&name);
             name.len() >= 2 && long.iter().any(|l| l.starts_with(name))
         } else if let Some(cluster) = arg.strip_prefix('-') {
             // Short options can be combined (`-vf out.sql`)
@@ -1095,6 +1098,9 @@ mod tests {
             "--res=x",
             "-T /tmp",
             "--tab=/tmp",
+            "--result_file=x",
+            "--loose-result-file=x",
+            "--loose_tab=/tmp",
         ] {
             assert!(
                 split_extra_args(DumpTool::Mysqldump, extra).is_err(),
