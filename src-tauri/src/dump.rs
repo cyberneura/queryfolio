@@ -444,7 +444,12 @@ fn mysql_tls_args(server: &ServerConfig, mariadb: bool) -> Result<Vec<String>, A
         (SqlSslMode::VerifyCa, false) => vec!["--ssl-mode=VERIFY_CA".into()],
         (SqlSslMode::VerifyFull, false) => vec!["--ssl-mode=VERIFY_IDENTITY".into()],
         (SqlSslMode::Disable, true) => vec!["--skip-ssl".into()],
-        (SqlSslMode::Require, true) => vec!["--ssl".into()],
+        // Encryption without verification. MariaDB 11.4+ clients verify the certificate by
+        // default, so turn that off explicitly (older clients accept the --skip- form too, as
+        // it is a boolean option)
+        (SqlSslMode::Require, true) => {
+            vec!["--ssl".into(), "--skip-ssl-verify-server-cert".into()]
+        }
         // MariaDB's client has no "chain only" mode, so verify-ca also checks the host name
         (SqlSslMode::VerifyCa | SqlSslMode::VerifyFull, true) => {
             vec!["--ssl".into(), "--ssl-verify-server-cert".into()]
@@ -1105,7 +1110,10 @@ mod tests {
             mysql_tls_args(&s, false).unwrap(),
             vec!["--ssl-mode=REQUIRED"]
         );
-        assert_eq!(mysql_tls_args(&s, true).unwrap(), vec!["--ssl"]);
+        assert_eq!(
+            mysql_tls_args(&s, true).unwrap(),
+            vec!["--ssl", "--skip-ssl-verify-server-cert"]
+        );
         s.ssl_mode = Some("verify-full".into());
         assert_eq!(
             mysql_tls_args(&s, false).unwrap(),
@@ -1117,6 +1125,10 @@ mod tests {
         );
         s.ssl_mode = Some("disable".into());
         assert_eq!(mysql_tls_args(&s, true).unwrap(), vec!["--skip-ssl"]);
+        // --ssl-ca would turn TLS back on for MariaDB, but a root CA is only accepted with the
+        // verifying modes in the first place
+        s.ssl_root_cert = Some("/etc/ssl/ca.pem".into());
+        assert!(mysql_tls_args(&s, true).is_err());
     }
 
     #[test]
