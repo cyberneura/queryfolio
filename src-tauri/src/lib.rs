@@ -2,6 +2,7 @@ mod ai;
 mod cli;
 mod config;
 mod db;
+mod dump;
 mod engines;
 mod history;
 mod meta_commands;
@@ -67,6 +68,8 @@ struct AppState {
     live: std::sync::Mutex<LiveDelivery>,
     /// AI chat abort requests (per connection name).
     chat_cancels: ChatCancels,
+    /// Running dumps (dump ID numbered by the frontend -> its cancel token)
+    dumps: std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
 }
 
 /// Upper limit of IDs for which abort requests are remembered (they are kept to guard against
@@ -1670,6 +1673,100 @@ fn encode_export_contents(contents: &str, encoding: &str) -> Result<Vec<u8>, App
     Ok(encoded.into_owned())
 }
 
+/// What the dump dialog shows for a connection: the detected mysqldump / pg_dump binaries
+/// (the recommended one first) and the database dumped by default
+#[tauri::command]
+async fn get_dump_info(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+) -> Result<dump::DumpInfo, AppError> {
+    let server = state.find_server(&connection).await?;
+    let tool = dump::tool_for_server(&server)?;
+    let active = state.active_schema_key(&server).await;
+    Ok(dump::DumpInfo {
+        tool,
+        tools: dump::detect_tools(tool).await,
+        default_database: Some(active).filter(|s| !s.is_empty()),
+        via_ssh_tunnel: server.ssh_tunnel.is_some(),
+    })
+}
+
+/// The command line the dump would run, for display (contains no password)
+#[tauri::command]
+async fn preview_dump_command(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    request: dump::DumpRequest,
+) -> Result<String, AppError> {
+    let server = state.find_server(&connection).await?;
+    let active = state.active_schema_key(&server).await;
+    // The TLS options differ for MariaDB's client; decided the same way as run_dump
+    let mariadb = dump::tool_for_server(&server)? == dump::DumpTool::Mysqldump
+        && dump::is_mariadb_client(&config::expand_tilde(request.tool_path.trim())).await;
+    dump::preview_command(&server, &request, Some(active.as_str()), mariadb)
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DumpProgress {
+    dump_id: String,
+    bytes: u64,
+}
+
+/// Runs mysqldump / pg_dump for the connection and writes the dump to request.output_path.
+/// Progress (bytes written) is emitted as `dump-progress` events; cancel with cancel_dump.
+#[tauri::command]
+async fn run_dump(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    dump_id: String,
+    request: dump::DumpRequest,
+) -> Result<dump::DumpOutcome, AppError> {
+    use tauri::Emitter;
+    // Registered before the first await, so a cancel sent right after starting is not lost
+    let cancel = tokio_util::sync::CancellationToken::new();
+    {
+        let mut dumps = state.dumps.lock().unwrap();
+        if dumps.contains_key(&dump_id) {
+            return Err(AppError::Dump(format!(
+                "Dump '{dump_id}' is already running"
+            )));
+        }
+        dumps.insert(dump_id.clone(), cancel.clone());
+    }
+    let result = async {
+        let server = state.find_server(&connection).await?;
+        let active = state.active_schema_key(&server).await;
+        dump::run_dump(&server, &request, Some(active.as_str()), cancel, |bytes| {
+            let _ = app.emit(
+                "dump-progress",
+                DumpProgress {
+                    dump_id: dump_id.clone(),
+                    bytes,
+                },
+            );
+        })
+        .await
+    }
+    .await;
+    state.dumps.lock().unwrap().remove(&dump_id);
+    result
+}
+
+/// Stops a running dump (the tool is killed and the partial file removed).
+/// Returns false if no dump with that ID is running.
+#[tauri::command]
+fn cancel_dump(state: tauri::State<'_, AppState>, dump_id: String) -> bool {
+    match state.dumps.lock().unwrap().get(&dump_id) {
+        Some(cancel) => {
+            cancel.cancel();
+            true
+        }
+        None => false,
+    }
+}
+
 #[tauri::command]
 async fn write_export_file(
     path: String,
@@ -2306,6 +2403,10 @@ pub fn run() {
             add_file_connection,
             read_override_config_yaml,
             write_export_file,
+            get_dump_info,
+            preview_dump_command,
+            run_dump,
+            cancel_dump,
             frontend_ready,
         ])
         .run(tauri::generate_context!())

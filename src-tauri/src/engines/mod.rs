@@ -44,6 +44,9 @@ pub struct EngineCapabilities {
     pub supports_editable_cells: bool,
     /// Whether AI features (SQL generation / explanation) are supported
     pub supports_ai: bool,
+    /// Whether the database / tables can be dumped with the engine's CLI tool
+    /// (mysqldump / pg_dump; dump.rs)
+    pub supports_dump: bool,
 }
 
 /// Common capabilities of the SQL engines (mysql / postgres / sqlite).
@@ -57,6 +60,13 @@ const SQL_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_format: true,
     supports_editable_cells: true,
     supports_ai: true,
+    supports_dump: false,
+};
+
+/// MySQL / PostgreSQL additionally have a dump tool (mysqldump / pg_dump)
+const SQL_DUMP_CAPABILITIES: EngineCapabilities = EngineCapabilities {
+    supports_dump: true,
+    ..SQL_CAPABILITIES
 };
 
 const REDIS_CAPABILITIES: EngineCapabilities = EngineCapabilities {
@@ -71,6 +81,7 @@ const REDIS_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_format: false,
     supports_editable_cells: false,
     supports_ai: false,
+    supports_dump: false,
 };
 
 /// Elasticsearch works with Kibana Console-style request blocks in the editor, and the
@@ -85,6 +96,7 @@ const ELASTICSEARCH_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_format: false,
     supports_editable_cells: false,
     supports_ai: false,
+    supports_dump: false,
 };
 
 /// DuckDB is a SQL engine, but the path that applies cell edits (run_statements) assumes
@@ -128,7 +140,7 @@ const MSSQL_CAPABILITIES: EngineCapabilities = EngineCapabilities {
 
 pub fn capabilities(engine: Engine) -> EngineCapabilities {
     match engine {
-        Engine::MySql | Engine::Postgres => SQL_CAPABILITIES.clone(),
+        Engine::MySql | Engine::Postgres => SQL_DUMP_CAPABILITIES.clone(),
         Engine::Sqlite => SQLITE_CAPABILITIES.clone(),
         Engine::MsSql => MSSQL_CAPABILITIES.clone(),
         Engine::Redis => REDIS_CAPABILITIES.clone(),
@@ -165,6 +177,21 @@ mod tests {
         assert!(!capabilities_for_name("sqlite").tables_need_schema);
         assert!(!capabilities_for_name("duckdb").tables_need_schema);
         assert!(capabilities_for_name("sqlite").supports_editable_cells);
+        // Only mysql / postgres have a dump tool (dump.rs)
+        assert!(sql.supports_dump);
+        assert!(capabilities_for_name("postgres").supports_dump);
+        let others = [
+            "sqlite",
+            "duckdb",
+            "mssql",
+            "redis",
+            "elasticsearch",
+            "dynamodb",
+            "nope",
+        ];
+        for engine in others {
+            assert!(!capabilities_for_name(engine).supports_dump, "{engine}");
+        }
 
         let redis = capabilities_for_name("redis");
         assert_eq!(redis.editor_language, "redis");

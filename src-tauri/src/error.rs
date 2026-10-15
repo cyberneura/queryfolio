@@ -63,6 +63,10 @@ pub enum AppError {
 
     #[error("SQL Server error: {0}")]
     MsSql(String),
+
+    /// Dumping with mysqldump / pg_dump failed (dump.rs)
+    #[error("Dump error: {0}")]
+    Dump(String),
 }
 
 impl From<redis::RedisError> for AppError {
