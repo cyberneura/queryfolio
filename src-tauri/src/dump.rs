@@ -15,11 +15,12 @@
 //!   would cut the dump off in the middle).
 //! - **Never putting the password on the command line** (it would be visible to every user of
 //!   the machine through `ps`). mysqldump reads it from a temporary option file
-//!   (`--defaults-extra-file`, mode 600, deleted when the dump ends) and pg_dump from
+//!   (`--defaults-file`, mode 600, deleted when the dump ends) and pg_dump from
 //!   `PGPASSWORD` in the child's environment. pg_dump also gets `--no-password` so that a
 //!   missing password fails instead of waiting forever for input nobody can type.
-//! - **Not leaving half-written files.** The tool writes to `<output>.partial`, which is renamed
-//!   to the chosen path only when the tool exits successfully, and removed on failure / cancel.
+//! - **Not leaving half-written files.** The tool writes to a temporary `.partial` file next to
+//!   the output, which is renamed to the chosen path only when the tool exits successfully, and
+//!   removed on failure / cancel.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -370,8 +371,14 @@ fn split_extra_args(tool: DumpTool, extra: &str) -> Result<Vec<String>, AppError
     Ok(args)
 }
 
-/// Arguments for mysqldump. The password is not among them (see write_mysql_password_file).
+/// Arguments for mysqldump. The password is not among them (see write_mysql_option_file).
 /// `defaults_file` must be the first argument (mysqldump ignores it anywhere else).
+///
+/// It is `--defaults-file`, not `--defaults-extra-file`: the extra file is read *before* the
+/// user's `~/.my.cnf`, whose `password` would then override the configured one, and whose
+/// `[mysqldump] result-file=` / `tab=` would send the output past the partial file. With
+/// `--defaults-file` no other option file is read (`.mylogin.cnf` is shut out separately with
+/// MYSQL_TEST_LOGIN_FILE in run_dump). Command-line options override option files anyway.
 pub fn mysqldump_args(
     server: &ServerConfig,
     request: &DumpRequest,
@@ -389,16 +396,21 @@ pub fn mysqldump_args(
     }
     let mut args = Vec::new();
     if let Some(path) = defaults_file {
-        args.push(format!("--defaults-extra-file={}", path.display()));
+        args.push(format!("--defaults-file={}", path.display()));
     }
     args.push(format!("--host={host}"));
     args.push(format!("--port={port}"));
     // Without this, "localhost" means the Unix socket to the mysql client, while the app
     // (sqlx) and the SSH tunnel always use TCP
     args.push("--protocol=TCP".into());
-    if let Some(user) = server.user.as_deref().filter(|u| !u.is_empty()) {
-        args.push(format!("--user={user}"));
-    }
+    // Without a user, sqlx (the app's connection) logs in as root, while the mysql client would
+    // use the OS user name
+    let user = server
+        .user
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .unwrap_or("root");
+    args.push(format!("--user={user}"));
     args.extend(mysql_tls_args(server, mariadb)?);
     if request.single_transaction {
         args.push("--single-transaction".into());
@@ -560,9 +572,12 @@ fn pg_table_pattern(table: &DumpTable) -> String {
     }
 }
 
-/// Contents of the option file that passes the password to mysqldump.
+/// Contents of the option file given to mysqldump: the password, if any.
 /// Inside double quotes the option file format recognizes backslash escapes.
-fn mysql_option_file_contents(password: &str) -> String {
+fn mysql_option_file_contents(password: Option<&str>) -> String {
+    let Some(password) = password else {
+        return "[client]\n".to_string();
+    };
     let mut escaped = String::with_capacity(password.len());
     for c in password.chars() {
         match c {
@@ -630,8 +645,8 @@ fn unique_stamp() -> String {
     format!("{}-{nanos}", std::process::id())
 }
 
-/// Writes the password to a new file only the current user can read
-fn write_mysql_password_file(password: &str) -> Result<RemoveOnDrop, AppError> {
+/// Writes mysqldump's option file to a new file only the current user can read
+fn write_mysql_option_file(password: Option<&str>) -> Result<RemoveOnDrop, AppError> {
     use std::io::Write;
     let stamp = unique_stamp();
     let (mut file, path) = create_private_file(&std::env::temp_dir(), |attempt| {
@@ -729,11 +744,13 @@ pub fn preview_command(
         endpoint.port = 0;
     }
     let database = resolve_database(request, active_schema);
-    let placeholder = server
-        .password
-        .as_ref()
-        .filter(|_| tool == DumpTool::Mysqldump)
-        .map(|_| PathBuf::from("<temporary file with the password>"));
+    let placeholder = (tool == DumpTool::Mysqldump).then(|| {
+        PathBuf::from(if server.password.is_some() {
+            "<temporary file with the password>"
+        } else {
+            "<temporary empty option file>"
+        })
+    });
     let (args, env) = build_command_line(
         tool,
         server,
@@ -837,9 +854,11 @@ pub async fn run_dump(
         return Err(AppError::Cancelled);
     }
 
-    let password_file = match (&server.password, tool) {
-        (Some(password), DumpTool::Mysqldump) => Some(write_mysql_password_file(password)?),
-        _ => None,
+    // Always written for mysqldump, even without a password: --defaults-file is what keeps
+    // the user's option files out (see mysqldump_args)
+    let option_file = match tool {
+        DumpTool::Mysqldump => Some(write_mysql_option_file(server.password.as_deref())?),
+        DumpTool::PgDump => None,
     };
     let (args, env) = build_command_line(
         tool,
@@ -848,10 +867,18 @@ pub async fn run_dump(
         database.as_deref(),
         &endpoint,
         mariadb,
-        password_file.as_ref().and_then(|g| g.0.as_deref()),
+        option_file.as_ref().and_then(|g| g.0.as_deref()),
     )?;
     let mut command = tokio::process::Command::new(&tool_path);
     command.args(args).envs(env);
+    if tool == DumpTool::Mysqldump {
+        // .mylogin.cnf (mysql_config_editor) is read even with --defaults-file and could
+        // override the password; point the client at a login file that does not exist
+        command.env(
+            "MYSQL_TEST_LOGIN_FILE",
+            std::env::temp_dir().join(format!("queryfolio-no-login-{}.cnf", unique_stamp())),
+        );
+    }
     if let (Some(password), DumpTool::PgDump) = (&server.password, tool) {
         command.env("PGPASSWORD", password);
     }
@@ -994,7 +1021,7 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "--defaults-extra-file=/tmp/pw.cnf",
+                "--defaults-file=/tmp/pw.cnf",
                 "--host=db.example.com",
                 "--port=3307",
                 "--protocol=TCP",
@@ -1217,9 +1244,18 @@ mod tests {
     #[test]
     fn option_file_escapes_the_password() {
         assert_eq!(
-            mysql_option_file_contents("a\"b\\c\nd"),
+            mysql_option_file_contents(Some("a\"b\\c\nd")),
             "[client]\npassword=\"a\\\"b\\\\c\\nd\"\n"
         );
+    }
+
+    #[test]
+    fn mysqldump_defaults_to_root_like_sqlx() {
+        let mut s = server("mysql");
+        s.user = None;
+        let args = mysqldump_args(&s, &request(), "shop", "h", 1, false, None).unwrap();
+        assert!(args.contains(&"--user=root".to_string()), "{args:?}");
+        assert_eq!(mysql_option_file_contents(None), "[client]\n");
     }
 
     #[test]
@@ -1263,7 +1299,7 @@ mod tests {
         let s = server("mysql");
         let line = preview_command(&s, &request(), Some("shop"), false).unwrap();
         assert!(
-            line.contains("'--defaults-extra-file=<temporary file with the password>'"),
+            line.contains("'--defaults-file=<temporary file with the password>'"),
             "{line}"
         );
         assert!(!line.contains("p\"w"));
@@ -1334,7 +1370,7 @@ mod tests {
         std::fs::write(
             &tool,
             "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'mysqldump  Ver 8.4.0'; exit 0; fi\n\
-             case \"$1\" in --defaults-extra-file=*) f=\"${1#*=}\";; esac\n\
+             case \"$1\" in --defaults-file=*) f=\"${1#*=}\";; esac\n\
              echo partial\ncat \"$f\" >&2\nexit 2\n",
         )
         .unwrap();
