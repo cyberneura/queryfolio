@@ -882,8 +882,17 @@ pub async fn run_dump(
             std::env::temp_dir().join(format!("queryfolio-no-login-{}.cnf", unique_stamp())),
         );
     }
-    if let (Some(password), DumpTool::PgDump) = (&server.password, tool) {
-        command.env("PGPASSWORD", password);
+    if tool == DumpTool::PgDump {
+        // libpq fills parameters missing from the connection string from the environment.
+        // An inherited PGHOSTADDR would replace the address `host` resolves to (and receive
+        // PGPASSWORD), and PGSERVICE could pull in another host from a service file; the app's
+        // own connection (sqlx) uses neither
+        for name in ["PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE"] {
+            command.env_remove(name);
+        }
+        if let Some(password) = &server.password {
+            command.env("PGPASSWORD", password);
+        }
     }
 
     let (file, partial) = create_partial_file(&output)?;
