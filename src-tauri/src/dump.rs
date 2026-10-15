@@ -433,21 +433,21 @@ pub fn mysqldump_args(
 /// MySQL's client has --ssl-mode; MariaDB's does not and uses --ssl / --skip-ssl /
 /// --ssl-verify-server-cert. For `prefer` (the default), MySQL's client already tries TLS by
 /// default, so nothing is passed; MariaDB's client before 11.4 does not (its default is
-/// plaintext), so `--ssl` asks it to try TLS like the app's own connection does.
+/// plaintext), so `--ssl` asks it to try TLS like the app's own connection does, without the
+/// certificate verification 11.4+ would add.
 fn mysql_tls_args(server: &ServerConfig, mariadb: bool) -> Result<Vec<String>, AppError> {
     let mode = server.sql_ssl_mode()?;
     let mut args: Vec<String> = match (mode, mariadb) {
         (SqlSslMode::Prefer, false) => vec![],
-        (SqlSslMode::Prefer, true) => vec!["--ssl".into()],
         (SqlSslMode::Disable, false) => vec!["--ssl-mode=DISABLED".into()],
         (SqlSslMode::Require, false) => vec!["--ssl-mode=REQUIRED".into()],
         (SqlSslMode::VerifyCa, false) => vec!["--ssl-mode=VERIFY_CA".into()],
         (SqlSslMode::VerifyFull, false) => vec!["--ssl-mode=VERIFY_IDENTITY".into()],
         (SqlSslMode::Disable, true) => vec!["--skip-ssl".into()],
-        // Encryption without verification. MariaDB 11.4+ clients verify the certificate by
-        // default, so turn that off explicitly (older clients accept the --skip- form too, as
-        // it is a boolean option)
-        (SqlSslMode::Require, true) => {
+        // Try / require encryption without verification. MariaDB 11.4+ clients verify the
+        // certificate by default, so turn that off explicitly (older clients accept the --skip-
+        // form too, as it is a boolean option). MariaDB's client cannot tell prefer from require
+        (SqlSslMode::Prefer | SqlSslMode::Require, true) => {
             vec!["--ssl".into(), "--skip-ssl-verify-server-cert".into()]
         }
         // MariaDB's client has no "chain only" mode, so verify-ca also checks the host name
@@ -926,6 +926,8 @@ pub async fn run_dump(
         }));
     }
     let bytes = std::fs::metadata(&partial)?.len();
+    // Replaces an existing file (the save dialog already asked) on Windows too: std's rename
+    // is MoveFileExW with MOVEFILE_REPLACE_EXISTING there (same as query_files::write_file_atomic)
     std::fs::rename(&partial, &output)?;
     partial_guard.keep();
     on_progress(bytes);
@@ -1104,7 +1106,10 @@ mod tests {
     fn mysql_tls_flags_follow_ssl_mode_and_client() {
         let mut s = server("mysql");
         assert!(mysql_tls_args(&s, false).unwrap().is_empty());
-        assert_eq!(mysql_tls_args(&s, true).unwrap(), vec!["--ssl"]);
+        assert_eq!(
+            mysql_tls_args(&s, true).unwrap(),
+            vec!["--ssl", "--skip-ssl-verify-server-cert"]
+        );
         s.ssl_mode = Some("require".into());
         assert_eq!(
             mysql_tls_args(&s, false).unwrap(),
