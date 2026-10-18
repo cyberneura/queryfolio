@@ -81,8 +81,9 @@ pub struct DbManager {
     /// Per-connection lock held while a pool / tunnel is being established, and while a
     /// password_command password is being refreshed
     connecting: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Per-connection count of password refresh attempts (see refresh_password)
-    password_refreshes: std::sync::Mutex<HashMap<String, u64>>,
+    /// Failed password refreshes per pool, keyed by the pool's current connect options
+    /// (ConnectOptionsSnapshot::key; see refresh_password)
+    password_refresh_failures: std::sync::Mutex<HashMap<usize, u64>>,
 }
 
 #[derive(Default)]
@@ -316,11 +317,10 @@ impl DbManager {
         if server.password_command.is_none() || !refreshable {
             return op(pool).await;
         }
-        let attempts_seen = self.password_refresh_attempts(&server.name);
+        let seen = self.refresh_state(&pool);
         match op(pool.clone()).await {
             Err(error) if should_refresh_password(retry, &error) => {
-                self.refresh_password(server, &pool, attempts_seen, error)
-                    .await?;
+                self.refresh_password(server, &pool, seen, error).await?;
                 op(pool).await
             }
             result => result,
@@ -329,22 +329,26 @@ impl DbManager {
 
     /// Re-runs password_command and applies its output to the pool.
     ///
-    /// Single-flight per connection: operations that hit the expiry together (TABLES pane,
-    /// completion, a query) wait on the connection lock, and only the first one runs the
-    /// command, so a helper that prompts (SSO, Touch ID) prompts once. The others see that an
-    /// attempt was made since they started and just retry. Attempts are counted whether or not
-    /// they succeed: otherwise every waiter would run a failing helper again (one prompt or one
-    /// 60-second timeout each); after a failed attempt their retry fails and reports the auth error
+    /// Single-flight per pool: operations that hit the expiry together (TABLES pane, completion,
+    /// a query) wait on the connection lock, and only the first one runs the command, so a
+    /// helper that prompts (SSO, Touch ID) prompts once. The others see that the pool was
+    /// refreshed (its connect options were replaced), or that an attempt on it failed, since
+    /// they started, and just retry. Failures count too: otherwise every waiter would run a
+    /// failing helper again (one prompt or one 60-second timeout each).
+    ///
+    /// The state belongs to the pool, not the connection name: an operation can still hold an
+    /// older pool of the connection (dropped by a schema switch / reload), and refreshing that
+    /// one says nothing about the pool another operation is using
     async fn refresh_password(
         &self,
         server: &ServerConfig,
         pool: &DbPool,
-        attempts_seen: u64,
+        seen: RefreshState,
         auth_error: AppError,
     ) -> Result<(), AppError> {
         let connect_lock = self.connect_lock(&server.name);
         let _refreshing = connect_lock.lock().await;
-        if self.password_refresh_attempts(&server.name) != attempts_seen {
+        if self.refresh_state(pool) != seen {
             return Ok(());
         }
         let Some(command) = server.password_command()? else {
@@ -355,33 +359,35 @@ impl DbManager {
             server.name
         );
         let fetched = crate::config::run_password_command(&server.name, command).await;
-        if let Ok(password) = &fetched {
-            set_pool_password(pool, password);
+        let key = seen.options.key();
+        let mut failures = self.password_refresh_failures.lock().unwrap();
+        match fetched {
+            Ok(password) => {
+                set_pool_password(pool, &password);
+                failures.remove(&key);
+                Ok(())
+            }
+            Err(refresh_error) => {
+                *failures.entry(key).or_insert(0) += 1;
+                // Report the command's failure too: the auth error alone would hide a problem on
+                // the token side (an expired SSO session etc.)
+                Err(AppError::Config(format!(
+                    "{auth_error}\nRe-running password_command failed: {refresh_error}"
+                )))
+            }
         }
-        // Counted when the attempt has finished: an operation that failed while it was running
-        // read the old count, and must retry rather than run the command again
-        *self
-            .password_refreshes
-            .lock()
-            .unwrap()
-            .entry(server.name.clone())
-            .or_insert(0) += 1;
-        // Report the command's failure too: the auth error alone would hide a problem on the
-        // token side (an expired SSO session etc.)
-        fetched.map(|_| ()).map_err(|refresh_error| {
-            AppError::Config(format!(
-                "{auth_error}\nRe-running password_command failed: {refresh_error}"
-            ))
-        })
     }
 
-    fn password_refresh_attempts(&self, connection: &str) -> u64 {
-        self.password_refreshes
+    fn refresh_state(&self, pool: &DbPool) -> RefreshState {
+        let options = ConnectOptionsSnapshot::of(pool);
+        let failures = self
+            .password_refresh_failures
             .lock()
             .unwrap()
-            .get(connection)
+            .get(&options.key())
             .copied()
-            .unwrap_or(0)
+            .unwrap_or(0);
+        RefreshState { options, failures }
     }
 
     /// Drops all pools and tunnels. Called when the config is reloaded.
@@ -391,6 +397,8 @@ impl DbManager {
         inner.tunnels.clear();
         inner.schema_overrides.clear();
         inner.reset_epoch += 1;
+        drop(inner);
+        self.password_refresh_failures.lock().unwrap().clear();
     }
 
     /// Drops the pool and SSH tunnel of the given connection.
@@ -765,6 +773,53 @@ fn should_refresh_password(retry: PasswordRetry, error: &AppError) -> bool {
     match retry {
         PasswordRetry::BeforeStatement => matches!(error, AppError::ConnectAuth(_)),
         PasswordRetry::Idempotent => is_auth_failure(error),
+    }
+}
+
+/// What refresh_password compares to tell whether the pool was refreshed, or a refresh of it
+/// failed, since an operation started
+#[derive(PartialEq)]
+struct RefreshState {
+    options: ConnectOptionsSnapshot,
+    failures: u64,
+}
+
+/// The connect options a pool uses right now. set_connect_options replaces the Arc, so a
+/// different Arc means the password was replaced. Holding the Arc keeps its address from being
+/// reused by the replacement, which would make the comparison lie
+enum ConnectOptionsSnapshot {
+    Postgres(Arc<sqlx::postgres::PgConnectOptions>),
+    MySql(Arc<sqlx::mysql::MySqlConnectOptions>),
+    Other,
+}
+
+impl ConnectOptionsSnapshot {
+    fn of(pool: &DbPool) -> Self {
+        match pool {
+            DbPool::Postgres(pool) => Self::Postgres(pool.connect_options()),
+            DbPool::MySql(pool) => Self::MySql(pool.connect_options()),
+            _ => Self::Other,
+        }
+    }
+
+    /// Identifies the options while a pool uses them (the pool holds the Arc meanwhile)
+    fn key(&self) -> usize {
+        match self {
+            Self::Postgres(options) => Arc::as_ptr(options) as usize,
+            Self::MySql(options) => Arc::as_ptr(options) as usize,
+            Self::Other => 0,
+        }
+    }
+}
+
+impl PartialEq for ConnectOptionsSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Postgres(a), Self::Postgres(b)) => Arc::ptr_eq(a, b),
+            (Self::MySql(a), Self::MySql(b)) => Arc::ptr_eq(a, b),
+            (Self::Other, Self::Other) => true,
+            _ => false,
+        }
     }
 }
 
@@ -4791,6 +4846,47 @@ mod tests {
                 assert_eq!(result.is_ok(), !helper_fails, "{result:?}");
             }
         }
+    }
+
+    /// Refreshing one pool of a connection does not stand in for another: an operation still
+    /// holding an older pool (dropped by a schema switch) refreshes that one, and an operation on
+    /// the current pool still refreshes its own
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_refresh_state_is_per_pool() {
+        // Arrange
+        let helper = CountingPasswordCommand::new("pw");
+        let (old_pool, server) = lazy_pg_pool_and_server(&helper);
+        let (new_pool, _) = lazy_pg_pool_and_server(&helper);
+        let manager = DbManager::default();
+        let seen_new = manager.refresh_state(&new_pool);
+        let old_calls = AtomicUsize::new(0);
+        let new_calls = AtomicUsize::new(0);
+        let connect_auth = || AppError::ConnectAuth(sqlx::Error::PoolTimedOut);
+        manager
+            .run_with_password_refresh(
+                &server,
+                old_pool,
+                PasswordRetry::BeforeStatement,
+                failing_op(&old_calls, vec![connect_auth]),
+            )
+            .await
+            .unwrap();
+
+        // Act
+        let result = manager
+            .run_with_password_refresh(
+                &server,
+                new_pool.clone(),
+                PasswordRetry::BeforeStatement,
+                failing_op(&new_calls, vec![connect_auth]),
+            )
+            .await;
+
+        // Assert
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(helper.runs(), 2);
+        assert!(manager.refresh_state(&new_pool) != seen_new);
     }
 
     /// A slow password_command does not delay get_pool for another connection that is open

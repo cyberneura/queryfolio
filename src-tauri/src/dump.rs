@@ -849,8 +849,13 @@ pub async fn run_dump(
     let server = match server.password_command()? {
         Some(command) => {
             let mut resolved = server.clone();
-            resolved.password =
-                Some(crate::config::run_password_command(&server.name, command).await?);
+            // A helper waiting on a prompt must stop with the dump (dropping it kills the child)
+            let password = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(AppError::Cancelled),
+                password = crate::config::run_password_command(&server.name, command) => password?,
+            };
+            resolved.password = Some(password);
             with_password = resolved;
             &with_password
         }
@@ -1442,6 +1447,38 @@ mod tests {
         // Assert
         let text = std::fs::read_to_string(&output).unwrap();
         assert!(text.contains("-- pw: fresh-token"), "{text}");
+    }
+
+    /// Cancelling while password_command is still running stops the dump right away
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_stops_a_waiting_password_command() {
+        use std::os::unix::fs::PermissionsExt;
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("pg_dump");
+        std::fs::write(&tool, "#!/bin/sh\necho 'pg_dump (PostgreSQL) 16.0'\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut req = request();
+        req.tool_path = tool.to_string_lossy().into_owned();
+        req.output_path = dir.path().join("out.sql").to_string_lossy().into_owned();
+        let mut s = server("postgres");
+        s.password = None;
+        s.password_command = Some("/bin/sleep 30".into());
+        let cancel = CancellationToken::new();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            canceller.cancel();
+        });
+        let started = std::time::Instant::now();
+
+        // Act
+        let err = run_dump(&s, &req, Some("shop"), cancel, |_| {}).await.unwrap_err();
+
+        // Assert
+        assert!(matches!(err, AppError::Cancelled), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[cfg(unix)]
