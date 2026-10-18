@@ -13,6 +13,25 @@ https://github.com/user-attachments/assets/90439816-49c8-4ebd-a068-b102cfe9c7aa
 
 ![Queryfolio screenshot](docs/screenshot.png)
 
+## Who it's for / goal
+
+Queryfolio is built as its developer's own everyday SQL client: one app for the MySQL /
+PostgreSQL / SQLite / DuckDB / SQL Server / Redis / Elasticsearch / DynamoDB connections used
+at work, with guards that make it hard to change data by accident. **The goal is to make that
+personal workflow comfortable**, not to grow a user base. Others are welcome to use it, but
+features are added when they help this workflow.
+
+What this means in practice:
+
+- A feature request is judged by "does it make the developer's own day-to-day database work
+  faster or safer?", not by what other SQL clients offer or by what might attract users.
+- Work that mainly serves new users (the Windows build, the product page, wider distribution)
+  is low priority. The Windows build is kept because it is cheap to keep building.
+- Release download counts, stars and product-page traffic are not tracked as success numbers.
+  The measure is whether the developer keeps reaching for Queryfolio instead of other clients,
+  and whether the safety guards (readonly / Writable, dangerous-statement checks) keep doing
+  their job.
+
 ## Features
 
 - MySQL / PostgreSQL / SQLite support (via sqlx)
