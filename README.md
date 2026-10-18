@@ -2,6 +2,8 @@
 
 SQL client desktop app. A lightweight, multi-purpose SQL GUI client.
 
+Website: https://www.cyberneura.com/app/queryfolio
+
 One app for several database engines: **MySQL / PostgreSQL / SQLite / DuckDB / Microsoft SQL Server** on the SQL side,
 plus **Redis / Elasticsearch / DynamoDB**. The editor language and the unit of execution switch
 per engine, and each engine declares what it supports, so features it lacks are hidden from the
