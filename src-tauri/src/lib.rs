@@ -13,6 +13,7 @@ mod router;
 mod schema_info;
 mod third_party_notices;
 mod tunnel;
+mod update_check;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1931,6 +1932,9 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
     // Place it right under About (the app menu on macOS, the Help menu elsewhere)
     let licenses_item =
         MenuItemBuilder::with_id("show_licenses", "Third-Party Licenses").build(app)?;
+    // Next to them: a manual update check (CYBERNEURA-DEV-1079, update_check.rs)
+    let update_item =
+        MenuItemBuilder::with_id("check_for_updates", "Check for Updates…").build(app)?;
 
     #[cfg(target_os = "macos")]
     let app_menu = {
@@ -1944,6 +1948,7 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
                 Some(about_metadata(app)),
             )?)
             .item(&licenses_item)
+            .item(&update_item)
             .separator()
             .services()
             .separator()
@@ -1994,7 +1999,8 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
         #[cfg(not(target_os = "macos"))]
         let builder = builder
             .about(Some(about_metadata(app)))
-            .item(&licenses_item);
+            .item(&licenses_item)
+            .item(&update_item);
         builder.build()?
     };
 
@@ -2313,6 +2319,7 @@ pub fn run() {
                     eprintln!("[menu] failed to emit show licenses event: {e}");
                 }
             }
+            "check_for_updates" => update_check::check_for_updates(app),
             "view_override_config" => {
                 if let Err(e) = app.emit("menu-view-override-config", ()) {
                     eprintln!("[menu] failed to emit view override config event: {e}");
