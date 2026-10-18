@@ -1,6 +1,6 @@
 <script lang="ts">
   interface Props {
-    /// 危険と判定した理由 (バックエンドの英語メッセージ)
+    /// Reason it was judged dangerous (English message from the backend)
     reason: string;
     onConfirm: () => void;
     onCancel: () => void;

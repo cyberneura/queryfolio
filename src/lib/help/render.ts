@@ -1,9 +1,9 @@
-/// ヘルプ本文 (Markdown) を表示用のブロックへ分解する。
+/// Split the help body (Markdown) into blocks for display.
 ///
-/// 完全な Markdown レンダラは持ち込まない。ここで扱うのは自分たちで書いた
-/// ヘルプだけなので、実際に使っている記法 (見出し / コードフェンス / 箇条書き /
-/// 段落) に絞る。HTML を組み立てず構造だけ返すので、表示側は Svelte の
-/// マークアップで描ける (innerHTML を使わずに済む)。
+/// We do not bring in a full Markdown renderer. This only handles help text we wrote
+/// ourselves, so it is limited to the syntax actually used (headings / code fences / bullet
+/// lists / paragraphs). It returns only structure without building HTML, so the view side
+/// can render it with Svelte markup (no need for innerHTML).
 
 export type HelpBlock =
   | { type: "heading"; level: 1 | 2; text: string }
@@ -12,9 +12,9 @@ export type HelpBlock =
   | { type: "paragraph"; text: string };
 
 /**
- * ヘルプ本文をブロック列に分解する。
- * @param markdown - ヘルプの Markdown
- * @returns 表示用ブロックの配列
+ * Split the help body into a list of blocks.
+ * @param markdown - The help Markdown
+ * @returns Array of blocks for display
  */
 export function parseHelpDoc(markdown: string): HelpBlock[] {
   const blocks: HelpBlock[] = [];
@@ -43,7 +43,7 @@ export function parseHelpDoc(markdown: string): HelpBlock[] {
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
 
-    // コードフェンス。閉じフェンスが無いまま終わっても、そこまでを 1 ブロックにする
+    // Code fence. Even if the closing fence is missing, treat everything up to the end as one block
     if (line.startsWith("```")) {
       flushAll();
       const content: string[] = [];
@@ -79,7 +79,7 @@ export function parseHelpDoc(markdown: string): HelpBlock[] {
       continue;
     }
 
-    // 箇条書きの継続行 (インデントされた折り返し) は直前の項目に足す
+    // A bullet continuation line (an indented wrapped line) is appended to the previous item
     if (list.length > 0 && /^\s+\S/.test(line)) {
       list[list.length - 1] = `${list[list.length - 1]} ${line.trim()}`;
       continue;
@@ -93,21 +93,21 @@ export function parseHelpDoc(markdown: string): HelpBlock[] {
   return blocks;
 }
 
-/// インライン記法のうち、ヘルプで実際に使うのは `code` と **strong** の 2 つ。
-/// これも HTML にせず、描画側が繰り返せる断片の列にして返す。
+/// Of the inline syntax, the help only uses `code` and **strong**.
+/// This also returns a sequence of fragments the renderer can iterate over, not HTML.
 export interface InlineSpan {
   type: "text" | "code" | "strong";
   text: string;
 }
 
 /**
- * 段落・箇条書きの 1 行をインライン断片へ分解する。
- * @param text - 対象の 1 行
- * @returns インライン断片の配列
+ * Split one line of a paragraph / bullet into inline fragments.
+ * @param text - The line to process
+ * @returns Array of inline fragments
  */
 export function parseInline(text: string): InlineSpan[] {
   const spans: InlineSpan[] = [];
-  // `code` を先に切る (** の中に ` が来ることは想定しない)
+  // Split out `code` first (we do not expect a ` inside **)
   const pattern = /`([^`]+)`|\*\*([^*]+)\*\*/g;
   let last = 0;
   let match: RegExpExecArray | null;

@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
-# 配布物に含まれる依存ライブラリのライセンスを THIRD-PARTY-NOTICES.txt に書き出す。
-# `pnpm notices` から呼ばれる。依存を足したり上げたりしたら流し直してコミットする
-# (lib.rs のテストが、直接依存がこのファイルに載っているかを見る)。
+# Write the licenses of the dependency libraries included in the distribution to THIRD-PARTY-NOTICES.txt.
+# Called from `pnpm notices`. Re-run and commit it whenever dependencies are added or bumped
+# (a test in lib.rs checks that the direct dependencies are listed in this file).
 #
-# 節は 3 つ:
-# - JavaScript: package.json の dependencies を推移的に (pnpm licenses list --prod)。
-#   加えて、devDependencies にあるがビルドで webview に bundle されるものを
-#   BUNDLED_DEV_PACKAGES に列挙する (svelte / SvelteKit のランタイム、svelte-sonner と
-#   その依存、CSS に入る tailwindcss、フォントを同梱する bootstrap-icons)。
-#   この一覧は `vite build` に sourcemap を出させ、sources に現れる node_modules の
-#   パッケージを数えて決めた。devDependencies に bundle されるものを足したらここにも足す。
-# - Rust: cargo-about (`cargo install cargo-about --locked --features cli`)。
-#   設定は src-tauri/about.toml、書式は src-tauri/about.hbs。
-# - Native: crate が C / C++ のソースを同梱して静的リンクするライブラリ (OpenSSL / libssh2 /
-#   zlib / SQLite / DuckDB が third_party に同梱するもの)。crate 自身のライセンスは Rust 節に
-#   出るが、同梱しているライブラリのライセンスは別物なので、crate のソース (DuckDB は同じ
-#   version のタグの DuckDB リポジトリ。GitHub へのネットワーク接続が要る) から本文を読んで載せる。
+# There are 3 sections:
+# - JavaScript: package.json dependencies, transitively (pnpm licenses list --prod).
+#   In addition, packages that are in devDependencies but get bundled into the webview by the build
+#   are listed in BUNDLED_DEV_PACKAGES (the svelte / SvelteKit runtime, svelte-sonner and its
+#   dependencies, tailwindcss which ends up in the CSS, and bootstrap-icons which ships the font).
+#   This list was determined by having `vite build` emit a sourcemap and counting the node_modules
+#   packages that appear in its sources. If you add a devDependency that gets bundled, add it here too.
+# - Rust: cargo-about (`cargo install cargo-about --locked --features cli`).
+#   The config is src-tauri/about.toml and the format is src-tauri/about.hbs.
+# - Native: libraries that crates ship C / C++ sources for and link statically (OpenSSL / libssh2 /
+#   zlib / SQLite / what DuckDB bundles in third_party). The crate's own license appears in the Rust
+#   section, but the license of the library it bundles is a separate one, so we read the text from the
+#   crate's source (for DuckDB, the DuckDB repository at the tag of the same version; this needs a
+#   network connection to GitHub) and include it.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -31,8 +32,8 @@ if [ ! -d node_modules ]; then
   exit 1
 fi
 
-# 同じディレクトリに作る。別ファイルシステムの /tmp からの mv はコピーになり、途中で
-# 止まると壊れた出力が残る
+# Create it in the same directory. An mv from /tmp on a different filesystem becomes a copy, and
+# if it stops midway a broken output is left behind
 TMP=$(mktemp "${OUT}.XXXXXX")
 PROD_JSON=$(mktemp "${OUT}.prod.XXXXXX")
 ALL_JSON=$(mktemp "${OUT}.all.XXXXXX")
@@ -82,7 +83,7 @@ const flatten = (file) =>
 const packages = new Map();
 const add = (entry) => {
   if (entry.versions.length !== 1) {
-    // 複数 version が入っていると、どれが bundle されたかをここでは決められない
+    // If multiple versions are present, we cannot decide here which one was bundled
     throw new Error(`${entry.name} has several versions: ${entry.versions.join(", ")}`);
   }
   packages.set(entry.name, { name: entry.name, version: entry.versions[0], dir: entry.paths[0] });
@@ -99,7 +100,7 @@ for (const pkg of [...packages.values()].sort((a, b) => a.name.localeCompare(b.n
   const manifest = JSON.parse(fs.readFileSync(path.join(pkg.dir, "package.json"), "utf8"));
   const repo =
     typeof manifest.repository === "string" ? manifest.repository : manifest.repository?.url;
-  // LICENSE.spdx のような SPDX のメタデータは本文ではないので除く
+  // SPDX metadata such as LICENSE.spdx is not license text, so exclude it
   const files = fs
     .readdirSync(pkg.dir)
     .filter((f) => /^(LICEN[CS]E|COPYING|NOTICE)/i.test(f) && !/\.spdx$/i.test(f))
@@ -111,9 +112,9 @@ for (const pkg of [...packages.values()].sort((a, b) => a.name.localeCompare(b.n
   console.log(`  ${pkg.name} ${pkg.version}${repo ? ` (${repo})` : ""}`);
   console.log("");
   if (files.length === 0) {
-    // 本文の無い package を黙って通すと、notices から本文が抜けたことに誰も気付かない。
-    // 許すのは Tauri プラグインの JS 側だけ: 同じリポジトリ・同じライセンスの Rust crate
-    // (tauri-plugin-<name>) が Rust 節に本文付きで載るので、そちらを指す
+    // Silently letting through a package with no license text would let the text vanish from the notices
+    // unnoticed. Only the JS side of Tauri plugins is allowed: the Rust crate with the same repository and
+    // same license (tauri-plugin-<name>) appears in the Rust section with its text, so point to that
     const plugin = pkg.name.match(/^@tauri-apps\/plugin-(.+)$/);
     const crate = plugin && `tauri-plugin-${plugin[1]}`;
     if (!crate || !crates.has(crate)) {
@@ -140,7 +141,7 @@ NODE
 
 HEADER
 
-  # --fail: ライセンスを特定できない crate があれば警告で省略せず失敗させる
+  # --fail: if there is a crate whose license cannot be identified, fail instead of omitting it with a warning
   cargo about generate --manifest-path src-tauri/Cargo.toml --locked --fail src-tauri/about.hbs
 
   cat <<'HEADER'
@@ -154,11 +155,11 @@ HEADER
 const fs = require("fs");
 const path = require("path");
 
-// crate, library, SPDX, files (crate ディレクトリからの相対パス。null は本文なしの注記)
+// crate, library, SPDX, files (paths relative to the crate directory; null is a note with no text)
 const NATIVE = [
   ["openssl-src", "OpenSSL", "Apache-2.0", ["openssl/LICENSE.txt"]],
   ["libssh2-sys", "libssh2", "BSD-3-Clause", ["libssh2/COPYING"]],
-  // macOS は OS の libz をリンクし、Windows ではこのソースから静的にビルドする
+  // macOS links the OS's libz; on Windows it is built statically from this source
   ["libz-sys", "zlib", "Zlib", ["src/zlib/LICENSE"]],
   ["libsqlite3-sys", "SQLite", "blessing", null],
 ];
@@ -190,12 +191,11 @@ for (const [crate, library, license, files] of NATIVE) {
   }
 }
 
-// DuckDB (libduckdb-sys の bundled) は third_party/ に他のライブラリを同梱してまとめて
-// 静的リンクする。crate の tarball にはそれらのライセンスファイルが入っていないので、
-// tarball が同梱している DuckDB の version を読み、同じタグの DuckDB リポジトリから
-// third_party/<dir>/ のライセンスファイルを取ってくる。
-// 未知のディレクトリが増えたら止める: ライセンスを確かめずに載せると、GPL のような
-// 配布条件の変わるものが紛れても気付けないため。確かめてからここに足す。
+// DuckDB (libduckdb-sys's bundled) ships other libraries in third_party/ and links them all statically.
+// The crate tarball does not include their license files, so we read the DuckDB version the tarball
+// bundles and fetch the license files under third_party/<dir>/ from the DuckDB repository at the same tag.
+// Stop when an unknown directory appears: if we included it without checking the license, something
+// like a GPL component with different distribution terms could slip in unnoticed. Check it, then add it here.
 const DUCKDB_THIRD_PARTY = {
   brotli: "MIT",
   concurrentqueue: "BSD-2-Clause OR BSL-1.0",

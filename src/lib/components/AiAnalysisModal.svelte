@@ -3,10 +3,10 @@
   import { splitMarkdownSegments } from "$lib/markdown";
 
   interface Props {
-    /// モーダルの見出し (EXPLAIN 解説と選択 SQL 解説で使い回すため
-    /// 差し替え可能にする。省略時は EXPLAIN 解説用の見出し)
+    /// The modal heading (replaceable, since it is reused for the EXPLAIN explanation and the
+    /// selected-SQL explanation. When omitted, the heading for the EXPLAIN explanation)
     title?: string;
-    /// AI 解説の Markdown テキスト
+    /// Markdown text of the AI explanation
     text: string;
     onClose: () => void;
   }
@@ -15,13 +15,13 @@
 
   let copied = $state(false);
 
-  // Markdown の表示区間 (完全なレンダラは持たず、コードブロックの
-  // 装飾 + テキストの pre-wrap 表示のみ行う。ChatPane と共用)
+  // Markdown display segments (no full renderer; only code block decoration +
+  // pre-wrap text display. Shared with ChatPane)
   const segments = $derived(splitMarkdownSegments(text));
 
   const copy = async () => {
-    // navigator.clipboard は Tauri 2 で OS のパーミッションプロンプトが
-    // 出ることがあるため、公式プラグイン経由で書き込む
+    // navigator.clipboard may show an OS permission prompt in Tauri 2,
+    // so write through the official plugin
     await writeText(text);
     copied = true;
     setTimeout(() => {

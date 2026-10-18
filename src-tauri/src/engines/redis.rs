@@ -1,19 +1,19 @@
-//! Redis エンジン。
+//! Redis engine.
 //!
-//! エディタの 1 行 = 1 コマンド (`GET my-key` / `MGET a b c` ...) として実行する。
-//! 複数行 (選択実行) は同一コネクション上で上から順に実行する。
-//! sqlx を使わず `redis` crate で接続し、結果 (RESP 値) を QueryResult の
-//! 表形式へ整形して返す。
+//! One editor line = one command (`GET my-key` / `MGET a b c` ...).
+//! Multiple lines (selection execution) run top to bottom on the same connection.
+//! Connects with the `redis` crate instead of sqlx, and formats the result (RESP values)
+//! into the tabular QueryResult shape.
 //!
-//! - 接続はクエリ実行のたびに `redis::Client` から multiplexed connection を
-//!   新規に張る (キャンセルで実行途中に接続を放棄してもプールに壊れた
-//!   コネクションが残らない。接続コストは小さい)。
-//! - readonly ガードは読み取りコマンドのホワイトリスト方式 (SQL のような
-//!   構文解析ができないため、既知の読み取りコマンドのみ許可する)。
-//! - 危険コマンド (FLUSHALL / FLUSHDB 等) は SQL の危険文ガードと同じ扱い。
-//! - キャンセルはクライアント側で実行を打ち切る (`CancelTarget::ClientSide`)。
-//!   サーバー側で文を止める手段が無いため、実行中コマンドはサーバー上では
-//!   完了し得るが、接続ごと破棄するので結果は読まれない。
+//! - A fresh multiplexed connection is opened from `redis::Client` on every query execution
+//!   (so a connection abandoned mid-execution by cancellation never leaves a broken
+//!   connection in a pool. Connection cost is small).
+//! - The readonly guard is a whitelist of read commands (SQL-style parsing is not possible,
+//!   so only known read commands are allowed).
+//! - Dangerous commands (FLUSHALL / FLUSHDB etc.) are treated like the SQL dangerous-statement guard.
+//! - Cancellation aborts execution on the client side (`CancelTarget::ClientSide`).
+//!   There is no way to stop a statement on the server, so the running command may still
+//!   complete there, but the connection is dropped so its result is never read.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -31,12 +31,12 @@ use crate::error::AppError;
 
 pub const DEFAULT_PORT: u16 = 6379;
 
-/// 接続確立 (PING 確認込み) のタイムアウト。
+/// Timeout for establishing the connection (including the PING check).
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// readonly 接続 / Writable スイッチ OFF で実行を許可する読み取りコマンド。
-/// SQL と違い構文からの判定ができないため、既知の読み取りコマンドの
-/// ホワイトリストで判定する (未知のコマンドは安全側 = 拒否に倒れる)。
+/// Read commands allowed on a readonly connection / with the Writable switch OFF.
+/// Unlike SQL, this cannot be decided from syntax, so it uses a whitelist of known read
+/// commands (unknown commands fall on the safe side = rejected).
 const READONLY_COMMANDS: &[&str] = &[
     // keys / generic
     "GET", "MGET", "STRLEN", "GETRANGE", "SUBSTR", "EXISTS", "TYPE", "TTL", "PTTL",
@@ -65,23 +65,23 @@ const READONLY_COMMANDS: &[&str] = &[
     "INFO", "PING", "ECHO", "TIME", "LASTSAVE", "COMMAND", "LOLWUT",
 ];
 
-/// pub/sub / モニタ系は multiplexed connection のリクエスト/レスポンス
-/// モデルで扱えないため、writable でも常に拒否する。
+/// pub/sub and monitor commands cannot be handled by the request/response model of a
+/// multiplexed connection, so they are always rejected even when writable.
 const UNSUPPORTED_COMMANDS: &[&str] = &[
     "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE", "SSUBSCRIBE",
     "SUNSUBSCRIBE", "MONITOR",
 ];
 
-/// ブロッキングコマンド。クライアント側キャンセル (future の打ち切り) では
-/// サーバー側の待機は止まらず、応答が来るまで接続 (ソケット/タスク) が
-/// 塞がったままリークするため、実行前に拒否する。
+/// Blocking commands. Aborting on the client side (dropping the future) does not stop the
+/// server-side wait, and the connection (socket/task) would stay blocked and leak until a
+/// reply arrives, so they are rejected before execution.
 const BLOCKING_COMMANDS: &[&str] = &[
     "BLPOP", "BRPOP", "BLMOVE", "BRPOPLPUSH", "BLMPOP",
     "BZPOPMIN", "BZPOPMAX", "BZMPOP", "WAIT", "WAITAOF",
 ];
 
-/// 実行できないコマンドならその理由を返す (pub/sub 系・ブロッキング系・
-/// BLOCK オプション付きの XREAD / XREADGROUP)。
+/// Returns the reason if the command cannot be executed (pub/sub, blocking commands,
+/// and XREAD / XREADGROUP with the BLOCK option).
 fn unsupported_reason(args: &[Vec<u8>]) -> Option<String> {
     let name = command_name(args);
     if UNSUPPORTED_COMMANDS.contains(&name.as_str()) {
@@ -93,10 +93,10 @@ fn unsupported_reason(args: &[Vec<u8>]) -> Option<String> {
         ));
     }
     if matches!(name.as_str(), "XREAD" | "XREADGROUP") {
-        // BLOCK オプションは STREAMS キーワードより前にしか現れない
-        // (STREAMS 以降はストリーム名 / ID なので、BLOCK という名前の
-        // ストリームを誤検知しない)。XREADGROUP は先頭の GROUP <group>
-        // <consumer> も読み飛ばす (グループ名 / コンシューマ名も対象外)。
+        // The BLOCK option can only appear before the STREAMS keyword
+        // (everything after STREAMS is stream names / IDs, so a stream that happens to be named
+        // BLOCK is not misdetected). XREADGROUP also skips the leading GROUP <group>
+        // <consumer> (group and consumer names are excluded too).
         let mut options: &[Vec<u8>] = &args[1..];
         if name == "XREADGROUP"
             && options
@@ -119,10 +119,10 @@ fn unsupported_reason(args: &[Vec<u8>]) -> Option<String> {
     None
 }
 
-/// readonly 接続 / Writable スイッチ OFF で実行を許可するコマンドか。
-/// 基本はホワイトリスト (READONLY_COMMANDS) だが、サブコマンドで読み書きが
-/// 分かれる親コマンドはサブコマンド単位で判定する
-/// (MEMORY PURGE はサーバー側のメンテナンス操作なので許可しない)。
+/// Whether the command may run on a readonly connection / with the Writable switch OFF.
+/// Normally a whitelist (READONLY_COMMANDS), but parent commands whose subcommands split
+/// into read and write are judged per subcommand
+/// (MEMORY PURGE is a server maintenance operation, so it is not allowed).
 fn is_readonly_command(args: &[Vec<u8>]) -> bool {
     let name = command_name(args);
     if name == "MEMORY" {
@@ -137,9 +137,9 @@ fn is_readonly_command(args: &[Vec<u8>]) -> bool {
     READONLY_COMMANDS.contains(&name.as_str())
 }
 
-/// 誤操作で全キー消失やサーバー停止を招く危険コマンドの理由を返す。
-/// SQL の dangerous_reason と同じ扱い (allow_dangerous_statements が無効なら
-/// 拒否、有効ならフロントが実行前に確認を出す)。
+/// Returns the reason for dangerous commands that can wipe all keys or stop the server by mistake.
+/// Treated like dangerous_reason for SQL (rejected unless allow_dangerous_statements is
+/// enabled; if enabled, the frontend asks for confirmation before running).
 fn dangerous_command_reason(command: &str) -> Option<&'static str> {
     match command {
         "FLUSHALL" => Some("FLUSHALL would remove every key from all databases."),
@@ -150,9 +150,9 @@ fn dangerous_command_reason(command: &str) -> Option<&'static str> {
     }
 }
 
-/// 入力全体 (複数行可) から最初の危険コマンドの理由を返す。
-/// フロントの実行前確認ダイアログ用 (db::dangerous_statement_reason から呼ぶ)。
-/// パースできない入力は None (実行時に構文エラーとして返る)。
+/// Returns the reason for the first dangerous command in the whole input (multiple lines allowed).
+/// For the frontend pre-execution confirmation dialog (called from db::dangerous_statement_reason).
+/// Unparseable input yields None (it is returned as a syntax error at execution time).
 pub fn dangerous_reason_for_input(input: &str) -> Option<&'static str> {
     let commands = parse_input(input).ok()?;
     commands
@@ -160,16 +160,16 @@ pub fn dangerous_reason_for_input(input: &str) -> Option<&'static str> {
         .find_map(|args| dangerous_command_reason(&command_name(args)))
 }
 
-/// コマンド名 (先頭トークン) を大文字で返す。
-/// 引数はバイナリ安全のためバイト列で持つ (\xHH エスケープで任意のバイトを
-/// 送れる)。コマンド名の判定は lossy な UTF-8 変換で行う。
+/// Returns the command name (first token) in upper case.
+/// Arguments are kept as bytes to be binary safe (arbitrary bytes can be sent with \xHH
+/// escapes). The command name is judged via a lossy UTF-8 conversion.
 fn command_name(args: &[Vec<u8>]) -> String {
     args.first()
         .map(|a| String::from_utf8_lossy(a).to_ascii_uppercase())
         .unwrap_or_default()
 }
 
-/// 表示用にコマンドを 1 行のテキストへ戻す (複数コマンド結果の command カラム用)。
+/// Turns the command back into one line of text for display (for the command column of multi-command results).
 fn display_command(args: &[Vec<u8>]) -> String {
     args.iter()
         .map(|a| String::from_utf8_lossy(a).into_owned())
@@ -177,8 +177,8 @@ fn display_command(args: &[Vec<u8>]) -> String {
         .join(" ")
 }
 
-/// エディタの入力をコマンド列に分解する。
-/// 1 行 = 1 コマンド。空行と `#` 始まりのコメント行は無視する。
+/// Splits the editor input into a list of commands.
+/// One line = one command. Blank lines and `#`-prefixed comment lines are ignored.
 fn parse_input(input: &str) -> Result<Vec<Vec<Vec<u8>>>, AppError> {
     let mut commands = Vec::new();
     for line in input.lines() {
@@ -194,17 +194,17 @@ fn parse_input(input: &str) -> Result<Vec<Vec<Vec<u8>>>, AppError> {
     Ok(commands)
 }
 
-/// char を UTF-8 バイト列としてトークンへ積む。
+/// Pushes a char onto the token as UTF-8 bytes.
 fn push_char(token: &mut Vec<u8>, c: char) {
     let mut buf = [0u8; 4];
     token.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
 }
 
-/// 1 行を redis-cli 互換の規則でトークン列に分解する。
-/// - 空白区切り
-/// - "..." (ダブルクォート): \\ \" \n \t \r \a \b \xHH のエスケープに対応
-/// - '...' (シングルクォート): \' と \\ のみエスケープ
-/// - 閉じクォートの直後は空白か行末でなければならない
+/// Splits one line into tokens using redis-cli compatible rules.
+/// - Whitespace separated
+/// - "..." (double quotes): supports the escapes \\ \" \n \t \r \a \b \xHH
+/// - '...' (single quotes): only \' and \\ are escapes
+/// - A closing quote must be followed by whitespace or end of line
 fn parse_command_line(line: &str) -> Result<Vec<Vec<u8>>, AppError> {
     let mut args: Vec<Vec<u8>> = Vec::new();
     let chars: Vec<char> = line.chars().collect();
@@ -230,9 +230,9 @@ fn parse_command_line(line: &str) -> Result<Vec<Vec<u8>>, AppError> {
                         'a' => token.push(0x07),
                         'b' => token.push(0x08),
                         'x' => {
-                            // \xHH (16 進 2 桁) は生のバイトを積む (redis-cli と
-                            // 同じバイナリ安全。0x80 以上も UTF-8 化しない)。
-                            // 不正なら文字どおりに扱う
+                            // \xHH (2 hex digits) pushes a raw byte (binary safe like redis-cli;
+                            // bytes 0x80 and above are not UTF-8 converted either).
+                            // Invalid ones are treated literally
                             let hex: String = chars[i + 2..].iter().take(2).collect();
                             if hex.len() == 2 {
                                 if let Ok(byte) = u8::from_str_radix(&hex, 16) {
@@ -288,7 +288,7 @@ fn parse_command_line(line: &str) -> Result<Vec<Vec<u8>>, AppError> {
             args.push(token);
             continue;
         }
-        // クォートの閉じ直後は区切り (空白 or 行末) を要求する (redis-cli と同じ)
+        // After a closing quote a delimiter (whitespace or end of line) is required (same as redis-cli)
         if i < chars.len() && !chars[i].is_whitespace() {
             return Err(AppError::Redis(
                 "A closing quote must be followed by a space".into(),
@@ -299,18 +299,18 @@ fn parse_command_line(line: &str) -> Result<Vec<Vec<u8>>, AppError> {
     Ok(args)
 }
 
-/// `CONFIG GET databases` が取れなかった場合に使う database 数。
-/// Redis / Valkey の既定値。
+/// Number of databases to use when `CONFIG GET databases` could not be obtained.
+/// The default for Redis / Valkey.
 const DEFAULT_DATABASE_COUNT: i64 = 16;
 
-/// プルダウンに並べる database 番号の上限。
-/// `CONFIG GET databases` は理屈上いくらでも大きい値を返せるので、
-/// 選択肢の生成が暴れないよう頭を押さえる。
+/// Upper bound on the database numbers listed in the dropdown.
+/// `CONFIG GET databases` could in theory return an arbitrarily large value, so cap it
+/// to keep option generation from running away.
 const MAX_DATABASE_COUNT: i64 = 1024;
 
-/// database 番号の一覧 ("0" 〜 "N-1") を作る。
+/// Builds the list of database numbers ("0" to "N-1").
 ///
-/// 0 以下や壊れた値は既定値に、大きすぎる値は MAX_DATABASE_COUNT に丸める。
+/// Values of 0 or less and broken values fall back to the default; too-large values are clamped to MAX_DATABASE_COUNT.
 fn database_names(count: i64) -> Vec<String> {
     let count = if count <= 0 {
         DEFAULT_DATABASE_COUNT
@@ -320,34 +320,34 @@ fn database_names(count: i64) -> Vec<String> {
     (0..count).map(|db| db.to_string()).collect()
 }
 
-/// 選択できる database 番号の一覧 ("0" 〜 "N-1") を返す (CYBERNEURA-DEV-408)。
+/// Returns the selectable database numbers ("0" to "N-1") (CYBERNEURA-DEV-408).
 ///
-/// 数は `CONFIG GET databases` で取る。ACL で CONFIG を禁止している環境や、
-/// マネージドサービスで応答が返らない環境があるため、**取れなければ既定の 16 に
-/// 倒す** (一覧が出ないより、既定値で出したほうが使える)。
-/// 値が壊れていた場合も同じ扱いにする。
+/// The count is taken with `CONFIG GET databases`. Some environments forbid CONFIG via ACL,
+/// and managed services may not respond, so **if it cannot be obtained, fall back to the
+/// default 16** (showing a list with the default is more useful than showing none).
+/// The same applies when the value is broken.
 ///
-/// 既定値へ倒れた場合、実際の database 数が 16 より多い環境では 16 以降を
-/// プルダウンから選べない。ただし**設定 / オーバーライドで現在選ばれている番号は
-/// 一覧に無くても選択肢に残る** (EditorToolbar が activeSchema を option として
-/// 足すため)。逆に 16 未満の環境では存在しない番号が並ぶ。**選んだ時点では成功として
-/// 扱われ、失敗するのは次のクエリ**になる。これは redis に限らず Database 欄の共通の
-/// 挙動で (`set_active_schema` はオーバーライドを保存するだけ。接続して検証するのは
-/// メタコマンドの経路のみ)、失敗時は `rollback_schema_override` が元へ戻すので
-/// 壊れた状態にはならない。選択時に検証しようとすると、接続を遅延確立する設計
-/// (AGENTS.md の「接続 (SSH トンネル) の遅延確立」) とぶつかるため踏み込まない。
+/// When it falls back to the default and the real database count is more than 16, numbers
+/// from 16 on cannot be chosen from the dropdown. However, **the number currently selected by
+/// config / override stays in the options even if absent from the list** (EditorToolbar adds
+/// activeSchema as an option). Conversely, with fewer than 16, nonexistent numbers are listed.
+/// **Selecting one is treated as a success; the failure comes at the next query.** This is
+/// common to the Database field, not just redis (`set_active_schema` only stores the override;
+/// only the meta-command path connects and verifies), and on failure `rollback_schema_override`
+/// restores the previous value, so it never ends up broken. Verifying at selection would collide
+/// with the lazy connection design (AGENTS.md, "lazy establishment of the connection (SSH tunnel)"), so we do not.
 pub async fn list_databases(client: &redis::Client) -> Result<Vec<String>, AppError> {
     let count = match open_connection(client).await {
         Ok(mut conn) => {
             let mut cmd = redis::cmd("CONFIG");
             cmd.arg("GET").arg("databases");
-            // 応答は ["databases", "16"] (RESP2) か {databases: 16} (RESP3)。
-            // どちらも 2 要素の文字列列として読めるので Vec<String> で受ける。
+            // The reply is ["databases", "16"] (RESP2) or {databases: 16} (RESP3).
+            // Either can be read as a 2-element string sequence, so receive it as Vec<String>.
             //
-            // PING と同じくタイムアウトを掛ける。open_connection が見るのは接続の
-            // 確立までで、TCP は繋がるのに応答しない相手 (止まった SSH トンネル /
-            // half-open なサービス) だとこの await が戻らなくなる。
-            // 落ちたら既定値へ倒す (一覧が出ないより既定値で出したほうが使える)
+            // Apply a timeout, as with PING. open_connection only waits for the connection to be
+            // established; with a peer that accepts TCP but never responds (a stalled SSH tunnel /
+            // half-open service) this await would never return.
+            // On failure, fall back to the default (showing the default list is more useful than none)
             let reply: Result<Vec<String>, _> =
                 match tokio::time::timeout(CONNECT_TIMEOUT, cmd.query_async(&mut conn)).await {
                     Ok(reply) => reply,
@@ -363,21 +363,21 @@ pub async fn list_databases(client: &redis::Client) -> Result<Vec<String>, AppEr
     Ok(database_names(count))
 }
 
-/// 接続先アドレスを組み立てる。`tls` が true なら TLS 付き (`rediss://` 相当)。
+/// Builds the target address. If `tls` is true, uses TLS (equivalent to `rediss://`).
 ///
-/// `insecure` は常に false。ここを true にすると任意のサイト向けの正当な証明書が
-/// 通ってしまい、中間者攻撃をそのまま受け入れる。`tls: true` と書いた利用者の期待は
-/// 「経路が守られている」ことなので、検証しない TLS を黙って提供しない
-/// (config.rs が verify しない ssl_mode と ssl_root_cert の併記を設定エラーに
-/// しているのと同じ方針)。
+/// `insecure` is always false. Setting it to true would accept any valid certificate issued
+/// for any site, i.e. accept man-in-the-middle attacks as is. A user who wrote `tls: true`
+/// expects "the path is protected", so we never silently provide TLS without verification
+/// (the same policy as config.rs treating a non-verifying ssl_mode combined with
+/// ssl_root_cert as a configuration error).
 ///
-/// `tls_params` を None にしているのでルート CA はシステムの信頼ストアを使う
-/// (redis crate の tls-rustls は rustls-native-certs を引く)。自己署名 CA を
-/// 使いたい場合は SSH トンネルを使うこと。
+/// `tls_params` is None, so root CAs come from the system trust store
+/// (the redis crate's tls-rustls pulls in rustls-native-certs). To use a self-signed CA,
+/// use an SSH tunnel.
 ///
-/// なお SSH トンネル経由の接続では接続先が 127.0.0.1 になるため、`tls: true` を
-/// 足すと証明書のホスト名検証で失敗する。トンネル自体が暗号化されているので
-/// 併用する必要は無い (SQL 系エンジンの verify-full と同じ制約)。
+/// Note that over an SSH tunnel the target becomes 127.0.0.1, so adding `tls: true` fails
+/// certificate hostname verification. The tunnel is already encrypted, so combining them
+/// is unnecessary (same constraint as verify-full on the SQL engines).
 fn connection_addr(tls: bool, host: &str, port: u16) -> redis::ConnectionAddr {
     if tls {
         redis::ConnectionAddr::TcpTls {
@@ -391,8 +391,8 @@ fn connection_addr(tls: bool, host: &str, port: u16) -> redis::ConnectionAddr {
     }
 }
 
-/// 接続を確立して疎通確認 (PING) まで行う。
-/// schema は database 番号 (省略時 0)。
+/// Establishes the connection and goes as far as a reachability check (PING).
+/// schema is the database number (0 if omitted).
 pub async fn connect(
     server: &ServerConfig,
     host: &str,
@@ -422,10 +422,10 @@ pub async fn connect(
         .into_connection_info()?
         .set_redis_settings(redis_settings);
     let client = redis::Client::open(info)?;
-    // sqlx の connect_with と同様、接続時点で到達性と認証を確認する。
-    // PING にも接続タイムアウトを掛ける: TCP は繋がるのに応答しない相手
-    // (止まった SSH トンネル / half-open なサービス) で、キャンセル登録前の
-    // get_pool (DbManager のロック保持中) が無期限に停止しないようにする
+    // Like sqlx connect_with, check reachability and authentication at connect time.
+    // PING also gets the connect timeout: with a peer that accepts TCP but never responds
+    // (a stalled SSH tunnel / half-open service), this keeps get_pool (called before cancel
+    // registration, while DbManager holds its lock) from hanging forever
     let mut conn = open_connection(&client).await?;
     let ping_cmd = redis::cmd("PING");
     let ping = ping_cmd.query_async::<String>(&mut conn);
@@ -453,8 +453,8 @@ async fn open_connection(client: &redis::Client) -> Result<MultiplexedConnection
     }
 }
 
-/// コマンド列を実行して結果を返す (キャンセル対応版)。
-/// db::run_query_cancellable から DbPool::Redis の場合に委譲される。
+/// Runs the command list and returns the result (cancellable version).
+/// db::run_query_cancellable delegates here for DbPool::Redis.
 pub async fn run_query_cancellable(
     client: &redis::Client,
     registry: &CancelRegistry,
@@ -469,7 +469,7 @@ pub async fn run_query_cancellable(
         return Err(AppError::Redis("The command is empty".into()));
     }
 
-    // 何も実行する前に全コマンドを検証する (一部だけ実行される事態を防ぐ)
+    // Validate all commands before running anything (to prevent only some of them from being executed)
     for args in &commands {
         let name = command_name(args);
         if let Some(reason) = unsupported_reason(args) {
@@ -495,10 +495,10 @@ pub async fn run_query_cancellable(
         cancelled,
     );
     let started = Instant::now();
-    // キャンセルは実行の future を打ち切る。接続はこの実行専用に張ったもの
-    // なので、途中放棄してもプールを壊さない (次の実行は新しい接続を張る)。
-    // biased で実行結果側を先に見る: 結果とキャンセル通知が同じ poll で
-    // 同時に ready になった場合は完了済みの結果を優先する (成功結果を捨てない)。
+    // Cancellation aborts the execution future. The connection was opened just for this
+    // execution, so abandoning it midway does not break a pool (the next run opens a new one).
+    // biased checks the execution side first: if the result and the cancel notification become
+    // ready in the same poll, the completed result wins (a successful result is not discarded).
     let result = tokio::select! {
         biased;
         result = execute_commands(client, &commands, max_rows) => result,
@@ -506,8 +506,8 @@ pub async fn run_query_cancellable(
     };
     let was_cancelled = guard.was_cancelled();
     drop(guard);
-    // キャンセルが完了と競合した場合 (コマンドが先に完了していた場合) は
-    // 成功結果をそのまま返す (SQL 側の run_query_cancellable と同じ挙動)
+    // If cancellation races with completion (the command had already completed), return
+    // the successful result as is (same behavior as run_query_cancellable on the SQL side)
     if was_cancelled && result.is_err() {
         return Err(AppError::Cancelled);
     }
@@ -516,8 +516,8 @@ pub async fn run_query_cancellable(
     Ok(result)
 }
 
-/// 複数コマンドはトランザクションではない: 途中のコマンドが失敗すると
-/// そこで中断し、それまでに実行済みのコマンドはそのまま残る (psql の複数文と同じ)。
+/// Multiple commands are not a transaction: if a command in the middle fails, execution
+/// stops there and the commands already run stay applied (same as multiple statements in psql).
 async fn execute_commands(
     client: &redis::Client,
     commands: &[Vec<Vec<u8>>],
@@ -528,11 +528,11 @@ async fn execute_commands(
         let value = run_command(&mut conn, &commands[0]).await?;
         return Ok(shape_single(&commands[0], value, max_rows));
     }
-    // 複数コマンドは「コマンド + 結果」の 2 カラムで 1 行ずつ返す。
-    // コマンドは全件実行する (書き込みを黙って落とさない) が、結果テーブルは
-    // max_rows で打ち切って truncated を立てる (巨大な選択実行で webview へ
-    // 非有界の結果を送らない)。1 セルに入るコレクション (LRANGE / HGETALL 等の
-    // 応答) も value_to_json_limited で要素数を打ち切る。
+    // Multiple commands return one row each with two columns, "command" + result.
+    // All commands are executed (writes are not silently dropped), but the result table is
+    // cut off at max_rows and sets truncated (so a huge selection run does not send an
+    // unbounded result to the webview). Collections inside one cell (replies such as LRANGE /
+    // HGETALL) are also capped in element count by value_to_json_limited.
     let mut rows = Vec::new();
     let mut truncated = false;
     for args in commands {
@@ -564,9 +564,9 @@ async fn run_command(
     Ok(cmd.query_async(conn).await?)
 }
 
-/// 結果が field/value のペア列 (フラットな偶数長配列) で返るコマンドか。
-/// RESP2 では HGETALL 等が Map でなく配列で返るため、コマンド名から判定して
-/// field/value の 2 カラムに整形する (RESP3 の Map は shape_single が直接扱う)。
+/// Whether the command returns its result as field/value pairs (a flat even-length array).
+/// In RESP2, HGETALL etc. return an array rather than a Map, so decide from the command name
+/// and format into two columns, field/value (a RESP3 Map is handled directly by shape_single).
 fn returns_field_value_pairs(args: &[Vec<u8>]) -> bool {
     match command_name(args).as_str() {
         "HGETALL" => true,
@@ -577,11 +577,11 @@ fn returns_field_value_pairs(args: &[Vec<u8>]) -> bool {
     }
 }
 
-/// 単一コマンドの結果を表形式へ整形する。
-/// - Map (RESP3) → field / value の 2 カラム
-/// - ペア返しコマンド (HGETALL 等) の偶数長配列 (RESP2) → field / value の 2 カラム
-/// - Array / Set → value 1 カラムで 1 要素 1 行 (max_rows で打ち切り)
-/// - スカラー → value 1 カラム 1 行
+/// Formats a single command's result into tabular form.
+/// - Map (RESP3) -> two columns, field / value
+/// - Even-length array (RESP2) from a pair-returning command (HGETALL etc.) -> two columns, field / value
+/// - Array / Set -> one "value" column, one row per element (cut off at max_rows)
+/// - Scalar -> one "value" column, one row
 fn shape_single(args: &[Vec<u8>], value: redis::Value, max_rows: usize) -> QueryResult {
     match value {
         redis::Value::Map(pairs) => {
@@ -648,8 +648,8 @@ fn shape_result(
     }
 }
 
-/// RESP 値を JSON へ変換する。バイナリ安全な bulk string は UTF-8 なら文字列、
-/// そうでなければ base64 で返す (SQL エンジンの BLOB と同じ扱い)。
+/// Converts a RESP value to JSON. A binary-safe bulk string becomes a string if valid UTF-8,
+/// otherwise base64 (same treatment as BLOB in the SQL engines).
 fn value_to_json(value: redis::Value) -> serde_json::Value {
     match value {
         redis::Value::Nil => serde_json::Value::Null,
@@ -666,8 +666,8 @@ fn value_to_json(value: redis::Value) -> serde_json::Value {
             serde_json::Value::Array(items.into_iter().map(value_to_json).collect())
         }
         redis::Value::Map(pairs) => {
-            // キーが文字列にならない場合も JSON オブジェクトのキーとして
-            // 表現できるよう文字列化する
+            // Stringify keys that are not strings so they can
+            // be represented as JSON object keys
             let map = pairs
                 .into_iter()
                 .map(|(k, v)| {
@@ -684,10 +684,10 @@ fn value_to_json(value: redis::Value) -> serde_json::Value {
     }
 }
 
-/// value_to_json の要素数打ち切り版 (複数コマンド結果の 1 セル用)。
-/// 配列 / Set / Map の要素を max_items で打ち切り、打ち切った場合は末尾に
-/// その旨の文字列要素を足して truncated も立てる (単一コマンドの
-/// shape_single の行打ち切りと同じ上限を、セル内のコレクションにも適用する)。
+/// Element-capped version of value_to_json (for one cell of a multi-command result).
+/// Caps array / Set / Map elements at max_items and, when it cuts off, appends a string
+/// element saying so at the end and sets truncated too (applying the same limit as the row
+/// cut-off in shape_single for a single command to collections inside a cell).
 fn value_to_json_limited(
     value: redis::Value,
     max_items: usize,
@@ -740,7 +740,7 @@ fn value_to_json_limited(
 mod tests {
     use super::*;
 
-    /// テスト用: トークン列を lossy な文字列へ戻す
+    /// For tests: turn a token list back into a lossy string
     fn parsed(line: &str) -> Vec<String> {
         parse_command_line(line)
             .unwrap()
@@ -770,26 +770,26 @@ mod tests {
         assert!(parse_command_line("GET \"unterminated").is_err());
         assert!(parse_command_line("GET 'unterminated").is_err());
         assert_eq!(parse_command_line("").unwrap(), Vec::<Vec<u8>>::new());
-        // マルチバイト文字は UTF-8 のまま
+        // Multibyte characters stay as UTF-8
         assert_eq!(parsed("GET キー"), vec!["GET", "キー"]);
     }
 
-    /// database 番号の一覧は 0 始まりの連番 (CYBERNEURA-DEV-408)。
-    /// 壊れた値や大きすぎる値でプルダウンが暴れないことも固定する。
+    /// The database number list is a 0-based sequence (CYBERNEURA-DEV-408).
+    /// Also pins that broken or too-large values do not make the dropdown run away.
     #[test]
     fn test_database_names() {
         assert_eq!(database_names(3), vec!["0", "1", "2"]);
         assert_eq!(database_names(16).len(), 16);
         assert_eq!(database_names(16).last().unwrap(), "15");
-        // 0 以下は既定値に倒す (一覧が空だとプルダウンが出ない)
+        // 0 or less falls back to the default (an empty list would hide the dropdown)
         assert_eq!(database_names(0).len(), DEFAULT_DATABASE_COUNT as usize);
         assert_eq!(database_names(-1).len(), DEFAULT_DATABASE_COUNT as usize);
-        // 大きすぎる値は頭を押さえる
+        // Too-large values are clamped
         assert_eq!(database_names(100_000).len(), MAX_DATABASE_COUNT as usize);
     }
 
-    /// tls: true が黙って無視され、平文 TCP で接続していた不具合
-    /// (CYBERNEURA-DEV-420) の回帰テスト。
+    /// Regression test for the bug where tls: true was silently ignored and plain TCP
+    /// was used (CYBERNEURA-DEV-420).
     #[test]
     fn test_connection_addr_uses_tls_when_requested() {
         match connection_addr(true, "redis.example.com", 6380) {
@@ -801,7 +801,7 @@ mod tests {
             } => {
                 assert_eq!(host, "redis.example.com");
                 assert_eq!(port, 6380);
-                // 検証しない TLS は中間者をそのまま受け入れるので必ず false
+                // TLS without verification would accept a man-in-the-middle, so this must be false
                 assert!(!insecure);
             }
             other => panic!("tls: true must not fall back to plaintext: {other:?}"),
@@ -821,7 +821,7 @@ mod tests {
 
     #[test]
     fn test_parse_command_line_binary_hex_escape() {
-        // \xHH は 0x80 以上でも生のバイトのまま (UTF-8 化しないバイナリ安全)
+        // \xHH stays a raw byte even at 0x80 and above (binary safe, not UTF-8 converted)
         let args = parse_command_line(r#"SET key "\xff\x00\x41""#).unwrap();
         assert_eq!(args[2], vec![0xffu8, 0x00, 0x41]);
     }
@@ -836,7 +836,7 @@ mod tests {
 
     #[test]
     fn test_readonly_whitelist() {
-        // XPENDING は pending entries list を見るだけで書き込まない (XINFO と同類)
+        // XPENDING only reads the pending entries list and does not write (same family as XINFO)
         for cmd in ["GET", "MGET", "HGETALL", "SCAN", "ZRANGE", "INFO", "PING", "XPENDING"] {
             assert!(READONLY_COMMANDS.contains(&cmd), "{cmd} should be readonly");
         }
@@ -847,34 +847,34 @@ mod tests {
 
     #[test]
     fn test_is_readonly_command_memory_subcommands() {
-        // MEMORY はサブコマンド単位: 読み取り系のみ許可
+        // MEMORY is judged per subcommand: only read ones are allowed
         assert!(is_readonly_command(&args_of("MEMORY USAGE key")));
         assert!(is_readonly_command(&args_of("memory stats")));
         assert!(is_readonly_command(&args_of("MEMORY DOCTOR")));
-        // MEMORY PURGE はサーバー側のメンテナンス操作なので拒否
+        // MEMORY PURGE is a server maintenance operation, so it is rejected
         assert!(!is_readonly_command(&args_of("MEMORY PURGE")));
-        // サブコマンド無しの MEMORY も拒否 (安全側)
+        // MEMORY without a subcommand is rejected too (safe side)
         assert!(!is_readonly_command(&args_of("MEMORY")));
-        // 通常コマンドは従来どおり
+        // Ordinary commands are unchanged
         assert!(is_readonly_command(&args_of("GET key")));
         assert!(!is_readonly_command(&args_of("SET key value")));
     }
 
     #[test]
     fn test_unsupported_reason() {
-        // pub/sub 系
+        // pub/sub commands
         assert!(unsupported_reason(&args_of("SUBSCRIBE ch")).is_some());
-        // ブロッキング系は常に拒否
+        // Blocking commands are always rejected
         assert!(unsupported_reason(&args_of("BLPOP key 0")).is_some());
         assert!(unsupported_reason(&args_of("blpop key 5")).is_some());
         assert!(unsupported_reason(&args_of("WAIT 1 1000")).is_some());
-        // XREAD は BLOCK オプション付きのみ拒否
+        // XREAD is rejected only with the BLOCK option
         assert!(unsupported_reason(&args_of("XREAD BLOCK 0 STREAMS s 0")).is_some());
         assert!(unsupported_reason(&args_of("XREAD block 100 STREAMS s 0")).is_some());
         assert!(unsupported_reason(&args_of("XREAD COUNT 10 STREAMS s 0")).is_none());
-        // STREAMS 以降のトークン (ストリーム名 / ID) は BLOCK でも誤検知しない
+        // Tokens after STREAMS (stream names / IDs) are not misdetected even if named BLOCK
         assert!(unsupported_reason(&args_of("XREAD STREAMS BLOCK 0")).is_none());
-        // XREADGROUP は GROUP <group> <consumer> も対象外
+        // XREADGROUP also excludes GROUP <group> <consumer>
         assert!(unsupported_reason(&args_of(
             "XREADGROUP GROUP BLOCK consumer STREAMS s >"
         ))
@@ -883,7 +883,7 @@ mod tests {
             "XREADGROUP GROUP g c BLOCK 0 STREAMS s >"
         ))
         .is_some());
-        // 通常コマンドは対象外
+        // Ordinary commands are not targeted
         assert!(unsupported_reason(&args_of("GET key")).is_none());
         assert!(unsupported_reason(&args_of("LPOP key")).is_none());
     }
@@ -894,7 +894,7 @@ mod tests {
         assert!(dangerous_reason_for_input("FLUSHALL").is_some());
         assert!(dangerous_reason_for_input("flushdb").is_some());
         assert!(dangerous_reason_for_input("GET a\nSHUTDOWN").is_some());
-        // パース不能な入力は None (実行時にエラーとして返る)
+        // Unparseable input is None (returned as an error at execution time)
         assert!(dangerous_reason_for_input("GET \"broken").is_none());
     }
 
@@ -926,14 +926,14 @@ mod tests {
         );
     }
 
-    /// テスト用: コマンドライン文字列を引数リストへ
+    /// For tests: command-line string to an argument list
     fn args_of(line: &str) -> Vec<Vec<u8>> {
         parse_command_line(line).unwrap()
     }
 
     #[test]
     fn test_value_to_json_limited() {
-        // 上限内はそのまま
+        // Within the limit, unchanged
         let mut truncated = false;
         let v = value_to_json_limited(
             redis::Value::Array(vec![redis::Value::Int(1), redis::Value::Int(2)]),
@@ -943,7 +943,7 @@ mod tests {
         assert_eq!(v, serde_json::json!([1, 2]));
         assert!(!truncated);
 
-        // 上限超は打ち切り + マーカー + truncated フラグ
+        // Over the limit: cut off + marker + truncated flag
         let mut truncated = false;
         let v = value_to_json_limited(
             redis::Value::Array(vec![
@@ -960,7 +960,7 @@ mod tests {
         );
         assert!(truncated);
 
-        // ネストしたコレクションも打ち切る
+        // Nested collections are cut off too
         let mut truncated = false;
         let v = value_to_json_limited(
             redis::Value::Array(vec![redis::Value::Array(vec![
@@ -977,7 +977,7 @@ mod tests {
         );
         assert!(truncated);
 
-        // スカラーはそのまま
+        // Scalars are unchanged
         let mut truncated = false;
         let v = value_to_json_limited(redis::Value::Int(42), 1, &mut truncated);
         assert_eq!(v, serde_json::json!(42));
@@ -986,7 +986,7 @@ mod tests {
 
     #[test]
     fn test_shape_single() {
-        // 配列は 1 要素 1 行
+        // An array is one element per row
         let result = shape_single(
             &args_of("MGET a b"),
             redis::Value::Array(vec![
@@ -999,7 +999,7 @@ mod tests {
         assert_eq!(result.row_count, 2);
         assert!(!result.truncated);
 
-        // max_rows で打ち切り
+        // Cut off at max_rows
         let result = shape_single(
             &args_of("LRANGE l 0 -1"),
             redis::Value::Array(vec![
@@ -1012,12 +1012,12 @@ mod tests {
         assert_eq!(result.row_count, 2);
         assert!(result.truncated);
 
-        // スカラーは 1 行
+        // A scalar is one row
         let result = shape_single(&args_of("GET a"), redis::Value::Int(1), 10);
         assert_eq!(result.columns, vec!["value"]);
         assert_eq!(result.row_count, 1);
 
-        // Map (RESP3) は field / value。max_rows 超は truncated
+        // Map (RESP3) is field / value. Beyond max_rows, truncated
         let result = shape_single(
             &args_of("HGETALL h"),
             redis::Value::Map(vec![
@@ -1039,7 +1039,7 @@ mod tests {
 
     #[test]
     fn test_shape_single_resp2_pairs() {
-        // RESP2 の HGETALL はフラット配列で返る → field/value にペア整形する
+        // RESP2 HGETALL returns a flat array -> format into field/value pairs
         let flat = redis::Value::Array(vec![
             redis::Value::BulkString(b"name".to_vec()),
             redis::Value::BulkString(b"alice".to_vec()),
@@ -1052,9 +1052,9 @@ mod tests {
         assert_eq!(result.rows[0], vec![serde_json::json!("name"), serde_json::json!("alice")]);
         assert!(!result.truncated);
 
-        // CONFIG GET もペア整形の対象 (大文字小文字を区別しない)
+        // CONFIG GET is also formatted as pairs (case-insensitive)
         assert!(returns_field_value_pairs(&args_of("config get maxmemory")));
-        // ペア整形対象でないコマンドのフラット配列はそのまま 1 カラム
+        // A flat array from a command not formatted as pairs stays as a single column
         let flat = redis::Value::Array(vec![
             redis::Value::BulkString(b"a".to_vec()),
             redis::Value::BulkString(b"b".to_vec()),
@@ -1062,12 +1062,12 @@ mod tests {
         let result = shape_single(&args_of("MGET k1 k2"), flat, 10);
         assert_eq!(result.columns, vec!["value"]);
 
-        // 奇数長の配列はペア整形しない (安全側)
+        // An odd-length array is not formatted as pairs (safe side)
         let odd = redis::Value::Array(vec![redis::Value::Int(1)]);
         let result = shape_single(&args_of("HGETALL h"), odd, 10);
         assert_eq!(result.columns, vec!["value"]);
 
-        // ペア数が max_rows を超えたら truncated
+        // If the pair count exceeds max_rows, truncated
         let flat = redis::Value::Array(vec![
             redis::Value::BulkString(b"f1".to_vec()),
             redis::Value::BulkString(b"v1".to_vec()),

@@ -1,9 +1,10 @@
-//! クエリ実行履歴の記録・検索。
+//! Recording and searching the query execution history.
 //!
-//! 接続ごとに JSONL 形式 (~/.config/queryfolio/history/<connection>.jsonl)
-//! で追記し、上限行数を超えたら古い行を落としてローテーションする。
-//! SQL 文面にはパスワード等の機密が含まれ得るため、履歴ディレクトリは
-//! 700、履歴ファイルは 600 のパーミッションで作成する。
+//! Entries are appended per connection in JSONL format
+//! (~/.config/queryfolio/history/<connection>.jsonl); once the line limit is exceeded,
+//! the oldest lines are dropped (rotation). SQL text may contain secrets such as
+//! passwords, so the history directory is created with mode 700 and history files
+//! with mode 600.
 
 use std::collections::HashMap;
 use std::fs;
@@ -17,55 +18,55 @@ use crate::config;
 use crate::error::AppError;
 use crate::query_files::validate_component;
 
-/// 接続あたりの履歴の上限行数。
+/// Maximum number of history lines per connection.
 pub const MAX_HISTORY_LINES: usize = 10_000;
 
-/// ローテーション後に残す行数。上限より少なくすることで、上限到達後に
-/// 追記のたび全書き換えが走るのを防ぐ (次のローテーションまで
-/// MAX_HISTORY_LINES - ROTATED_KEEP_LINES 回は追記だけで済む)。
+/// Number of lines to keep after rotation. Keeping fewer than the limit prevents a full
+/// rewrite on every append once the limit is reached (until the next rotation, only
+/// appends are needed for MAX_HISTORY_LINES - ROTATED_KEEP_LINES entries).
 const ROTATED_KEEP_LINES: usize = 9_000;
 
-/// list_query_history で limit 未指定時に返す件数。
+/// Number of entries returned by list_query_history when no limit is given.
 pub const DEFAULT_LIST_LIMIT: usize = 200;
 
-/// 履歴 1 件分のレコード。JSONL の 1 行に対応する。
+/// A single history record. Corresponds to one line of the JSONL file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
-    /// 実行時刻 (ISO 8601 / RFC 3339)
+    /// Execution time (ISO 8601 / RFC 3339)
     pub time: String,
     pub sql: String,
-    /// 実行時のアクティブスキーマ (database)
+    /// Active schema (database) at execution time
     pub schema: Option<String>,
-    /// 取得行数または影響行数 (失敗時は None)
+    /// Number of rows fetched or affected (None on failure)
     pub row_count: Option<u64>,
-    /// 所要時間 (ミリ秒)
+    /// Elapsed time (milliseconds)
     pub elapsed_ms: u64,
     pub success: bool,
 }
 
-/// 接続ごとの履歴ファイル行数をキャッシュするマネージャ。
-/// 追記のたびに全行を読み直すのを避け、初回アクセス時のみ実ファイルを
-/// 数える。プロセス内で追記を直列化するため Mutex で保護する
-/// (単一ユーザーのデスクトップアプリなので競合はプロセス内のみ)。
+/// Manager that caches the history file line count per connection.
+/// Avoids re-reading every line on each append by counting the actual file only on
+/// first access. Protected by a Mutex to serialize appends within the process (this is
+/// a single-user desktop app, so contention only occurs inside the process).
 #[derive(Default)]
 pub struct HistoryManager {
     counts: Mutex<HashMap<String, usize>>,
 }
 
-/// デフォルトの履歴保存ディレクトリ (~/.config/queryfolio/history)。
+/// Default history directory (~/.config/queryfolio/history).
 pub fn default_history_dir() -> Result<PathBuf, AppError> {
     Ok(config::app_config_dir()?.join("history"))
 }
 
-/// 接続名に対応する履歴ファイルのパスを返す。
-/// 接続名はパス要素になるため validate_component で検証する。
+/// Returns the history file path for a connection name.
+/// The connection name becomes a path component, so it is checked with validate_component.
 fn history_file(history_dir: &Path, connection: &str) -> Result<PathBuf, AppError> {
     let connection = validate_component(connection)
         .map_err(|e| AppError::History(format!("Invalid connection name: {e}")))?;
     Ok(history_dir.join(format!("{connection}.jsonl")))
 }
 
-/// 履歴ディレクトリを作成し、パーミッションを 700 に設定する。
+/// Creates the history directory and sets its permissions to 700.
 fn ensure_history_dir(history_dir: &Path) -> Result<(), AppError> {
     fs::create_dir_all(history_dir)?;
     #[cfg(unix)]
@@ -76,7 +77,7 @@ fn ensure_history_dir(history_dir: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-/// ファイルの行数を数える (初回アクセス時のみ呼ばれる)。
+/// Counts the lines of a file (called only on first access).
 fn count_lines(path: &Path) -> Result<usize, AppError> {
     if !path.exists() {
         return Ok(0);
@@ -85,7 +86,7 @@ fn count_lines(path: &Path) -> Result<usize, AppError> {
     Ok(reader.lines().count())
 }
 
-/// パーミッション 600 で書き込み用にファイルを開く共通オプション。
+/// Common options for opening a file for writing with permissions 600.
 fn open_options_600(append: bool) -> fs::OpenOptions {
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true);
@@ -103,7 +104,7 @@ fn open_options_600(append: bool) -> fs::OpenOptions {
 }
 
 impl HistoryManager {
-    /// 履歴を 1 件追記する。上限超過時は古い行を落としてローテーションする。
+    /// Appends one history entry. When the limit is exceeded, drops old lines (rotation).
     pub fn append(
         &self,
         history_dir: &Path,
@@ -119,7 +120,7 @@ impl HistoryManager {
         )
     }
 
-    /// 上限をパラメータ化した実装本体 (テストで小さい上限を使うため分離)。
+    /// The actual implementation with a parameterized limit (split out so tests can use a small limit).
     fn append_with_limits(
         &self,
         history_dir: &Path,
@@ -132,7 +133,7 @@ impl HistoryManager {
         let line = serde_json::to_string(entry)
             .map_err(|e| AppError::History(format!("Failed to serialize an entry: {e}")))?;
 
-        // ロックで追記処理全体を直列化し、カウンタと実ファイルの整合を保つ
+        // Serialize the whole append operation with the lock to keep the counter and the real file consistent
         let mut counts = self
             .counts
             .lock()
@@ -141,8 +142,8 @@ impl HistoryManager {
         let mut count = match counts.get(connection) {
             Some(count) => *count,
             None => {
-                // 初回アクセス: 既存行数を数え、旧バージョンや手動作成の
-                // ファイルでもパーミッションが 600 になるよう是正する
+                // First access: count the existing lines and fix the permissions to 600,
+                // even for files created by older versions or by hand
                 let existing = count_lines(&path)?;
                 #[cfg(unix)]
                 if path.exists() {
@@ -166,9 +167,9 @@ impl HistoryManager {
     }
 }
 
-/// 履歴ファイルの末尾 keep_lines 行だけを残して書き直す。
-/// 一時ファイルに書いてから rename することで、途中失敗しても
-/// 元ファイルが壊れないようにする。残した行数を返す。
+/// Rewrites the history file keeping only its last keep_lines lines.
+/// Writes to a temporary file and then renames it, so the original file is not
+/// corrupted even if something fails midway. Returns the number of lines kept.
 fn rotate_file(path: &Path, keep_lines: usize) -> Result<usize, AppError> {
     let reader = BufReader::new(fs::File::open(path)?);
     let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
@@ -187,8 +188,8 @@ fn rotate_file(path: &Path, keep_lines: usize) -> Result<usize, AppError> {
     Ok(kept.len())
 }
 
-/// 履歴を新しい順に返す。search を指定すると SQL の部分一致
-/// (大文字小文字を区別しない) で絞り込む。
+/// Returns the history newest first. If search is given, filters by substring match
+/// on the SQL (case-insensitive).
 pub fn list_history(
     history_dir: &Path,
     connection: &str,
@@ -209,7 +210,7 @@ pub fn list_history(
         if line.trim().is_empty() {
             continue;
         }
-        // 壊れた行 (クラッシュ時の書きかけ等) は無視して読み進める
+        // Skip broken lines (e.g. partially written during a crash) and keep reading
         let Ok(entry) = serde_json::from_str::<HistoryEntry>(&line) else {
             continue;
         };
@@ -220,7 +221,7 @@ pub fn list_history(
         }
         entries.push(entry);
     }
-    // ファイルは追記順 = 古い順なので、反転して新しい順にする
+    // The file is in append order = oldest first, so reverse it to get newest first
     entries.reverse();
     entries.truncate(limit);
     Ok(entries)
@@ -250,7 +251,7 @@ mod tests {
         manager.append(dir.path(), "conn", &entry("SELECT 2", false)).unwrap();
         manager.append(dir.path(), "conn", &entry("SELECT 3", true)).unwrap();
 
-        // 新しい順に返る
+        // Returned newest first
         let entries = list_history(dir.path(), "conn", None, 100).unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].sql, "SELECT 3");
@@ -260,13 +261,13 @@ mod tests {
         assert_eq!(entries[1].row_count, None);
         assert_eq!(entries[0].row_count, Some(3));
 
-        // limit で先頭 (新しい方) から切り詰める
+        // limit truncates the list, keeping the entries from the front (the newest ones)
         let entries = list_history(dir.path(), "conn", None, 2).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].sql, "SELECT 3");
         assert_eq!(entries[1].sql, "SELECT 2");
 
-        // 接続別にファイルが分かれる
+        // Files are separated per connection
         assert_eq!(list_history(dir.path(), "other", None, 100).unwrap().len(), 0);
     }
 
@@ -285,7 +286,7 @@ mod tests {
             .append(dir.path(), "conn", &entry("UPDATE users SET a = 1", true))
             .unwrap();
 
-        // 部分一致 (大文字小文字を区別しない)
+        // Substring match (case-insensitive)
         let entries = list_history(dir.path(), "conn", Some("USERS"), 100).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].sql, "UPDATE users SET a = 1");
@@ -294,7 +295,7 @@ mod tests {
         let entries = list_history(dir.path(), "conn", Some("orders"), 100).unwrap();
         assert_eq!(entries.len(), 1);
 
-        // 空白のみの検索語は全件扱い
+        // A whitespace-only search term matches everything
         let entries = list_history(dir.path(), "conn", Some("  "), 100).unwrap();
         assert_eq!(entries.len(), 3);
 
@@ -307,7 +308,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = HistoryManager::default();
 
-        // 上限 5 / ローテーション後 3 行で 7 回追記する
+        // Append 7 times with a limit of 5 and 3 lines kept after rotation
         for i in 1..=7 {
             manager
                 .append_with_limits(
@@ -319,12 +320,12 @@ mod tests {
                 )
                 .unwrap();
         }
-        // 6 回目で上限超過 → 末尾 3 行 (4,5,6) に縮小、7 回目で 4 行になる
+        // The 6th append exceeds the limit -> shrinks to the last 3 lines (4,5,6); the 7th makes it 4 lines
         let entries = list_history(dir.path(), "conn", None, 100).unwrap();
         let sqls: Vec<&str> = entries.iter().map(|e| e.sql.as_str()).collect();
         assert_eq!(sqls, vec!["SELECT 7", "SELECT 6", "SELECT 5", "SELECT 4"]);
 
-        // 一時ファイルが残っていない
+        // No temporary file is left behind
         assert!(!dir.path().join("conn.jsonl.tmp").exists());
     }
 
@@ -332,7 +333,7 @@ mod tests {
     fn test_count_recovery_across_instances() {
         let dir = tempfile::tempdir().unwrap();
 
-        // 別インスタンス (再起動相当) でも既存行数を数え直してローテーションする
+        // Even a different instance (equivalent to a restart) recounts the existing lines and rotates
         let manager1 = HistoryManager::default();
         for i in 1..=4 {
             manager1
@@ -345,7 +346,7 @@ mod tests {
                 .append_with_limits(dir.path(), "conn", &entry(&format!("B{i}"), true), 5, 3)
                 .unwrap();
         }
-        // 4 + 2 = 6 行 → 5 行超過でローテーションされ 3 行になる
+        // 4 + 2 = 6 lines -> exceeds 5, so it is rotated down to 3 lines
         let entries = list_history(dir.path(), "conn", None, 100).unwrap();
         let sqls: Vec<&str> = entries.iter().map(|e| e.sql.as_str()).collect();
         assert_eq!(sqls, vec!["B2", "B1", "A4"]);
@@ -357,7 +358,7 @@ mod tests {
         let manager = HistoryManager::default();
         manager.append(dir.path(), "conn", &entry("SELECT 1", true)).unwrap();
 
-        // クラッシュ等による壊れた行が混ざっても読み進められる
+        // Reading continues even if broken lines (e.g. from a crash) are mixed in
         let path = dir.path().join("conn.jsonl");
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
         writeln!(file, "{{broken json").unwrap();
@@ -388,7 +389,7 @@ mod tests {
             & 0o777;
         assert_eq!(file_mode, 0o600);
 
-        // ローテーション後もパーミッションが維持される
+        // Permissions are preserved after rotation
         for i in 0..10 {
             manager
                 .append_with_limits(&history_dir, "conn", &entry(&format!("S{i}"), true), 5, 3)
@@ -406,7 +407,7 @@ mod tests {
     fn test_invalid_connection_name() {
         let dir = tempfile::tempdir().unwrap();
         let manager = HistoryManager::default();
-        // パストラバーサルになる接続名は拒否する
+        // Reject connection names that would cause path traversal
         assert!(manager
             .append(dir.path(), "../evil", &entry("SELECT 1", true))
             .is_err());

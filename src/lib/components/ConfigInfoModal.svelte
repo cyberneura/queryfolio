@@ -21,7 +21,7 @@
     }
   });
 
-  // 再読込に失敗した場合はモーダルを閉じず、エラーを表示して誤認を防ぐ
+  // If the reload fails, keep the modal open and show the error to avoid misleading the user
   const reload = async () => {
     reloadError = null;
     if (await appStore.reloadConnections()) {
@@ -48,10 +48,10 @@
     }
   }}
 >
-  <!-- 他のモーダル (AiAnalysisModal / SearchModal / ConfigEditorModal) と同様に
-       ビューポート内へ収める。loadError に長いメッセージが入ると縦にはみ出すが、
-       fixed かつ中央揃えなので上端が画面外へ出て読めなくなる (ドキュメント自体は
-       スクロールしないため戻せない。CYBERNEURA-DEV-421) -->
+  <!-- Fit within the viewport, like the other modals (AiAnalysisModal / SearchModal / ConfigEditorModal).
+       A long message in loadError overflows vertically, but since the modal is fixed and
+       centered, the top edge goes off screen and becomes unreadable (the document itself
+       does not scroll, so it cannot be scrolled back. CYBERNEURA-DEV-421) -->
   <div
     class="flex max-h-[85vh] w-[560px] flex-col gap-3 overflow-auto rounded-lg border border-zinc-700 bg-zinc-900 p-4 shadow-xl"
   >

@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# version を採番して main に載せ、それで始まる Release ワークフローを watch する。
-# `pnpm release [patch|minor|major]` から呼ばれる (省略時は patch)。
+# Assign a version number, land it on main, and watch the Release workflow that starts from it.
+# Called from `pnpm release [patch|minor|major]` (defaults to patch).
 #
-# 処理の流れ:
-#   1. 作業ツリーがクリーン かつ HEAD == origin/main であることを検証
-#   2. tauri.conf.json の version を bump 種別に応じて採番
-#   3. tauri.conf.json / package.json の version を書き換えて commit & push
-#   4. その push で始まった run を探して watch
+# Flow:
+#   1. Verify the working tree is clean and HEAD == origin/main
+#   2. Compute the next version in tauri.conf.json according to the bump type
+#   3. Rewrite the version in tauri.conf.json / package.json, then commit & push
+#   4. Find the run started by that push and watch it
 #
-# リリースを始めるのは push であってこのスクリプトではない (workflow の on: push)。
-# ここが落ちてもビルドは走るし、同じ version をもう一度 push しても workflow 側の
-# 判定が「リリース済み」を見て何もしない。
+# It is the push, not this script, that starts the release (the workflow's `on: push`).
+# The build still runs if this script fails, and pushing the same version again is harmless:
+# the workflow sees it is already released and does nothing.
 #
-# version を毎回インクリメントするのは、公開済みバージョンと同じ version で
-# workflow を再実行すると tauri-action が draft 状態の不一致でエラーになるため。
-# 採番を自動化することで「bump し忘れて落ちる」事故を構造的に無くす。
+# The version is incremented every time because re-running the workflow with the same version as
+# an already published one makes tauri-action fail on a draft state mismatch.
+# Automating the numbering structurally eliminates the "forgot to bump and it failed" accident.
 #
-# gh CLI (認証済み) が必要。
+# Requires the gh CLI (authenticated).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -30,9 +30,9 @@ case "${BUMP}" in
     ;;
 esac
 
-# gh の存在と認証を、何かを書き換える前に確認する。リリース自体は push で始まるので
-# gh が無くてもビルドは走るが、その場合このスクリプトは watch できずに終わる。
-# 「起動したかどうか分からないまま終わる」より、先に言って止める。
+# Check that gh exists and is authenticated before rewriting anything. The release itself starts
+# from the push, so the build runs even without gh, but then this script cannot watch it.
+# Better to say so and stop up front than to end without knowing whether it started.
 if ! command -v gh >/dev/null 2>&1; then
   echo "Error: gh CLI not found. Install it and run 'gh auth login'." >&2
   exit 1
@@ -42,8 +42,8 @@ if ! gh auth status >/dev/null 2>&1; then
   exit 1
 fi
 
-# 採番は main のクリーンな状態からのみ行う。ローカルの未コミット変更が紛れ込んだり、
-# origin/main とズレたままビルドするのを防ぐ (ビルドは origin/main の内容で走るため)。
+# Only number from a clean main. This prevents uncommitted local changes from slipping in, or
+# building while out of sync with origin/main (the build runs on the contents of origin/main).
 if [ "$(git branch --show-current)" != "main" ]; then
   echo "Error: not on the 'main' branch. Switch to main first." >&2
   exit 1
@@ -52,19 +52,20 @@ if [ -n "$(git status --porcelain)" ]; then
   echo "Error: working tree is not clean. Commit or stash your changes first." >&2
   exit 1
 fi
-# refspec を明示して origin/main を確実に更新する。`git fetch origin main` でも
-# remote-tracking ref は更新されるが (git 1.8.4 以降の opportunistic update)、
-# 明示しておけば remote の fetch 設定に依存しない。先頭の + は clone 既定の refspec と
-# 同じ強制更新で、force push 後も fetch 自体は成功させ、ズレは下の比較で検出する。
+# Specify the refspec explicitly so origin/main is reliably updated. `git fetch origin main` also
+# updates the remote-tracking ref (opportunistic update since git 1.8.4), but being explicit
+# means we do not depend on the remote's fetch config. The leading + is the same forced update as
+# the clone's default refspec; fetching still succeeds after a force push, and the mismatch is
+# caught by the comparison below.
 git fetch origin +main:refs/remotes/origin/main
 if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
   echo "Error: local HEAD does not match origin/main. Push (or pull) first." >&2
   exit 1
 fi
 
-# 現行 version を読み、bump 種別に応じて次の version を計算する。厳密な X.Y.Z
-# だけを受け付ける (Number.isNaN(undefined) は false のため、"1.2" や "1.2.3.4"
-# のような不正な値を弾くには正規表現で全体を検証する必要がある)。
+# Read the current version and compute the next one according to the bump type. Only a strict X.Y.Z
+# is accepted (Number.isNaN(undefined) is false, so rejecting bad values such as "1.2" or "1.2.3.4"
+# requires validating the whole string with a regex).
 CURRENT=$(node -p "require('./src-tauri/tauri.conf.json').version")
 VERSION=$(node -e '
   const cur = process.argv[1];
@@ -82,10 +83,10 @@ VERSION=$(node -e '
 
 echo "Bumping version: ${CURRENT} -> ${VERSION} (${BUMP})"
 
-# tauri.conf.json / package.json の version を更新する。両ファイルを先に読んで
-# 置換に成功することを確認してから書き込む (片方だけ更新されて中途半端な状態で
-# 終わるのを避ける)。JSON をパースしてトップレベルの version 値を特定し、その値を
-# ピンポイントで置換する (ファイル全体を再整形せず、別位置の version キーの誤爆も防ぐ)。
+# Update the version in tauri.conf.json / package.json. Read both files first and confirm the
+# replacement succeeds before writing (to avoid ending up half-updated with only one of them
+# changed). Parse the JSON to locate the top-level version value and replace just that value
+# (without reformatting the whole file, and without hitting a version key at another position).
 node -e '
   const fs = require("fs");
   const version = process.argv[1];
@@ -116,15 +117,15 @@ fi
 
 echo "Waiting for the release build of v${VERSION} ..."
 
-# push で始まった run は API に出てくるまで少し遅れるので、ポーリングして拾う。
-# 「最新の run」ではなく「今 push した bump コミットを head に持つ push の run」を探す:
-# 待っている間に別の push や dispatch が挟まっても、他の run を watch してしまわない。
+# A run started by the push shows up in the API after a short delay, so poll for it.
+# Look for "the push run whose head is the bump commit we just pushed", not "the latest run":
+# even if another push or dispatch lands while waiting, we never watch someone else's run.
 RELEASE_SHA=$(git rev-parse HEAD)
 
-# `|| true` が無いと、GitHub API の一時エラーで set -e がリトライループごと殺す
-# (X=$(failing-cmd) は set -e で即 exit する)。ここは「まだ run が出てこない」状態を
-# 待つループなので、失敗は空文字として扱う。
-# 60 回 x 2 秒 = 最大 2 分。run 一覧 API は反映が遅れることがあり、短いと誤判定する。
+# Without `|| true`, a transient GitHub API error makes set -e kill the whole retry loop
+# (X=$(failing-cmd) exits immediately under set -e). This loop keeps waiting while no run
+# has appeared yet, so a failure is treated as an empty string.
+# 60 tries x 2 seconds = 2 minutes at most. The run-list API can lag, and a shorter wait misjudges.
 RUN_ID=""
 for _ in $(seq 1 60); do
   sleep 2
@@ -137,7 +138,7 @@ for _ in $(seq 1 60); do
   fi
 done
 if [ -z "${RUN_ID}" ]; then
-  # 見つからないだけで、run 自体は動いている可能性が高い (watch できないだけ)。
+  # Most likely it was just not found and the run itself is going (we simply cannot watch it).
   echo "Error: could not find the workflow run within 2 minutes." >&2
   echo "  The build may still be running. Check it with:" >&2
   echo "    gh run list --workflow=release.yml" >&2
@@ -146,9 +147,9 @@ fi
 echo "Watching run ${RUN_ID} ..."
 gh run watch "${RUN_ID}" --exit-status
 
-# run の成功は「公開された」を意味しない。plan が release=false を返した run
-# (後から push された新しい version に先に公開された等) も、build 以降が skip されて
-# 成功で終わる。公開済み (draft ではない) Release があることを確かめてから Done と言う。
+# A successful run does not mean "published". A run where plan returned release=false (e.g. a
+# newer version pushed later was published first) also ends in success, with build and later
+# jobs skipped. Confirm a published (non-draft) Release exists before saying Done.
 if [ "$(gh release view "v${VERSION}" --json isDraft --jq '.isDraft' 2>/dev/null || true)" != "false" ]; then
   echo "Error: the run succeeded but v${VERSION} is not published. See why in the plan job:" >&2
   echo "  gh run view ${RUN_ID} --log" >&2

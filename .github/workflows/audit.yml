@@ -1,19 +1,19 @@
 name: Audit
 
-# 依存の既知脆弱性を定期的に見る (CYBERNEURA-DEV-577)。
+# Periodically check dependencies for known vulnerabilities (CYBERNEURA-DEV-577).
 #
-# **pull_request では動かさない。** このリポジトリは PR チェックを持たない運用で、
-# ここに PR トリガーを足すと「上流に新しい advisory が出た日」に無関係な PR まで
-# まとめて赤くなり、マージが止まる。audit が見ているのは変更差分ではなく
-# 依存ツリーの現在の状態なので、PR ごとに回す必要もない。
+# **Do not run on pull_request.** This repository does not use PR checks, and adding a PR trigger
+# here would turn unrelated PRs red all at once on the day a new advisory appears upstream, blocking
+# merges. What audit looks at is the current state of the dependency tree, not the change diff, so
+# there is no need to run it for every PR either.
 #
-# 既知で今は動かせないものは無視リストに入れてある:
-#   - Rust: src-tauri/.cargo/audit.toml (理由と外す条件を書くこと)
-#   - npm: 無視の仕組みは使っていない。残っているのは @sveltejs/kit が抱える
-#     cookie <0.7.0 (low) だけで、kit の更新待ち
+# Known issues that cannot be fixed right now are put on an ignore list:
+#   - Rust: src-tauri/.cargo/audit.toml (write the reason and the condition for removing it)
+#   - npm: no ignore mechanism is used. The only remaining one is cookie <0.7.0 (low) held by
+#     @sveltejs/kit, which is waiting for a kit update
 on:
   schedule:
-    # 毎週月曜 09:00 JST (00:00 UTC)
+    # Every Monday 09:00 JST (00:00 UTC)
     - cron: "0 0 * * 1"
   workflow_dispatch:
 
@@ -21,9 +21,9 @@ permissions:
   contents: read
 
 jobs:
-  # npm と cargo は**別ジョブに分ける**。同じジョブに並べると、片方が
-  # 見つけた時点で後続ステップが skip され、もう片方の結果がその週まるごと
-  # 見えなくなる (JS の指摘 1 件で Rust の指摘が隠れる)。
+  # Split npm and cargo into **separate jobs**. If they are placed in the same job, subsequent steps
+  # are skipped as soon as one finds something, and the other's result is invisible for that whole
+  # week (one JS finding would hide the Rust findings).
   npm:
     runs-on: ubuntu-latest
     steps:
@@ -43,13 +43,13 @@ jobs:
           node-version: 22
 
       - name: pnpm audit
-        # **`pnpm install` はしない。** audit は pnpm-lock.yaml だけで動く (実測確認済み)。
-        # install すると、監査しようとしている依存の postinstall などを毎週 CI で
-        # 実行することになり、侵害された依存があった時にそれを走らせる側になる。
+        # **Do not run `pnpm install`.** audit works with pnpm-lock.yaml alone (verified by measurement).
+        # Installing would run the postinstall scripts etc. of the very dependencies being audited in CI every
+        # week, making us the one to execute a compromised dependency if there were one.
         #
-        # low は落とさない。今残っている low は @sveltejs/kit が抱える cookie <0.7.0
-        # だけで、kit が範囲を上げるまで手が無い。ここで赤にすると「上流待ちの 1 件」で
-        # 毎週赤が続き、本当に新しいものが出た時に気付けなくなる
+        # Do not fail on low. The only low remaining now is cookie <0.7.0 held by @sveltejs/kit,
+        # and nothing can be done until kit raises its range. Making it red here would keep it red every week
+        # for "one item waiting on upstream", and we would fail to notice when something genuinely new appears
         run: pnpm audit --audit-level moderate
 
   cargo:
@@ -66,11 +66,11 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-audit
-        # cargo audit は Cargo.lock だけを読むので、依存のビルドは要らない
+        # cargo audit reads only Cargo.lock, so building the dependencies is not needed
         run: cargo install cargo-audit --locked
 
       - name: cargo audit
-        # audit.toml は cargo-audit が .cargo/audit.toml しか読まないため、
-        # src-tauri を作業ディレクトリにして実行する
+        # cargo-audit reads only .cargo/audit.toml for audit.toml, so
+        # run with src-tauri as the working directory
         working-directory: src-tauri
         run: cargo audit

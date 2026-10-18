@@ -19,9 +19,9 @@
     }
   });
 
-  // ネイティブメニューから開くので、設定エディタ等の別モーダルの上に重なることがある。
-  // Escape はこのモーダルだけを閉じたいので、capture で先に受けて下のモーダル
-  // (と CodeMirror) へ届けない
+  // It is opened from the native menu, so it can overlap another modal such as the config editor.
+  // Escape should close only this modal, so catch it first in the capture phase and do not
+  // let it reach the modal below (and CodeMirror)
   const onWindowKeydown = (e: KeyboardEvent) => {
     if (e.key === "Escape") {
       e.preventDefault();
@@ -33,7 +33,7 @@
 
 <svelte:window onkeydowncapture={onWindowKeydown} />
 
-<!-- 他のモーダル (最大 z-50: ResultsPane のセル編集プレビュー) より上に出す -->
+<!-- Show above other modals (max z-50: the cell edit preview in ResultsPane) -->
 <div
   class="fixed inset-0 z-[60] flex items-center justify-center bg-black/60"
   role="presentation"
@@ -57,8 +57,8 @@
     {#if loadError}
       <pre class="whitespace-pre-wrap font-mono text-xs text-red-400">{loadError}</pre>
     {:else if text !== null}
-      <!-- 本文は数万行あるので、この要素だけをスクロールさせる
-           (ドキュメント自体はスクロールしない。app.css 参照) -->
+      <!-- The body is tens of thousands of lines, so only this element scrolls
+           (the document itself does not scroll. See app.css) -->
       <pre
         class="min-h-0 flex-1 select-text overflow-auto whitespace-pre-wrap rounded border border-zinc-700 bg-zinc-950 p-3 font-mono text-[11px] leading-relaxed text-zinc-300"
         data-annotate="text-licenses">{text}</pre>

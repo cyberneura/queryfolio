@@ -1,66 +1,170 @@
 <script lang="ts">
   import * as api from "$lib/api";
-  import type { ColumnInfo, TableInfo } from "$lib/api";
+  import type { ColumnInfo, DumpTable, TableInfo } from "$lib/api";
   import appStore from "$lib/stores/app.svelte";
+  import DumpModal from "./DumpModal.svelte";
 
   interface Props {
-    /// FILES / HISTORY タブへの切り替え (タブ状態は +page.svelte が持つ)
+    /// Switch to the FILES / HISTORY tab (tab state is held by +page.svelte)
     onShowFiles: () => void;
     onShowHistory: () => void;
   }
 
   let { onShowFiles, onShowHistory }: Props = $props();
 
-  /// 接続・スキーマ切替の連続変化をまとめるデバウンス時間
+  /// Debounce time that coalesces consecutive connection / schema changes
   const RELOAD_DEBOUNCE_MS = 150;
-  /// シングルクリック (名前挿入) とダブルクリック (SELECT 挿入) の判別時間。
-  /// OS のダブルクリック間隔 (macOS デフォルト約 500ms) より短いと
-  /// ダブルクリック時に名前と SELECT の両方が挿入されてしまうため、
-  /// 余裕を持たせた値にする
+  /// Time to distinguish a single click (insert name) from a double click (insert SELECT).
+  /// If shorter than the OS double-click interval (about 500ms by default on macOS),
+  /// a double click would insert both the name and the SELECT,
+  /// so use a value with some margin
   const CLICK_DELAY_MS = 500;
 
-  /// 展開中テーブルのカラム取得状態 (キーは qualified_name)
+  /// Column fetch state of expanded tables (key is qualified_name)
   interface ExpandedEntry {
-    /// 取得完了までは null (Loading 表示)
+    /// null until fetching completes (shows Loading)
     columns: ColumnInfo[] | null;
     error: string | null;
   }
 
   let tables = $state<TableInfo[]>([]);
+  /// Connection and database the `tables` were loaded from. The list stays on screen while the
+  /// next one loads, so a dump started from a row must use these, not the current selection
+  let tablesConnection = $state<string | null>(null);
+  let tablesDatabase = $state<string | null>(null);
+  /// Database list shown instead of the tables while no database is chosen
+  /// (appStore.tablesPaneListsSchemas)
+  let schemaNames = $state<string[]>([]);
+  /// Connection the schemaNames were fetched from. The list stays on screen while the next
+  /// connection's list loads, and choosing from it then would apply the old connection's
+  /// database name to the new connection, so only the current connection's list is shown
+  let schemaNamesConnection = $state<string | null>(null);
+  const currentSchemaNames = $derived(
+    schemaNamesConnection === appStore.selectedConnection ? schemaNames : [],
+  );
+  /// Name of the schema being switched to from the list (disables the list meanwhile)
+  let choosingSchema = $state<string | null>(null);
   let loading = $state(false);
   let loadError = $state<string | null>(null);
   let expanded = $state<Record<string, ExpandedEntry>>({});
 
   let clickTimer: ReturnType<typeof setTimeout> | null = null;
 
-  /// 実行中の load の世代番号。接続・スキーマの連続切替やリロード連打で
-  /// 古い応答が後から解決しても、最新の load の結果だけを反映するために使う
+  /// Right-click menu of a table / database row (only for engines that can dump)
+  interface ContextMenu {
+    x: number;
+    y: number;
+    connection: string;
+    /// null = the active schema
+    database: string | null;
+    table: DumpTable | null;
+  }
+  let contextMenu = $state<ContextMenu | null>(null);
+  /// Open dump dialog (the connection is fixed when it opens)
+  let dumpTarget = $state<{
+    connection: string;
+    database: string | null;
+    table: DumpTable | null;
+  } | null>(null);
+
+  const canDump = $derived(appStore.selectedCapabilities?.supports_dump === true);
+
+  /// Right-click on a database row (SCHEMAS mode; only the current connection's list is shown)
+  const openSchemaMenu = (event: MouseEvent, schema: string) => {
+    const connection = appStore.selectedConnection;
+    if (!canDump || !connection) {
+      return;
+    }
+    event.preventDefault();
+    contextMenu = { x: event.clientX, y: event.clientY, connection, database: schema, table: null };
+  };
+
+  /// Right-click on a table row. The row may still belong to the previous connection / database
+  /// while the next list loads, so the dump targets where the list came from, and is not offered
+  /// at all when that is no longer the selection
+  const openTableMenu = (event: MouseEvent, table: TableInfo) => {
+    if (!canDump) {
+      return;
+    }
+    event.preventDefault();
+    if (
+      !tablesConnection ||
+      tablesConnection !== appStore.selectedConnection ||
+      tablesDatabase !== (appStore.activeSchema || null)
+    ) {
+      return;
+    }
+    contextMenu = {
+      x: event.clientX,
+      y: event.clientY,
+      connection: tablesConnection,
+      database: tablesDatabase,
+      table: { schema: table.schema, name: table.name },
+    };
+  };
+
+  const openDump = (
+    connection: string | null,
+    database: string | null,
+    table: DumpTable | null,
+  ) => {
+    contextMenu = null;
+    if (connection) {
+      dumpTarget = { connection, database, table };
+    }
+  };
+
+  /// Generation number of the running load. Used so that only the result of the latest load
+  /// is applied even if an old response resolves later, during consecutive connection /
+  /// schema switches or repeated reloads
   let loadGeneration = 0;
 
   const toErrorMessage = (e: unknown): string =>
     typeof e === "string" ? e : String(e);
 
-  const load = async (connection: string | null, refresh = false) => {
+  /// listSchemas = true loads the database list (SCHEMAS) instead of the tables
+  const load = async (
+    connection: string | null,
+    listSchemas: boolean,
+    refresh = false,
+  ) => {
     const generation = ++loadGeneration;
-    // 接続やスキーマが変わったら展開状態は意味を失うためリセットする
+    // When the connection or schema changes, the expanded state loses meaning, so reset it
     expanded = {};
     if (!connection) {
       tables = [];
+      schemaNames = [];
       loadError = null;
+      // An in-flight load is now stale and will not clear the flag itself
+      loading = false;
       return;
     }
     loading = true;
+    const databaseAtLoad = appStore.activeSchema || null;
     try {
-      const result = await api.listTables(connection, refresh);
-      // より新しい load が始まっていたら、古い応答は捨てる
-      if (generation !== loadGeneration) {
-        return;
+      if (listSchemas) {
+        const result = await api.listSchemas(connection);
+        // If a newer load has started, discard the old response
+        if (generation !== loadGeneration) {
+          return;
+        }
+        schemaNames = result;
+        schemaNamesConnection = connection;
+        tables = [];
+      } else {
+        const result = await api.listTables(connection, refresh);
+        if (generation !== loadGeneration) {
+          return;
+        }
+        tables = result;
+        tablesConnection = connection;
+        tablesDatabase = databaseAtLoad;
+        schemaNames = [];
       }
-      tables = result;
       loadError = null;
-      // スキーマブラウザを開いた = 接続を使う契機。listTables で既にトンネルは
-      // 開いているので、この機会にスキーマ一覧・補完マップも取り込んでおく
-      // (接続選択だけでは張らない方針のため、選択時点では未取得)。
+      // Opening the schema browser = a moment to use the connection. The tunnel is already
+      // open from listTables, so also load the schema list and completion map now
+      // (not fetched at connection selection time, since we do not connect on selection alone).
       void appStore.ensureConnectionResources(connection);
     } catch (e) {
       if (generation !== loadGeneration) {
@@ -68,6 +172,7 @@
       }
       loadError = toErrorMessage(e);
       tables = [];
+      schemaNames = [];
     } finally {
       if (generation === loadGeneration) {
         loading = false;
@@ -75,27 +180,50 @@
     }
   };
 
-  /// リロードボタン: キャッシュを破棄してテーブル一覧を再取得し、
-  /// SQL 補完用のスキーママップも追従させる (list_tables の refresh が
-  /// バックエンドのカラムキャッシュも破棄するため、再取得で反映される)
+  /// Reload button: discards the cache and re-fetches the table list, and also
+  /// updates the schema map for SQL completion (the refresh of list_tables also discards
+  /// the backend column cache, so the re-fetch reflects it)
   const reload = async () => {
-    await load(appStore.selectedConnection, true);
+    await load(
+      appStore.selectedConnection,
+      appStore.tablesPaneListsSchemas,
+      true,
+    );
     void appStore.loadSchemaMap();
   };
 
-  // 接続・アクティブスキーマの変化で再読込する (初回マウント時も走る)。
-  // スキーマ切替 (changeActiveSchema) 後のツリー更新もこの購読で行われる。
-  // 接続選択直後は activeSchema が複数回変化するためデバウンスする。
+  // Reload when the connection or active schema changes (also runs on first mount).
+  // The tree update after a schema switch (changeActiveSchema) is also done via this subscription,
+  // and so is the move from SCHEMAS to TABLES once a database is chosen.
+  // activeSchema changes several times right after a connection is selected, so debounce.
   $effect(() => {
     const connection = appStore.selectedConnection;
+    const listSchemas = appStore.tablesPaneListsSchemas;
     void appStore.activeSchema;
     const timer = setTimeout(() => {
-      void load(connection);
+      void load(connection, listSchemas);
     }, RELOAD_DEBOUNCE_MS);
     return () => clearTimeout(timer);
   });
 
-  /// ツリー展開の遅延ロード: 展開時に初めてカラムを取得する
+  /// Choosing a database in SCHEMAS mode makes it the active schema (same as the toolbar's
+  /// schema selector). The pane then follows activeSchema and shows its tables
+  const chooseSchema = async (schema: string) => {
+    if (
+      choosingSchema ||
+      schemaNamesConnection !== appStore.selectedConnection
+    ) {
+      return;
+    }
+    choosingSchema = schema;
+    try {
+      await appStore.changeActiveSchema(schema);
+    } finally {
+      choosingSchema = null;
+    }
+  };
+
+  /// Lazy loading of tree expansion: fetch columns for the first time when expanded
   const toggleExpand = async (table: TableInfo) => {
     const key = table.qualified_name;
     const connection = appStore.selectedConnection;
@@ -109,7 +237,7 @@
     expanded[key] = { columns: null, error: null };
     try {
       const columns = await api.listColumns(connection, key);
-      // 取得中に折りたたまれた・接続が変わった場合は反映しない
+      // Do not apply if it was collapsed or the connection changed while fetching
       if (expanded[key] && appStore.selectedConnection === connection) {
         expanded[key] = { columns, error: null };
       }
@@ -120,11 +248,11 @@
     }
   };
 
-  /// シングルクリック: テーブル名をエディタに挿入。
-  /// ダブルクリックと区別するため少し待ってから確定する。
+  /// Single click: insert the table name into the editor.
+  /// Wait a little before committing to distinguish it from a double click.
   const onTableClick = (table: TableInfo, event: MouseEvent) => {
-    // ダブルクリックの 2 打目 (detail > 1) ではタイマーを張り直さない
-    // (直後の dblclick ハンドラが 1 打目のタイマーを取り消して処理する)
+    // Do not re-arm the timer on the 2nd click of a double click (detail > 1)
+    // (the dblclick handler right after cancels the 1st click's timer and handles it)
     if (event.detail > 1) {
       return;
     }
@@ -137,9 +265,10 @@
     }, CLICK_DELAY_MS);
   };
 
-  /// ダブルクリック: クエリスニペットをエディタに挿入する (実行はしない)。
-  /// スニペットはエディタ言語・エンジンに合わせる (es は検索リクエスト
-  /// ブロック、dynamodb は LIMIT 句の無い PartiQL、それ以外は SELECT 文)
+  /// Double click: insert a query snippet into the editor (does not run it).
+  /// The snippet matches the editor language / engine (a search request block for es,
+  /// PartiQL without a LIMIT clause for dynamodb, TOP for mssql, and a SELECT statement
+  /// with LIMIT otherwise)
   const onTableDblClick = (table: TableInfo) => {
     if (clickTimer) {
       clearTimeout(clickTimer);
@@ -155,11 +284,18 @@
     const engine = appStore.connections
       .find((c) => c.name === appStore.selectedConnection)
       ?.engine.toLowerCase();
-    // バックエンドの parse_engine と同じく大文字小文字を区別しない
+    // Case-insensitive, same as the backend's parse_engine
     if (engine === "dynamodb") {
-      // PartiQL に LIMIT 句は無い (行数はバックエンドの max_rows で抑える)。
-      // テーブル名はハイフン等を含み得るためダブルクォートで括る
+      // PartiQL has no LIMIT clause (the row count is limited by the backend's max_rows).
+      // Table names may contain hyphens etc., so wrap them in double quotes
       appStore.insertSqlSnippet(`SELECT * FROM "${table.qualified_name}";`);
+      return;
+    }
+    if (engine === "mssql" || engine === "sqlserver") {
+      // T-SQL has no LIMIT clause (use TOP). The backend (qualified_name in engines/mssql.rs)
+      // returns names containing spaces or dots wrapped in square brackets,
+      // so they can be embedded as is
+      appStore.insertSqlSnippet(`SELECT TOP 100 * FROM ${table.qualified_name};`);
       return;
     }
     appStore.insertSqlSnippet(
@@ -186,11 +322,28 @@
     >
       HISTORY
     </button>
-    <span class="text-xs font-semibold tracking-wide text-zinc-400">TABLES</span>
+    <span class="text-xs font-semibold tracking-wide text-zinc-400">
+      {appStore.tablesPaneListsSchemas ? "SCHEMAS" : "TABLES"}
+    </span>
+    {#if canDump && !appStore.tablesPaneListsSchemas}
+      <button
+        class="ml-auto rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
+        title="Dump this database (right-click a table to dump only that table)"
+        aria-label="Dump database"
+        data-annotate="button-dump-database"
+        disabled={!appStore.selectedConnection}
+        onclick={() => openDump(appStore.selectedConnection, null, null)}
+      >
+        <i class="bi bi-download" aria-hidden="true"></i>
+      </button>
+    {/if}
     <button
-      class="ml-auto rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
-      title="Reload tables"
-      aria-label="Reload tables"
+      class="rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
+      class:ml-auto={!canDump || appStore.tablesPaneListsSchemas}
+      title={appStore.tablesPaneListsSchemas ? "Reload schemas" : "Reload tables"}
+      aria-label={appStore.tablesPaneListsSchemas
+        ? "Reload schemas"
+        : "Reload tables"}
       data-annotate="button-reload-tables"
       disabled={!appStore.selectedConnection || loading}
       onclick={() => void reload()}
@@ -203,13 +356,41 @@
       <p class="px-3 py-2 text-xs text-zinc-500">Select a connection</p>
     {:else if loadError}
       <p class="px-3 py-2 text-xs text-red-400">{loadError}</p>
+    {:else if appStore.tablesPaneListsSchemas}
+      {#if currentSchemaNames.length === 0}
+        <p class="px-3 py-2 text-xs text-zinc-500">
+          {loading ? "Loading..." : "No schemas found"}
+        </p>
+      {:else}
+        <p class="px-3 pb-1 pt-2 text-[10px] text-zinc-500">
+          No database is set for this connection. Choose one to show its tables.
+        </p>
+        {#each currentSchemaNames as schema (schema)}
+          <button
+            class="flex w-full min-w-0 items-center gap-1.5 px-3 py-1 text-left text-sm text-zinc-200 hover:bg-zinc-800 disabled:opacity-40"
+            title="Use this schema and show its tables"
+            data-annotate="button-schema-{schema}"
+            disabled={choosingSchema !== null}
+            onclick={() => void chooseSchema(schema)}
+            oncontextmenu={(e) => openSchemaMenu(e, schema)}
+          >
+            <i class="bi bi-database shrink-0 text-xs text-zinc-500" aria-hidden="true"
+            ></i>
+            <span class="truncate">{schema}</span>
+          </button>
+        {/each}
+      {/if}
     {:else if tables.length === 0}
       <p class="px-3 py-2 text-xs text-zinc-500">
         {loading ? "Loading..." : "No tables found"}
       </p>
     {:else}
       {#each tables as table (table.qualified_name)}
-        <div class="group flex items-center hover:bg-zinc-800">
+        <div
+          class="group flex items-center hover:bg-zinc-800"
+          role="presentation"
+          oncontextmenu={(e) => openTableMenu(e, table)}
+        >
           <button
             class="shrink-0 px-1.5 py-1 text-[10px] text-zinc-500 hover:text-zinc-200"
             title={expanded[table.qualified_name]
@@ -269,3 +450,71 @@
     {/if}
   </div>
 </div>
+
+<svelte:window
+  onkeydown={(e) => {
+    if (contextMenu && e.key === "Escape") {
+      contextMenu = null;
+    }
+  }}
+/>
+
+{#if contextMenu}
+  {@const menu = contextMenu}
+  <!-- Full-screen layer: any click or right-click outside the menu closes it -->
+  <div
+    class="fixed inset-0 z-20"
+    role="presentation"
+    onclick={() => (contextMenu = null)}
+    oncontextmenu={(e) => {
+      e.preventDefault();
+      contextMenu = null;
+    }}
+  >
+    <div
+      class="fixed min-w-44 rounded border border-zinc-700 bg-zinc-800 py-1 text-xs text-zinc-200 shadow-xl"
+      style="left: {Math.min(menu.x, window.innerWidth - 240)}px; top: {Math.min(menu.y, window.innerHeight - 72)}px"
+      role="menu"
+    >
+      {#if menu.table}
+        <button
+          class="flex w-full items-center gap-2 px-3 py-1 text-left hover:bg-zinc-700"
+          role="menuitem"
+          data-annotate="menu-dump-table"
+          onclick={(e) => {
+            e.stopPropagation();
+            openDump(menu.connection, menu.database, menu.table);
+          }}
+        >
+          <i class="bi bi-download" aria-hidden="true"></i>
+          Dump table "{menu.table.name}"...
+        </button>
+      {/if}
+      <button
+        class="flex w-full items-center gap-2 px-3 py-1 text-left hover:bg-zinc-700"
+        role="menuitem"
+        data-annotate="menu-dump-database"
+        onclick={(e) => {
+          e.stopPropagation();
+          openDump(menu.connection, menu.database, null);
+        }}
+      >
+        <i class="bi bi-database-down" aria-hidden="true"></i>
+        Dump database{menu.database
+          ? ` "${menu.database}"`
+          : appStore.activeSchema
+            ? ` "${appStore.activeSchema}"`
+            : ""}...
+      </button>
+    </div>
+  </div>
+{/if}
+
+{#if dumpTarget}
+  <DumpModal
+    connection={dumpTarget.connection}
+    database={dumpTarget.database}
+    table={dumpTarget.table}
+    onClose={() => (dumpTarget = null)}
+  />
+{/if}

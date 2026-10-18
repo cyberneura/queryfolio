@@ -8,23 +8,25 @@ use base64::Engine as _;
 use futures::TryStreamExt;
 use serde::Serialize;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlRow, MySqlSslMode};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow, PgSslMode};
+use sqlx::postgres::{
+    PgConnectOptions, PgPoolOptions, PgRow, PgSslMode, PgTypeKind, PgValueFormat,
+};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
-use sqlx::{Column, Connection as _, Executor, Row, TypeInfo};
+use sqlx::{Column, Connection as _, Executor, Row, TypeInfo, ValueRef};
 
 use crate::config::{ServerConfig, SqlSslMode};
 use crate::error::AppError;
 use crate::config::expand_tilde;
 use crate::tunnel::SshTunnel;
 
-/// 1 回のクエリで取得する行数の上限デフォルト。
+/// Default upper limit on the number of rows fetched by a single query.
 pub const DEFAULT_MAX_ROWS: usize = 1000;
 
 const POOL_MAX_CONNECTIONS: u32 = 3;
 const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// SQLite の progress handler を呼ぶ VM 命令数の間隔。
-/// 小さいほどキャンセルの反応が速いが、実行オーバーヘッドが増える。
+/// Interval, in VM instructions, at which SQLite's progress handler is called.
+/// Smaller values make cancellation more responsive but add execution overhead.
 const SQLITE_PROGRESS_HANDLER_OPS: i32 = 1000;
 
 #[derive(Clone)]
@@ -32,18 +34,21 @@ pub enum DbPool {
     MySql(sqlx::MySqlPool),
     Postgres(sqlx::PgPool),
     Sqlite(sqlx::SqlitePool),
-    /// Redis は sqlx を使わない。Client は接続情報のみ持ち、
-    /// 実行のたびに multiplexed connection を張る (engines::redis)。
+    /// Redis does not use sqlx. The Client only holds connection info, and
+    /// a multiplexed connection is opened on every execution (engines::redis).
     Redis(redis::Client),
-    /// Elasticsearch は sqlx を使わず reqwest で REST API を叩く
-    /// (engines::elasticsearch)。EsClient は base_url と認証情報のみ持つ。
+    /// Elasticsearch does not use sqlx and calls the REST API via reqwest
+    /// (engines::elasticsearch). EsClient only holds base_url and credentials.
     Elasticsearch(crate::engines::elasticsearch::EsClient),
-    /// DuckDB は sqlx を使わず duckdb crate で結線する (engines::duckdb)。
-    /// SQL エンジンだがコネクションは 1 本を Mutex で維持する。
+    /// DuckDB does not use sqlx and is wired up with the duckdb crate (engines::duckdb).
+    /// It is a SQL engine, but a single connection is kept behind a Mutex.
     DuckDb(crate::engines::duckdb::DuckDbHandle),
-    /// DynamoDB は sqlx を使わず AWS SDK で PartiQL (ExecuteStatement) を
-    /// 実行する (engines::dynamodb)。DynamoClient は SDK クライアントのみ持つ。
+    /// DynamoDB does not use sqlx and runs PartiQL (ExecuteStatement) through
+    /// the AWS SDK (engines::dynamodb). DynamoClient only holds the SDK client.
     DynamoDb(crate::engines::dynamodb::DynamoClient),
+    /// SQL Server does not use sqlx and is wired up with tiberius (engines::mssql).
+    /// It is a SQL engine, but a single connection is kept behind a Mutex.
+    MsSql(crate::engines::mssql::MsSqlHandle),
 }
 
 #[derive(Debug, Serialize)]
@@ -54,308 +59,366 @@ pub struct QueryResult {
     pub affected_rows: Option<u64>,
     pub truncated: bool,
     pub elapsed_ms: u64,
-    /// 自動付与した LIMIT の値 (付与していなければ None)
+    /// The LIMIT value that was added automatically (None if none was added)
     pub applied_limit: Option<u64>,
-    /// `\c` で切り替えた後のアクティブスキーマ (それ以外は None)。
-    /// フロント側の表示・スキーマブラウザ・補完を追従させるために返す。
+    /// The active schema after switching with `\c` (None otherwise).
+    /// Returned so that the frontend display, schema browser and completion follow along.
     #[serde(default)]
     pub switched_schema: Option<String>,
 }
 
-/// 接続名ごとのプールと SSH トンネルを保持するマネージャ。
+/// Manager that holds the pool and SSH tunnel for each connection name.
 ///
-/// 接続の確立 (SSH トンネル・password_command・DB への接続) は数秒かかり得る
-/// ため、マップ全体のロック (inner) を握ったままは行わない。握ったままだと、
-/// ある接続の password_command が認証待ちで止まっている間、確立済みの別の
-/// 接続のクエリまでプールの取り出しで待たされる。代わりに接続名ごとのロック
-/// (connect_locks) で同じ接続の確立だけを直列化し、二重生成を防ぐ。
-/// ロックの順序は常に connect_locks → inner (逆順で待たない)。
+/// The maps are guarded by one tokio Mutex (`inner`), but establishing a pool
+/// (SSH tunnel + DB handshake, which can take seconds or hang until a timeout)
+/// is done outside it, under a per-connection lock (`connecting`). Holding
+/// `inner` across the connect would make a slow connection block queries on
+/// every other connection. The per-connection lock still prevents creating the
+/// same connection's pool / tunnel twice.
 #[derive(Default)]
 pub struct DbManager {
     inner: tokio::sync::Mutex<DbManagerInner>,
+    /// Per-connection lock held while a pool / tunnel is being established, and while a
+    /// password_command password is being refreshed
+    connecting: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-connection count of password refresh attempts (see refresh_password)
+    password_refreshes: std::sync::Mutex<HashMap<String, u64>>,
 }
 
 #[derive(Default)]
 struct DbManagerInner {
     pools: HashMap<String, DbPool>,
     tunnels: HashMap<String, SshTunnel>,
-    /// 接続名ごとのアクティブスキーマ (database) のオーバーライド。
-    /// 設定の schema と異なる database に切り替えている時のみ存在する。
+    /// Per-connection override of the active schema (database).
+    /// Present only while switched to a database different from the schema in the config.
     schema_overrides: HashMap<String, String>,
-    /// 接続名ごとの「接続の確立」を直列化するロック。
-    /// プール・トンネルを破棄する操作 (disconnect / スキーマ切替) もこれを取り、
-    /// 確立の途中に割り込まない (確立が終わるのを待ってから破棄する)。
-    connect_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
-    /// reset (設定リロード) のたびに進む世代。reset は全接続が対象なので
-    /// 接続ごとのロックは取らず、確立中だった get_pool が古い設定で作った
-    /// プール・トンネルを登録しないよう、この世代で検知する。
-    reset_generation: u64,
+    /// Bumped by reset(). Together with `generations` it tells get_pool that the
+    /// state it read before connecting is stale (see still_current).
+    reset_epoch: u64,
+    /// Per-connection counter bumped whenever its pool / tunnel / schema override
+    /// is dropped or replaced (disconnect, schema switch, rollback)
+    generations: HashMap<String, u64>,
 }
 
 impl DbManagerInner {
-    fn connect_lock(&mut self, connection: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.connect_locks
+    fn generation(&self, connection: &str) -> (u64, u64) {
+        (
+            self.reset_epoch,
+            self.generations.get(connection).copied().unwrap_or(0),
+        )
+    }
+
+    /// Whether a pool / tunnel established from the state read at `generation` can
+    /// still be cached. Ok(false) = the connection was disconnected / its schema was
+    /// switched meanwhile, so connect again from the current state. Err = the config
+    /// was reloaded meanwhile: the caller's ServerConfig itself may be stale, so
+    /// retrying with it would cache a pool built from the old host / credentials
+    fn still_current(&self, connection: &str, generation: (u64, u64)) -> Result<bool, AppError> {
+        let current = self.generation(connection);
+        if current.0 != generation.0 {
+            return Err(reloaded_while_connecting());
+        }
+        Ok(current == generation)
+    }
+
+    fn bump_generation(&mut self, connection: &str) {
+        *self.generations.entry(connection.to_string()).or_insert(0) += 1;
+    }
+}
+
+fn reloaded_while_connecting() -> AppError {
+    AppError::Config("The configuration was reloaded while connecting. Run the query again.".into())
+}
+
+impl DbManager {
+    fn connect_lock(&self, connection: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.connecting
+            .lock()
+            .unwrap()
             .entry(connection.to_string())
             .or_default()
             .clone()
     }
-}
-
-impl DbManager {
-    /// 接続名ごとの確立ロックを返す (inner のロックは返す前に手放す)。
-    async fn connect_lock(&self, connection: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.inner.lock().await.connect_lock(connection)
-    }
 
     pub async fn get_pool(&self, server: &ServerConfig) -> Result<DbPool, AppError> {
-        let connect_lock = {
-            let mut inner = self.inner.lock().await;
-            if let Some(pool) = inner.pools.get(&server.name) {
-                return Ok(pool.clone());
-            }
-            inner.connect_lock(&server.name)
-        };
-        let _connecting = connect_lock.lock().await;
-
-        // 確立ロックを待っている間に、同じ接続の別の呼び出しが張り終えている
-        // ことがある。その場合はそれを使う (password_command を二重に走らせない)
-        let (mut server, tunnel_port, generation) = {
+        // Note the reset epoch the caller's ServerConfig belongs to before waiting
+        // on the per-connection lock: a reload while waiting (e.g. behind another
+        // caller that is connecting) must not let this stale config be cached
+        let entry_epoch = {
             let inner = self.inner.lock().await;
             if let Some(pool) = inner.pools.get(&server.name) {
                 return Ok(pool.clone());
             }
-            // アクティブスキーマが切り替えられていれば接続先 database を差し替える
-            let mut server = server.clone();
-            if let Some(schema) = inner.schema_overrides.get(&server.name) {
-                server.schema = Some(schema.clone());
-            }
-            let tunnel_port = inner.tunnels.get(&server.name).map(|t| t.local_port);
-            (server, tunnel_port, inner.reset_generation)
+            inner.reset_epoch
         };
+        // Only one task establishes a given connection at a time. Others wait
+        // here and then pick up the pool it cached
+        let connect_lock = self.connect_lock(&server.name);
+        let _connecting = connect_lock.lock().await;
 
-        let engine = parse_engine(&server.engine)?;
+        // The output of password_command, fetched at most once per get_pool even when the loop
+        // connects again. It goes only into the cloned ServerConfig (so every engine that reads
+        // server.password works unchanged) and from there into the new pool's connect options
+        let mut password: Option<String> = None;
+        loop {
+            // Snapshot the state needed to connect, then release `inner` so that
+            // other connections are not blocked while this one connects
+            let (server, tunnel_port, generation) = {
+                let inner = self.inner.lock().await;
+                if let Some(pool) = inner.pools.get(&server.name) {
+                    return Ok(pool.clone());
+                }
+                // If the active schema has been switched, replace the target database
+                let mut server = server.clone();
+                if let Some(schema) = inner.schema_overrides.get(&server.name) {
+                    server.schema = Some(schema.clone());
+                }
+                let tunnel_port = inner.tunnels.get(&server.name).map(|t| t.local_port);
+                let generation = inner.generation(&server.name);
+                if generation.0 != entry_epoch {
+                    return Err(reloaded_while_connecting());
+                }
+                (server, tunnel_port, generation)
+            };
+            let mut server = server;
+            if let Some(command) = server.password_command()? {
+                if password.is_none() {
+                    password =
+                        Some(crate::config::run_password_command(&server.name, command).await?);
+                }
+                server.password = password.clone();
+            }
+            let server = &server;
 
-        // password_command は新しいプールを作る時にだけ実行する。結果は
-        // このプールの接続オプションにだけ渡り、他には保持しない。
-        // 複製した ServerConfig の password へ入れるので、server.password を
-        // 読む全エンジンがそのまま動く
-        resolve_password(&mut server).await?;
-        let server = &server;
+            let engine = parse_engine(&server.engine)?;
 
-        // SSH トンネルが必要なら先に確立し、接続先をローカルポートに差し替える
-        let (host, port) = match (&server.ssh_tunnel, engine) {
-            // ファイルベースのエンジンにトンネルの意味は無い
-            (Some(_), Engine::Sqlite) => {
-                return Err(AppError::Config(
-                    "ssh_tunnel cannot be used with sqlite".into(),
-                ));
-            }
-            (Some(_), Engine::DuckDb) => {
-                return Err(AppError::Config(
-                    "ssh_tunnel cannot be used with duckdb".into(),
-                ));
-            }
-            // DynamoDB は HTTPS の AWS エンドポイントへ直接繋ぐ (SigV4 署名に
-            // リージョンのエンドポイントが前提)。トンネルは非対応
-            (Some(_), Engine::DynamoDb) => {
-                return Err(AppError::Config(
-                    "ssh_tunnel cannot be used with dynamodb".into(),
-                ));
-            }
-            (Some(tunnel_config), _) => {
-                // スキーマ切替等でプールだけ破棄された場合、既存トンネルは
-                // 接続先ホストが同じなのでそのまま再利用する
-                let local_port = match tunnel_port {
-                    Some(local_port) => local_port,
-                    None => {
-                        let target_host =
-                            server.host.clone().unwrap_or_else(|| "localhost".into());
-                        let target_port = server.port.unwrap_or(default_port(engine));
-                        let tunnel_config = tunnel_config.clone();
-                        // ssh2 は blocking なので spawn_blocking で実行する
-                        let tunnel = tokio::task::spawn_blocking(move || {
-                            SshTunnel::start(&tunnel_config, &target_host, target_port)
-                        })
-                        .await
-                        .map_err(|e| {
-                            AppError::SshTunnel(format!("SSH tunnel task failed: {e}"))
-                        })??;
-                        let local_port = tunnel.local_port;
-                        // DB への接続に失敗してもトンネルは残し、次の試行で
-                        // 再利用する (プールより先に登録する)
-                        let mut inner = self.inner.lock().await;
-                        if inner.reset_generation != generation {
-                            // 確立中に設定リロードが挟まった。古い設定のトンネルは
-                            // 登録できず、ここで閉じるので、それを使うプールも
-                            // 作れない
-                            return Err(AppError::Config(format!(
-                                "The config was reloaded while connecting to '{}'. \
-                                 Run it again.",
-                                server.name
-                            )));
+            // If an SSH tunnel is needed, establish it first and replace the target with the local port
+            let (host, port) = match (&server.ssh_tunnel, engine) {
+                // Tunnels are meaningless for file-based engines
+                (Some(_), Engine::Sqlite) => {
+                    return Err(AppError::Config(
+                        "ssh_tunnel cannot be used with sqlite".into(),
+                    ));
+                }
+                (Some(_), Engine::DuckDb) => {
+                    return Err(AppError::Config(
+                        "ssh_tunnel cannot be used with duckdb".into(),
+                    ));
+                }
+                // DynamoDB connects directly to the HTTPS AWS endpoint (SigV4 signing
+                // requires the regional endpoint). Tunnels are not supported
+                (Some(_), Engine::DynamoDb) => {
+                    return Err(AppError::Config(
+                        "ssh_tunnel cannot be used with dynamodb".into(),
+                    ));
+                }
+                (Some(tunnel_config), _) => {
+                    // If only the pool was dropped (e.g. by a schema switch), the existing tunnel
+                    // points to the same target host, so it is reused as is
+                    let local_port = match tunnel_port {
+                        Some(local_port) => local_port,
+                        None => {
+                            let target_host =
+                                server.host.clone().unwrap_or_else(|| "localhost".into());
+                            let target_port = server.port.unwrap_or(default_port(engine));
+                            let tunnel_config = tunnel_config.clone();
+                            // ssh2 is blocking, so run it with spawn_blocking
+                            let tunnel = tokio::task::spawn_blocking(move || {
+                                SshTunnel::start(&tunnel_config, &target_host, target_port)
+                            })
+                            .await
+                            .map_err(|e| {
+                                AppError::SshTunnel(format!("SSH tunnel task failed: {e}"))
+                            })??;
+                            let local_port = tunnel.local_port;
+                            // Cache the tunnel right away (even if the DB connect below
+                            // fails, the next attempt reuses it), unless the connection
+                            // was disconnected / reset meanwhile
+                            let mut inner = self.inner.lock().await;
+                            if !inner.still_current(&server.name, generation)? {
+                                continue;
+                            }
+                            inner.tunnels.insert(server.name.clone(), tunnel);
+                            local_port
                         }
-                        inner.tunnels.insert(server.name.clone(), tunnel);
-                        local_port
+                    };
+                    ("127.0.0.1".to_string(), local_port)
+                }
+                (None, _) => (
+                    server.host.clone().unwrap_or_else(|| "localhost".into()),
+                    server.port.unwrap_or(default_port(engine)),
+                ),
+            };
+
+            let connected = connect(server, engine, &host, port).await;
+            let mut inner = self.inner.lock().await;
+            // The handshake itself may fail *because* of the change (a disconnect
+            // kills the tunnel it was using), so look at the generation before
+            // reporting the error
+            let pool = match connected {
+                Ok(pool) => pool,
+                Err(e) => {
+                    if inner.still_current(&server.name, generation)? {
+                        return Err(e);
                     }
-                };
-                ("127.0.0.1".to_string(), local_port)
+                    continue;
+                }
+            };
+            // A disconnect / schema switch happened while connecting: this pool may
+            // point at a dropped tunnel or the old database, so discard it and
+            // connect again from the current state (a reload is an error, see still_current)
+            if !inner.still_current(&server.name, generation)? {
+                continue;
             }
-            (None, _) => (
-                server.host.clone().unwrap_or_else(|| "localhost".into()),
-                server.port.unwrap_or(default_port(engine)),
-            ),
-        };
-
-        let pool = connect(server, engine, &host, port).await?;
-        let mut inner = self.inner.lock().await;
-        // 確立中に設定リロードが挟まっていたら、古い設定で張ったプールは
-        // 登録しない (この呼び出しには返す。次の呼び出しは新しい設定で張り直す)
-        if inner.reset_generation == generation {
             inner.pools.insert(server.name.clone(), pool.clone());
+            return Ok(pool);
         }
-        Ok(pool)
     }
 
-    /// 接続を pool 上で実行し、password_command で取得したパスワードの期限切れ
-    /// (認証エラー) なら、パスワードを取り直して 1 度だけ再実行する。
-    ///
-    /// sqlx のプールは後から新しいコネクションを張る時にも作成時の接続オプション
-    /// (= 当時のパスワード) を使うため、RDS の IAM 認証トークン (有効 15 分) で
-    /// 作ったプールは、既存のコネクションが生きていても新しいコネクションから
-    /// 失敗し始める。認証エラーは接続の確立時にしか起きず、文は実行されて
-    /// いないので、再実行しても二重実行にはならない。
-    ///
-    /// 静的な password の接続は再実行しない (取り直しても同じ値なので)。
-    pub async fn with_pool<T, F, Fut>(&self, server: &ServerConfig, run: F) -> Result<T, AppError>
-    where
-        F: Fn(DbPool) -> Fut,
-        Fut: std::future::Future<Output = Result<T, AppError>>,
-    {
-        let pool = self.get_pool(server).await?;
-        self.retry_on_expired_password(server, pool, run).await
-    }
-
-    /// with_pool の、プールを取得済みの呼び出し側向け版
-    /// (プール取得と実行の間に別の処理を挟む AI チャット用)。
-    pub async fn retry_on_expired_password<T, F, Fut>(
+    /// get_pool + run_with_password_refresh.
+    pub async fn with_pool<T, F, Fut>(
         &self,
         server: &ServerConfig,
-        pool: DbPool,
-        run: F,
+        retry: PasswordRetry,
+        op: F,
     ) -> Result<T, AppError>
     where
         F: Fn(DbPool) -> Fut,
         Fut: std::future::Future<Output = Result<T, AppError>>,
     {
-        let uses_password_command = server.password_command.is_some();
-        let mut retried = false;
-        loop {
-            let error = match run(pool.clone()).await {
-                Err(error)
-                    if should_retry_with_fresh_password(
-                        uses_password_command,
-                        retried,
-                        db_error_code(&error),
-                    ) =>
-                {
-                    error
-                }
-                // 成功・認証以外のエラー・再試行後の失敗はそのまま返す
-                result => return result,
-            };
-            eprintln!(
-                "[db] '{}': authentication failed, re-running password_command and retrying once",
-                server.name
-            );
-            // 取り直しに失敗したら、そちらの理由 (コマンドのエラー) も返す。
-            // 元の認証エラーだけ返すと、トークン取得側の問題 (SSO の期限切れ等) に
-            // 気付けない
-            self.refresh_password(server, &pool).await.map_err(|refresh_error| {
-                AppError::Config(format!(
-                    "{error}\nRe-running password_command failed: {refresh_error}"
-                ))
-            })?;
-            retried = true;
-        }
+        let pool = self.get_pool(server).await?;
+        self.run_with_password_refresh(server, pool, retry, op).await
     }
 
-    /// password_command を実行し直し、pool がこれから張るコネクションの
-    /// パスワードを差し替える。
+    /// Runs `op` on the pool. On a password_command connection (Postgres / MySQL), if it fails
+    /// with an authentication error that `retry` allows, re-runs password_command, gives the new
+    /// password to the pool and runs `op` once more.
     ///
-    /// プールは作り直さず `Pool::set_connect_options` で差し替える。作り直すと
-    /// (1) 既に渡したプールの複製 (キャンセル発行用に CancelTarget が持つもの等) が
-    /// 古いパスワードのまま残り、(2) 認証済みで生きている既存コネクションまで
-    /// 捨てることになる。差し替えならプールを共有する全ての複製に効き、既存の
-    /// コネクションはそのまま使える。SSH トンネルにも触れない (接続先は同じ
-    /// ローカルポートのまま)。接続オプションはプール自身が持っているものを
-    /// 複製してパスワードだけ変えるので、トンネルの解決や TLS 設定をやり直す
-    /// 必要も無い。
-    async fn refresh_password(&self, server: &ServerConfig, pool: &DbPool) -> Result<(), AppError> {
-        let Some(command) = server.password_command()? else {
-            return Ok(());
-        };
-        let password = crate::config::run_password_command(&server.name, command).await?;
-        match pool {
-            DbPool::Postgres(pool) => {
-                let options = (*pool.connect_options()).clone().password(&password);
-                pool.set_connect_options(options);
-            }
-            DbPool::MySql(pool) => {
-                let options = (*pool.connect_options()).clone().password(&password);
-                pool.set_connect_options(options);
-            }
-            // 認証エラーの再試行は Postgres / MySQL だけが対象
-            // (should_retry_with_fresh_password)
-            DbPool::Sqlite(_)
-            | DbPool::Redis(_)
-            | DbPool::Elasticsearch(_)
-            | DbPool::DuckDb(_)
-            | DbPool::DynamoDb(_) => {}
+    /// sqlx opens later connections with the options the pool was created with, so a pool built
+    /// from a short-lived token (RDS IAM auth: 15 minutes) starts failing on new connections
+    /// while the established ones keep working.
+    ///
+    /// The new password is applied with `Pool::set_connect_options` instead of rebuilding the
+    /// pool, so every copy of the pool (e.g. the one a CancelTarget holds) sees it, established
+    /// connections are kept, and the SSH tunnel is left alone.
+    pub async fn run_with_password_refresh<T, F, Fut>(
+        &self,
+        server: &ServerConfig,
+        pool: DbPool,
+        retry: PasswordRetry,
+        op: F,
+    ) -> Result<T, AppError>
+    where
+        F: Fn(DbPool) -> Fut,
+        Fut: std::future::Future<Output = Result<T, AppError>>,
+    {
+        let refreshable = matches!(pool, DbPool::Postgres(_) | DbPool::MySql(_));
+        if server.password_command.is_none() || !refreshable {
+            return op(pool).await;
         }
-        Ok(())
+        let attempts_seen = self.password_refresh_attempts(&server.name);
+        match op(pool.clone()).await {
+            Err(error) if should_refresh_password(retry, &error) => {
+                self.refresh_password(server, &pool, attempts_seen, error)
+                    .await?;
+                op(pool).await
+            }
+            result => result,
+        }
     }
 
-    /// プールとトンネルを全て破棄する。設定リロード時に呼ぶ。
+    /// Re-runs password_command and applies its output to the pool.
+    ///
+    /// Single-flight per connection: operations that hit the expiry together (TABLES pane,
+    /// completion, a query) wait on the connection lock, and only the first one runs the
+    /// command, so a helper that prompts (SSO, Touch ID) prompts once. The others see that an
+    /// attempt was made since they started and just retry. Attempts are counted whether or not
+    /// they succeed: otherwise every waiter would run a failing helper again (one prompt or one
+    /// 60-second timeout each); after a failed attempt their retry fails and reports the auth error
+    async fn refresh_password(
+        &self,
+        server: &ServerConfig,
+        pool: &DbPool,
+        attempts_seen: u64,
+        auth_error: AppError,
+    ) -> Result<(), AppError> {
+        let connect_lock = self.connect_lock(&server.name);
+        let _refreshing = connect_lock.lock().await;
+        if self.password_refresh_attempts(&server.name) != attempts_seen {
+            return Ok(());
+        }
+        let Some(command) = server.password_command()? else {
+            return Err(auth_error);
+        };
+        eprintln!(
+            "[db] '{}': authentication failed, re-running password_command",
+            server.name
+        );
+        let fetched = crate::config::run_password_command(&server.name, command).await;
+        if let Ok(password) = &fetched {
+            set_pool_password(pool, password);
+        }
+        // Counted when the attempt has finished: an operation that failed while it was running
+        // read the old count, and must retry rather than run the command again
+        *self
+            .password_refreshes
+            .lock()
+            .unwrap()
+            .entry(server.name.clone())
+            .or_insert(0) += 1;
+        // Report the command's failure too: the auth error alone would hide a problem on the
+        // token side (an expired SSO session etc.)
+        fetched.map(|_| ()).map_err(|refresh_error| {
+            AppError::Config(format!(
+                "{auth_error}\nRe-running password_command failed: {refresh_error}"
+            ))
+        })
+    }
+
+    fn password_refresh_attempts(&self, connection: &str) -> u64 {
+        self.password_refreshes
+            .lock()
+            .unwrap()
+            .get(connection)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Drops all pools and tunnels. Called when the config is reloaded.
     pub async fn reset(&self) {
         let mut inner = self.inner.lock().await;
-        inner.reset_generation += 1;
         inner.pools.clear();
         inner.tunnels.clear();
         inner.schema_overrides.clear();
+        inner.reset_epoch += 1;
     }
 
-    /// 指定接続のプールと SSH トンネルを破棄する。
-    /// 「この接続はもう不要」と判断された契機 (エディタタブを全て閉じた時など) に
-    /// 呼ぶ。トンネルとプールは必ず一緒に破棄する — プールがトンネルの死んだ
-    /// ローカルポート宛のコネクションを掴んだまま残ると、次にこの接続を使った時に
-    /// クエリが失敗するため。
-    /// アクティブスキーマの選択 (schema_overrides) は UI の状態なので保持し、
-    /// 次に接続を張り直した時に同じスキーマで繋がるようにする。
+    /// Drops the pool and SSH tunnel of the given connection.
+    /// Call this when the connection is judged to be no longer needed (e.g. when
+    /// all editor tabs are closed). The tunnel and the pool must always be dropped
+    /// together: if a pool kept holding connections to the dead local port of the
+    /// tunnel, queries would fail the next time this connection is used.
+    /// The active schema selection (schema_overrides) is UI state, so it is kept,
+    /// so that the next reconnect uses the same schema.
     pub async fn disconnect(&self, connection: &str) {
-        // 確立の途中なら終わるのを待ってから破棄する
-        let connect_lock = self.connect_lock(connection).await;
-        let _connecting = connect_lock.lock().await;
         let mut inner = self.inner.lock().await;
         inner.pools.remove(connection);
         inner.tunnels.remove(connection);
+        inner.bump_generation(connection);
     }
 
-    /// 接続のアクティブスキーマ (database) を切り替える。
-    /// プールを破棄し、次のクエリから新しい database で接続し直す
-    /// (SQL の USE ではなくプール再構築で切り替えることで、プール内の
-    /// コネクション間でセッション状態が食い違うのを防ぐ)。
-    /// SSH トンネルは接続先ホストが変わらないため維持する。
+    /// Switches the active schema (database) of a connection.
+    /// Drops the pool and reconnects to the new database from the next query
+    /// (switching by rebuilding the pool rather than SQL USE prevents session
+    /// state from diverging between connections in the pool).
+    /// The SSH tunnel is kept because the target host does not change.
     pub async fn set_schema_override(&self, connection: &str, schema: String) {
         self.replace_schema_override(connection, Some(schema)).await;
     }
 
-    /// アクティブスキーマのオーバーライドを設定または解除する。
-    /// None を渡すと設定ファイルの schema に戻る。
+    /// Sets or clears the active schema override.
+    /// Passing None goes back to the schema in the config file.
     async fn replace_schema_override(&self, connection: &str, schema: Option<String>) {
-        // 確立中のプールは切替前のスキーマで張られるので、確立が終わってから
-        // それを破棄する (割り込むと切替前のスキーマのプールが登録され残る)
-        let connect_lock = self.connect_lock(connection).await;
-        let _connecting = connect_lock.lock().await;
         let mut inner = self.inner.lock().await;
         match schema {
             Some(schema) => {
@@ -366,24 +429,23 @@ impl DbManager {
             }
         }
         inner.pools.remove(connection);
+        inner.bump_generation(connection);
     }
 
-    /// 切り替えに失敗した時 (存在しない database を指定された等) に、
-    /// アクティブスキーマを previous へ戻す。
+    /// When switching fails (e.g. a nonexistent database was specified), restores
+    /// the active schema to previous.
     ///
-    /// 現在値が expected (自分が設定した値) と一致する場合だけ戻す
-    /// compare-and-swap。切り替え中にユーザーがスキーマ選択などで別の値へ
-    /// 変更していた場合、それを巻き戻さないようにするため。
-    /// 戻した場合は true を返す。
+    /// This is a compare-and-swap that restores only if the current value equals
+    /// expected (the value we set). It avoids rolling back a different value the
+    /// user may have chosen (e.g. via schema selection) during the switch.
+    /// Returns true if it restored.
     pub async fn rollback_schema_override(
         &self,
         connection: &str,
         expected: &str,
         previous: Option<String>,
     ) -> bool {
-        let connect_lock = self.connect_lock(connection).await;
-        let _connecting = connect_lock.lock().await;
-        // 判定と書き戻しの間に割り込まれないよう、同じロックスコープで行う
+        // Do the check and write-back in the same lock scope so nothing can interleave
         let mut inner = self.inner.lock().await;
         if inner.schema_overrides.get(connection).map(String::as_str) != Some(expected) {
             return false;
@@ -399,10 +461,11 @@ impl DbManager {
             }
         }
         inner.pools.remove(connection);
+        inner.bump_generation(connection);
         true
     }
 
-    /// 接続のアクティブスキーマのオーバーライドを返す (無ければ None)。
+    /// Returns the active schema override of a connection (None if there is none).
     pub async fn schema_override(&self, connection: &str) -> Option<String> {
         self.inner.lock().await.schema_overrides.get(connection).cloned()
     }
@@ -417,11 +480,12 @@ pub(crate) enum Engine {
     Elasticsearch,
     DuckDb,
     DynamoDb,
+    MsSql,
 }
 
-/// プールから実行専用に確保した 1 本のコネクション。
-/// キャンセル対象 (backend PID 等) はセッション単位の情報のため、
-/// クエリはプール直ではなくこのコネクション上で実行する。
+/// A single connection acquired from the pool for exclusive use during execution.
+/// The cancellation target (backend PID, etc.) is session-level information,
+/// so queries run on this connection rather than directly on the pool.
 enum DbConnection {
     MySql(sqlx::pool::PoolConnection<sqlx::MySql>),
     Postgres(sqlx::pool::PoolConnection<sqlx::Postgres>),
@@ -431,15 +495,18 @@ enum DbConnection {
 impl DbConnection {
     async fn acquire(pool: &DbPool) -> Result<Self, AppError> {
         Ok(match pool {
-            DbPool::MySql(p) => DbConnection::MySql(p.acquire().await?),
-            DbPool::Postgres(p) => DbConnection::Postgres(p.acquire().await?),
-            DbPool::Sqlite(p) => DbConnection::Sqlite(p.acquire().await?),
-            // sqlx を使わないエンジンは run_query_cancellable が acquire より
-            // 前に各エンジンモジュールへ委譲するため、ここには来ない
+            DbPool::MySql(p) => DbConnection::MySql(p.acquire().await.map_err(acquire_error)?),
+            DbPool::Postgres(p) => {
+                DbConnection::Postgres(p.acquire().await.map_err(acquire_error)?)
+            }
+            DbPool::Sqlite(p) => DbConnection::Sqlite(p.acquire().await.map_err(acquire_error)?),
+            // Engines that do not use sqlx are delegated to their engine modules by
+            // run_query_cancellable before acquire, so we never get here
             DbPool::Redis(_)
             | DbPool::Elasticsearch(_)
             | DbPool::DuckDb(_)
-            | DbPool::DynamoDb(_) => {
+            | DbPool::DynamoDb(_)
+            | DbPool::MsSql(_) => {
                 return Err(AppError::Config(
                     "This engine does not use SQL connections".into(),
                 ));
@@ -456,39 +523,52 @@ impl DbConnection {
     }
 }
 
-/// キャンセル発行の手段 (エンジン別)。
-/// Postgres / MySQL はサーバー側で実行中の文を、プールの別コネクション
-/// から停止させる (接続自体は切断しないため、実行側のコネクションは
-/// 健全なままプールへ戻る)。SQLite は progress handler が cancelled
-/// フラグを監視して文を SQLITE_INTERRUPT で中断する。
+/// A rejected login while acquiring becomes AppError::ConnectAuth: nothing was sent yet, so
+/// PasswordRetry::BeforeStatement may retry it
+fn acquire_error(error: sqlx::Error) -> AppError {
+    let error = AppError::Db(error);
+    if !is_auth_failure(&error) {
+        return error;
+    }
+    match error {
+        AppError::Db(error) => AppError::ConnectAuth(error),
+        other => other,
+    }
+}
+
+/// How cancellation is issued (per engine).
+/// Postgres / MySQL stop the statement running on the server from another
+/// connection in the pool (the connection itself is not closed, so the
+/// execution-side connection returns to the pool healthy). SQLite has its
+/// progress handler watch the cancelled flag and abort the statement with SQLITE_INTERRUPT.
 pub(crate) enum CancelTarget {
-    /// SELECT pg_cancel_backend($pid) を別接続から発行する
+    /// Issues SELECT pg_cancel_backend($pid) from another connection
     Postgres { pid: i32, pool: sqlx::PgPool },
-    /// KILL QUERY <connection_id> を別接続から発行する
+    /// Issues KILL QUERY <connection_id> from another connection
     MySql { connection_id: u64, pool: sqlx::MySqlPool },
-    /// cancelled フラグを立てるだけ (progress handler が中断する)
+    /// Only sets the cancelled flag (the progress handler aborts)
     Sqlite,
-    /// クライアント側で実行の future を打ち切る (サーバー側で文を止める
-    /// 手段が無いエンジン用。Redis 等)。notify で実行側の select を起こす
+    /// Aborts the execution future on the client side (for engines with no way to
+    /// stop a statement on the server, e.g. Redis). Wakes the execution-side select via notify
     ClientSide { notify: Arc<tokio::sync::Notify> },
-    /// duckdb の InterruptHandle で実行中の文を中断させる。
-    /// spawn_blocking の実行は future の drop では止まらないため、
-    /// エンジン側の interrupt が必須 (実行中の文が無ければ no-op)
+    /// Interrupts the running statement with duckdb's InterruptHandle.
+    /// Execution under spawn_blocking is not stopped by dropping the future, so
+    /// an engine-side interrupt is required (no-op if no statement is running)
     DuckDb { interrupt: Arc<duckdb::InterruptHandle> },
 }
 
-/// 実行中クエリ 1 件分の登録情報
+/// Registration info for one running query
 struct RunningQuery {
-    /// 登録の世代識別子 (古いガードが新しい登録を消さないための照合用)
+    /// Generation id of the registration (to check that a stale guard does not remove a newer registration)
     id: u64,
     target: CancelTarget,
     cancelled: Arc<AtomicBool>,
 }
 
-/// 実行中クエリのレジストリ (接続名単位)。
-/// 同一接続の並列実行はフロントエンド側で抑止している
-/// (app.svelte.ts の isConnectionRunning ガード) ため、接続ごとに
-/// 最後に登録された実行のみをキャンセル対象として保持すれば十分。
+/// Registry of running queries (per connection name).
+/// Parallel execution on the same connection is suppressed on the frontend
+/// (the isConnectionRunning guard in app.svelte.ts), so it is enough to keep
+/// only the most recently registered execution per connection as the cancellation target.
 #[derive(Default)]
 pub struct CancelRegistry {
     running: std::sync::Mutex<HashMap<String, RunningQuery>>,
@@ -496,7 +576,7 @@ pub struct CancelRegistry {
 }
 
 impl CancelRegistry {
-    /// 実行開始を登録する。返り値のガードの drop で登録が解除される。
+    /// Registers the start of an execution. The registration is released when the returned guard is dropped.
     pub(crate) fn register(
         &self,
         connection: &str,
@@ -520,14 +600,37 @@ impl CancelRegistry {
         }
     }
 
-    /// 接続で実行中のクエリにキャンセルを要求する。
-    /// 実行中のクエリが無ければ何もせず false を返す。
-    /// クエリが直前に完了していた場合でも、pg_cancel_backend / KILL QUERY
-    /// はアイドルなセッションへの no-op になるため安全 (接続を壊す
-    /// KILL CONNECTION は使わない)。
+    /// Requests cancellation of the query running on a connection.
+    /// Does nothing and returns false if no query is running.
+    /// Even if the query had just finished, pg_cancel_backend / KILL QUERY
+    /// are no-ops against an idle session, so this is safe (KILL CONNECTION,
+    /// which would break the connection, is not used).
     pub async fn cancel(&self, connection: &str) -> Result<bool, AppError> {
-        // Mutex ガードを await をまたいで保持しないよう、
-        // 発行に必要な情報だけ取り出してからロックを解放する
+        self.cancel_matching(connection, None).await
+    }
+
+    /// The id of the registration running on a connection, and for Postgres / MySQL the pool
+    /// its cancellation opens a connection from
+    pub(crate) fn registration(&self, connection: &str) -> Option<(u64, Option<DbPool>)> {
+        let running = self.running.lock().unwrap();
+        let query = running.get(connection)?;
+        let pool = match &query.target {
+            CancelTarget::Postgres { pool, .. } => Some(DbPool::Postgres(pool.clone())),
+            CancelTarget::MySql { pool, .. } => Some(DbPool::MySql(pool.clone())),
+            _ => None,
+        };
+        Some((query.id, pool))
+    }
+
+    /// cancel, but only while the registration `id` is still the one running (returns false
+    /// otherwise). For retrying a cancellation, which must not hit a query started meanwhile
+    pub async fn cancel_registration(&self, connection: &str, id: u64) -> Result<bool, AppError> {
+        self.cancel_matching(connection, Some(id)).await
+    }
+
+    async fn cancel_matching(&self, connection: &str, id: Option<u64>) -> Result<bool, AppError> {
+        // Take only the information needed for issuing, then release the lock, so
+        // the Mutex guard is not held across an await
         enum CancelAction {
             Postgres { pid: i32, pool: sqlx::PgPool },
             MySql { connection_id: u64, pool: sqlx::MySqlPool },
@@ -540,6 +643,9 @@ impl CancelRegistry {
             let Some(query) = running.get(connection) else {
                 return Ok(false);
             };
+            if id.is_some_and(|id| id != query.id) {
+                return Ok(false);
+            }
             query.cancelled.store(true, Ordering::SeqCst);
             match &query.target {
                 CancelTarget::Postgres { pid, pool } => CancelAction::Postgres {
@@ -573,8 +679,8 @@ impl CancelRegistry {
                 connection_id,
                 pool,
             } => {
-                // KILL はプレースホルダを使えないが、connection_id は
-                // サーバーが返した数値なので直接埋め込んで問題ない
+                // KILL cannot use placeholders, but connection_id is a number
+                // returned by the server, so embedding it directly is fine
                 sqlx::query(&format!("KILL QUERY {connection_id}"))
                     .execute(&pool)
                     .await?;
@@ -586,16 +692,16 @@ impl CancelRegistry {
         Ok(true)
     }
 
-    /// (テスト用) 接続の実行が登録されているかを返す
+    /// (For tests) Returns whether an execution is registered for the connection
     #[cfg(test)]
     fn is_running(&self, connection: &str) -> bool {
         self.running.lock().unwrap().contains_key(connection)
     }
 }
 
-/// 実行終了時にレジストリから登録を外すガード。
-/// 登録後に同じ接続で新しい実行が登録し直された場合 (id 不一致) は
-/// 新しい登録を消さないよう何もしない。
+/// Guard that removes the registration from the registry when the execution ends.
+/// If a new execution was registered again on the same connection after
+/// registration (id mismatch), it does nothing so as not to remove the new registration.
 pub(crate) struct RunningQueryGuard<'a> {
     registry: &'a CancelRegistry,
     connection: String,
@@ -604,7 +710,7 @@ pub(crate) struct RunningQueryGuard<'a> {
 }
 
 impl RunningQueryGuard<'_> {
-    /// この実行にキャンセル要求があったかを返す
+    /// Returns whether cancellation was requested for this execution
     pub(crate) fn was_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
@@ -622,7 +728,7 @@ impl Drop for RunningQueryGuard<'_> {
     }
 }
 
-/// 設定の engine 文字列を Engine に解決する。
+/// Resolves the engine string in the config into an Engine.
 pub fn parse_engine(engine: &str) -> Result<Engine, AppError> {
     match engine.to_ascii_lowercase().as_str() {
         "mysql" | "mariadb" => Ok(Engine::MySql),
@@ -632,38 +738,65 @@ pub fn parse_engine(engine: &str) -> Result<Engine, AppError> {
         "elasticsearch" | "es" | "opensearch" => Ok(Engine::Elasticsearch),
         "duckdb" => Ok(Engine::DuckDb),
         "dynamodb" => Ok(Engine::DynamoDb),
+        "mssql" | "sqlserver" => Ok(Engine::MsSql),
         other => Err(AppError::Config(format!(
             "Unsupported engine: {other} \
-             (supported: mysql / postgres / sqlite / duckdb / redis / \
+             (supported: mysql / postgres / sqlite / duckdb / mssql / redis / \
              elasticsearch / dynamodb)"
         ))),
     }
 }
 
-/// password_command があれば実行し、その結果を server.password に入れる
-/// (server は get_pool が複製したもの。設定のキャッシュには書き戻さない)。
-async fn resolve_password(server: &mut ServerConfig) -> Result<(), AppError> {
-    if let Some(command) = server.password_command()?.map(str::to_string) {
-        let password = crate::config::run_password_command(&server.name, &command).await?;
-        server.password = Some(password);
-    }
-    Ok(())
+/// Which authentication failures of an operation may be retried after refreshing the password
+/// (DbManager::run_with_password_refresh).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordRetry {
+    /// Only a failure to open the connection the operation acquires first
+    /// (`AppError::ConnectAuth`, see DbConnection::acquire). For user SQL: an error code alone
+    /// cannot tell a failed login from a statement raising the same SQLSTATE (a PL/pgSQL
+    /// `RAISE ... USING ERRCODE = '28P01'` after side effects would run twice)
+    BeforeStatement,
+    /// Any authentication failure. Only for operations that are safe to run twice and run no
+    /// user code: catalog reads, and pg_cancel_backend / KILL QUERY
+    Idempotent,
 }
 
-/// DB のエラーコード (認証エラーの判定用)。
+fn should_refresh_password(retry: PasswordRetry, error: &AppError) -> bool {
+    match retry {
+        PasswordRetry::BeforeStatement => matches!(error, AppError::ConnectAuth(_)),
+        PasswordRetry::Idempotent => is_auth_failure(error),
+    }
+}
+
+/// Replaces the password the pool uses for the connections it opens from now on
+fn set_pool_password(pool: &DbPool, password: &str) {
+    match pool {
+        DbPool::Postgres(pool) => {
+            let options = (*pool.connect_options()).clone().password(password);
+            pool.set_connect_options(options);
+        }
+        DbPool::MySql(pool) => {
+            let options = (*pool.connect_options()).clone().password(password);
+            pool.set_connect_options(options);
+        }
+        _ => {}
+    }
+}
+
+/// Error code of a DB error (for detecting authentication failures).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DbErrorCode<'a> {
-    /// Postgres の SQLSTATE
+    /// Postgres SQLSTATE
     Postgres(&'a str),
-    /// MySQL のエラー番号 (SQLSTATE より細かい)
+    /// MySQL error number (finer-grained than its SQLSTATE)
     MySql(u16),
-    /// それ以外 (DB のエラーでない・他のエンジン)
+    /// Anything else (not a DB error, or another engine)
     Other,
 }
 
-/// 認証の失敗を表すエラーコードか。
-/// - Postgres: 28P01 (invalid_password。期限切れの IAM トークンもこれ) /
-///   28000 (invalid_authorization_specification。pg_hba で拒否された等)
+/// Whether the code means the login was rejected.
+/// - Postgres: 28P01 (invalid_password; an expired IAM token is this too) /
+///   28000 (invalid_authorization_specification, e.g. rejected by pg_hba)
 /// - MySQL: 1045 (ER_ACCESS_DENIED_ERROR)
 pub(crate) fn is_auth_failure_code(code: DbErrorCode<'_>) -> bool {
     match code {
@@ -673,8 +806,14 @@ pub(crate) fn is_auth_failure_code(code: DbErrorCode<'_>) -> bool {
     }
 }
 
+fn is_auth_failure(error: &AppError) -> bool {
+    matches!(error, AppError::ConnectAuth(_)) || is_auth_failure_code(db_error_code(error))
+}
+
 fn db_error_code(error: &AppError) -> DbErrorCode<'_> {
-    let AppError::Db(sqlx::Error::Database(db_error)) = error else {
+    let (AppError::Db(sqlx::Error::Database(db_error))
+    | AppError::ConnectAuth(sqlx::Error::Database(db_error))) = error
+    else {
         return DbErrorCode::Other;
     };
     if let Some(pg) = db_error.try_downcast_ref::<sqlx::postgres::PgDatabaseError>() {
@@ -686,39 +825,29 @@ fn db_error_code(error: &AppError) -> DbErrorCode<'_> {
     DbErrorCode::Other
 }
 
-/// パスワードを取り直して再実行すべきか (DbManager::retry_on_expired_password)。
-/// password_command の接続で、まだ再実行しておらず、認証エラーで失敗した時だけ。
-/// 静的な password は取り直しても同じ値なので再実行しない。
-pub(crate) fn should_retry_with_fresh_password(
-    uses_password_command: bool,
-    already_retried: bool,
-    code: DbErrorCode<'_>,
-) -> bool {
-    uses_password_command && !already_retried && is_auth_failure_code(code)
-}
-
-fn default_port(engine: Engine) -> u16 {
+pub(crate) fn default_port(engine: Engine) -> u16 {
     match engine {
         Engine::MySql => 3306,
         Engine::Postgres => 5432,
-        // DynamoDb はエンドポイント解決を engines::dynamodb::connect が行う
+        // DynamoDb endpoint resolution is done by engines::dynamodb::connect
         Engine::Sqlite | Engine::DuckDb | Engine::DynamoDb => 0,
         Engine::Redis => crate::engines::redis::DEFAULT_PORT,
         Engine::Elasticsearch => crate::engines::elasticsearch::DEFAULT_PORT,
+        Engine::MsSql => crate::engines::mssql::DEFAULT_PORT,
     }
 }
 
-/// ssl_root_cert のパスを展開して返す (未設定なら None)。
-/// 値の妥当性 (空文字・検証しないモードとの併記) は ServerConfig 側で検証し、
-/// ここではファイルとして開ける形かを見る
-/// (存在しないパスは接続時の分かりにくいエラーになる前に弾く)。
-fn ssl_root_cert_path(server: &ServerConfig) -> Result<Option<PathBuf>, AppError> {
+/// Expands and returns the ssl_root_cert path (None if unset).
+/// Validity of the value (empty string, combining with a no-verification mode) is checked on the ServerConfig side;
+/// here we only check that it is in a form that can be opened as a file
+/// (a nonexistent path is rejected before it turns into a confusing error at connect time).
+pub(crate) fn ssl_root_cert_path(server: &ServerConfig) -> Result<Option<PathBuf>, AppError> {
     let Some(raw) = server.sql_ssl_root_cert()? else {
         return Ok(None);
     };
     let path = expand_tilde(raw);
-    // ディレクトリを渡されると sqlx 側で分かりにくい読み込みエラーになるので、
-    // 通常ファイルであることまで確かめる
+    // If a directory is passed, sqlx gives a confusing read error, so
+    // also check that it is a regular file
     if !path.is_file() {
         return Err(AppError::Config(format!(
             "Server '{}': ssl_root_cert is not a file: {}",
@@ -742,7 +871,7 @@ async fn connect(
                 SqlSslMode::Prefer => MySqlSslMode::Preferred,
                 SqlSslMode::Require => MySqlSslMode::Required,
                 SqlSslMode::VerifyCa => MySqlSslMode::VerifyCa,
-                // MySQL の VerifyIdentity が libpq の verify-full 相当
+                // MySQL's VerifyIdentity is equivalent to libpq's verify-full
                 SqlSslMode::VerifyFull => MySqlSslMode::VerifyIdentity,
             };
             let mut options = MySqlConnectOptions::new()
@@ -800,7 +929,7 @@ async fn connect(
             Ok(DbPool::Postgres(pool))
         }
         Engine::Sqlite => {
-            // sqlite は schema (無ければ host) を DB ファイルパスとして扱う
+            // sqlite treats schema (or host if absent) as the DB file path
             let path = server
                 .schema
                 .as_deref()
@@ -831,20 +960,24 @@ async fn connect(
         Engine::Elasticsearch => Ok(DbPool::Elasticsearch(
             crate::engines::elasticsearch::connect(server, host, port).await?,
         )),
-        // duckdb は sqlite と同じくファイルベースなので host / port は使わない
+        // duckdb is file-based like sqlite, so host / port are not used
         Engine::DuckDb => Ok(DbPool::DuckDb(
             crate::engines::duckdb::connect(server).await?,
         )),
-        // dynamodb はリージョン (schema) とエンドポイント上書き (host / port) を
-        // モジュール側で解決するため、ここで計算した host / port は使わない
+        // dynamodb resolves the region (schema) and the endpoint override (host / port)
+        // in the module, so the host / port computed here are not used
         Engine::DynamoDb => Ok(DbPool::DynamoDb(
             crate::engines::dynamodb::connect(server).await?,
+        )),
+        // mssql is TCP, so the host / port replaced by the SSH tunnel are used as is
+        Engine::MsSql => Ok(DbPool::MsSql(
+            crate::engines::mssql::connect(server, host, port).await?,
         )),
     }
 }
 
-/// SQL を実行して結果を返す (テスト用の非キャンセル版ラッパー)。
-/// アプリ本体はキャンセル対応の run_query_cancellable を使う。
+/// Runs SQL and returns the result (a non-cancellable wrapper for tests).
+/// The app itself uses the cancellation-aware run_query_cancellable.
 #[cfg(test)]
 pub(crate) async fn run_query(
     pool: &DbPool,
@@ -855,7 +988,7 @@ pub(crate) async fn run_query(
     allow_dangerous: bool,
 ) -> Result<QueryResult, AppError> {
     let mut conn = DbConnection::acquire(pool).await?;
-    // テストは config readonly 相当の bool を渡す。
+    // Tests pass a bool equivalent to config readonly.
     let guard = if readonly {
         ReadonlyGuard::Config
     } else {
@@ -864,15 +997,16 @@ pub(crate) async fn run_query(
     run_query_on(&mut conn, sql, max_rows, auto_limit, guard, allow_dangerous).await
 }
 
-/// SQL を実行して結果を返す (キャンセル対応版)。
-/// 実行専用のコネクションをプールから確保し、実行前にエンジン別の
-/// キャンセル対象 (Postgres は backend PID、MySQL は CONNECTION_ID、
-/// SQLite は中断フラグ付き progress handler) を registry に登録してから
-/// 実行する。キャンセル要求後にクエリがエラーで終わった場合は
-/// AppError::Cancelled を返す。キャンセルはサーバー側の文の停止のみで
-/// 接続は切断しないため、コネクションは健全なままプールへ戻り、
-/// 同じ接続で次のクエリを正常に実行できる。
-// readonly / allow_dangerous は独立した実行ガードなので個別引数のまま渡す
+/// Runs SQL and returns the result (cancellation-aware version).
+/// Acquires a dedicated connection for execution from the pool and, before
+/// executing, registers the engine-specific cancellation target (backend PID
+/// for Postgres, CONNECTION_ID for MySQL, a progress handler with an abort
+/// flag for SQLite) in the registry. If the query ends with an error after a
+/// cancellation request, AppError::Cancelled is returned. Cancellation only
+/// stops the statement on the server and does not close the connection, so
+/// the connection returns to the pool healthy and the next query on the same
+/// connection runs normally.
+// readonly / allow_dangerous are independent execution guards, so they are passed as separate arguments
 #[allow(clippy::too_many_arguments)]
 pub async fn run_query_cancellable(
     pool: &DbPool,
@@ -884,8 +1018,8 @@ pub async fn run_query_cancellable(
     readonly: ReadonlyGuard,
     allow_dangerous: bool,
 ) -> Result<QueryResult, AppError> {
-    // 非 SQL エンジンは各エンジンモジュールへ委譲する (auto_limit は SQL 固有
-    // なので渡さない)
+    // Non-SQL engines are delegated to their engine modules (auto_limit is
+    // SQL-specific, so it is not passed)
     if let DbPool::Redis(client) = pool {
         return crate::engines::redis::run_query_cancellable(
             client,
@@ -910,8 +1044,8 @@ pub async fn run_query_cancellable(
         )
         .await;
     }
-    // DuckDB は SQL エンジンだが sqlx 非対応のためモジュールへ委譲する
-    // (auto_limit を含む SQL 系の共通ガードはモジュール側で適用する)
+    // DuckDB is a SQL engine but does not support sqlx, so it is delegated to its module
+    // (common SQL guards, including auto_limit, are applied on the module side)
     if let DbPool::DuckDb(handle) = pool {
         return crate::engines::duckdb::run_query_cancellable(
             handle,
@@ -925,9 +1059,9 @@ pub async fn run_query_cancellable(
         )
         .await;
     }
-    // DynamoDB (PartiQL) もモジュールへ委譲する。PartiQL に LIMIT 句は無いため
-    // auto_limit は渡さず、ExecuteStatement の limit パラメータ + max_rows で
-    // 行数を抑える (モジュール側)
+    // DynamoDB (PartiQL) is also delegated to its module. PartiQL has no LIMIT clause,
+    // so auto_limit is not passed; the row count is bounded by the
+    // ExecuteStatement limit parameter + max_rows (on the module side)
     if let DbPool::DynamoDb(client) = pool {
         return crate::engines::dynamodb::run_query_cancellable(
             client,
@@ -940,11 +1074,26 @@ pub async fn run_query_cancellable(
         )
         .await;
     }
+    // SQL Server is also a SQL engine but does not support sqlx, so it is delegated to its module
+    // (auto LIMIT is applied on the module side as T-SQL TOP)
+    if let DbPool::MsSql(handle) = pool {
+        return crate::engines::mssql::run_query_cancellable(
+            handle,
+            registry,
+            connection_name,
+            sql,
+            max_rows,
+            auto_limit,
+            readonly,
+            allow_dangerous,
+        )
+        .await;
+    }
 
     let mut conn = DbConnection::acquire(pool).await?;
     let cancelled = Arc::new(AtomicBool::new(false));
 
-    // 実行前にキャンセル対象を控える
+    // Note the cancellation target before execution
     let target = match (&mut conn, pool) {
         (DbConnection::Postgres(c), DbPool::Postgres(p)) => {
             let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
@@ -956,8 +1105,8 @@ pub async fn run_query_cancellable(
             }
         }
         (DbConnection::MySql(c), DbPool::MySql(p)) => {
-            // CONNECTION_ID() は BIGINT UNSIGNED だが、実装差異に備えて
-            // i64 でのデコードにもフォールバックする
+            // CONNECTION_ID() is BIGINT UNSIGNED, but fall back to decoding
+            // as i64 as well to allow for implementation differences
             let row = sqlx::query("SELECT CONNECTION_ID()")
                 .fetch_one(&mut **c)
                 .await?;
@@ -971,8 +1120,8 @@ pub async fn run_query_cancellable(
             }
         }
         (DbConnection::Sqlite(c), _) => {
-            // フラグが立ったら progress handler が false を返し、
-            // 実行中の文が SQLITE_INTERRUPT で中断される
+            // Once the flag is set, the progress handler returns false and
+            // the running statement is aborted with SQLITE_INTERRUPT
             let flag = cancelled.clone();
             c.lock_handle().await?.set_progress_handler(
                 SQLITE_PROGRESS_HANDLER_OPS,
@@ -980,7 +1129,7 @@ pub async fn run_query_cancellable(
             );
             CancelTarget::Sqlite
         }
-        // acquire はプールと同じエンジンのコネクションしか返さない
+        // acquire only returns connections of the same engine as the pool
         _ => unreachable!("connection engine mismatch"),
     };
 
@@ -990,27 +1139,27 @@ pub async fn run_query_cancellable(
     let was_cancelled = guard.was_cancelled();
     drop(guard);
 
-    // SQLite: progress handler をプールへ返す前に必ず外す。
-    // 外し損ねるとフラグの立ったハンドラが残り、このコネクションの
-    // 次のクエリが即座に中断されてしまう。
-    // (lock_handle が失敗するのはワーカースレッドが死んでいる場合のみで、
-    //  その場合コネクション自体が使えないためプール側で破棄される)
+    // SQLite: always remove the progress handler before returning the connection to the pool.
+    // If it is left behind, a handler with its flag set remains and the next
+    // query on this connection is aborted immediately.
+    // (lock_handle fails only when the worker thread is dead, in which case
+    //  the connection itself is unusable and is discarded on the pool side)
     if let DbConnection::Sqlite(c) = &mut conn {
         if let Ok(mut handle) = c.lock_handle().await {
             handle.remove_progress_handler();
         }
     }
 
-    // キャンセル要求後のエラーは「キャンセルされた」として返す
-    // (キャンセルが間に合わずクエリが完了していた場合は成功結果を返す)
+    // An error after a cancellation request is returned as "cancelled"
+    // (if the query had already completed before the cancel took effect, the success result is returned)
     if was_cancelled && result.is_err() {
         return Err(AppError::Cancelled);
     }
     result
 }
 
-/// 読み取り専用ガードでブロックする際のエラー (由来別メッセージ)。
-/// run_query_on と run_statements で共有する。
+/// Error returned when blocking on the read-only guard (message depends on its origin).
+/// Shared by run_query_on and run_statements.
 pub(crate) fn readonly_block_error(readonly: ReadonlyGuard) -> AppError {
     let message = match readonly {
         ReadonlyGuard::Config => {
@@ -1025,13 +1174,13 @@ pub(crate) fn readonly_block_error(readonly: ReadonlyGuard) -> AppError {
             "The AI assistant can only run read-only statements. \
              Statement was not executed."
         }
-        // Off はブロックしないためこのエラーは作られない
+        // Off does not block, so this error is never created
         ReadonlyGuard::Off => unreachable!(),
     };
     AppError::Readonly(message.into())
 }
 
-/// 危険な文 (WHERE 無しの UPDATE/DELETE 等) でブロックする際のエラー。
+/// Error returned when blocking on a dangerous statement (UPDATE/DELETE without WHERE, etc.).
 pub(crate) fn dangerous_block_error(reason: &str) -> AppError {
     AppError::Dangerous(format!(
         "{reason} Set \"allow_dangerous_statements: true\" for this connection \
@@ -1039,7 +1188,7 @@ pub(crate) fn dangerous_block_error(reason: &str) -> AppError {
     ))
 }
 
-/// 確保済みコネクション上で 1 文を実行し、影響行数を返す (結果セットは読まない)。
+/// Runs one statement on an acquired connection and returns the affected row count (does not read the result set).
 async fn execute_statement(conn: &mut DbConnection, sql: &str) -> Result<u64, AppError> {
     Ok(match conn {
         DbConnection::MySql(c) => (&mut **c).execute(sql).await?.rows_affected(),
@@ -1048,11 +1197,12 @@ async fn execute_statement(conn: &mut DbConnection, sql: &str) -> Result<u64, Ap
     })
 }
 
-/// 結果グリッドのセル編集を UPDATE 群として 1 トランザクションで適用する。
-/// 全文が成功したら COMMIT、途中で失敗したら ROLLBACK して最初のエラーを返す
-/// (all-or-nothing)。この経路は一般の複数文実行の裏口にならないよう、
-/// 各文が UPDATE であることを必須とし、readonly / 危険文ガードも run_query と
-/// 同様に適用する。合計の影響行数を返す。
+/// Applies cell edits from the result grid as a set of UPDATEs in one transaction.
+/// COMMIT if all statements succeed; if one fails, ROLLBACK and return the first error
+/// (all-or-nothing). So that this path does not become a back door for general
+/// multi-statement execution, every statement is required to be an UPDATE, and the
+/// readonly / dangerous-statement guards apply just as in run_query.
+/// Returns the total affected row count.
 pub async fn run_statements(
     pool: &DbPool,
     statements: &[String],
@@ -1062,14 +1212,15 @@ pub async fn run_statements(
     if statements.is_empty() {
         return Err(AppError::Config("There are no changes to apply".into()));
     }
-    // DuckDb はセル編集の適用経路 (sqlx のトランザクション実行) を持たない
-    // ため、capabilities.supports_editable_cells = false と合わせて拒否する
+    // DuckDb / MsSql have no path for applying cell edits (sqlx transaction execution),
+    // so reject them, consistent with capabilities.supports_editable_cells = false
     if matches!(
         pool,
         DbPool::Redis(_)
             | DbPool::Elasticsearch(_)
             | DbPool::DuckDb(_)
             | DbPool::DynamoDb(_)
+            | DbPool::MsSql(_)
     ) {
         return Err(AppError::Config(
             "Cell editing is not supported for this engine".into(),
@@ -1078,18 +1229,18 @@ pub async fn run_statements(
     let mut conn = DbConnection::acquire(pool).await?;
     let engine = conn.engine();
 
-    // 何も書き込む前に全文を検証する (一部だけ適用される事態を防ぐ)。
+    // Validate all statements before writing anything (to avoid only some being applied).
     for sql in statements {
         let sql = sql.trim();
-        // セル編集の適用は UPDATE のみ。他の文はこの経路では拒否する。
+        // Cell edits only apply UPDATE. Other statements are rejected on this path.
         if leading_keyword(sql) != "update" {
             return Err(AppError::Config(
                 "Only UPDATE statements can be applied from the results grid.".into(),
             ));
         }
-        // 複文はガードをすり抜けるため、ガードが有効なら拒否する
-        // (run_query_on と同じ理由。`UPDATE ... WHERE ...; DROP TABLE t;` は
-        // 先頭が update で where もあるため、両方のガードを通過してしまう)
+        // Multiple statements slip past the guards, so reject them if a guard is enabled
+        // (same reason as run_query_on. `UPDATE ... WHERE ...; DROP TABLE t;` starts
+        // with update and has a where, so it would pass both guards)
         if (readonly != ReadonlyGuard::Off || !allow_dangerous)
             && contains_multiple_statements(sql, engine)
         {
@@ -1105,30 +1256,30 @@ pub async fn run_statements(
         }
     }
 
-    // エージェント経路が立てた PRAGMA query_only が残っているコネクションを
-    // 引いた場合に備えて解除する (run_query_on と同じ理由。設定は
-    // 「使う側が毎回明示する」方式で確定させる)
+    // Reset in case we pulled a connection on which PRAGMA query_only, set by the
+    // agent path, remains (same reason as run_query_on. The setting is finalized
+    // by "the calling code making it explicit every time")
     if let DbConnection::Sqlite(c) = &mut conn {
         set_sqlite_query_only(c, false).await?;
     }
 
-    // 1 トランザクションで全文を適用する。DDL は含めない (UPDATE のみ) ため、
-    // 暗黙コミットは起きない。COMMIT/ROLLBACK まで必ず到達させてから
-    // コネクションをプールへ返す。
+    // Apply all statements in one transaction. DDL is not included (UPDATE only), so
+    // no implicit commit happens. Make sure it reaches COMMIT/ROLLBACK
+    // before returning the connection to the pool.
     execute_statement(&mut conn, "BEGIN").await?;
     let mut total: u64 = 0;
     for sql in statements {
         match execute_statement(&mut conn, sql.trim()).await {
             Ok(affected) => total += affected,
             Err(e) => {
-                // ロールバック自体の失敗は握り潰し、元のエラーを返す
+                // Swallow a failure of the rollback itself and return the original error
                 let _ = execute_statement(&mut conn, "ROLLBACK").await;
                 return Err(e);
             }
         }
     }
-    // COMMIT が失敗 (deferred 制約違反 / SQLite busy 等) しても、コネクションを
-    // トランザクション状態のままプールへ返さないよう ROLLBACK を試みる。
+    // Even if COMMIT fails (deferred constraint violation / SQLite busy, etc.), try ROLLBACK so
+    // the connection is not returned to the pool in a transaction state.
     if let Err(e) = execute_statement(&mut conn, "COMMIT").await {
         let _ = execute_statement(&mut conn, "ROLLBACK").await;
         return Err(e);
@@ -1136,28 +1287,28 @@ pub async fn run_statements(
     Ok(total)
 }
 
-/// 読み取り専用ガードの由来。ブロック時のメッセージを由来に応じて
-/// 出し分けるために使う (config の readonly か、ツールバーの Writable スイッチか)。
-/// Agent だけは由来であると同時に強度も表す (DB レベルの強制を伴う)。
+/// Origin of the read-only guard. Used to vary the block message
+/// by origin (config readonly, or the toolbar's Writable switch).
+/// Agent is both an origin and a strength level (it comes with DB-level enforcement).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReadonlyGuard {
-    /// 書き込み許可 (readonly ガードなし)
+    /// Writes allowed (no readonly guard)
     Off,
-    /// config の readonly: true による読み取り専用 (スイッチでは解除できない)
+    /// Read-only via config `readonly: true` (cannot be lifted with the switch)
     Config,
-    /// ツールバーの Writable スイッチ OFF による読み取り専用
+    /// Read-only because the toolbar's Writable switch is OFF
     Switch,
-    /// AI チャットのエージェントによる実行。文レベルの判定に加えて
-    /// DB レベルでも読み取り専用を強制する (run_query_readonly)。
-    /// 文レベルの判定だけでは `SELECT nextval(...)` のような副作用のある
-    /// 関数呼び出しを防げないため。
+    /// Execution by the AI chat agent. In addition to the statement-level check,
+    /// read-only is also enforced at the DB level (run_query_readonly).
+    /// This is because statement-level checks alone cannot stop calls to
+    /// functions with side effects such as `SELECT nextval(...)`.
     Agent,
 }
 
-/// DB レベルの読み取り専用セッションを開始する SQL (エンジン別)。
-/// トランザクションを読み取り専用で開始し、実行後は必ず ROLLBACK する。
-/// SQLite にはトランザクション属性が無いため PRAGMA query_only を使う
-/// (set_sqlite_query_only)。
+/// SQL that starts a DB-level read-only session (per engine).
+/// Starts a read-only transaction and always ROLLBACKs after execution.
+/// SQLite has no transaction attribute, so it uses PRAGMA query_only
+/// (set_sqlite_query_only).
 fn readonly_begin_sql(engine: Engine) -> Option<&'static str> {
     match engine {
         Engine::Postgres => Some("BEGIN READ ONLY"),
@@ -1166,11 +1317,11 @@ fn readonly_begin_sql(engine: Engine) -> Option<&'static str> {
     }
 }
 
-/// SQLite の DB レベル読み取り専用を設定する。
-/// 解除 (0 に戻す) ではなく「実行のたびに 0/1 を明示する」方式にしている:
-/// クエリの future が途中で drop される (チャットの中断) と後始末は走らず、
-/// query_only = 1 が残ったコネクションがプールへ返り得るため、
-/// 後片付けに頼らず毎回の実行で状態を確定させる。
+/// Sets SQLite's DB-level read-only mode.
+/// Instead of undoing it (back to 0), we make 0/1 explicit on every execution:
+/// if the query future is dropped midway (chat abort), cleanup does not run
+/// and a connection with query_only = 1 left over could return to the pool,
+/// so the state is fixed on every execution rather than relying on cleanup.
 async fn set_sqlite_query_only(
     conn: &mut sqlx::SqliteConnection,
     enabled: bool,
@@ -1184,7 +1335,7 @@ async fn set_sqlite_query_only(
     Ok(())
 }
 
-/// run_query の本体。確保済みのコネクション上で実行する。
+/// Body of run_query. Runs on an acquired connection.
 async fn run_query_on(
     conn: &mut DbConnection,
     sql: &str,
@@ -1194,11 +1345,11 @@ async fn run_query_on(
     allow_dangerous: bool,
 ) -> Result<QueryResult, AppError> {
     let engine = conn.engine();
-    // psql 風メタコマンド (\l, \dt など) はカタログ照会 SQL に変換して実行する。
-    // \c / USE (スキーマ切替) は SQL にならないため、ここへ来る前に lib.rs の
-    // run_query が処理している。エージェント経路 (ReadonlyGuard::Agent) は
-    // run_query を通らないため、切替をここで拒否することになる (接続状態を
-    // 変える操作はエージェントに許していない)
+    // psql-style meta commands (\l, \dt, etc.) are converted into catalog query SQL and executed.
+    // \c / USE (schema switching) does not become SQL, so lib.rs's run_query
+    // handles it before getting here. The agent path (ReadonlyGuard::Agent) does not go
+    // through run_query, so the switch is rejected here (operations that
+    // change connection state are not allowed for the agent)
     let translated = match crate::meta_commands::translate(engine, sql)? {
         Some(crate::meta_commands::MetaCommand::Sql(sql)) => Some(sql),
         Some(crate::meta_commands::MetaCommand::Connect(_)) => {
@@ -1214,26 +1365,27 @@ async fn run_query_on(
         return Err(AppError::Config("The SQL statement is empty".into()));
     }
 
-    // readonly 接続では読み取り系の文のみ許可する。
-    // メタコマンドは読み取り系のカタログ照会にしか変換されないため、
-    // 変換後の SQL はこの判定を常に通る。
-    // エージェント経路は通常の readonly ガードより狭いホワイトリストを課す
-    // (複文 / CALL / PRAGMA / EXPLAIN ANALYZE を落とす)。lib.rs でもプール取得
-    // 前に同じ判定をしているが、ここでも課すことで ReadonlyGuard::Agent 単体で
-    // エージェントの実行ポリシーが成立する (呼び出し側の実装に依存しない)
+    // On a readonly connection, only read statements are allowed.
+    // Meta commands are only converted into read-only catalog queries,
+    // so the converted SQL always passes this check.
+    // The agent path imposes a narrower whitelist than the normal readonly guard
+    // (dropping multi-statements / CALL / PRAGMA / EXPLAIN ANALYZE). lib.rs applies the
+    // same check before acquiring the pool, but imposing it here too lets
+    // ReadonlyGuard::Agent alone establish the agent's execution policy
+    // (without depending on the caller's implementation)
     if readonly == ReadonlyGuard::Agent {
         if let Some(reason) = agent_rejection_reason(sql, engine) {
             return Err(AppError::Readonly(reason));
         }
     }
-    // 複文 (`;` 区切り) は 1 文目だけを見るガードをすり抜ける。
-    // `SELECT 1; DELETE FROM t;` は先頭が select なので is_readonly_allowed を、
-    // `UPDATE t SET x=1 WHERE id=1; DROP TABLE t;` は where があるので
-    // dangerous_reason を通過してしまう。一方、実行経路のドライバは複文を
-    // そのまま実行する (SQLite は fetch 経路でも、Postgres / MySQL は引数なしの
-    // execute 経路 = 単純問い合わせプロトコルで通る)。
-    // そのためガードが有効な接続では複文自体を拒否する。両方のガードを外して
-    // いる接続では従来どおり複文を許すので、スクリプトの貼り付け実行は壊れない。
+    // Multiple statements (`;`-separated) slip past guards that only look at the first statement.
+    // `SELECT 1; DELETE FROM t;` starts with select, so it passes is_readonly_allowed, and
+    // `UPDATE t SET x=1 WHERE id=1; DROP TABLE t;` has a where, so it passes
+    // dangerous_reason. Meanwhile the execution-path drivers run multiple statements
+    // as is (SQLite even on the fetch path; Postgres / MySQL via the argument-less
+    // execute path = the simple query protocol).
+    // So on connections where a guard is enabled, multiple statements themselves are rejected. On connections with
+    // both guards off, multiple statements are allowed as before, so pasting and running scripts is not broken.
     if (readonly != ReadonlyGuard::Off || !allow_dangerous)
         && contains_multiple_statements(sql, engine)
     {
@@ -1244,17 +1396,17 @@ async fn run_query_on(
         return Err(readonly_block_error(readonly));
     }
 
-    // 危険な文 (WHERE 無しの UPDATE / DELETE、DROP / TRUNCATE) は、
-    // allow_dangerous_statements を有効にした接続でのみ実行を許す。
-    // 誤操作による全行破壊・テーブル消失を防ぐ事故防止ガード。
+    // Dangerous statements (UPDATE / DELETE without WHERE, DROP / TRUNCATE) are allowed
+    // to run only on connections with allow_dangerous_statements enabled.
+    // An accident-prevention guard against whole-table destruction or table loss from mistakes.
     if !allow_dangerous {
         if let Some(reason) = dangerous_reason(sql, engine) {
             return Err(dangerous_block_error(reason));
         }
     }
 
-    // LIMIT 未指定の SELECT にはデフォルトの LIMIT を付与する
-    // (メタコマンド変換後の SQL には適用しない)
+    // Add a default LIMIT to a SELECT without a LIMIT
+    // (not applied to SQL converted from meta commands)
     let mut applied_limit = None;
     let limited_sql;
     let sql = match auto_limit {
@@ -1263,8 +1415,8 @@ async fn run_query_on(
                 && translated.is_none()
                 && should_auto_limit(sql, engine) =>
         {
-            // 末尾のコメント・セミコロンを除いた本体の直後に付与する
-            // (コメントの後ろに付けると LIMIT がコメントに飲み込まれる)
+            // Add it right after the body, excluding trailing comments and semicolons
+            // (appending after a comment would let the comment swallow the LIMIT)
             let body = &sql[..scan_sql(sql, engine).body_end];
             limited_sql = format!("{body} LIMIT {limit}");
             applied_limit = Some(limit);
@@ -1274,17 +1426,17 @@ async fn run_query_on(
     };
     let started = Instant::now();
 
-    // SQLite の DB レベル読み取り専用は PRAGMA query_only (セッション設定)
-    // なので、エージェント経路でなくても毎回明示して状態を確定させる
-    // (中断で解除処理が走らないまま プールへ返ったコネクションの後始末)
+    // SQLite's DB-level read-only is PRAGMA query_only (a session setting),
+    // so make it explicit on every execution even outside the agent path
+    // (cleans up connections returned to the pool without the abort-time reset having run)
     if let DbConnection::Sqlite(c) = &mut *conn {
         set_sqlite_query_only(c, readonly == ReadonlyGuard::Agent).await?;
     }
 
-    // エージェント経路は読み取り専用トランザクションの中で実行する。
-    // 文レベルのガード (is_readonly_allowed / agent_rejection_reason) は
-    // `SELECT nextval(...)` のような副作用のある関数呼び出しを見抜けないため、
-    // 最終的な拒否は DB 自身にさせる。
+    // The agent path runs inside a read-only transaction.
+    // Statement-level guards (is_readonly_allowed / agent_rejection_reason) cannot
+    // detect calls to functions with side effects such as `SELECT nextval(...)`,
+    // so the final rejection is left to the DB itself.
     if readonly == ReadonlyGuard::Agent {
         return run_query_readonly(conn, sql, max_rows, applied_limit, started).await;
     }
@@ -1297,18 +1449,18 @@ async fn run_query_on(
     run_query_with(exec, sql, max_rows, applied_limit, started).await
 }
 
-/// 実行に使うコネクション参照。プールのコネクションと、読み取り専用
-/// トランザクション (エージェント経路) で実行部を共有するために挟む。
+/// Connection reference used for execution. Inserted so that the execution part is shared between a pool connection
+/// and a read-only transaction (agent path).
 enum DbExec<'a> {
     MySql(&'a mut sqlx::MySqlConnection),
     Postgres(&'a mut sqlx::PgConnection),
     Sqlite(&'a mut sqlx::SqliteConnection),
 }
 
-/// DB レベルの読み取り専用でクエリを実行する (エージェント経路)。
-/// Postgres / MySQL は読み取り専用トランザクションで包み、結果に関わらず
-/// ROLLBACK する (読み取りしかしないので COMMIT する必要が無い)。
-/// SQLite は PRAGMA query_only を呼び出し側で設定済み。
+/// Runs a query with DB-level read-only (agent path).
+/// Postgres / MySQL wrap it in a read-only transaction and ROLLBACK
+/// regardless of the result (it only reads, so there is no need to COMMIT).
+/// For SQLite, PRAGMA query_only has already been set by the caller.
 async fn run_query_readonly(
     conn: &mut DbConnection,
     sql: &str,
@@ -1316,30 +1468,30 @@ async fn run_query_readonly(
     applied_limit: Option<u64>,
     started: Instant,
 ) -> Result<QueryResult, AppError> {
-    // トランザクションで包めないエンジン (SQLite) は PRAGMA 済みなのでそのまま
+    // Engines that cannot be wrapped in a transaction (SQLite) have already had PRAGMA applied, so run as is
     let begin = match readonly_begin_sql(conn.engine()) {
         Some(begin) => begin,
         None => {
             let exec = match conn {
                 DbConnection::Sqlite(c) => DbExec::Sqlite(c),
-                // readonly_begin_sql が None を返すのは SQLite だけ
+                // readonly_begin_sql returns None only for SQLite
                 _ => unreachable!("engine without a read-only transaction"),
             };
             return run_query_with(exec, sql, max_rows, applied_limit, started).await;
         }
     };
 
-    // sqlx の Transaction は drop 時にも ROLLBACK を積む (中断でこの関数の
-    // future が drop されても、コネクションがトランザクションを開いたまま
-    // プールへ返ることはない)
+    // sqlx's Transaction also queues a ROLLBACK on drop (even if this function's
+    // future is dropped by an abort, the connection is not returned to the
+    // pool with the transaction left open)
     match conn {
         DbConnection::Postgres(c) => {
             let mut tx = c.begin_with(begin).await?;
             let result =
                 run_query_with(DbExec::Postgres(&mut tx), sql, max_rows, applied_limit, started)
                     .await;
-            // ROLLBACK 自体の失敗は握り潰す (結果を返すのが優先。失敗した
-            // コネクションは ping に失敗してプールから破棄される)
+            // Swallow a failure of the ROLLBACK itself (returning the result takes priority;
+            // a failed connection fails ping and is discarded from the pool)
             let _ = tx.rollback().await;
             result
         }
@@ -1354,7 +1506,7 @@ async fn run_query_readonly(
     }
 }
 
-/// 確保済みの実行先 (コネクション or トランザクション) で 1 文を実行する。
+/// Runs one statement on an acquired target (connection or transaction).
 async fn run_query_with(
     mut exec: DbExec<'_>,
     sql: &str,
@@ -1413,8 +1565,8 @@ async fn run_query_with(
         DbExec::Sqlite(c) => fetch_rows!(&mut **c, sqlite_value_to_json),
     };
 
-    // 0 行の結果でも列ヘッダを表示できるよう、describe で列情報を補完する。
-    // SHOW 等 prepare できない文では失敗することがあるため、エラーは無視する。
+    // So that column headers can be shown even for 0-row results, supplement column info with describe.
+    // It can fail for statements that cannot be prepared, such as SHOW, so the error is ignored.
     if columns.is_empty() {
         let described: Result<Vec<String>, sqlx::Error> = match &mut exec {
             DbExec::MySql(c) => (&mut **c)
@@ -1447,8 +1599,8 @@ async fn run_query_with(
     })
 }
 
-/// 接続先サーバー上の database (スキーマ) 一覧を返す。
-/// sqlite は database の概念が単一ファイルなので、設定のパスをそのまま返す。
+/// Returns the list of databases (schemas) on the target server.
+/// For sqlite, the database concept is a single file, so the configured path is returned as is.
 pub async fn list_schemas(
     pool: &DbPool,
     server: &ServerConfig,
@@ -1473,7 +1625,7 @@ pub async fn list_schemas(
                 .filter_map(|row| row.try_get::<String, _>(0).ok())
                 .collect())
         }
-        // duckdb も sqlite と同じくファイルパスをそのまま返す
+        // duckdb also returns the file path as is, like sqlite
         DbPool::Sqlite(_) | DbPool::DuckDb(_) => {
             let path = server
                 .schema
@@ -1482,25 +1634,26 @@ pub async fn list_schemas(
                 .unwrap_or("main");
             Ok(vec![path.to_string()])
         }
-        // Redis の「database」は番号 (CYBERNEURA-DEV-408)。
-        // 数はサーバー設定なのでモジュール側で問い合わせる
+        // A Redis "database" is a number (CYBERNEURA-DEV-408).
+        // The count is a server setting, so it is queried on the module side
         DbPool::Redis(client) => crate::engines::redis::list_databases(client).await,
-        // Elasticsearch / DynamoDB に database 一覧の概念は無い
-        // (capabilities.supports_schemas = false でフロントは呼ばないが、
-        // 直接呼ばれても壊れないよう空を返す)
+        DbPool::MsSql(handle) => crate::engines::mssql::list_databases(handle).await,
+        // Elasticsearch / DynamoDB have no concept of a database list
+        // (the frontend does not call this since capabilities.supports_schemas = false, but
+        // return empty so that nothing breaks even if it is called directly)
         DbPool::Elasticsearch(_) | DbPool::DynamoDb(_) => Ok(vec![]),
     }
 }
 
-/// SQL の先頭キーワード (コメントを除く) を小文字で返す。
+/// Returns the leading keyword of the SQL (excluding comments) in lowercase.
 ///
-/// 方言を受け取らないため、ここでは `/*! ... */` も通常のブロックコメントとして
-/// 読み飛ばす。MySQL ではこれがサーバーに実行されるが、方言依存の解釈をこの
-/// 共通パーサーに入れると、`/*!` が本当にコメントである他方言で
-/// `/*! SELECT 1 */ DROP TABLE t` の先頭キーワードを select と誤読し、
-/// readonly / 危険文ガードが DROP を見落とす (逆向きの穴になる)。
-/// MySQL の実行コメントは scan_sql が cleaned に残すので、そちらを見る
-/// dangerous_reason 側で拾う。
+/// Since no dialect is passed in, `/*! ... */` is also skipped here as a normal block comment.
+/// MySQL executes this on the server, but if dialect-dependent interpretation were put into
+/// this common parser, then in other dialects where `/*!` really is a comment,
+/// the leading keyword of `/*! SELECT 1 */ DROP TABLE t` would be misread as select,
+/// and the readonly / dangerous-statement guards would miss the DROP (a hole in the opposite direction).
+/// MySQL's executable comments are left in cleaned by scan_sql, so look at that
+/// and the guard on the dangerous_reason side catches it.
 pub(crate) fn leading_keyword(sql: &str) -> String {
     strip_leading_comments(sql)
         .chars()
@@ -1509,12 +1662,12 @@ pub(crate) fn leading_keyword(sql: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// 先頭の空白とコメント (`--` / `#` / `/* */`) を読み飛ばした残りを返す。
+/// Returns the remainder after skipping leading whitespace and comments (`--` / `#` / `/* */`).
 ///
-/// 方言の扱い (`/*! ... */` を通常のコメントとして読み飛ばすこと) と、その
-/// 理由は leading_keyword のコメントを参照。先頭キーワードの判定だけでなく、
-/// キーワードより後ろの部分を切り出す用途 (meta_commands の `USE <database>`)
-/// でも使う。
+/// For how dialects are handled (skipping `/*! ... */` as a normal comment) and
+/// the reason, see the comment on leading_keyword. It is used not only to determine
+/// the leading keyword but also to slice out the part after the keyword
+/// (`USE <database>` in meta_commands).
 pub(crate) fn strip_leading_comments(sql: &str) -> &str {
     let mut rest = sql;
     loop {
@@ -1536,23 +1689,24 @@ pub(crate) fn strip_leading_comments(sql: &str) -> &str {
     rest
 }
 
-/// SQL の走査結果。cleaned はキーワード判定用 (文字列リテラルとコメントを
-/// 空白化して小文字化したもの)、body_end は自動 LIMIT の挿入位置
-/// (末尾のコメント・セミコロン・空白を除いた本体の終了位置)。
+/// Result of scanning SQL. cleaned is for keyword detection (string literals and comments
+/// are blanked out and lowercased); body_end is the insertion position for the auto LIMIT
+/// (the end of the body, excluding trailing comments, semicolons and whitespace).
 pub(crate) struct SqlScan {
-    cleaned: String,
+    /// Body with literals and comments blanked out and lowercased (for word boundary detection)
+    pub(crate) cleaned: String,
     pub(crate) body_end: usize,
 }
 
-/// chars[i] から `--` 行コメントが始まるか。
+/// Whether a `--` line comment starts at chars[i].
 ///
-/// MySQL だけは `--` の直後が空白 (制御文字・行末を含む) の時しか行コメントに
-/// ならない。`SELECT 1--1` は「1 - (-1)」であってコメントではない。
+/// Only in MySQL does `--` become a line comment solely when it is immediately followed by
+/// whitespace (including control characters and end of line). `SELECT 1--1` is "1 - (-1)", not a comment.
 /// https://dev.mysql.com/doc/refman/8.4/en/ansi-diff-comments.html
 ///
-/// ここを他方言と同じ扱いにすると、`SELECT 1--1; DROP TABLE t;` のセミコロン以降を
-/// 丸ごとコメントとして落としてしまい、複文判定 (contains_multiple_statements) と
-/// readonly / 危険文ガードが、MySQL が実際に実行する 2 文目を見落とす。
+/// If this were treated the same as other dialects, everything after the semicolon in `SELECT 1--1; DROP TABLE t;`
+/// would be dropped as a comment, and the multi-statement check (contains_multiple_statements) and the
+/// readonly / dangerous-statement guards would miss the second statement that MySQL actually executes.
 fn is_dash_comment_start(chars: &[char], i: usize, mysql: bool) -> bool {
     if chars.get(i) != Some(&'-') || chars.get(i + 1) != Some(&'-') {
         return false;
@@ -1565,36 +1719,38 @@ fn is_dash_comment_start(chars: &[char], i: usize, mysql: bool) -> bool {
         .is_none_or(|next| next.is_whitespace() || next.is_control())
 }
 
-/// エンジンごとのコメント・クォート規則で SQL を 1 パス走査する。
-/// - 文字列リテラル: ' " ` (二重化エスケープ対応)。Postgres はドル引用
-///   ($tag$ ... $tag$) にも対応 (# は Postgres では XOR 演算子なので
-///   コメント扱いしない)
-/// - コメント: -- と /* */。MySQL は # 行コメントも対象
+/// Scans SQL in one pass with per-engine comment and quote rules.
+/// - String literals: ' " ` (doubled-quote escapes supported). Postgres also supports
+///   dollar quoting ($tag$ ... $tag$) (# is the XOR operator in Postgres, so
+///   it is not treated as a comment)
+/// - Comments: -- and /* */. For MySQL, # line comments are also handled
 ///
-/// **バックスラッシュによるエスケープ (`'a\'b'`) は意図的に解釈しない。**
-/// MySQL は既定でこれを解釈するが、NO_BACKSLASH_ESCAPES を有効にした環境では
-/// 解釈しない。どちらか一方に決め打ちすると、
-/// - エスケープを解釈する側に倒す → NO_BACKSLASH_ESCAPES の環境で
-///   `SELECT 'a\'; DROP TABLE t; --'` のセミコロン以降をリテラルとして飲み込み、
-///   複文判定・readonly / 危険文ガードをすり抜けさせてしまう
-/// - 解釈しない側に倒す (現状) → 既定設定の MySQL で `'a\'; b'` のような
-///   リテラルを含む正当なクエリが「複文」と判定されて拒否される
-/// となる。この結果はガードの拒否側 (安全側) なので、後者を選んでいる
-/// (回避したい場合は `''` で引用符をエスケープするか、Writable ON +
-/// allow_dangerous_statements: true にしてガードを外す)。
+/// **Backslash escapes (`'a\'b'`) are intentionally not interpreted.**
+/// MySQL interprets them by default, but not in environments with NO_BACKSLASH_ESCAPES enabled.
+/// Committing to either one gives:
+/// - Leaning toward interpreting escapes -> in NO_BACKSLASH_ESCAPES environments,
+///   `SELECT 'a\'; DROP TABLE t; --'` would swallow everything after the semicolon as a literal,
+///   letting it slip past the multi-statement check and the readonly / dangerous-statement guards
+/// - Leaning toward not interpreting (current) -> on default-setting MySQL, a legitimate query
+///   containing a literal like `'a\'; b'` is judged to be "multiple statements" and rejected
+/// The latter result is on the rejecting (safe) side of the guards, so we choose it
+/// (to avoid it, escape the quote with `''`, or turn off the guards with Writable ON +
+/// allow_dangerous_statements: true).
 pub(crate) fn scan_sql(sql: &str, engine: Engine) -> SqlScan {
     let hash_comments = matches!(engine, Engine::MySql);
-    // MySQL の実行コメント (`/*! ... */`) はサーバーが SQL として解釈・実行する
+    // MySQL executable comments (`/*! ... */`) are interpreted and executed as SQL by the server
     let executable_comments = matches!(engine, Engine::MySql);
-    // DuckDB はドル引用に対応しており方言は Postgres 相当
+    // DuckDB supports dollar quoting, so its dialect is equivalent to Postgres
     let dollar_quotes = matches!(engine, Engine::Postgres | Engine::DuckDb);
+    // T-SQL encloses identifiers in square brackets (`[name]`). `]]` escapes the closing bracket
+    let bracket_quotes = matches!(engine, Engine::MsSql);
     let chars: Vec<char> = sql.chars().collect();
     let mut cleaned = String::with_capacity(sql.len());
     let mut body_end = 0;
     let mut byte_pos = 0;
     let mut i = 0;
 
-    // i 番目の文字を消費して byte 位置を進める
+    // Consume the i-th character and advance the byte position
     macro_rules! advance {
         () => {{
             byte_pos += chars[i].len_utf8();
@@ -1619,8 +1775,23 @@ pub(crate) fn scan_sql(sql: &str, engine: Engine) -> SqlScan {
             }
             cleaned.push(' ');
             body_end = byte_pos;
+        } else if bracket_quotes && c == '[' {
+            advance!();
+            while i < chars.len() {
+                let inner = chars[i];
+                advance!();
+                if inner == ']' {
+                    if i < chars.len() && chars[i] == ']' {
+                        advance!();
+                        continue;
+                    }
+                    break;
+                }
+            }
+            cleaned.push(' ');
+            body_end = byte_pos;
         } else if dollar_quotes && c == '$' {
-            // $tag$ ... $tag$ のドル引用を検出する
+            // Detect $tag$ ... $tag$ dollar quoting
             let mut j = i + 1;
             while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
                 j += 1;
@@ -1631,7 +1802,7 @@ pub(crate) fn scan_sql(sql: &str, engine: Engine) -> SqlScan {
                 for _ in 0..tag_chars {
                     advance!();
                 }
-                // 閉じタグを探す
+                // Look for the closing tag
                 loop {
                     if i >= chars.len() {
                         break;
@@ -1662,14 +1833,14 @@ pub(crate) fn scan_sql(sql: &str, engine: Engine) -> SqlScan {
             }
             cleaned.push(' ');
         } else if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
-            // MySQL の実行コメント (`/*! ... */` / `/*!50110 ... */`) は
-            // サーバーがコメントではなく SQL として解釈・実行する。
-            // ここで他のコメントと同じく空白化すると、
-            // `UPDATE t SET x=1 WHERE id=1; /*! DROP TABLE t */` の DROP が
-            // cleaned から消え、複文判定も危険文ガードも見落とす。
-            // 開始マーカー (`/*!` とバージョン番号) だけを読み飛ばし、
-            // 中身は通常の SQL として走査させる (閉じの `*/` は記号として
-            // cleaned に残るが、単語境界の判定には影響しない)。
+            // MySQL executable comments (`/*! ... */` / `/*!50110 ... */`) are interpreted
+            // and executed by the server as SQL, not as comments.
+            // If they were blanked out like other comments here,
+            // the DROP in `UPDATE t SET x=1 WHERE id=1; /*! DROP TABLE t */` would vanish
+            // from cleaned, and both the multi-statement check and the dangerous-statement guard would miss it.
+            // Skip only the start marker (`/*!` and the version number) and
+            // let the contents be scanned as normal SQL (the closing `*/` remains in
+            // cleaned as symbols but does not affect word boundary detection).
             if executable_comments && chars.get(i + 2) == Some(&'!') {
                 advance!();
                 advance!();
@@ -1703,16 +1874,23 @@ pub(crate) fn scan_sql(sql: &str, engine: Engine) -> SqlScan {
     SqlScan { cleaned, body_end }
 }
 
-/// デフォルト LIMIT を安全に付与できる文かを判定する。
-/// 対象は SELECT 系のみ。LIMIT / FETCH / OFFSET / FOR UPDATE / INTO /
-/// WITH ... INSERT 等の語を含む場合は、構文エラーや意味の変化を避けるため
-/// 付与しない (保守的側に倒す。スキップしてもクライアント側の max_rows
-/// 打ち切りが安全網になる)。
+/// Determines whether a statement can safely get the default LIMIT.
+/// Only SELECT-type statements are targeted. If it contains words such as LIMIT / FETCH / OFFSET /
+/// FOR UPDATE / INTO / WITH ... INSERT, no LIMIT is added to avoid syntax errors or
+/// changes in meaning (erring on the conservative side; even if skipped, the
+/// client-side max_rows cutoff is the safety net).
 pub(crate) fn should_auto_limit(sql: &str, engine: Engine) -> bool {
-    // VALUES (SQLite では LIMIT 不可) や TABLE は対象にせず、
-    // SELECT / WITH のみに限定する。DuckDB は FROM-first 構文
-    // (`FROM t`) も SELECT と同じ問い合わせ形なので対象にする
-    // (SUMMARIZE / PIVOT は末尾 LIMIT の可否が形に依存するため付けない)
+    // T-SQL gets TOP inserted instead of LIMIT. The decision of whether it is added must be the same as on the
+    // inserting side (engines::mssql::apply_auto_top); otherwise lib.rs sees "LIMIT is added"
+    // and leaves max_rows at its default, while TOP is actually not added and
+    // default_limit has no effect (UNION / WITH / statements that already have TOP)
+    if engine == Engine::MsSql {
+        return crate::engines::mssql::apply_auto_top(sql, 1).is_some();
+    }
+    // VALUES (no LIMIT allowed in SQLite) and TABLE are not targeted;
+    // limit it to SELECT / WITH only. DuckDB's FROM-first syntax
+    // (`FROM t`) is the same query shape as SELECT, so it is targeted
+    // (SUMMARIZE / PIVOT are not given one because whether a trailing LIMIT works depends on their shape)
     let kw = leading_keyword(sql);
     let applicable = matches!(kw.as_str(), "select" | "with")
         || (engine == Engine::DuckDb && kw == "from");
@@ -1729,17 +1907,17 @@ pub(crate) fn should_auto_limit(sql: &str, engine: Engine) -> bool {
         .any(|word| veto_words.contains(&word))
 }
 
-/// エンジン別の EXPLAIN プレフィックスを付けた SQL を組み立てる。
-/// 対象は SELECT / WITH のみ (should_auto_limit と同じ leading_keyword 判定)。
-/// Postgres の EXPLAIN ANALYZE は対象文を実際に実行するため、DML に付けると
-/// 書き込みが走ってしまう。安全側に倒して SELECT 系以外は一律エラーにする。
+/// Builds SQL with the per-engine EXPLAIN prefix.
+/// Only SELECT / WITH are targeted (same leading_keyword check as should_auto_limit).
+/// Postgres's EXPLAIN ANALYZE actually executes the target statement, so putting it on DML
+/// would run the write. Erring on the safe side, everything other than SELECT-type is an error.
 ///
-/// MySQL は EXPLAIN FORMAT=JSON を選ぶ。EXPLAIN ANALYZE (8.0.18+) は
-/// 対象文を実際に実行するうえ MariaDB では未対応のため、実行を伴わずに
-/// コスト・行数見積もりが得られる FORMAT=JSON の方が安全で互換性も広い。
+/// MySQL uses EXPLAIN FORMAT=JSON. EXPLAIN ANALYZE (8.0.18+) actually executes
+/// the target statement and is not supported on MariaDB, so FORMAT=JSON, which gives
+/// cost and row estimates without executing, is safer and more widely compatible.
 pub fn build_explain_sql(engine: &str, sql: &str) -> Result<String, AppError> {
     let engine = parse_engine(engine)?;
-    // DynamoDB (PartiQL) に EXPLAIN は無い
+    // DynamoDB (PartiQL) has no EXPLAIN
     if matches!(
         engine,
         Engine::Redis | Engine::Elasticsearch | Engine::DynamoDb
@@ -1753,16 +1931,16 @@ pub fn build_explain_sql(engine: &str, sql: &str) -> Result<String, AppError> {
             "Explain is available only for SELECT / WITH statements".into(),
         ));
     }
-    // EXPLAIN のプレフィックスが効くのは 1 文目だけで、`SELECT 1; DROP TABLE t;`
-    // の 2 文目以降はそのまま実行される。EXPLAIN に複文を渡す用途も無いため拒否する。
+    // The EXPLAIN prefix only applies to the first statement, and the second and later statements
+    // of `SELECT 1; DROP TABLE t;` are executed as is. There is no use case for passing multiple statements to EXPLAIN, so reject them.
     if contains_multiple_statements(sql, engine) {
         return Err(AppError::Explain(
             "Explain is available only for a single statement".into(),
         ));
     }
-    // EXPLAIN ANALYZE は対象文を実際に実行するため、先頭が SELECT / WITH
-    // でも書き込みを伴い得る文 (SELECT INTO / CTE 付き DML) は対象外にする
-    // (is_readonly_allowed と同じ保守的な単語判定を流用する)
+    // EXPLAIN ANALYZE actually executes the target statement, so even if it starts with SELECT / WITH,
+    // statements that may write (SELECT INTO / DML with CTE) are excluded
+    // (reusing the same conservative word check as is_readonly_allowed)
     if !is_readonly_allowed(sql, engine) {
         return Err(AppError::Explain(
             "Explain is not available for statements that may write data \
@@ -1771,23 +1949,26 @@ pub fn build_explain_sql(engine: &str, sql: &str) -> Result<String, AppError> {
         ));
     }
     let prefix = match engine {
-        // ANALYZE で実測時間、BUFFERS でバッファアクセス統計も取得する
+        // ANALYZE gets measured time, and BUFFERS also gets buffer access statistics
         Engine::Postgres => "EXPLAIN (ANALYZE, BUFFERS)",
         Engine::MySql => "EXPLAIN FORMAT=JSON",
         Engine::Sqlite => "EXPLAIN QUERY PLAN",
-        // DuckDB の EXPLAIN ANALYZE は対象文を実際に実行するため使わない
+        // DuckDB's EXPLAIN ANALYZE actually executes the target statement, so it is not used
         Engine::DuckDb => "EXPLAIN",
-        // Redis / Elasticsearch / DynamoDb は冒頭の早期 return で弾いている
+        // T-SQL has no EXPLAIN. engines/mssql.rs receives it as queryfolio's pseudo statement
+        // and turns it into estimated execution plan rows with SET SHOWPLAN_ALL ON (it is not executed)
+        Engine::MsSql => "EXPLAIN",
+        // Redis / Elasticsearch / DynamoDb are rejected by the early return at the top
         Engine::Redis | Engine::Elasticsearch | Engine::DynamoDb => unreachable!(),
     };
     Ok(format!("{prefix}\n{sql}"))
 }
 
-/// RETURNING 句を含むかを単語境界で判定する。
-/// INSERT / UPDATE / DELETE ... RETURNING (Postgres / SQLite) の結果行を
-/// 取りこぼさないための判定。文字列リテラル内の単語にも反応する可能性が
-/// あるが、その場合も fetch 経路で正しく実行される (affected 表示が
-/// 行数表示になるだけ) ため許容する。
+/// Determines at word boundaries whether it contains a RETURNING clause.
+/// Used so as not to miss the result rows of INSERT / UPDATE / DELETE ... RETURNING
+/// (Postgres / SQLite). It may also react to words inside string literals,
+/// but even then the statement runs correctly on the fetch path (the affected
+/// display just becomes a row count display), so that is tolerated.
 pub(crate) fn contains_returning(sql: &str) -> bool {
     let lower = sql.to_ascii_lowercase();
     let bytes = lower.as_bytes();
@@ -1807,40 +1988,40 @@ pub(crate) fn contains_returning(sql: &str) -> bool {
     false
 }
 
-/// readonly 接続で実行を許可する文かを判定する。
-/// 先頭キーワードが読み取り系 (is_fetch_statement) であることに加えて:
-/// - WITH: CTE 本体が DML (WITH ... DELETE 等) の場合を拒否するため、
-///   文字列リテラル・コメントを除去した cleaned に insert / update /
-///   delete / merge の単語が含まれたら拒否する
-/// - SELECT: SELECT INTO (Postgres ではテーブル作成、MySQL では
-///   INTO OUTFILE 等) を拒否するため、into の単語が含まれたら拒否する
-/// - EXPLAIN: EXPLAIN ANALYZE (Postgres / MySQL 8.0.19+) は対象文を
-///   実際に実行するため、analyze と DML / into の単語が両方含まれたら
-///   拒否する (SELECT INTO のテーブル作成や INTO OUTFILE のファイル
-///   書き込みも実行されてしまうため)。ANALYZE 無しの EXPLAIN は実行を
-///   伴わないので DML でも許可する
-/// - PRAGMA: SQLite の代入形 PRAGMA (`PRAGMA user_version = 1`、
-///   `PRAGMA journal_mode = WAL` 等) は DB を変更するため、cleaned に `=`
-///   を含む PRAGMA は拒否する。読み取り形 (`PRAGMA table_info(t)`、
-///   `PRAGMA user_version` 等) は許可する
-/// リテラル内の単語は scan_sql が除去し、カラム名等への部分一致は
-/// 単語境界の分割で誤検知しない。
-/// 弱点: SELECT に副作用のある関数 (nextval 等) や CALL のプロシージャ内の
-/// 書き込み、括弧形の設定 PRAGMA (`PRAGMA journal_mode(WAL)` 等) までは
-/// 防げない。あくまで事故防止のガードである。
-/// `;` 区切りの複文かどうかを判定する。
+/// Determines whether a statement is allowed to run on a readonly connection.
+/// In addition to the leading keyword being read-type (is_fetch_statement):
+/// - WITH: to reject a CTE body that is DML (WITH ... DELETE, etc.),
+///   reject if the cleaned text (string literals and comments removed) contains the words
+///   insert / update / delete / merge
+/// - SELECT: to reject SELECT INTO (table creation in Postgres, INTO OUTFILE
+///   etc. in MySQL), reject if the word into is contained
+/// - EXPLAIN: EXPLAIN ANALYZE (Postgres / MySQL 8.0.19+) actually
+///   executes the target statement, so reject if both analyze and a DML / into word
+///   are contained (because the table creation of SELECT INTO and the file
+///   writing of INTO OUTFILE would also be executed). EXPLAIN without ANALYZE does not
+///   execute anything, so it is allowed even for DML
+/// - PRAGMA: assignment-form PRAGMAs in SQLite (`PRAGMA user_version = 1`,
+///   `PRAGMA journal_mode = WAL`, etc.) modify the DB, so a PRAGMA whose cleaned text
+///   contains `=` is rejected. Read forms (`PRAGMA table_info(t)`,
+///   `PRAGMA user_version`, etc.) are allowed
+/// Words inside literals are removed by scan_sql, and partial matches against
+/// column names and the like are not falsely detected thanks to word boundary splitting.
+/// Weakness: it cannot stop side-effecting functions in SELECT (nextval, etc.), writes
+/// inside CALLed procedures, or parenthesized setting PRAGMAs (`PRAGMA journal_mode(WAL)`, etc.).
+/// It is only an accident-prevention guard.
+/// Determines whether the statement is `;`-separated multiple statements.
 ///
-/// 文字列リテラル・コメントは scan_sql が除去済みの cleaned を見るため、
-/// `SELECT 'a;b'` のようなリテラル内のセミコロンには反応しない。
-/// 末尾のセミコロン (`SELECT 1;`) は 1 文として扱う。
+/// Since it looks at cleaned, from which string literals and comments were already removed by scan_sql,
+/// it does not react to semicolons inside literals such as `SELECT 'a;b'`.
+/// A trailing semicolon (`SELECT 1;`) is treated as one statement.
 pub(crate) fn contains_multiple_statements(sql: &str, engine: Engine) -> bool {
     let cleaned = scan_sql(sql, engine).cleaned;
     cleaned.trim_end().trim_end_matches(';').contains(';')
 }
 
-/// ガードが有効な接続で複文が渡された時のエラー。
-/// 解除の手順まで書く (どちらのガードが効いているかは呼び出し側で分かるが、
-/// 複文はその両方をすり抜けるため、判定としては 1 つにまとめている)。
+/// Error returned when multiple statements are passed on a connection with a guard enabled.
+/// It also includes how to lift the guard (the caller knows which guard is in effect, but
+/// multiple statements slip past both, so the decision is combined into one).
 pub(crate) fn multi_statement_block_error() -> AppError {
     AppError::Readonly(
         "Multiple statements are not allowed while the read-only / safety guard is on. \
@@ -1871,34 +2052,34 @@ pub(crate) fn is_readonly_allowed(sql: &str, engine: Engine) -> bool {
                     || has_word("replace")
                     || DML_WORDS.iter().any(|w| has_word(w))))
         }
-        // 代入形 PRAGMA (`= value`) は DB を変更するので拒否する
+        // Assignment-form PRAGMA (`= value`) modifies the DB, so reject it
         "pragma" => !cleaned.contains('='),
         _ => true,
     }
 }
 
-/// 誤操作で全行破壊・テーブル消失を招く危険な文かを判定し、危険なら
-/// 理由 (フロントに表示する英語メッセージ) を返す。
-/// allow_dangerous_statements が無効な接続でこれらの文を拒否する事故防止ガード。
+/// Determines whether a statement is dangerous, i.e. could cause whole-table destruction or table loss by mistake, and if so
+/// returns the reason (an English message shown on the frontend).
+/// An accident-prevention guard that rejects these statements on connections where allow_dangerous_statements is off.
 ///
-/// 判定は is_readonly_allowed と同じく、文字列リテラル・コメントを scan_sql で
-/// 除去した cleaned に対する単語境界判定で行う (リテラル内の where 等には反応
-/// しない)。
-/// - UPDATE / DELETE: where の単語が無ければ「全行対象」とみなし危険とする
-/// - TRUNCATE: 常に危険 (全行削除)
-/// - DROP: 常に危険 (オブジェクトの永久削除)
+/// As with is_readonly_allowed, the decision is a word boundary check on cleaned, from which
+/// string literals and comments were removed by scan_sql (it does not react to a where
+/// inside a literal).
+/// - UPDATE / DELETE: if there is no where word, it is considered "all rows" and dangerous
+/// - TRUNCATE: always dangerous (deletes all rows)
+/// - DROP: always dangerous (permanently deletes objects)
 ///
-/// 先頭キーワードだけでなく、実際に書き込みが走る次のラップ形も対象にする:
-/// - WITH ... DELETE / UPDATE (Postgres の CTE 付き DML)。先頭は with でも本体で
-///   全行 DELETE/UPDATE が走る
-/// - EXPLAIN ANALYZE / EXPLAIN (ANALYZE) ...: 対象文を実際に実行するため、
-///   中の DELETE/UPDATE/TRUNCATE/DROP も対象。ANALYZE 無しの EXPLAIN は実行を
-///   伴わないので対象外
+/// Not only the leading keyword but also the following wrapped forms that actually write are targeted:
+/// - WITH ... DELETE / UPDATE (Postgres DML with CTE). Even though it starts with with, the body runs
+///   an all-rows DELETE/UPDATE
+/// - EXPLAIN ANALYZE / EXPLAIN (ANALYZE) ...: since the target statement is actually executed,
+///   the DELETE/UPDATE/TRUNCATE/DROP inside is also targeted. EXPLAIN without ANALYZE does not
+///   execute, so it is excluded
 ///
-/// 弱点: WITH の場合、無関係な CTE / 外側の SELECT にある where を「WHERE あり」と
-/// 誤認して WHERE 無し DML を見逃すことがある (where を一切含まない典型形は捕捉
-/// する)。サブクエリ内だけの where も同様。安全側=許可側に倒れるため完全ではなく、
-/// 代表的な事故パターンを止めるガードである。
+/// Weakness: for WITH, a where in an unrelated CTE / outer SELECT may be mistaken for "has WHERE"
+/// and a DML without WHERE can be missed (the typical form containing no where at all is
+/// caught). The same goes for a where only inside a subquery. It falls to the safe = allow side, so it is not
+/// perfect; it is a guard that stops the representative accident patterns.
 pub(crate) fn dangerous_reason(sql: &str, engine: Engine) -> Option<&'static str> {
     let cleaned = scan_sql(sql, engine).cleaned;
     let has_word = |target: &str| {
@@ -1907,11 +2088,11 @@ pub(crate) fn dangerous_reason(sql: &str, engine: Engine) -> Option<&'static str
             .any(|word| word == target)
     };
     let kw = leading_keyword(sql);
-    // 先頭がコメントだけで終わる場合 (leading_keyword が空) は、cleaned の先頭語を
-    // 先頭キーワードとして扱う。MySQL の実行コメント (`/*! DROP TABLE t */`) は
-    // scan_sql が中身を cleaned に残すため、これで drop を拾える。
-    // 実行コメントを持たない方言では cleaned にも中身が残らないので、この分岐は
-    // 「コメントだけの入力」で空のままになり、判定は変わらない。
+    // If it ends with only comments (leading_keyword is empty), the first word of cleaned is
+    // treated as the leading keyword. MySQL executable comments (`/*! DROP TABLE t */`)
+    // keep their contents in cleaned via scan_sql, so this picks up drop.
+    // In dialects without executable comments, cleaned also keeps no contents, so this branch
+    // stays empty for "comment-only input" and the decision does not change.
     let kw = if kw.is_empty() {
         cleaned
             .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
@@ -1922,11 +2103,11 @@ pub(crate) fn dangerous_reason(sql: &str, engine: Engine) -> Option<&'static str
         kw
     };
 
-    // EXPLAIN ANALYZE / EXPLAIN (ANALYZE) は対象文を実際に実行するため、
-    // ラップされた DML も危険判定の対象にする。ANALYZE 無しの EXPLAIN は
-    // 実行を伴わないので対象外。
+    // EXPLAIN ANALYZE / EXPLAIN (ANALYZE) actually executes the target statement,
+    // so wrapped DML is also subject to the dangerous check. EXPLAIN without ANALYZE
+    // does not execute, so it is excluded.
     let explain_executes = kw == "explain" && has_word("analyze");
-    // 実行時に DML が走り得るラップ形 (CTE 付き DML / EXPLAIN ANALYZE)。
+    // Wrapped forms in which DML can run at execution time (DML with CTE / EXPLAIN ANALYZE).
     let wraps_dml = kw == "with" || explain_executes;
 
     let is_delete = kw == "delete" || (wraps_dml && has_word("delete"));
@@ -1938,8 +2119,8 @@ pub(crate) fn dangerous_reason(sql: &str, engine: Engine) -> Option<&'static str
     if is_update && !has_word("where") {
         return Some("UPDATE without a WHERE clause would modify every row.");
     }
-    // TRUNCATE / DROP は常に破壊的。WITH には書けないので、ラップ形としては
-    // EXPLAIN ANALYZE 経由のみ考慮する。
+    // TRUNCATE / DROP are always destructive. They cannot be written in WITH, so as a wrapped form
+    // only the EXPLAIN ANALYZE route is considered.
     if kw == "truncate" || (explain_executes && has_word("truncate")) {
         return Some("TRUNCATE would remove every row from the table.");
     }
@@ -1949,9 +2130,9 @@ pub(crate) fn dangerous_reason(sql: &str, engine: Engine) -> Option<&'static str
     None
 }
 
-/// フロントエンドの実行前確認ダイアログ用ラッパー。危険な文なら理由を返す。
-/// 実行はしない。allow_dangerous_statements が有効な接続で、実行前に
-/// ユーザーへ確認を出すかどうかの判断に使う。
+/// Wrapper for the frontend's pre-execution confirmation dialog. Returns the reason if the statement is dangerous.
+/// It does not execute. Used on connections with allow_dangerous_statements enabled to decide
+/// whether to ask the user for confirmation before execution.
 pub fn dangerous_statement_reason(engine: &str, sql: &str) -> Result<Option<String>, AppError> {
     let engine = parse_engine(engine)?;
     if engine == Engine::Redis {
@@ -1965,15 +2146,15 @@ pub fn dangerous_statement_reason(engine: &str, sql: &str) -> Result<Option<Stri
     Ok(dangerous_reason(sql, engine).map(|s| s.to_string()))
 }
 
-/// 行を返す文かどうかを先頭キーワードで判定する。
-/// AI エージェント (チャットの run_sql ツール) に許可する文の先頭キーワード。
-/// ユーザー操作時の readonly ガード (is_fetch_statement) より意図的に狭い:
-/// - `call`: ストアドプロシージャは中で DML を実行できる (readonly ガードは
-///   中身を見られないため素通りする)
-/// - `pragma`: 括弧形など、代入検出をすり抜けて DB 設定を変えうる形がある
+/// Determines by the leading keyword whether a statement returns rows.
+/// Leading keywords of statements allowed for the AI agent (the chat's run_sql tool).
+/// Intentionally narrower than the readonly guard for user operations (is_fetch_statement):
+/// - `call`: a stored procedure can run DML inside (the readonly guard cannot
+///   see inside, so it would pass)
+/// - `pragma`: there are forms, such as the parenthesized one, that slip past assignment detection and can change DB settings
 ///
-/// エージェントは「読むだけ」を構造的に保証したいので、少しでも書き込みが
-/// 走りうる入口は落とす (人間の操作と違い、拒否されても本人が直せない)。
+/// Since we want to structurally guarantee that the agent only reads, any entrance through which a write
+/// could run is dropped (unlike human operations, the agent cannot fix it itself when rejected).
 const AGENT_ALLOWED_KEYWORDS: &[&str] = &[
     "select",
     "with",
@@ -1985,28 +2166,28 @@ const AGENT_ALLOWED_KEYWORDS: &[&str] = &[
     "table",
 ];
 
-/// その SQL を「もう一度実行しても副作用が無い」と判断してよいかを返す。
+/// Returns whether that SQL can be judged to have "no side effects even if executed again".
 ///
-/// Copy / Export は結果テーブルの打ち切りを避けるために同じ SQL を実行し直すが、
-/// 書き込みを伴う文を二度実行すると事故になる。判定は AI エージェント経路と
-/// 同じ厳しさ (狭いホワイトリスト + 複文禁止 + EXPLAIN ANALYZE 禁止 +
-/// readonly ガード) を使う。
+/// Copy / Export re-run the same SQL to avoid a truncated result table,
+/// but running a statement that writes twice would be an accident. The check uses the same
+/// strictness as the AI agent path (narrow whitelist + multiple statements forbidden + EXPLAIN ANALYZE forbidden +
+/// readonly guard).
 pub fn is_safe_to_rerun(sql: &str, engine: Engine) -> bool {
-    // DynamoDB の `tables` は ListTables を叩くだけの読み取り文で、SQL 系の
-    // キーワード判定 (AGENT_ALLOWED_KEYWORDS / is_fetch_statement) には乗らない
-    // (CYBERNEURA-DEV-406)。ここで拾わないと、テーブル数が default_limit を超えた
-    // 時に Copy / Export が打ち切られた表のまま出力される。
-    // この分岐は Copy / Export の再実行判定だけに効く (AI エージェント経路は
-    // agent_rejection_reason を直接使う)
+    // DynamoDB's `tables` is a read statement that just calls ListTables and does not fit the SQL-style
+    // keyword check (AGENT_ALLOWED_KEYWORDS / is_fetch_statement)
+    // (CYBERNEURA-DEV-406). If it is not picked up here, when the table count exceeds default_limit,
+    // Copy / Export would output the truncated table as is.
+    // This branch only affects the re-execution check for Copy / Export (the AI agent path
+    // uses agent_rejection_reason directly)
     if engine == Engine::DynamoDb && crate::engines::dynamodb::is_tables_statement(sql) {
         return true;
     }
     agent_rejection_reason(sql, engine).is_none()
 }
 
-/// AI エージェントが実行しようとした SQL を拒否すべきなら理由を返す。
-/// 通常の readonly ガードに加えて、上記の狭いホワイトリストと
-/// 複文 (`;` 区切り) の禁止を課す。
+/// Returns the reason if the SQL the AI agent tried to run should be rejected.
+/// In addition to the normal readonly guard, it imposes the narrow whitelist above and
+/// a ban on multiple statements (`;`-separated).
 pub(crate) fn agent_rejection_reason(sql: &str, engine: Engine) -> Option<String> {
     let keyword = leading_keyword(sql);
     if !AGENT_ALLOWED_KEYWORDS.contains(&keyword.as_str()) {
@@ -2015,16 +2196,16 @@ pub(crate) fn agent_rejection_reason(sql: &str, engine: Engine) -> Option<String
             AGENT_ALLOWED_KEYWORDS.join(" / ").to_uppercase()
         ));
     }
-    // 複文はドライバ次第で通ることがあり、1 文目だけを見るガードを
-    // すり抜けうるため、エージェント経路では一律に拒否する
+    // Multiple statements may pass depending on the driver and can
+    // slip past guards that only look at the first statement, so they are uniformly rejected on the agent path
     if contains_multiple_statements(sql, engine) {
         return Some("The assistant may only run one statement at a time; rejected.".to_string());
     }
     let cleaned = scan_sql(sql, engine).cleaned;
-    // EXPLAIN ANALYZE は対象文を実際に実行する。is_readonly_allowed は中身の
-    // DML / INTO しか見ないため、`EXPLAIN (ANALYZE) CREATE TABLE x AS SELECT ...`
-    // のような DDL がすり抜ける。エージェントに実行を伴う EXPLAIN は不要なので
-    // (計画を見るだけなら ANALYZE 無しで足りる) まとめて拒否する。
+    // EXPLAIN ANALYZE actually executes the target statement. is_readonly_allowed only looks at the
+    // DML / INTO inside, so DDL such as `EXPLAIN (ANALYZE) CREATE TABLE x AS SELECT ...`
+    // slips through. The agent has no need for an EXPLAIN that executes
+    // (ANALYZE-less is enough to just see the plan), so they are rejected together.
     let has_word = |target: &str| {
         cleaned
             .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
@@ -2068,8 +2249,8 @@ pub(crate) fn bytes_to_json(bytes: Vec<u8>) -> serde_json::Value {
     }
 }
 
-/// 指定した型でのデコードを試み、成功したら JSON にして返すマクロ。
-/// NULL は JSON null になる。型不一致は次の候補へフォールスルーする。
+/// Macro that tries decoding as the given type and, on success, returns it as JSON.
+/// NULL becomes JSON null. A type mismatch falls through to the next candidate.
 macro_rules! try_decode {
     ($row:expr, $i:expr, $t:ty, $conv:expr) => {
         match $row.try_get::<Option<$t>, _>($i) {
@@ -2083,7 +2264,7 @@ macro_rules! try_decode {
     };
 }
 
-/// どの型でもデコードできなかった場合の最終フォールバック。
+/// Final fallback when decoding is impossible with any type.
 macro_rules! decode_fallback {
     ($row:expr, $i:expr) => {{
         try_decode!($row, $i, String, |v: String| serde_json::Value::String(v));
@@ -2099,9 +2280,9 @@ fn json_number_f64(v: f64) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::Value::String(v.to_string()))
 }
 
-/// JavaScript の Number は 2^53-1 (MAX_SAFE_INTEGER) を超える整数を
-/// 表現できず、Tauri の invoke 境界で丸められてしまう。
-/// 安全範囲を超える 64bit 整数は文字列で返して精度を保つ。
+/// JavaScript's Number cannot represent integers beyond 2^53-1 (MAX_SAFE_INTEGER),
+/// and they would be rounded at Tauri's invoke boundary.
+/// 64-bit integers beyond the safe range are returned as strings to preserve precision.
 const JS_MAX_SAFE_INTEGER: i64 = (1 << 53) - 1;
 
 pub(crate) fn json_i64(v: i64) -> serde_json::Value {
@@ -2133,7 +2314,7 @@ fn mysql_value_to_json(row: &MySqlRow, i: usize) -> serde_json::Value {
         "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" => {
             try_decode!(row, i, i64, json_i64);
         }
-        // YEAR は sqlx 内部で UNSIGNED フラグ付きのため u64 側でデコードする
+        // YEAR carries the UNSIGNED flag inside sqlx, so decode it on the u64 side
         "TINYINT UNSIGNED" | "SMALLINT UNSIGNED" | "MEDIUMINT UNSIGNED"
         | "INT UNSIGNED" | "BIGINT UNSIGNED" | "YEAR" => {
             try_decode!(row, i, u64, json_u64);
@@ -2142,7 +2323,7 @@ fn mysql_value_to_json(row: &MySqlRow, i: usize) -> serde_json::Value {
             try_decode!(row, i, f64, json_number_f64);
         }
         "DECIMAL" => {
-            // 精度を保つため文字列で返す
+            // Return as a string to preserve precision
             try_decode!(row, i, rust_decimal::Decimal, |v: rust_decimal::Decimal| {
                 serde_json::Value::String(v.to_string())
             });
@@ -2178,13 +2359,129 @@ fn mysql_value_to_json(row: &MySqlRow, i: usize) -> serde_json::Value {
     decode_fallback!(row, i)
 }
 
+/// Turns the Postgres array binary representation (array_send in arrayfuncs.c) into a JSON array.
+/// Multidimensional arrays become nested arrays, and NULL elements become null. The contents of elements are
+/// converted by `decode_element`. sqlx's `Vec<T>` decoder only accepts one-dimensional arrays whose
+/// subscripts start at 1, so we read it ourselves (the lower bound of subscripts cannot be put in JSON, so it is discarded).
+/// None if the format is broken (the caller falls back to `<undecodable>`).
+fn pg_binary_array_to_json(
+    buf: &[u8],
+    decode_element: impl Fn(&[u8]) -> serde_json::Value,
+) -> Option<serde_json::Value> {
+    // Postgres's MAXDIM
+    const MAX_DIMS: usize = 6;
+
+    fn take<'a>(buf: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+        if buf.len() < n {
+            return None;
+        }
+        let (head, rest) = buf.split_at(n);
+        *buf = rest;
+        Some(head)
+    }
+    fn take_i32(buf: &mut &[u8]) -> Option<i32> {
+        take(buf, 4).map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    let mut buf = buf;
+    let ndim = usize::try_from(take_i32(&mut buf)?).ok()?;
+    // A has-null flag other than 0 / 1 is broken input (same check as array_recv).
+    // The element type OID is not used (the element type is known from the column's type info)
+    if !matches!(take_i32(&mut buf)?, 0 | 1) {
+        return None;
+    }
+    take(&mut buf, 4)?;
+    if ndim == 0 {
+        return buf.is_empty().then(|| serde_json::Value::Array(Vec::new()));
+    }
+    if ndim > MAX_DIMS {
+        return None;
+    }
+    let mut dims = Vec::with_capacity(ndim);
+    for _ in 0..ndim {
+        let len = usize::try_from(take_i32(&mut buf)?).ok()?;
+        // Postgres normalizes an empty array to ndim = 0, so a zero-length dimension never arrives
+        // (the exceptions int2vector / oidvector do not go through here = the enum array path).
+        // If one arrives, reject it as broken input (if an inner dimension is 0, the outer loop keeps
+        // spinning without reading a single byte of input, slipping past the element count check)
+        if len == 0 {
+            return None;
+        }
+        dims.push(len);
+        // Lower bound of the subscript
+        take(&mut buf, 4)?;
+    }
+    // Each element takes at least 4 bytes (the length), so input whose total element count cannot be
+    // covered by the remaining bytes is rejected before any allocation or looping
+    let total = dims.iter().try_fold(1usize, |acc, &d| acc.checked_mul(d))?;
+    if total > buf.len() / 4 {
+        return None;
+    }
+
+    // Elements are laid out in row-major order, so recurse per dimension to nest them
+    fn build(
+        dims: &[usize],
+        buf: &mut &[u8],
+        decode_element: &dyn Fn(&[u8]) -> serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let (&len, inner) = dims.split_first()?;
+        let mut items = Vec::with_capacity(len);
+        for _ in 0..len {
+            if inner.is_empty() {
+                let elem_len = take_i32(buf)?;
+                // NULL is only -1. Any other negative length is broken input
+                if elem_len == -1 {
+                    items.push(serde_json::Value::Null);
+                } else {
+                    let elem_len = usize::try_from(elem_len).ok()?;
+                    items.push(decode_element(take(buf, elem_len)?));
+                }
+            } else {
+                items.push(build(inner, buf, decode_element)?);
+            }
+        }
+        Some(serde_json::Value::Array(items))
+    }
+    let value = build(&dims, &mut buf, &decode_element)?;
+    // If bytes are left over after reading the declared element count, the header and the contents disagree
+    buf.is_empty().then_some(value)
+}
+
 fn pg_value_to_json(row: &PgRow, i: usize) -> serde_json::Value {
+    // User-defined enum types (and their arrays) are not included in the types compatible with
+    // sqlx's String decoder (TEXT / VARCHAR, etc.), so as is they would hit decode_fallback
+    // `<undecodable>`. An enum value is the label's UTF-8 in both text and binary
+    // formats, so read the raw value as a string as is
+    let enum_value = match row.column(i).type_info().kind() {
+        PgTypeKind::Enum(_) => Some(false),
+        PgTypeKind::Array(elem) if matches!(elem.kind(), PgTypeKind::Enum(_)) => Some(true),
+        _ => None,
+    };
+    if let (Some(is_array), Ok(raw)) = (enum_value, row.try_get_raw(i)) {
+        if raw.is_null() {
+            return serde_json::Value::Null;
+        }
+        let format = raw.format();
+        let decoded = match (is_array, format) {
+            (true, PgValueFormat::Binary) => raw.as_bytes().ok().and_then(|bytes| {
+                pg_binary_array_to_json(bytes, |b| bytes_to_json(b.to_vec()))
+            }),
+            // Show a text-format array as the `{a,b}` literal as is
+            _ => raw
+                .as_str()
+                .ok()
+                .map(|label| serde_json::Value::String(label.to_string())),
+        };
+        if let Some(v) = decoded {
+            return v;
+        }
+    }
     let type_name = row.column(i).type_info().name().to_string();
     match type_name.as_str() {
         "BOOL" => {
             try_decode!(row, i, bool, |v: bool| serde_json::Value::Bool(v));
         }
-        // Postgres の数値型は型互換が厳密なため、カラム型と同じ幅でデコードする
+        // Postgres numeric types have strict type compatibility, so decode with the same width as the column type
         "INT2" => {
             try_decode!(row, i, i16, |v: i16| serde_json::json!(v));
         }
@@ -2268,19 +2565,19 @@ fn sqlite_value_to_json(row: &SqliteRow, i: usize) -> serde_json::Value {
         }
         _ => {}
     }
-    // sqlite は動的型付けのため、宣言型と実値が一致しないことがある
+    // sqlite is dynamically typed, so the declared type and the actual value may not match
     try_decode!(row, i, i64, json_i64);
     try_decode!(row, i, f64, json_number_f64);
     decode_fallback!(row, i)
 }
 
-/// 接続設定の `schema` から「アクティブスキーマ」として見せる値を決める。
+/// Decides the value to show as the "active schema" from the connection config's `schema`.
 ///
-/// redis だけ扱いが違う。`engines/redis.rs` の connect は schema を trim して
-/// 見るので、**未設定も空白だけも database 0 に繋ぐ**。ここでその両方を
-/// `Some("0")` に正規化しないと、Database 欄のプルダウンが「どの選択肢とも
-/// 一致しない」状態になり、表示上は先頭の 0 が選ばれているのにアプリの状態は
-/// 空、という食い違いが残る (CYBERNEURA-DEV-408)。
+/// Only redis is handled differently. connect in `engines/redis.rs` trims schema before
+/// looking at it, so **both unset and whitespace-only connect to database 0**. Unless both are
+/// normalized to `Some("0")` here, the Database dropdown ends up "matching none of the
+/// options", leaving a mismatch where the leading 0 appears selected on screen but the
+/// app state is empty (CYBERNEURA-DEV-408).
 pub fn resolve_active_schema(engine: &str, schema: Option<&str>) -> Option<String> {
     let is_redis = matches!(parse_engine(engine), Ok(Engine::Redis));
     match schema {
@@ -2307,8 +2604,8 @@ mod tests {
 
     #[test]
     fn resolve_active_schema_defaults_redis_to_zero() {
-        // 未設定・空文字・空白だけは、いずれも connect 側が database 0 に
-        // 繋ぐので同じ扱いにする。
+        // Unset, empty and whitespace-only all make connect use database 0,
+        // so treat them the same.
         for schema in [None, Some(""), Some("   ")] {
             assert_eq!(
                 super::resolve_active_schema("redis", schema),
@@ -2316,7 +2613,7 @@ mod tests {
                 "schema={schema:?}"
             );
         }
-        // エイリアスでも同じ
+        // The same goes for aliases
         assert_eq!(
             super::resolve_active_schema("valkey", Some("")),
             Some("0".to_string())
@@ -2326,7 +2623,7 @@ mod tests {
     #[test]
     fn resolve_active_schema_leaves_other_engines_untouched() {
         assert_eq!(super::resolve_active_schema("postgres", None), None);
-        // redis 以外では空文字をそのまま返す (この正規化は redis 固有)
+        // Except for redis, return an empty string as is (this normalization is redis-specific)
         assert_eq!(
             super::resolve_active_schema("postgres", Some("")),
             Some(String::new())
@@ -2362,29 +2659,29 @@ mod tests {
     #[test]
     fn test_agent_rejection_reason() {
         let f = |s: &str| agent_rejection_reason(s, Engine::Sqlite);
-        // 読み取り系は通す
+        // Read statements pass
         assert!(f("SELECT * FROM t").is_none());
         assert!(f("WITH x AS (SELECT 1) SELECT * FROM x").is_none());
         assert!(f("EXPLAIN SELECT 1").is_none());
         assert!(f("SHOW TABLES").is_none());
-        // 末尾のセミコロン 1 つは複文ではない
+        // A single trailing semicolon is not multiple statements
         assert!(f("SELECT 1;").is_none());
         assert!(f("SELECT 1;  ").is_none());
-        // CALL は readonly ガードを素通りするが (ストアドが中で DML を実行
-        // できる)、エージェント経路では拒否する
+        // CALL passes the readonly guard (a stored procedure can run DML
+        // inside), but it is rejected on the agent path
         assert!(is_readonly_allowed("CALL do_something()", Engine::MySql));
         assert!(f("CALL do_something()").is_some());
-        // PRAGMA も readonly ガードは読み取り形を通すが、エージェントには不要
+        // The readonly guard also lets read-form PRAGMA through, but the agent does not need it
         assert!(is_readonly_allowed("PRAGMA user_version", Engine::Sqlite));
         assert!(f("PRAGMA user_version").is_some());
-        // 書き込み系は当然拒否
+        // Write statements are rejected, of course
         assert!(f("UPDATE t SET a = 1").is_some());
         assert!(f("DROP TABLE t").is_some());
-        // 複文は 1 文目が読み取りでも拒否する
+        // Multiple statements are rejected even if the first one is a read
         assert!(f("SELECT 1; DELETE FROM t").is_some());
-        // EXPLAIN ANALYZE は対象文を実行するため拒否する。特に
-        // EXPLAIN (ANALYZE) CREATE TABLE ... AS SELECT は DML 語も INTO も
-        // 含まないため is_readonly_allowed を素通りする
+        // EXPLAIN ANALYZE executes the target statement, so it is rejected. In particular,
+        // EXPLAIN (ANALYZE) CREATE TABLE ... AS SELECT contains neither a DML word nor INTO,
+        // so it passes is_readonly_allowed
         assert!(is_readonly_allowed(
             "EXPLAIN (ANALYZE) CREATE TABLE agent_tmp AS SELECT 1",
             Engine::Postgres
@@ -2395,50 +2692,50 @@ mod tests {
         )
         .is_some());
         assert!(agent_rejection_reason("EXPLAIN ANALYZE SELECT 1", Engine::Postgres).is_some());
-        // ANALYZE 無しの EXPLAIN は実行を伴わないので許可する
+        // EXPLAIN without ANALYZE does not execute, so it is allowed
         assert!(agent_rejection_reason("EXPLAIN SELECT 1", Engine::Postgres).is_none());
-        // リテラル内のセミコロンは複文ではない
+        // A semicolon inside a literal is not multiple statements
         assert!(f("SELECT 'a; b' FROM t").is_none());
     }
 
     #[test]
     fn test_contains_multiple_statements() {
         let f = |s: &str| contains_multiple_statements(s, Engine::Sqlite);
-        // 1 文 (末尾のセミコロン有無は問わない)
+        // One statement (with or without a trailing semicolon)
         assert!(!f("SELECT 1"));
         assert!(!f("SELECT 1;"));
         assert!(!f("SELECT 1;  "));
         assert!(!f("SELECT 1;\n"));
-        // 複文
+        // Multiple statements
         assert!(f("SELECT 1; DELETE FROM t"));
         assert!(f("SELECT 1; DELETE FROM t;"));
         assert!(f("UPDATE t SET x = 1 WHERE id = 1; DROP TABLE t;"));
-        // リテラル・コメント内のセミコロンには反応しない
+        // Does not react to semicolons inside literals and comments
         assert!(!f("SELECT 'a; b' FROM t"));
         assert!(!f("SELECT 1 -- ; not a statement"));
         assert!(!f("/* ; */ SELECT 1"));
-        // ドル引用 (Postgres) の中身も cleaned から除去される
+        // The contents of dollar quoting (Postgres) are also removed from cleaned
         assert!(!contains_multiple_statements(
             "SELECT $$a; b$$",
             Engine::Postgres
         ));
     }
 
-    /// MySQL の `--` は直後が空白の時だけ行コメント。
-    /// ここを他方言と同じにすると `SELECT 1--1; DROP TABLE t;` の 2 文目が
-    /// コメント扱いで消え、複文判定もガードもすり抜ける。
+    /// MySQL's `--` is a line comment only when immediately followed by whitespace.
+    /// If this were treated like other dialects, the second statement of `SELECT 1--1; DROP TABLE t;`
+    /// would vanish as a comment and slip past both the multi-statement check and the guards.
     #[test]
     fn test_mysql_dash_comment_requires_whitespace() {
         assert!(contains_multiple_statements(
             "SELECT 1--1; DROP TABLE t;",
             Engine::MySql
         ));
-        // `--;` も直後が空白でないためコメントではない (安全側 = 複文として検出)
+        // `--;` is also not followed by whitespace, so it is not a comment (safe side = detected as multiple statements)
         assert!(contains_multiple_statements(
             "SELECT 1 --; DROP TABLE t;",
             Engine::MySql
         ));
-        // 空白付き / 行末の `--` は従来どおりコメント
+        // `--` followed by whitespace / at end of line is a comment as before
         assert!(!contains_multiple_statements(
             "SELECT 1 -- ; DROP TABLE t;",
             Engine::MySql
@@ -2448,25 +2745,25 @@ mod tests {
             "SELECT * FROM t -- delete\n",
             Engine::MySql
         ));
-        // MySQL の # 行コメントは従来どおり
+        // MySQL's # line comment works as before
         assert!(!contains_multiple_statements(
             "SELECT 1 # ; DROP TABLE t",
             Engine::MySql
         ));
-        // バックスラッシュのエスケープは解釈しない (scan_sql のコメント参照)。
-        // 既定設定の MySQL では 1 文だが、NO_BACKSLASH_ESCAPES の環境では
-        // 2 文目が実行されるため、拒否側 = 安全側に倒す
+        // Backslash escapes are not interpreted (see the comment on scan_sql).
+        // On default-setting MySQL it is one statement, but in NO_BACKSLASH_ESCAPES environments
+        // the second statement is executed, so lean toward rejection = the safe side
         assert!(contains_multiple_statements(
             r"SELECT 'a\'; DROP TABLE t; --'",
             Engine::MySql
         ));
-        // 二重化によるエスケープは従来どおり 1 つのリテラルとして扱う
+        // Escaping by doubling is treated as one literal as before
         assert!(!contains_multiple_statements(
             "SELECT 'a''; still one literal'",
             Engine::MySql
         ));
 
-        // 他方言は `--` の直後が何であってもコメント
+        // In other dialects, `--` is a comment no matter what follows it
         assert!(!contains_multiple_statements(
             "SELECT 1--1; DROP TABLE t;",
             Engine::Postgres
@@ -2477,17 +2774,17 @@ mod tests {
         ));
     }
 
-    /// MySQL の実行コメント (`/*! ... */`) はサーバーが SQL として実行するので、
-    /// コメントとして落とすとガードから隠れてしまう。
+    /// MySQL executable comments (`/*! ... */`) are executed by the server as SQL,
+    /// so dropping them as comments would hide them from the guards.
     #[test]
     fn test_mysql_executable_comments_are_code() {
-        // 複文の 2 文目を実行コメントに隠せない
+        // The second statement of multiple statements cannot be hidden in an executable comment
         assert!(contains_multiple_statements(
             "UPDATE t SET x=1 WHERE id=1; /*! DROP TABLE t */",
             Engine::MySql
         ));
-        // 先頭が実行コメントでも危険文として拾う (leading_keyword は方言を
-        // 受け取らないため空を返すが、dangerous_reason が cleaned から補う)
+        // Picked up as a dangerous statement even if it starts with an executable comment (leading_keyword
+        // does not receive a dialect and so returns empty, but dangerous_reason fills in from cleaned)
         assert_eq!(leading_keyword("/*! DROP TABLE t */"), "");
         assert!(dangerous_reason("/*! DROP TABLE t */", Engine::MySql).is_some());
         assert!(dangerous_reason("/*!50110 TRUNCATE TABLE t */", Engine::MySql).is_some());
@@ -2496,17 +2793,17 @@ mod tests {
             "WITH x AS (SELECT 1) /*! DELETE FROM t */",
             Engine::MySql
         ));
-        // 通常のブロックコメントは従来どおりコメントとして落ちる
+        // Normal block comments are dropped as comments as before
         assert_eq!(leading_keyword("/* c */ SELECT 1"), "select");
         assert!(!contains_multiple_statements(
             "SELECT 1 /* ; DROP TABLE t */",
             Engine::MySql
         ));
         assert!(dangerous_reason("SELECT 1 /* DROP TABLE t */", Engine::MySql).is_none());
-        // scan_sql 側は MySQL のみ対象なので、他方言では従来どおりコメント。
-        // 逆に leading_keyword を方言非依存で実行コメント対応にすると、
-        // 他方言で `/*! SELECT 1 */ DROP TABLE t` の先頭を select と誤読して
-        // DROP を見落とすため、共通パーサーは変更していない
+        // scan_sql treats executable comments as such only for MySQL, so in other dialects it is a comment as before.
+        // Conversely, if leading_keyword were made dialect-independent and executable-comment-aware,
+        // in other dialects the head of `/*! SELECT 1 */ DROP TABLE t` would be misread as select
+        // and the DROP missed, so the common parser is left unchanged
         assert!(!contains_multiple_statements(
             "UPDATE t SET x=1 WHERE id=1; /*! DROP TABLE t */",
             Engine::Postgres
@@ -2518,24 +2815,24 @@ mod tests {
             "/*! SELECT 1 */ DROP TABLE t",
             Engine::Sqlite
         ));
-        // コメントだけの入力は従来どおり対象外
+        // Comment-only input is out of scope as before
         assert!(dangerous_reason("-- only comment", Engine::MySql).is_none());
         assert!(dangerous_reason("/* just a comment */", Engine::Postgres).is_none());
-        // 実行コメント内の LIMIT も見えるので auto LIMIT は付けない
+        // A LIMIT inside an executable comment is also visible, so no auto LIMIT is added
         assert!(!should_auto_limit(
             "SELECT * FROM t /*! LIMIT 5 */",
             Engine::MySql
         ));
     }
 
-    /// 複文でガードをすり抜けられないこと。
+    /// Multiple statements must not be able to slip past the guards.
     ///
-    /// is_readonly_allowed / dangerous_reason は先頭キーワードしか見ないため、
-    /// これらの文は単体では「許可」と判定される。ガードが有効な接続では
-    /// run_query_on / run_statements が複文の時点で拒否することで防いでいる。
+    /// is_readonly_allowed / dangerous_reason only look at the leading keyword, so
+    /// these statements are judged "allowed" on their own. On connections where a guard is enabled,
+    /// run_query_on / run_statements prevent this by rejecting at the multiple-statement stage.
     #[test]
     fn test_multi_statement_bypasses_keyword_guards() {
-        // readonly ガードは 1 文目が SELECT なので通してしまう
+        // The readonly guard lets it pass because the first statement is a SELECT
         assert!(is_readonly_allowed(
             "SELECT 1; DELETE FROM t;",
             Engine::Sqlite
@@ -2545,7 +2842,7 @@ mod tests {
             Engine::Sqlite
         ));
 
-        // 危険文ガードは 1 文目に WHERE があるので通してしまう
+        // The dangerous-statement guard lets it pass because the first statement has a WHERE
         assert!(dangerous_reason(
             "UPDATE t SET x = 1 WHERE id = 1; DROP TABLE t;",
             Engine::Sqlite
@@ -2556,7 +2853,7 @@ mod tests {
             Engine::Sqlite
         ));
 
-        // EXPLAIN は 1 文目にしか効かないため、組み立て時点で拒否する
+        // EXPLAIN only applies to the first statement, so reject at build time
         assert!(build_explain_sql("sqlite", "SELECT 1; DROP TABLE t;").is_err());
         assert!(build_explain_sql("sqlite", "SELECT 1;").is_ok());
     }
@@ -2564,41 +2861,41 @@ mod tests {
     #[test]
     fn test_is_readonly_allowed() {
         let f = |s: &str| is_readonly_allowed(s, Engine::Sqlite);
-        // 読み取り系は許可
+        // Read statements are allowed
         assert!(f("SELECT * FROM t"));
         assert!(f("WITH x AS (SELECT 1) SELECT * FROM x"));
         assert!(f("EXPLAIN SELECT 1"));
         assert!(f("SHOW TABLES"));
         assert!(f("PRAGMA table_info(t)"));
-        // 読み取り形 PRAGMA は許可
+        // Read-form PRAGMA is allowed
         assert!(f("PRAGMA user_version"));
         assert!(f("PRAGMA journal_mode"));
-        // 代入形 PRAGMA (DB を変更する) は拒否
+        // Assignment-form PRAGMA (modifies the DB) is rejected
         assert!(!f("PRAGMA user_version = 1"));
         assert!(!f("PRAGMA journal_mode = WAL"));
         assert!(!f("PRAGMA foreign_keys=ON"));
-        // 書き込み系は拒否
+        // Write statements are rejected
         assert!(!f("UPDATE t SET a = 1"));
         assert!(!f("INSERT INTO t VALUES (1)"));
         assert!(!f("DROP TABLE t"));
-        // CTE 付き DML は先頭が with でも拒否
+        // DML with CTE is rejected even if it starts with with
         assert!(!f("WITH old AS (SELECT id FROM t) DELETE FROM t WHERE id IN (SELECT id FROM old)"));
         assert!(!f("WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x"));
         assert!(!f("WITH x AS (SELECT 1) UPDATE t SET a = 1"));
         assert!(!f("with x as (select 1)\nmerge into t using x on true"));
-        // SELECT INTO (Postgres のテーブル作成 / MySQL の INTO OUTFILE) は拒否
+        // SELECT INTO (Postgres table creation / MySQL INTO OUTFILE) is rejected
         assert!(!is_readonly_allowed("SELECT * INTO new_table FROM t", Engine::Postgres));
         assert!(!is_readonly_allowed(
             "SELECT * FROM t INTO OUTFILE '/tmp/x'",
             Engine::MySql
         ));
-        // リテラル内の単語は scan_sql が除去するので誤検知しない
+        // Words inside literals are removed by scan_sql, so no false detection
         assert!(f("WITH x AS (SELECT 'delete') SELECT * FROM x"));
         assert!(f("SELECT 'into' FROM t"));
-        // 単語境界: 部分一致では拒否しない
+        // Word boundary: a partial match is not rejected
         assert!(f("WITH x AS (SELECT id FROM deleted_items) SELECT * FROM x"));
         assert!(f("SELECT * FROM intolerant"));
-        // EXPLAIN ANALYZE の対象が SELECT 系なら許可
+        // EXPLAIN ANALYZE is allowed if the target is SELECT-type
         assert!(is_readonly_allowed(
             "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t",
             Engine::Postgres
@@ -2607,7 +2904,7 @@ mod tests {
             "EXPLAIN ANALYZE SELECT * FROM t",
             Engine::MySql
         ));
-        // EXPLAIN ANALYZE は対象の DML を実際に実行するため拒否
+        // EXPLAIN ANALYZE actually executes the target DML, so it is rejected
         assert!(!is_readonly_allowed(
             "EXPLAIN ANALYZE DELETE FROM t",
             Engine::Postgres
@@ -2624,8 +2921,8 @@ mod tests {
             "explain analyze replace into t values (1)",
             Engine::MySql
         ));
-        // EXPLAIN ANALYZE + SELECT INTO はテーブル作成 (Postgres) や
-        // INTO OUTFILE のファイル書き込み (MySQL) が実行されるため拒否
+        // EXPLAIN ANALYZE + SELECT INTO would run Postgres table creation or
+        // the MySQL INTO OUTFILE file write, so it is rejected
         assert!(!is_readonly_allowed(
             "EXPLAIN (ANALYZE, BUFFERS) SELECT * INTO new_table FROM t",
             Engine::Postgres
@@ -2634,9 +2931,9 @@ mod tests {
             "EXPLAIN ANALYZE SELECT * FROM t INTO OUTFILE '/tmp/x'",
             Engine::MySql
         ));
-        // ANALYZE 無しの EXPLAIN は実行を伴わないため DML でも許可
+        // EXPLAIN without ANALYZE does not execute, so even DML is allowed
         assert!(is_readonly_allowed("EXPLAIN DELETE FROM t", Engine::Postgres));
-        // テーブル名への部分一致・リテラル内の単語は誤検知しない
+        // No false detection for partial matches against table names or words inside literals
         assert!(is_readonly_allowed(
             "EXPLAIN ANALYZE SELECT * FROM delete_log",
             Engine::Postgres
@@ -2650,52 +2947,52 @@ mod tests {
     #[test]
     fn test_dangerous_reason() {
         let d = |s: &str| dangerous_reason(s, Engine::Sqlite).is_some();
-        // WHERE 無しの UPDATE / DELETE は危険
+        // UPDATE / DELETE without WHERE is dangerous
         assert!(d("UPDATE t SET a = 1"));
         assert!(d("DELETE FROM t"));
         assert!(d("delete from t"));
-        // WHERE ありは安全
+        // With WHERE it is safe
         assert!(!d("UPDATE t SET a = 1 WHERE id = 1"));
         assert!(!d("DELETE FROM t WHERE id = 1"));
-        // 先頭コメントを挟んでも先頭キーワードで判定する
+        // Even with a leading comment, the decision is based on the leading keyword
         assert!(d("-- oops\nUPDATE t SET a = 1"));
         assert!(!d("/* c */ DELETE FROM t WHERE id = 1"));
-        // DROP / TRUNCATE は常に危険
+        // DROP / TRUNCATE are always dangerous
         assert!(d("DROP TABLE t"));
         assert!(d("TRUNCATE TABLE t"));
         assert!(dangerous_reason("TRUNCATE t", Engine::Postgres).is_some());
-        // 読み取り系・INSERT・DDL の他の文は対象外
+        // Other statements (read statements, INSERT, DDL) are out of scope
         assert!(!d("SELECT * FROM t"));
         assert!(!d("INSERT INTO t VALUES (1)"));
         assert!(!d("CREATE TABLE t (id INTEGER)"));
         assert!(!d("ALTER TABLE t ADD COLUMN x TEXT"));
-        // リテラル・カラム名の where や drop には反応しない (単語境界 / リテラル除去)
+        // Does not react to where or drop in literals or column names (word boundary / literal removal)
         assert!(d("UPDATE t SET note = 'where is it'"));
         assert!(!d("UPDATE t SET a = 1 WHERE label = 'drop'"));
-        // 弱点の明示: サブクエリ内 where だけの全行 UPDATE は見逃す (許可側に倒れる)
+        // Stating the weakness: an all-rows UPDATE with where only inside a subquery is missed (falls to the allow side)
         assert!(!d("UPDATE t SET a = (SELECT max(b) FROM u WHERE u.id = 1)"));
 
-        // CTE (WITH) でラップした WHERE 無し DML も捕捉する (Postgres)
+        // DML without WHERE wrapped in a CTE (WITH) is also caught (Postgres)
         let p = |s: &str| dangerous_reason(s, Engine::Postgres).is_some();
         assert!(p("WITH d AS (DELETE FROM users RETURNING *) SELECT count(*) FROM d"));
         assert!(p("WITH x AS (SELECT 1) UPDATE t SET a = 1"));
-        // CTE 内の DML に WHERE があれば対象外 (スコープ済み)
+        // If the DML inside the CTE has a WHERE, it is out of scope (scoped)
         assert!(!p("WITH d AS (DELETE FROM users WHERE id = 1 RETURNING *) SELECT count(*) FROM d"));
-        // 純粋な読み取り CTE は対象外
+        // A pure read CTE is out of scope
         assert!(!p("WITH d AS (SELECT * FROM t) SELECT * FROM d"));
         assert!(!p("WITH d AS (SELECT deleted_at FROM t) SELECT * FROM d"));
 
-        // EXPLAIN ANALYZE は対象文を実行するため、中の WHERE 無し DML を捕捉
+        // EXPLAIN ANALYZE executes the target statement, so DML without WHERE inside it is caught
         assert!(p("EXPLAIN ANALYZE DELETE FROM users"));
         assert!(p("EXPLAIN (ANALYZE) UPDATE t SET a = 1"));
         assert!(dangerous_reason("EXPLAIN ANALYZE DELETE FROM users", Engine::MySql).is_some());
-        // ANALYZE 無しの EXPLAIN は実行しないので対象外
+        // EXPLAIN without ANALYZE does not execute, so it is out of scope
         assert!(!p("EXPLAIN DELETE FROM users"));
         assert!(!p("EXPLAIN SELECT * FROM t"));
-        // EXPLAIN ANALYZE でも中が読み取りなら対象外
+        // Even with EXPLAIN ANALYZE, it is out of scope if the inside is a read
         assert!(!p("EXPLAIN ANALYZE SELECT * FROM t"));
 
-        // 公開ラッパー: 不明なエンジンはエラー
+        // Public wrapper: an unknown engine is an error
         assert!(dangerous_statement_reason("mysql", "DROP TABLE t")
             .unwrap()
             .is_some());
@@ -2705,18 +3002,18 @@ mod tests {
         assert!(dangerous_statement_reason("bogus", "DROP TABLE t").is_err());
     }
 
-    /// 切替失敗時のロールバックは compare-and-swap で、
-    /// その間に別経路で変更された値は巻き戻さない。
+    /// The rollback on a failed switch is a compare-and-swap,
+    /// so a value changed by another path in the meantime is not rolled back.
     #[tokio::test]
     async fn test_rollback_schema_override_is_compare_and_swap() {
         let manager = DbManager::default();
 
-        // 元が None (設定のデフォルト) の状態から切り替えて失敗 → 解除される
+        // Switch from the state where the original is None (config default) and fail -> cleared
         manager.set_schema_override("conn", "tried".to_string()).await;
         assert!(manager.rollback_schema_override("conn", "tried", None).await);
         assert_eq!(manager.schema_override("conn").await, None);
 
-        // 元の値がある状態から切り替えて失敗 → 元の値に戻る
+        // Switch from the state where the original has a value and fail -> back to the original value
         manager.set_schema_override("conn", "before".to_string()).await;
         manager.set_schema_override("conn", "tried".to_string()).await;
         assert!(
@@ -2729,7 +3026,7 @@ mod tests {
             Some("before".to_string())
         );
 
-        // 切替中にユーザーが別の値へ変えていた場合は巻き戻さない
+        // If the user changed it to a different value during the switch, it is not rolled back
         manager.set_schema_override("conn", "tried".to_string()).await;
         manager.set_schema_override("conn", "chosen".to_string()).await;
         assert!(
@@ -2746,17 +3043,141 @@ mod tests {
     #[tokio::test]
     async fn test_disconnect_keeps_schema_override() {
         let manager = DbManager::default();
-        // アクティブスキーマを選択した状態で切断しても、選択は保持される
-        // (次に張り直した時に同じスキーマで繋がるため)。
+        // Even if disconnected with an active schema selected, the selection is kept
+        // (so that the next reconnect uses the same schema).
         manager.set_schema_override("conn", "chosen".to_string()).await;
         manager.disconnect("conn").await;
         assert_eq!(
             manager.schema_override("conn").await,
             Some("chosen".to_string())
         );
-        // 存在しない接続を切断しても panic しない (何度呼んでも安全)。
+        // Disconnecting a nonexistent connection does not panic (safe no matter how many times it is called).
         manager.disconnect("no-such-conn").await;
         manager.disconnect("conn").await;
+    }
+
+    /// A connection that is still connecting (here: a server that accepts TCP but
+    /// never answers the handshake) must not block other connections. Establishing
+    /// a pool used to hold the manager-wide lock, so every other connection's
+    /// queries waited until the slow one connected or timed out.
+    #[tokio::test]
+    async fn test_slow_connect_does_not_block_other_connections() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let slow: ServerConfig = serde_yaml::from_str(&format!(
+            "{{name: slow, engine: postgres, host: 127.0.0.1, port: {port}, ssl_mode: disable}}"
+        ))
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fast.db");
+        std::fs::File::create(&path).unwrap();
+        let fast: ServerConfig = serde_yaml::from_str(&format!(
+            "{{name: fast, engine: sqlite, schema: {}}}",
+            serde_json::to_string(&path.to_string_lossy()).unwrap()
+        ))
+        .unwrap();
+
+        let manager = Arc::new(DbManager::default());
+        let slow_task = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.get_pool(&slow).await.map(|_| ()) })
+        };
+        // Let the slow connection start connecting first
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!slow_task.is_finished());
+
+        let pool = tokio::time::timeout(std::time::Duration::from_secs(5), manager.get_pool(&fast))
+            .await
+            .expect("the fast connection waited for the slow one")
+            .unwrap();
+        let result = run_query(&pool, "SELECT 1 AS one", 10, None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(result.row_count, 1);
+        assert!(!slow_task.is_finished());
+
+        slow_task.abort();
+        accept.abort();
+    }
+
+    /// What get_pool does when the state changes while it is connecting.
+    #[test]
+    fn test_still_current_distinguishes_reset_from_disconnect() {
+        let mut inner = DbManagerInner::default();
+        let generation = inner.generation("conn");
+        assert!(inner.still_current("conn", generation).unwrap());
+
+        // Another connection changing does not invalidate this one
+        inner.bump_generation("other");
+        assert!(inner.still_current("conn", generation).unwrap());
+
+        // Disconnect / schema switch of this connection: retry from the current state
+        inner.bump_generation("conn");
+        assert!(!inner.still_current("conn", generation).unwrap());
+
+        // Config reload: the caller's ServerConfig may be stale, so it is an error
+        // (retrying would cache a pool built from the old config)
+        let generation = inner.generation("conn");
+        inner.reset_epoch += 1;
+        assert!(inner.still_current("conn", generation).is_err());
+    }
+
+    /// A caller queued behind another connect of the same connection must not
+    /// cache its (stale) config when a reload happens while it waits.
+    #[tokio::test]
+    async fn test_reload_while_waiting_for_connect_lock_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queued.db");
+        std::fs::File::create(&path).unwrap();
+        let server: ServerConfig = serde_yaml::from_str(&format!(
+            "{{name: queued, engine: sqlite, schema: {}}}",
+            serde_json::to_string(&path.to_string_lossy()).unwrap()
+        ))
+        .unwrap();
+        let manager = Arc::new(DbManager::default());
+        // Stand in for another caller that is connecting
+        let lock = manager.connect_lock("queued");
+        let held = lock.lock().await;
+        let queued = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.get_pool(&server).await.map(|_| ()) })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        manager.reset().await;
+        drop(held);
+        assert!(queued.await.unwrap().is_err());
+        assert!(manager.inner.lock().await.pools.is_empty());
+    }
+
+    /// Concurrent get_pool calls for the same connection share one pool
+    /// (the per-connection lock prevents establishing it twice).
+    #[tokio::test]
+    async fn test_concurrent_get_pool_creates_one_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.db");
+        std::fs::File::create(&path).unwrap();
+        let server: ServerConfig = serde_yaml::from_str(&format!(
+            "{{name: shared, engine: sqlite, schema: {}}}",
+            serde_json::to_string(&path.to_string_lossy()).unwrap()
+        ))
+        .unwrap();
+        let manager = DbManager::default();
+        let (a, b) = tokio::join!(manager.get_pool(&server), manager.get_pool(&server));
+        match (a.unwrap(), b.unwrap()) {
+            (DbPool::Sqlite(a), DbPool::Sqlite(b)) => {
+                // Both handles refer to the same pool: closing one closes the other
+                a.close().await;
+                assert!(b.is_closed());
+            }
+            _ => panic!("expected sqlite pools"),
+        }
     }
 
     #[tokio::test]
@@ -2768,7 +3189,7 @@ mod tests {
             .unwrap();
         let pool = DbPool::Sqlite(pool);
 
-        // 準備 (allow_dangerous=true で自由に書き込み)
+        // Setup (write freely with allow_dangerous=true)
         run_query(
             &pool,
             "CREATE TABLE t (id INTEGER, name TEXT)",
@@ -2790,7 +3211,7 @@ mod tests {
         .await
         .unwrap();
 
-        // allow_dangerous=false: 危険な文は拒否され、データは無傷
+        // allow_dangerous=false: dangerous statements are rejected and the data is untouched
         for sql in ["UPDATE t SET name = 'x'", "DELETE FROM t", "DROP TABLE t"] {
             let err = run_query(&pool, sql, 10, None, false, false)
                 .await
@@ -2807,7 +3228,7 @@ mod tests {
             .unwrap();
         assert_eq!(result.rows[0][0], serde_json::json!(2));
 
-        // WHERE ありの UPDATE / DELETE は allow_dangerous=false でも実行できる
+        // UPDATE / DELETE with WHERE can run even with allow_dangerous=false
         run_query(
             &pool,
             "UPDATE t SET name = 'x' WHERE id = 1",
@@ -2819,7 +3240,7 @@ mod tests {
         .await
         .unwrap();
 
-        // allow_dangerous=true なら危険な文も実行できる
+        // With allow_dangerous=true, dangerous statements can run too
         run_query(&pool, "DELETE FROM t", 10, None, false, true)
             .await
             .unwrap();
@@ -2831,7 +3252,7 @@ mod tests {
 
     #[test]
     fn test_build_explain_sql() {
-        // エンジン別のプレフィックス
+        // Per-engine prefix
         assert_eq!(
             build_explain_sql("postgres", "SELECT * FROM t").unwrap(),
             "EXPLAIN (ANALYZE, BUFFERS)\nSELECT * FROM t"
@@ -2844,19 +3265,19 @@ mod tests {
             build_explain_sql("sqlite", "SELECT * FROM t").unwrap(),
             "EXPLAIN QUERY PLAN\nSELECT * FROM t"
         );
-        // エンジン名の別表記
+        // Alternative spellings of engine names
         assert!(build_explain_sql("PostgreSQL", "SELECT 1").is_ok());
         assert!(build_explain_sql("mariadb", "SELECT 1").is_ok());
-        // WITH (CTE) と先頭コメント付きも対象
+        // WITH (CTE) and a leading comment are also targeted
         assert!(build_explain_sql("sqlite", "WITH x AS (SELECT 1) SELECT * FROM x").is_ok());
         assert!(build_explain_sql("sqlite", "-- note\nSELECT 1").is_ok());
-        // SELECT / WITH 以外は拒否 (EXPLAIN ANALYZE が DML を実行するため)
+        // Anything other than SELECT / WITH is rejected (because EXPLAIN ANALYZE would execute the DML)
         assert!(build_explain_sql("postgres", "UPDATE t SET a = 1").is_err());
         assert!(build_explain_sql("postgres", "DELETE FROM t").is_err());
         assert!(build_explain_sql("mysql", "SHOW TABLES").is_err());
         assert!(build_explain_sql("sqlite", "").is_err());
-        // 先頭が SELECT / WITH でも書き込みを伴い得る文は拒否
-        // (Postgres の EXPLAIN ANALYZE が実際に実行してしまうため)
+        // Statements that start with SELECT / WITH but may write are rejected
+        // (because Postgres's EXPLAIN ANALYZE would actually execute them)
         assert!(build_explain_sql("postgres", "SELECT * INTO new_table FROM t").is_err());
         assert!(
             build_explain_sql("mysql", "SELECT * FROM t INTO OUTFILE '/tmp/x'").is_err()
@@ -2866,24 +3287,24 @@ mod tests {
             "WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x"
         )
         .is_err());
-        // リテラル内の into / delete は誤検知しない
+        // into / delete inside literals are not falsely detected
         assert!(build_explain_sql("postgres", "SELECT 'into' FROM t").is_ok());
         assert!(
             build_explain_sql("postgres", "WITH x AS (SELECT 'delete') SELECT * FROM x").is_ok()
         );
-        // メタコマンドも対象外
+        // Meta commands are also out of scope
         assert!(build_explain_sql("sqlite", "\\dt").is_err());
-        // 不明エンジンはエラー
+        // An unknown engine is an error
         assert!(build_explain_sql("oracle", "SELECT 1").is_err());
     }
 
     #[test]
     fn test_json_64bit_precision() {
-        // JS の安全整数範囲内は数値のまま
+        // Within the JS safe integer range, it stays a number
         assert_eq!(json_i64(42), serde_json::json!(42));
         assert_eq!(json_i64(-9007199254740991), serde_json::json!(-9007199254740991i64));
         assert_eq!(json_u64(9007199254740991), serde_json::json!(9007199254740991u64));
-        // 範囲外は文字列で精度を保つ
+        // Out of range, it is kept as a string to preserve precision
         assert_eq!(
             json_i64(i64::MAX),
             serde_json::Value::String("9223372036854775807".into())
@@ -2905,11 +3326,11 @@ mod tests {
         assert_eq!(scan("SELECT a -- limit\nFROM t", Engine::Sqlite), "select a  \nfrom t");
         assert_eq!(scan("SELECT /* limit */ a", Engine::Sqlite), "select   a");
         assert_eq!(scan("SELECT 'it''s' FROM t", Engine::Sqlite), "select   from t");
-        // MySQL の # 行コメント
+        // MySQL's # line comment
         assert_eq!(scan("SELECT a # limit\nFROM t", Engine::MySql), "select a  \nfrom t");
-        // Postgres では # は演算子なのでコメント扱いしない
+        // In Postgres # is an operator, so it is not treated as a comment
         assert_eq!(scan("SELECT a # b", Engine::Postgres), "select a # b");
-        // Postgres のドル引用は文字列として除去
+        // Postgres dollar quoting is removed as a string
         assert_eq!(
             scan("SELECT $$--not a comment$$ AS s", Engine::Postgres),
             "select   as s"
@@ -2928,19 +3349,19 @@ mod tests {
         assert_eq!(body("SELECT * FROM t -- note", Engine::Sqlite), "SELECT * FROM t");
         assert_eq!(body("SELECT 1; -- note", Engine::Sqlite), "SELECT 1");
         assert_eq!(body("SELECT 1 /* c */  ;  ", Engine::Sqlite), "SELECT 1");
-        // 文字列リテラル内の記号はコードとして残る
+        // Symbols inside string literals remain as code
         assert_eq!(
             body("SELECT 'a;-- b' FROM t;", Engine::Sqlite),
             "SELECT 'a;-- b' FROM t"
         );
-        // コメントの後に続きがあるケース
+        // Case where something follows the comment
         assert_eq!(body("SELECT 1 -- c\n+ 2", Engine::Sqlite), "SELECT 1 -- c\n+ 2");
-        // MySQL の # コメントも除去される
+        // MySQL's # comment is also removed
         assert_eq!(
             body("SELECT * FROM t # inspect", Engine::MySql),
             "SELECT * FROM t"
         );
-        // Postgres のドル引用内の -- は切らない
+        // -- inside Postgres dollar quoting is not cut
         assert_eq!(
             body("SELECT $$--not a comment$$ AS s", Engine::Postgres),
             "SELECT $$--not a comment$$ AS s"
@@ -2950,25 +3371,25 @@ mod tests {
     #[test]
     fn test_is_safe_to_rerun() {
         let f = |s: &str| is_safe_to_rerun(s, Engine::Sqlite);
-        // Copy / Export の取り直しで再実行してよい文
+        // Statements that may be re-run when re-fetching for Copy / Export
         assert!(f("SELECT * FROM t LIMIT 10000"));
         assert!(f("WITH x AS (SELECT 1) SELECT * FROM x"));
-        // 書き込みを伴う文は再実行しない (二重実行の事故になる)
+        // Statements that write are not re-run (it would be a double-execution accident)
         assert!(!f("INSERT INTO t VALUES (1) RETURNING id"));
         assert!(!f("UPDATE t SET a = 1 WHERE id = 1 RETURNING id"));
         assert!(!f("DELETE FROM t WHERE id = 1"));
         assert!(!f("WITH x AS (DELETE FROM t RETURNING id) SELECT * FROM x"));
-        // 対象文を実際に実行する EXPLAIN ANALYZE と複文も拒否する
+        // EXPLAIN ANALYZE, which actually executes the target statement, and multiple statements are also rejected
         assert!(!f("EXPLAIN ANALYZE SELECT * FROM t"));
         assert!(!f("SELECT 1; SELECT 2"));
 
-        // DynamoDB の `tables` は ListTables だけの読み取り文なので再実行してよい
-        // (CYBERNEURA-DEV-406)。SQL 系のキーワード判定には乗らないため個別に通す
+        // DynamoDB's `tables` is a read statement of just ListTables, so it may be re-run
+        // (CYBERNEURA-DEV-406). It does not fit the SQL-style keyword check, so it is allowed individually
         assert!(is_safe_to_rerun("tables", Engine::DynamoDb));
         assert!(is_safe_to_rerun("tables;", Engine::DynamoDb));
-        // 他のエンジンでは従来どおり拒否する
+        // Other engines reject it as before
         assert!(!is_safe_to_rerun("tables", Engine::Sqlite));
-        // 引数や複文が付いた形は DynamoDB でも拒否する
+        // A form with arguments or multiple statements is rejected even for DynamoDB
         assert!(!is_safe_to_rerun("tables; DELETE FROM t", Engine::DynamoDb));
     }
 
@@ -2977,30 +3398,30 @@ mod tests {
         let f = |s: &str| should_auto_limit(s, Engine::Sqlite);
         assert!(f("SELECT * FROM users"));
         assert!(f("WITH x AS (SELECT 1) SELECT * FROM x"));
-        // リテラル内の limit は無視して付与できる
+        // A limit inside a literal is ignored and a LIMIT can be added
         assert!(f("SELECT 'limit' FROM t"));
-        // 単語境界: limits というテーブル名は veto しない
+        // Word boundary: a table named limits does not veto
         assert!(f("SELECT * FROM limits"));
-        // 既に LIMIT / FETCH / OFFSET がある
+        // LIMIT / FETCH / OFFSET already present
         assert!(!f("SELECT * FROM t LIMIT 10"));
         assert!(!f("SELECT * FROM t FETCH FIRST 10 ROWS ONLY"));
         assert!(!f("SELECT * FROM t OFFSET 5"));
-        // サブクエリ内の LIMIT も保守的にスキップ
+        // A LIMIT inside a subquery is also skipped conservatively
         assert!(!f("SELECT * FROM (SELECT 1 LIMIT 3) s"));
-        // ロック句・DML 混じりの WITH
+        // WITH mixed with lock clauses or DML
         assert!(!f("SELECT * FROM t FOR UPDATE"));
         assert!(!f("WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x"));
-        // SELECT 系以外
+        // Other than SELECT-type
         assert!(!f("SHOW TABLES"));
         assert!(!f("UPDATE t SET a = 1"));
-        // VALUES は SQLite で LIMIT 不可のため対象外
+        // VALUES is out of scope because LIMIT is not allowed in SQLite
         assert!(!f("VALUES (1)"));
-        // Postgres: ドル引用内の limit は veto しない
+        // Postgres: a limit inside dollar quoting does not veto
         assert!(should_auto_limit(
             "SELECT $$limit$$ AS s",
             Engine::Postgres
         ));
-        // MySQL: # コメント内の limit は veto しない (本体には付与できる)
+        // MySQL: a limit inside a # comment does not veto (it can be added to the body)
         assert!(should_auto_limit(
             "SELECT * FROM t # limit note",
             Engine::MySql
@@ -3040,7 +3461,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_query_sqlite() {
-        // :memory: はコネクションごとに別 DB になるため、プールを 1 接続に固定する
+        // :memory: is a separate DB per connection, so pin the pool to 1 connection
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(
@@ -3087,21 +3508,21 @@ mod tests {
         assert_eq!(result.rows[1][2], serde_json::Value::Null);
         assert!(!result.truncated);
 
-        // max_rows での切り詰め
+        // Truncation by max_rows
         let result = run_query(&pool, "SELECT * FROM t ORDER BY id", 1, None, false, false)
             .await
             .unwrap();
         assert_eq!(result.row_count, 1);
         assert!(result.truncated);
 
-        // 0 行の SELECT でも列ヘッダが返る (describe による補完)
+        // Column headers are returned even for a 0-row SELECT (supplemented by describe)
         let result = run_query(&pool, "SELECT * FROM t WHERE id = -1", 10, None, false, false)
             .await
             .unwrap();
         assert_eq!(result.row_count, 0);
         assert_eq!(result.columns, vec!["id", "name", "score"]);
 
-        // INSERT ... RETURNING は行を返す
+        // INSERT ... RETURNING returns rows
         let result = run_query(
             &pool,
             "INSERT INTO t VALUES (3, 'dave', 2.0) RETURNING id, name",
@@ -3115,13 +3536,13 @@ mod tests {
         assert_eq!(result.columns, vec!["id", "name"]);
         assert_eq!(result.rows[0][1], serde_json::json!("dave"));
 
-        // psql 風メタコマンドが変換されて実行される
+        // psql-style meta commands are converted and executed
         let result = run_query(&pool, "\\dt", 10, None, false, false).await.unwrap();
         assert_eq!(result.row_count, 1);
         assert_eq!(result.rows[0][0], serde_json::json!("t"));
 
         let result = run_query(&pool, "\\d t", 10, None, false, false).await.unwrap();
-        // PRAGMA table_info は name カラム (index 1) にカラム名を返す
+        // PRAGMA table_info returns the column name in the name column (index 1)
         let column_names: Vec<&str> = result
             .rows
             .iter()
@@ -3129,28 +3550,28 @@ mod tests {
             .collect();
         assert_eq!(column_names, vec!["id", "name", "score"]);
 
-        // 未対応メタコマンドはエラー
+        // An unsupported meta command is an error
         assert!(run_query(&pool, "\\du", 10, None, false, false).await.is_err());
 
-        // 自動 LIMIT: LIMIT 未指定の SELECT に付与される (末尾 ; も処理)
+        // Auto LIMIT: added to a SELECT without a LIMIT (trailing ; is handled too)
         let result = run_query(&pool, "SELECT * FROM t ORDER BY id;", 10, Some(2), false, false)
             .await
             .unwrap();
         assert_eq!(result.row_count, 2);
         assert_eq!(result.applied_limit, Some(2));
 
-        // 既に LIMIT がある場合は付与しない
+        // Not added when a LIMIT already exists
         let result = run_query(&pool, "SELECT * FROM t LIMIT 1", 10, Some(2), false, false)
             .await
             .unwrap();
         assert_eq!(result.row_count, 1);
         assert_eq!(result.applied_limit, None);
 
-        // メタコマンドには適用しない
+        // Not applied to meta commands
         let result = run_query(&pool, "\\dt", 10, Some(2), false, false).await.unwrap();
         assert_eq!(result.applied_limit, None);
 
-        // 末尾コメント付きでも LIMIT がコメントに飲み込まれない
+        // Even with a trailing comment, the LIMIT is not swallowed by the comment
         let result = run_query(
             &pool,
             "SELECT * FROM t ORDER BY id -- trailing note",
@@ -3164,28 +3585,28 @@ mod tests {
         assert_eq!(result.row_count, 2);
         assert_eq!(result.applied_limit, Some(2));
 
-        // VALUES は自動 LIMIT の対象外 (SQLite では VALUES ... LIMIT が構文エラー)
+        // VALUES is out of scope for the auto LIMIT (VALUES ... LIMIT is a syntax error in SQLite)
         let result = run_query(&pool, "VALUES (1), (2), (3)", 10, Some(2), false, false)
             .await
             .unwrap();
         assert_eq!(result.row_count, 3);
         assert_eq!(result.applied_limit, None);
 
-        // build_explain_sql で組み立てた EXPLAIN QUERY PLAN が実行できる
-        // (readonly 接続でも許可される)
+        // The EXPLAIN QUERY PLAN built by build_explain_sql can be executed
+        // (and is allowed even on a readonly connection)
         let explain_sql = build_explain_sql("sqlite", "SELECT * FROM t ORDER BY id").unwrap();
         let result = run_query(&pool, &explain_sql, 10, Some(2), true, false)
             .await
             .unwrap();
         assert!(result.row_count >= 1);
         assert!(result.columns.contains(&"detail".to_string()));
-        // EXPLAIN には自動 LIMIT を付与しない (先頭キーワードが explain のため)
+        // No auto LIMIT is added to EXPLAIN (because the leading keyword is explain)
         assert_eq!(result.applied_limit, None);
     }
 
-    /// テスト用の 1 接続 SQLite プールを作る
+    /// Creates a single-connection SQLite pool for tests
     async fn make_test_pool() -> DbPool {
-        // :memory: はコネクションごとに別 DB になるため、プールを 1 接続に固定する
+        // :memory: is a separate DB per connection, so pin the pool to 1 connection
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(
@@ -3201,7 +3622,7 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_registry_no_running_query() {
         let registry = CancelRegistry::default();
-        // 実行中のクエリが無ければ false
+        // false if no query is running
         assert!(!registry.cancel("nothing").await.unwrap());
     }
 
@@ -3213,15 +3634,15 @@ mod tests {
         assert!(registry.is_running("conn-a"));
         assert!(!guard.was_cancelled());
 
-        // キャンセル要求でフラグが立つ
+        // A cancellation request sets the flag
         assert!(registry.cancel("conn-a").await.unwrap());
         assert!(cancelled.load(Ordering::SeqCst));
         assert!(guard.was_cancelled());
 
-        // 別接続には影響しない
+        // Other connections are not affected
         assert!(!registry.cancel("conn-b").await.unwrap());
 
-        // ガードの drop で登録が外れる
+        // Dropping the guard removes the registration
         drop(guard);
         assert!(!registry.is_running("conn-a"));
         assert!(!registry.cancel("conn-a").await.unwrap());
@@ -3235,14 +3656,14 @@ mod tests {
             CancelTarget::Sqlite,
             Arc::new(AtomicBool::new(false)),
         );
-        // 同じ接続で新しい実行が登録された場合、古いガードの drop で
-        // 新しい登録が消えてはならない
+        // If a new execution was registered on the same connection, dropping the
+        // old guard must not remove the new registration
         let new_flag = Arc::new(AtomicBool::new(false));
         let new_guard = registry.register("conn-a", CancelTarget::Sqlite, new_flag.clone());
         drop(old_guard);
         assert!(registry.is_running("conn-a"));
 
-        // キャンセルは新しい実行に届く
+        // Cancellation reaches the new execution
         assert!(registry.cancel("conn-a").await.unwrap());
         assert!(new_flag.load(Ordering::SeqCst));
         drop(new_guard);
@@ -3254,7 +3675,7 @@ mod tests {
         let pool = make_test_pool().await;
         let registry = Arc::new(CancelRegistry::default());
 
-        // 重いクエリ (WITH RECURSIVE の大量生成) を別タスクで実行する
+        // Run a heavy query (mass generation via WITH RECURSIVE) in a separate task
         let heavy_sql = "WITH RECURSIVE c(x) AS (\
              SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 100000000\
          ) SELECT count(*) FROM c";
@@ -3274,28 +3695,28 @@ mod tests {
             .await
         });
 
-        // 実行が登録されるまで待つ (登録はクエリ開始直前に行われる)
+        // Wait until the execution is registered (registration happens right before the query starts)
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
         while !registry.is_running("test-conn") {
             assert!(Instant::now() < deadline, "query was not registered in time");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        // キャンセル要求 → progress handler が中断し、Cancelled で返る
+        // Cancellation request -> the progress handler aborts it and it returns as Cancelled
         assert!(registry.cancel("test-conn").await.unwrap());
         let result = handle.await.unwrap();
         assert!(
             matches!(result, Err(AppError::Cancelled)),
             "expected Cancelled, got: {result:?}"
         );
-        // フロントに渡る文字列表現も確認する
+        // Also check the string representation passed to the frontend
         assert_eq!(AppError::Cancelled.to_string(), "Query cancelled");
 
-        // 実行終了で登録は解除されている
+        // The registration is released when the execution ends
         assert!(!registry.is_running("test-conn"));
 
-        // 同じ接続 (max_connections=1 なので同一コネクション) で
-        // 次のクエリが正常に実行できる = プールの接続が壊れていない
+        // On the same connection (the same connection since max_connections=1),
+        // the next query can run normally = the pool's connection is not broken
         let result =
             run_query_cancellable(&pool, &registry, "test-conn", "SELECT 1", 10, None, ReadonlyGuard::Off, false)
                 .await
@@ -3309,7 +3730,7 @@ mod tests {
         let pool = make_test_pool().await;
         let registry = Arc::new(CancelRegistry::default());
 
-        // 完了済みのクエリ (登録解除済み) へのキャンセルは no-op
+        // Cancelling an already completed query (registration released) is a no-op
         let result =
             run_query_cancellable(&pool, &registry, "test-conn", "SELECT 1", 10, None, ReadonlyGuard::Off, false)
                 .await
@@ -3317,7 +3738,7 @@ mod tests {
         assert_eq!(result.row_count, 1);
         assert!(!registry.cancel("test-conn").await.unwrap());
 
-        // その後のクエリも正常に実行できる
+        // Subsequent queries can also run normally
         let result =
             run_query_cancellable(&pool, &registry, "test-conn", "SELECT 2", 10, None, ReadonlyGuard::Off, false)
                 .await
@@ -3330,7 +3751,7 @@ mod tests {
         let pool = make_test_pool().await;
         let registry = CancelRegistry::default();
 
-        // キャンセル要求無しの失敗は Cancelled にならず DB エラーのまま
+        // A failure without a cancellation request does not become Cancelled and stays a DB error
         let result = run_query_cancellable(
             &pool,
             &registry,
@@ -3347,7 +3768,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_query_sqlite_readonly() {
-        // :memory: はコネクションごとに別 DB になるため、プールを 1 接続に固定する
+        // :memory: is a separate DB per connection, so pin the pool to 1 connection
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(
@@ -3359,7 +3780,7 @@ mod tests {
             .unwrap();
         let pool = DbPool::Sqlite(pool);
 
-        // 準備 (readonly=false で書き込み)
+        // Setup (write with readonly=false)
         run_query(&pool, "CREATE TABLE t (id INTEGER, name TEXT)", 10, None, false, false)
             .await
             .unwrap();
@@ -3367,7 +3788,7 @@ mod tests {
             .await
             .unwrap();
 
-        // 読み取り系の文は readonly でも実行できる
+        // Read statements can run even with readonly
         let result = run_query(&pool, "SELECT * FROM t", 10, None, true, false)
             .await
             .unwrap();
@@ -3385,7 +3806,7 @@ mod tests {
         .unwrap();
         assert_eq!(result.row_count, 1);
 
-        // EXPLAIN / PRAGMA も許可される
+        // EXPLAIN / PRAGMA are also allowed
         assert!(run_query(&pool, "EXPLAIN SELECT * FROM t", 10, None, true, false)
             .await
             .is_ok());
@@ -3393,11 +3814,11 @@ mod tests {
             .await
             .is_ok());
 
-        // メタコマンドは読み取り系のカタログ照会のみなので許可される
+        // Meta commands are only read-only catalog queries, so they are allowed
         let result = run_query(&pool, "\\dt", 10, None, true, false).await.unwrap();
         assert_eq!(result.rows[0][0], serde_json::json!("t"));
 
-        // 書き込み系の文は拒否される (エラーメッセージに readonly を明記)
+        // Write statements are rejected (the error message states readonly explicitly)
         for sql in [
             "INSERT INTO t VALUES (2, 'bob')",
             "UPDATE t SET name = 'x'",
@@ -3405,11 +3826,11 @@ mod tests {
             "CREATE TABLE t2 (id INTEGER)",
             "DROP TABLE t",
             "ALTER TABLE t ADD COLUMN extra TEXT",
-            // RETURNING 付きの DML (行を返す) も先頭キーワードで拒否される
+            // DML with RETURNING (which returns rows) is also rejected by the leading keyword
             "INSERT INTO t VALUES (3, 'carol') RETURNING id",
-            // 先頭コメントの後ろの DML も拒否される
+            // DML after a leading comment is also rejected
             "-- comment\nUPDATE t SET name = 'y'",
-            // CTE 付き DML は先頭が WITH でも拒否される
+            // DML with CTE is rejected even if it starts with WITH
             "WITH x AS (SELECT id FROM t) DELETE FROM t WHERE id IN (SELECT id FROM x)",
             "WITH x AS (SELECT 9) INSERT INTO t SELECT 9, 'eve' FROM x",
         ] {
@@ -3421,7 +3842,7 @@ mod tests {
             );
         }
 
-        // 拒否された文は実行されておらず、データは無傷
+        // Rejected statements were not executed and the data is untouched
         let result = run_query(&pool, "SELECT id, name FROM t", 10, None, true, false)
             .await
             .unwrap();
@@ -3429,8 +3850,8 @@ mod tests {
         assert_eq!(result.rows[0][1], serde_json::json!("alice"));
     }
 
-    // Writable スイッチ OFF (ReadonlyGuard::Switch) では書き込みを拒否し、
-    // ON (ReadonlyGuard::Off) では書き込みを許可する。
+    // With the Writable switch OFF (ReadonlyGuard::Switch) writes are rejected,
+    // and with it ON (ReadonlyGuard::Off) writes are allowed.
     #[tokio::test]
     async fn test_writable_switch_guard() {
         let pool = make_test_pool().await;
@@ -3443,12 +3864,12 @@ mod tests {
             }
         };
 
-        // テーブル作成はスイッチ ON でのみ通る (下準備を兼ねる)
+        // Table creation only passes with the switch ON (also serves as setup)
         run(ReadonlyGuard::Off, "CREATE TABLE t (id INTEGER, name TEXT)")
             .await
             .unwrap();
 
-        // スイッチ OFF では読み取りは許可、書き込みは拒否 (スイッチ由来のメッセージ)
+        // With the switch OFF, reads are allowed and writes are rejected (message derived from the switch)
         run(ReadonlyGuard::Switch, "SELECT * FROM t")
             .await
             .unwrap();
@@ -3461,7 +3882,7 @@ mod tests {
             "unexpected message: {message}"
         );
 
-        // スイッチ ON では書き込みが通る
+        // With the switch ON, writes pass
         run(ReadonlyGuard::Off, "INSERT INTO t VALUES (1, 'a')")
             .await
             .unwrap();
@@ -3472,7 +3893,7 @@ mod tests {
     }
 
     async fn sqlite_mem_pool() -> DbPool {
-        // :memory: はコネクションごとに別 DB になるため 1 接続に固定する
+        // :memory: is a separate DB per connection, so pin to 1 connection
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(
@@ -3495,7 +3916,7 @@ mod tests {
             .await
             .unwrap();
 
-        // 2 件の UPDATE を 1 トランザクションで適用する
+        // Apply two UPDATEs in one transaction
         let affected = run_statements(
             &pool,
             &[
@@ -3526,7 +3947,7 @@ mod tests {
             .await
             .unwrap();
 
-        // 1 文目は成功するが 2 文目が構文/参照エラー。全体がロールバックされる
+        // The first statement succeeds but the second has a syntax/reference error. Everything is rolled back
         let err = run_statements(
             &pool,
             &[
@@ -3540,7 +3961,7 @@ mod tests {
         .unwrap_err();
         assert!(!err.to_string().is_empty());
 
-        // ロールバックされたので 1 文目の変更も残っていない
+        // Because of the rollback, the first statement's change does not remain either
         let result = run_query(&pool, "SELECT name FROM t WHERE id = 1", 10, None, false, false)
             .await
             .unwrap();
@@ -3553,7 +3974,7 @@ mod tests {
         run_query(&pool, "CREATE TABLE t (id INTEGER PRIMARY KEY)", 10, None, false, false)
             .await
             .unwrap();
-        // UPDATE 以外は拒否する (何も適用されない)
+        // Anything other than UPDATE is rejected (nothing is applied)
         let err = run_statements(
             &pool,
             &["DELETE FROM t WHERE id = 1".into()],
@@ -3574,7 +3995,7 @@ mod tests {
         run_query(&pool, "INSERT INTO t VALUES (1, 'a')", 10, None, false, false)
             .await
             .unwrap();
-        // Writable スイッチ OFF (Switch) では UPDATE がブロックされる
+        // With the Writable switch OFF (Switch), UPDATE is blocked
         let err = run_statements(
             &pool,
             &["UPDATE t SET name = 'x' WHERE id = 1".into()],
@@ -3584,7 +4005,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("Writable switch"));
-        // 変更されていないこと
+        // Confirm it was not changed
         let result = run_query(&pool, "SELECT name FROM t WHERE id = 1", 10, None, false, false)
             .await
             .unwrap();
@@ -3630,15 +4051,15 @@ mod tests {
                 .unwrap(),
             vec!["a".to_string(), "b".to_string()]
         );
-        // 主キーの無いテーブルは空
+        // A table without a primary key yields an empty result
         assert!(crate::schema_info::fetch_primary_keys(&pool, "nokey")
             .await
             .unwrap()
             .is_empty());
     }
 
-    /// エージェント経路 (ReadonlyGuard::Agent) は文レベルのガードに加えて
-    /// DB レベルでも読み取り専用を強制する。SQLite は PRAGMA query_only。
+    /// In addition to the statement-level guard, the agent path (ReadonlyGuard::Agent)
+    /// enforces read-only at the DB level as well. For SQLite it is PRAGMA query_only.
     #[tokio::test]
     async fn test_agent_guard_enforces_sqlite_query_only() {
         let pool = make_test_pool().await;
@@ -3650,7 +4071,7 @@ mod tests {
             .await
             .unwrap();
 
-        // エージェント経路の読み取りは通る
+        // Reads on the agent path pass
         run_query_cancellable(
             &pool,
             &registry,
@@ -3664,8 +4085,8 @@ mod tests {
         .await
         .unwrap();
 
-        // 文レベルのガードを通さない生の書き込みも、DB 自身が拒否する
-        // (query_only が実際にコネクションへ効いていることの確認)
+        // Even a raw write that does not go through the statement-level guard is rejected by the DB itself
+        // (confirms that query_only is actually in effect on the connection)
         let err = sqlx::query("INSERT INTO t VALUES (1)")
             .execute(raw)
             .await
@@ -3677,8 +4098,8 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        // 通常経路の実行は query_only を解除するので、その後の書き込みは通る
-        // (中断で解除処理が走らなかった場合の回復)
+        // Execution on the normal path clears query_only, so writes afterward pass
+        // (recovery when the clearing did not run due to an abort)
         run_query_cancellable(
             &pool,
             &registry,
@@ -3697,7 +4118,7 @@ mod tests {
             .unwrap();
     }
 
-    /// セル編集 (run_statements) も query_only の残りを解除してから書き込む。
+    /// Cell edits (run_statements) also clear any leftover query_only before writing.
     #[tokio::test]
     async fn test_run_statements_clears_agent_query_only() {
         let pool = make_test_pool().await;
@@ -3716,7 +4137,7 @@ mod tests {
             .await
             .unwrap();
 
-        // エージェント経路の実行で query_only = 1 を残す
+        // Leave query_only = 1 behind through an agent-path execution
         run_query_cancellable(
             &pool,
             &registry,
@@ -3741,35 +4162,35 @@ mod tests {
         assert_eq!(affected, 1);
     }
 
-    /// 実サーバー (Postgres / MySQL) での DB レベル読み取り専用の検証。
-    /// この 2 エンジンは組み込みで起動できないため、サーバーを用意できる
-    /// 環境でのみ走る (URL が無ければスキップ):
+    /// Verification of DB-level read-only on real servers (Postgres / MySQL).
+    /// These two engines cannot be started embedded, so this only runs in
+    /// environments where a server can be prepared (skipped if there is no URL):
     ///   QUERYFOLIO_TEST_PG_URL=postgres://user:pass@localhost/db \
     ///   QUERYFOLIO_TEST_MYSQL_URL=mysql://user:pass@localhost/db \
     ///     cargo test test_agent_guard_enforces_readonly_transaction
-    /// 検証内容は「readonly_begin_sql で開いたトランザクションの中では
-    /// 書き込みが DB に拒否される」「読み取りは通り、ROLLBACK 後も同じ
-    /// コネクションで書き込める」の 2 点。
-    /// プローブは**通常 (非 TEMP) オブジェクトへの書き込み**を使う:
-    /// Postgres は `SELECT nextval(...)` (この課題の元になったケースそのもの)、
-    /// MySQL は通常表への INSERT。プローブに使えないもの (いずれも実測):
-    ///   - 一時オブジェクト: 両エンジンとも読み取り専用トランザクションの
-    ///     対象外で、書き込みが通ってしまう
-    ///   - MySQL の DDL (`CREATE TABLE`): 暗黙コミットでトランザクションを
-    ///     抜けるため拒否されない (DDL を止めているのは文レベルのホワイトリスト)
-    /// プローブ用のオブジェクトを作って書き込んで消すため、接続ユーザには
-    /// **CREATE / INSERT / DROP** の権限が要る (MySQL はこれらが独立した権限。
-    /// 足りないとテストは権限エラーで落ちる — 読み取り専用の検証が素通りして
-    /// 緑になることはないが、後始末に失敗して通常表が残ることはある)。
-    /// Postgres 側はシーケンスを作る CREATE 権限があれば所有者として
-    /// nextval / DROP まで通る。
-    /// 名前は実行ごとにユニークにする: 固定名を `DROP ... IF EXISTS` すると、
-    /// 接続先に同名のオブジェクトがあった場合にユーザのデータを消しかねず、
-    /// 同時実行のテスト同士も潰し合う。テストが途中で panic した時だけ
-    /// プローブ用オブジェクトが残るが、消してしまうよりは害が小さい。
+    /// It verifies two points: "writes are rejected by the DB inside a transaction opened with
+    /// readonly_begin_sql" and "reads pass, and after ROLLBACK writes are possible on
+    /// the same connection".
+    /// The probes use **writes to normal (non-TEMP) objects**:
+    /// for Postgres `SELECT nextval(...)` (exactly the case that originated this issue),
+    /// for MySQL an INSERT into a regular table. Things that cannot be used as probes (all measured):
+    ///   - Temporary objects: for both engines they are outside the scope of a read-only
+    ///     transaction, so writes go through
+    ///   - MySQL DDL (`CREATE TABLE`): an implicit commit leaves the transaction,
+    ///     so it is not rejected (what stops DDL is the statement-level whitelist)
+    /// Because it creates, writes to and drops probe objects, the connecting user needs
+    /// **CREATE / INSERT / DROP** privileges (in MySQL these are independent privileges.
+    /// If they are missing the test fails with a permission error — the read-only verification
+    /// never passes through and turns green, but cleanup may fail and leave a regular table behind).
+    /// On the Postgres side, with the CREATE privilege to create a sequence, the owner
+    /// gets through to nextval / DROP.
+    /// Names are made unique per run: if a fixed name were `DROP ... IF EXISTS`'d,
+    /// it could delete the user's data when an object of the same name exists on the target,
+    /// and concurrently running tests would also trample each other. Probe objects remain only
+    /// if a test panics midway, but that does less harm than deleting them.
     #[tokio::test]
     async fn test_agent_guard_enforces_readonly_transaction() {
-        // 実行ごとにユニークなプローブ名 (pid + 起動からの経過ナノ秒)
+        // A probe name unique per run (pid + nanoseconds elapsed since startup)
         let probe = format!(
             "queryfolio_ro_probe_{}_{}",
             std::process::id(),
@@ -3786,9 +4207,9 @@ mod tests {
                 .await
                 .unwrap();
             let mut conn = raw.acquire().await.unwrap();
-            // 通常のシーケンスをプローブに使う。**一時オブジェクトは
-            // 読み取り専用トランザクションの対象外**で nextval が通って
-            // しまうため、TEMP は使えない (実測)
+            // Use a regular sequence as the probe. **Temporary objects are
+            // outside the scope of a read-only transaction** and nextval would pass,
+            // so TEMP cannot be used (measured)
             sqlx::query(&format!("CREATE SEQUENCE {probe}"))
                 .execute(&mut *conn)
                 .await
@@ -3796,10 +4217,10 @@ mod tests {
 
             let begin = readonly_begin_sql(Engine::Postgres).unwrap();
             let mut tx = conn.begin_with(begin).await.unwrap();
-            // 読み取りは通る
+            // Reads pass
             sqlx::query("SELECT 1").execute(&mut *tx).await.unwrap();
-            // 副作用のある SELECT は DB が拒否する (文レベルのガードは
-            // 先頭キーワードしか見ないため通してしまう類の文)
+            // A SELECT with side effects is rejected by the DB (the kind of statement that the
+            // statement-level guard lets through because it only looks at the leading keyword)
             let err = sqlx::query(&format!("SELECT nextval('{probe}')"))
                 .execute(&mut *tx)
                 .await
@@ -3807,7 +4228,7 @@ mod tests {
                 .to_string();
             assert!(err.contains("read-only"), "postgres: {err}");
             tx.rollback().await.unwrap();
-            // ROLLBACK 後は同じコネクションで書き込める
+            // After ROLLBACK, writes are possible on the same connection
             sqlx::query(&format!("SELECT nextval('{probe}')"))
                 .execute(&mut *conn)
                 .await
@@ -3816,10 +4237,10 @@ mod tests {
                 .execute(&mut *conn)
                 .await
                 .unwrap();
-            // プールは 1 接続なので、経路全体の確認へ進む前に返す
+            // The pool has one connection, so return it before moving on to the whole-path check
             drop(conn);
 
-            // エージェント経路の読み取りが通ること (経路全体の確認)
+            // Reads on the agent path pass (whole-path check)
             let pool = DbPool::Postgres(raw);
             let registry = CancelRegistry::default();
             let result = run_query_cancellable(
@@ -3844,9 +4265,9 @@ mod tests {
                 .await
                 .unwrap();
             let mut conn = raw.acquire().await.unwrap();
-            // 通常表をプローブに使う。一時表への書き込みは読み取り専用
-            // トランザクションの対象外 (Postgres と同じ)、DDL は暗黙コミットで
-            // トランザクションを抜けてしまう — どちらもプローブにならない (実測)
+            // Use a regular table as the probe. Writes to a temporary table are outside the scope
+            // of a read-only transaction (same as Postgres), and DDL leaves the transaction
+            // via an implicit commit — neither works as a probe (measured)
             sqlx::query(&format!("CREATE TABLE {probe} (a INT)"))
                 .execute(&mut *conn)
                 .await
@@ -3865,7 +4286,7 @@ mod tests {
                 "mysql: {err}"
             );
             tx.rollback().await.unwrap();
-            // ROLLBACK 後は同じコネクションで書き込める
+            // After ROLLBACK, writes are possible on the same connection
             sqlx::query(&format!("INSERT INTO {probe} VALUES (1)"))
                 .execute(&mut *conn)
                 .await
@@ -3874,7 +4295,7 @@ mod tests {
                 .execute(&mut *conn)
                 .await
                 .unwrap();
-            // プールは 1 接続なので、経路全体の確認へ進む前に返す
+            // The pool has one connection, so return it before moving on to the whole-path check
             drop(conn);
 
             let pool = DbPool::MySql(raw);
@@ -3895,8 +4316,158 @@ mod tests {
         }
     }
 
-    /// エージェント経路でも文レベルのガードは効き続ける
-    /// (メッセージはエージェント向けの文言になる)。
+    /// A Postgres user-defined enum type is shown as a label string, and its array as
+    /// an array of labels (nested for multidimensional).
+    /// sqlx's String decoder only accepts TEXT / VARCHAR and the like, so
+    /// unless enums are handled specially they become `<undecodable: ...>`.
+    /// It is placed in a schema outside search_path to reproduce the case where the type name arrives
+    /// schema-qualified as `schema.type` (the form that actually occurred).
+    /// It needs a server, so it only runs when QUERYFOLIO_TEST_PG_URL is set.
+    #[tokio::test]
+    async fn test_pg_enum_decodes_as_label() {
+        let Ok(url) = std::env::var("QUERYFOLIO_TEST_PG_URL") else {
+            return;
+        };
+        let schema = format!(
+            "queryfolio_enum_probe_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(&format!("CREATE TYPE {schema}.mood AS ENUM ('happy', 'sad')"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let row = sqlx::query(&format!(
+            "SELECT 'sad'::{schema}.mood AS m, NULL::{schema}.mood AS n, \
+                    ARRAY['happy', NULL, 'sad']::{schema}.mood[] AS a, \
+                    '{{}}'::{schema}.mood[] AS e, \
+                    '{{{{happy,sad}},{{sad,happy}}}}'::{schema}.mood[] AS nested, \
+                    NULL::{schema}.mood[] AS na"
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let value = pg_value_to_json(&row, 0);
+        let null = pg_value_to_json(&row, 1);
+        let array = pg_value_to_json(&row, 2);
+        let empty = pg_value_to_json(&row, 3);
+        let nested = pg_value_to_json(&row, 4);
+        let null_array = pg_value_to_json(&row, 5);
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(value, serde_json::json!("sad"));
+        assert_eq!(null, serde_json::Value::Null);
+        assert_eq!(array, serde_json::json!(["happy", null, "sad"]));
+        assert_eq!(empty, serde_json::json!([]));
+        assert_eq!(nested, serde_json::json!([["happy", "sad"], ["sad", "happy"]]));
+        assert_eq!(null_array, serde_json::Value::Null);
+    }
+
+    /// Builds array_send-format bytes (the length of each dimension and the elements. None is NULL)
+    fn pg_array_bytes(dims: &[i32], elements: &[Option<&str>]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(dims.len() as i32).to_be_bytes());
+        buf.extend_from_slice(&0i32.to_be_bytes());
+        buf.extend_from_slice(&12345u32.to_be_bytes());
+        for &d in dims {
+            buf.extend_from_slice(&d.to_be_bytes());
+            buf.extend_from_slice(&1i32.to_be_bytes());
+        }
+        for e in elements {
+            match e {
+                Some(s) => {
+                    buf.extend_from_slice(&(s.len() as i32).to_be_bytes());
+                    buf.extend_from_slice(s.as_bytes());
+                }
+                None => buf.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        buf
+    }
+
+    fn label(b: &[u8]) -> serde_json::Value {
+        bytes_to_json(b.to_vec())
+    }
+
+    #[test]
+    fn test_pg_binary_array_to_json() {
+        let one_dim = pg_array_bytes(&[3], &[Some("a"), None, Some("b")]);
+        assert_eq!(
+            pg_binary_array_to_json(&one_dim, label),
+            Some(serde_json::json!(["a", null, "b"]))
+        );
+
+        let two_dim = pg_array_bytes(&[2, 2], &[Some("a"), Some("b"), Some("c"), Some("d")]);
+        assert_eq!(
+            pg_binary_array_to_json(&two_dim, label),
+            Some(serde_json::json!([["a", "b"], ["c", "d"]]))
+        );
+
+        let empty = pg_array_bytes(&[], &[]);
+        assert_eq!(pg_binary_array_to_json(&empty, label), Some(serde_json::json!([])));
+    }
+
+    /// Broken input returns None without panicking (does not attempt allocation with a huge length)
+    #[test]
+    fn test_pg_binary_array_to_json_rejects_malformed() {
+        let full = pg_array_bytes(&[2], &[Some("abc"), Some("de")]);
+        for cut in 0..full.len() {
+            assert_eq!(pg_binary_array_to_json(&full[..cut], label), None, "cut at {cut}");
+        }
+        // Only the element count is huge, with no contents
+        let huge = pg_array_bytes(&[i32::MAX], &[]);
+        assert_eq!(pg_binary_array_to_json(&huge, label), None);
+        // Negative number of dimensions / dimension length
+        let negative_dim = pg_array_bytes(&[-1], &[]);
+        assert_eq!(pg_binary_array_to_json(&negative_dim, label), None);
+        let mut negative_ndim = pg_array_bytes(&[], &[]);
+        negative_ndim[..4].copy_from_slice(&(-1i32).to_be_bytes());
+        assert_eq!(pg_binary_array_to_json(&negative_ndim, label), None);
+        // Number of dimensions exceeding MAXDIM (6)
+        let too_deep = pg_array_bytes(&[1; 7], &[Some("a")]);
+        assert_eq!(pg_binary_array_to_json(&too_deep, label), None);
+        // A zero-length dimension (if an inner one is 0, the outer one loops 2^31 times without reading input)
+        for dims in [[i32::MAX, 0], [0, i32::MAX], [2, 0]] {
+            let zero_dim = pg_array_bytes(&dims, &[]);
+            assert_eq!(pg_binary_array_to_json(&zero_dim, label), None, "{dims:?}");
+        }
+        // The product of dimensions overflows / cannot be covered by the remaining bytes
+        let overflow = pg_array_bytes(&[i32::MAX, i32::MAX, i32::MAX], &[Some("a")]);
+        assert_eq!(pg_binary_array_to_json(&overflow, label), None);
+        // NULL is only -1
+        let mut bad_null = pg_array_bytes(&[1], &[None]);
+        let at = bad_null.len() - 4;
+        bad_null[at..].copy_from_slice(&(-2i32).to_be_bytes());
+        assert_eq!(pg_binary_array_to_json(&bad_null, label), None);
+        // Bytes left after the declared elements
+        let mut trailing = pg_array_bytes(&[1], &[Some("a")]);
+        trailing.push(0);
+        assert_eq!(pg_binary_array_to_json(&trailing, label), None);
+        let mut trailing_empty = pg_array_bytes(&[], &[]);
+        trailing_empty.push(0);
+        assert_eq!(pg_binary_array_to_json(&trailing_empty, label), None);
+        // The has-null flag is only 0 / 1
+        let mut bad_flag = pg_array_bytes(&[1], &[Some("a")]);
+        bad_flag[4..8].copy_from_slice(&2i32.to_be_bytes());
+        assert_eq!(pg_binary_array_to_json(&bad_flag, label), None);
+    }
+
+    /// Statement-level guards remain effective on the agent path as well
+    /// (the message is worded for the agent).
     #[tokio::test]
     async fn test_agent_guard_blocks_write_statements() {
         let pool = make_test_pool().await;
@@ -3918,20 +4489,20 @@ mod tests {
         .await
         .unwrap_err()
         .to_string();
-        // エージェント用のホワイトリスト (agent_rejection_reason) が先に弾く
+        // The agent whitelist (agent_rejection_reason) rejects it first
         assert!(err.contains("assistant"), "unexpected error: {err}");
     }
 
     #[test]
     fn test_auth_failure_codes() {
-        // Postgres: 28P01 (パスワード不一致。期限切れの IAM トークンもこれ) と 28000
+        // Postgres: 28P01 (wrong password; an expired IAM token is this too) and 28000
         assert!(is_auth_failure_code(DbErrorCode::Postgres("28P01")));
         assert!(is_auth_failure_code(DbErrorCode::Postgres("28000")));
-        // 権限不足・接続数超過・起動中は認証の失敗ではない
+        // Missing privileges, too many connections and starting up are not login failures
         for code in ["42501", "53300", "57P03", "3D000", "08006"] {
             assert!(!is_auth_failure_code(DbErrorCode::Postgres(code)), "{code}");
         }
-        // MySQL: 1045 (ER_ACCESS_DENIED_ERROR) だけ。1044 は database への権限不足
+        // MySQL: only 1045 (ER_ACCESS_DENIED_ERROR). 1044 is a missing database privilege
         assert!(is_auth_failure_code(DbErrorCode::MySql(1045)));
         for number in [1044, 1049, 1142, 2013] {
             assert!(!is_auth_failure_code(DbErrorCode::MySql(number)), "{number}");
@@ -3940,74 +4511,373 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_decision() {
-        let auth = DbErrorCode::Postgres("28P01");
-        // password_command の接続で、まだ再試行していない認証エラーだけ
-        assert!(should_retry_with_fresh_password(true, false, auth));
-        assert!(should_retry_with_fresh_password(true, false, DbErrorCode::MySql(1045)));
-        // 再試行は 1 度だけ
-        assert!(!should_retry_with_fresh_password(true, true, auth));
-        // 静的な password は取り直しても同じなので再試行しない
-        assert!(!should_retry_with_fresh_password(false, false, auth));
-        // 認証以外のエラーは再試行しない
-        assert!(!should_retry_with_fresh_password(true, false, DbErrorCode::Postgres("42P01")));
-        assert!(!should_retry_with_fresh_password(true, false, DbErrorCode::Other));
-    }
-
-    #[test]
     fn test_db_error_code_of_non_database_errors() {
-        assert_eq!(
-            db_error_code(&AppError::Config("x".into())),
-            DbErrorCode::Other
-        );
+        assert_eq!(db_error_code(&AppError::Config("x".into())), DbErrorCode::Other);
         assert_eq!(
             db_error_code(&AppError::Db(sqlx::Error::PoolTimedOut)),
             DbErrorCode::Other
         );
     }
 
-    /// 認証以外のエラーは password_command の接続でも再実行しない
+    /// The command runs when the pool is created, and its failure is what get_pool reports
+    #[cfg(unix)]
     #[tokio::test]
-    async fn test_retry_on_expired_password_does_not_retry_other_errors() {
+    async fn test_get_pool_reports_password_command_failure() {
+        // Arrange
         let manager = DbManager::default();
         let server: ServerConfig = serde_yaml::from_str(
-            "name: c\nengine: postgres\npassword_command: /usr/bin/false\n",
+            "name: c\nengine: postgres\nhost: 127.0.0.1\nport: 1\n\
+             password_command: /bin/sh -c 'echo helper says no >&2; exit 4'\n",
         )
         .unwrap();
-        let pool = DbPool::Sqlite(
+
+        // Act
+        let err = manager.get_pool(&server).await.err().unwrap().to_string();
+
+        // Assert
+        assert!(err.contains("password_command of server 'c'"), "{err}");
+        assert!(err.contains("helper says no"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_get_pool_rejects_password_with_password_command() {
+        let manager = DbManager::default();
+        let server: ServerConfig = serde_yaml::from_str(
+            "name: c\nengine: postgres\nhost: 127.0.0.1\nport: 1\npassword: p\n\
+             password_command: /bin/echo x\n",
+        )
+        .unwrap();
+        let err = manager.get_pool(&server).await.err().unwrap().to_string();
+        assert!(err.contains("either password or password_command"), "{err}");
+    }
+
+    use std::sync::atomic::AtomicUsize;
+
+    /// A retried cancellation must not cancel a query that started after the one it was for
+    #[tokio::test]
+    async fn test_cancel_registration_skips_a_newer_query() {
+        // Arrange
+        let registry = CancelRegistry::default();
+        let first = registry.register("c", CancelTarget::Sqlite, Arc::new(AtomicBool::new(false)));
+        let (first_id, pool) = registry.registration("c").unwrap();
+        drop(first);
+        let newer_cancelled = Arc::new(AtomicBool::new(false));
+        let _newer = registry.register("c", CancelTarget::Sqlite, newer_cancelled.clone());
+
+        // Act
+        let cancelled = registry.cancel_registration("c", first_id).await.unwrap();
+
+        // Assert
+        assert!(pool.is_none());
+        assert!(!cancelled);
+        assert!(!newer_cancelled.load(Ordering::SeqCst));
+        let (newer_id, _) = registry.registration("c").unwrap();
+        assert!(registry.cancel_registration("c", newer_id).await.unwrap());
+        assert!(newer_cancelled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_should_refresh_password() {
+        let connect_auth = AppError::ConnectAuth(sqlx::Error::PoolTimedOut);
+        let other = AppError::Db(sqlx::Error::PoolTimedOut);
+        // User SQL: only a rejected login while acquiring the first connection
+        assert!(should_refresh_password(PasswordRetry::BeforeStatement, &connect_auth));
+        assert!(!should_refresh_password(PasswordRetry::BeforeStatement, &other));
+        // Idempotent operations: any auth failure (a plain Db 28P01 is covered by the real-DB
+        // test; the error type cannot be built here)
+        assert!(should_refresh_password(PasswordRetry::Idempotent, &connect_auth));
+        assert!(!should_refresh_password(PasswordRetry::Idempotent, &other));
+        assert!(!should_refresh_password(
+            PasswordRetry::Idempotent,
+            &AppError::Config("x".into())
+        ));
+    }
+
+    /// A Postgres pool that never connects (nothing below opens a connection), and a
+    /// password_command connection whose helper counts its runs
+    #[cfg(unix)]
+    fn lazy_pg_pool_and_server(helper: &CountingPasswordCommand) -> (DbPool, ServerConfig) {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://u@127.0.0.1:1/db")
+            .unwrap();
+        let server: ServerConfig = serde_yaml::from_str(&format!(
+            "name: c\nengine: postgres\npassword_command: \"{}\"\n",
+            helper.command().replace('"', "\\\"")
+        ))
+        .unwrap();
+        (DbPool::Postgres(pool), server)
+    }
+
+    /// An operation that fails with the given errors in turn, then succeeds
+    fn failing_op(
+        calls: &AtomicUsize,
+        errors: Vec<fn() -> AppError>,
+    ) -> impl Fn(DbPool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>>>>
+           + '_ {
+        move |_| {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            let result = match errors.get(call) {
+                Some(error) => Err(error()),
+                None => Ok(()),
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_connect_auth_failure_refreshes_and_retries_once() {
+        // Arrange
+        let helper = CountingPasswordCommand::new("new-pw");
+        let (pool, server) = lazy_pg_pool_and_server(&helper);
+        let manager = DbManager::default();
+        let calls = AtomicUsize::new(0);
+        let connect_auth = || AppError::ConnectAuth(sqlx::Error::PoolTimedOut);
+
+        // Act
+        let result = manager
+            .run_with_password_refresh(
+                &server,
+                pool,
+                PasswordRetry::BeforeStatement,
+                failing_op(&calls, vec![connect_auth]),
+            )
+            .await;
+
+        // Assert
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(helper.runs(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_refresh_is_tried_only_once_per_operation() {
+        // Arrange
+        let helper = CountingPasswordCommand::new("still-wrong");
+        let (pool, server) = lazy_pg_pool_and_server(&helper);
+        let manager = DbManager::default();
+        let calls = AtomicUsize::new(0);
+        let connect_auth = || AppError::ConnectAuth(sqlx::Error::PoolTimedOut);
+
+        // Act
+        let result = manager
+            .run_with_password_refresh(
+                &server,
+                pool,
+                PasswordRetry::BeforeStatement,
+                failing_op(&calls, vec![connect_auth, connect_auth, connect_auth]),
+            )
+            .await;
+
+        // Assert
+        assert!(matches!(result, Err(AppError::ConnectAuth(_))), "{result:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(helper.runs(), 1);
+    }
+
+    /// Errors that are not a rejected login while acquiring are returned as they are: the
+    /// operation is not run again and the command does not run
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_other_errors_are_not_retried() {
+        // Arrange
+        let helper = CountingPasswordCommand::new("pw");
+        let (pool, server) = lazy_pg_pool_and_server(&helper);
+        let manager = DbManager::default();
+        let calls = AtomicUsize::new(0);
+        let other = || AppError::Db(sqlx::Error::PoolTimedOut);
+
+        // Act
+        let result = manager
+            .run_with_password_refresh(
+                &server,
+                pool,
+                PasswordRetry::BeforeStatement,
+                failing_op(&calls, vec![other]),
+            )
+            .await;
+
+        // Assert
+        assert!(matches!(result, Err(AppError::Db(_))), "{result:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(helper.runs(), 0);
+    }
+
+    /// No refresh without password_command, nor for pools whose password cannot be replaced
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_no_refresh_for_static_passwords_or_other_engines() {
+        // Arrange
+        let helper = CountingPasswordCommand::new("pw");
+        let (pg_pool, server) = lazy_pg_pool_and_server(&helper);
+        let mut static_server = server.clone();
+        static_server.password_command = None;
+        static_server.password = Some("pw".into());
+        let sqlite_pool = DbPool::Sqlite(
             SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect("sqlite::memory:")
                 .await
                 .unwrap(),
         );
-        let calls = std::sync::atomic::AtomicUsize::new(0);
-        let calls = &calls;
-        let result: Result<(), AppError> = manager
-            .retry_on_expired_password(&server, pool, |_| async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Err(AppError::Config("boom".into()))
-            })
-            .await;
-        assert!(result.is_err());
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let manager = DbManager::default();
+        let connect_auth = || AppError::ConnectAuth(sqlx::Error::PoolTimedOut);
+
+        for (server, pool) in [(&static_server, pg_pool), (&server, sqlite_pool)] {
+            let calls = AtomicUsize::new(0);
+
+            // Act
+            let result = manager
+                .run_with_password_refresh(
+                    server,
+                    pool,
+                    PasswordRetry::BeforeStatement,
+                    failing_op(&calls, vec![connect_auth]),
+                )
+                .await;
+
+            // Assert
+            assert!(matches!(result, Err(AppError::ConnectAuth(_))), "{result:?}");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(helper.runs(), 0);
     }
 
-    /// 実 Postgres での password_command の検証 (QUERYFOLIO_TEST_PG_URL が無ければ
-    /// スキップ。接続ユーザには CREATEROLE が要る):
+    /// Operations that hit the expiry together run the helper once, whether it succeeds or
+    /// fails (a failing helper must not prompt / time out once per waiting operation)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_refresh_is_single_flight_even_when_it_fails() {
+        for helper_fails in [false, true] {
+            // Arrange
+            let helper = CountingPasswordCommand::new("pw");
+            let last_step = if helper_fails {
+                "exit 1".to_string()
+            } else {
+                format!("cat {}", helper.password_file.display())
+            };
+            let command = format!(
+                "/bin/sh -c 'sleep 0.3; echo x >> {}; {last_step}'",
+                helper.count_file.display()
+            );
+            let (pool, mut server) = lazy_pg_pool_and_server(&helper);
+            server.password_command = Some(command);
+            let manager = DbManager::default();
+            let calls: Vec<AtomicUsize> = (0..4).map(|_| AtomicUsize::new(0)).collect();
+            let connect_auth = || AppError::ConnectAuth(sqlx::Error::PoolTimedOut);
+            // After a failed refresh the retry is rejected again
+            let errors: Vec<fn() -> AppError> = if helper_fails {
+                vec![connect_auth, connect_auth]
+            } else {
+                vec![connect_auth]
+            };
+
+            // Act. join_all polls the first operation into its refresh before the others read
+            // the attempt counter, so this also catches counting an attempt when it starts
+            let results = futures::future::join_all(calls.iter().map(|calls| {
+                manager.run_with_password_refresh(
+                    &server,
+                    pool.clone(),
+                    PasswordRetry::BeforeStatement,
+                    failing_op(calls, errors.clone()),
+                )
+            }))
+            .await;
+
+            // Assert
+            assert_eq!(helper.runs(), 1, "helper_fails: {helper_fails}");
+            for result in results {
+                assert_eq!(result.is_ok(), !helper_fails, "{result:?}");
+            }
+        }
+    }
+
+    /// A slow password_command does not delay get_pool for another connection that is open
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_slow_password_command_does_not_block_other_connections() {
+        // Arrange
+        let manager = std::sync::Arc::new(DbManager::default());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fast.db");
+        std::fs::File::create(&db_path).unwrap();
+        let fast: ServerConfig = serde_yaml::from_str(&format!(
+            "name: fast\nengine: sqlite\nschema: {}\n",
+            db_path.display()
+        ))
+        .unwrap();
+        manager.get_pool(&fast).await.unwrap();
+        // The target does not exist, but it is not tried before the command finishes
+        let slow: ServerConfig = serde_yaml::from_str(
+            "name: slow\nengine: postgres\nhost: 127.0.0.1\nport: 1\n\
+             password_command: /bin/sleep 3\n",
+        )
+        .unwrap();
+        let slow_manager = manager.clone();
+        let slow_task = tokio::spawn(async move { slow_manager.get_pool(&slow).await });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Act
+        let started = std::time::Instant::now();
+        manager.get_pool(&fast).await.unwrap();
+
+        // Assert
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "fast connection waited {:?}",
+            started.elapsed()
+        );
+        slow_task.abort();
+    }
+
+    /// A password_command that counts its runs and prints the contents of a file
+    #[cfg(unix)]
+    struct CountingPasswordCommand {
+        _dir: tempfile::TempDir,
+        password_file: std::path::PathBuf,
+        count_file: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl CountingPasswordCommand {
+        fn new(password: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let password_file = dir.path().join("password");
+            let count_file = dir.path().join("count");
+            std::fs::write(&password_file, format!("{password}\n")).unwrap();
+            Self {
+                _dir: dir,
+                password_file,
+                count_file,
+            }
+        }
+
+        fn command(&self) -> String {
+            format!(
+                "/bin/sh -c 'echo x >> {}; cat {}'",
+                self.count_file.display(),
+                self.password_file.display()
+            )
+        }
+
+        fn set_password(&self, password: &str) {
+            std::fs::write(&self.password_file, format!("{password}\n")).unwrap();
+        }
+
+        fn runs(&self) -> usize {
+            std::fs::read_to_string(&self.count_file)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        }
+    }
+
+    /// password_command against a real Postgres. Skipped unless QUERYFOLIO_TEST_PG_URL is set:
     ///   QUERYFOLIO_TEST_PG_URL=postgres://postgres:pass@127.0.0.1:5432/postgres \
     ///     cargo test test_password_command_against_postgres
-    /// パスワード認証 (scram-sha-256 / md5) の TCP 接続であること (trust だと
-    /// パスワードが変わっても弾かれず、再試行の検証にならない)。
-    /// 検証内容:
-    /// 1. password_command の出力で接続できる
-    /// 2. ロールのパスワードを変え、既存コネクションを切ると、次の取得は
-    ///    認証エラー → コマンドを取り直して 1 度だけ再試行し、新しい
-    ///    パスワードで繋がる (SSH トンネルは使わないが、プールは作り直さず
-    ///    同じプールのまま続く)
-    /// 3. 取り直しても違うパスワードなら、再試行は 1 回だけで失敗を返す
-    /// 4. 静的な password の接続は再試行しない
-    /// 一意な名前のロールを作り、最後に消す。
+    /// The user needs CREATEROLE, and the server must use password auth (scram-sha-256 / md5)
+    /// over TCP: with trust, a rotated password is never rejected and nothing is tested.
+    /// Creates a uniquely named role, sequence and function, and drops them at the end.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_password_command_against_postgres() {
@@ -4026,150 +4896,207 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         );
-        sqlx::query(&format!("CREATE ROLE {role} LOGIN PASSWORD 'first-pw'"))
-            .execute(&admin)
-            .await
-            .unwrap();
-
-        let dir = tempfile::tempdir().unwrap();
-        let password_file = dir.path().join("password");
-        let count_file = dir.path().join("count");
-        std::fs::write(&password_file, "first-pw\n").unwrap();
-        // 実行回数を数えつつ、ファイルの中身をパスワードとして出す
-        let command = format!(
-            "/bin/sh -c 'echo x >> {}; cat {}'",
-            count_file.display(),
-            password_file.display()
-        );
-        let runs = || {
-            std::fs::read_to_string(&count_file)
-                .map(|s| s.lines().count())
-                .unwrap_or(0)
+        let exec = |sql: String| {
+            let admin = admin.clone();
+            async move { sqlx::query(&sql).execute(&admin).await.unwrap() }
         };
+        exec(format!("CREATE ROLE {role} LOGIN PASSWORD 'first-pw'")).await;
+        // Advances a sequence (not rolled back), then raises the SQLSTATE of a failed login
+        exec(format!("CREATE SEQUENCE {role}_seq")).await;
+        exec(format!(
+            "CREATE FUNCTION {role}_probe() RETURNS int SECURITY DEFINER AS $$ BEGIN \
+             PERFORM nextval('{role}_seq'); \
+             RAISE EXCEPTION 'raised by a statement' USING ERRCODE = '28P01'; END $$ \
+             LANGUAGE plpgsql"
+        ))
+        .await;
+
+        let helper = CountingPasswordCommand::new("first-pw");
         let yaml = format!(
             "name: pwcmd\nengine: postgres\nhost: {}\nport: {}\nschema: {}\nuser: {role}\n\
              ssl_mode: disable\npassword_command: \"{}\"\n",
             target.get_host(),
             target.get_port(),
             target.get_database().unwrap_or("postgres"),
-            command.replace('"', "\\\"")
+            helper.command().replace('"', "\\\"")
         );
-        let server: ServerConfig = serde_yaml::from_str(&yaml).unwrap();
-
-        // 既存コネクションを全部切る (プールは次の取得で新しく張るしかなくなる)
-        let kick = || async {
-            sqlx::query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = $1")
-                .bind(&role)
-                .execute(&admin)
-                .await
-                .unwrap();
+        let server_pwcmd: ServerConfig = serde_yaml::from_str(&yaml).unwrap();
+        let mut server_static = server_pwcmd.clone();
+        server_static.name = "static".into();
+        server_static.password_command = None;
+        server_static.password = Some("fifth-pw".into());
+        // Closes every connection of the role, so the pool has to open new ones
+        let kick = || {
+            exec(format!(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{role}'"
+            ))
         };
-        let current_user = |pool: DbPool| async move {
-            let DbPool::Postgres(pool) = pool else { unreachable!() };
-            let user: String = sqlx::query_scalar("SELECT current_user::text")
-                .fetch_one(&pool)
-                .await?;
-            Ok::<_, AppError>(user)
+        let rotate = |password: &'static str| {
+            let exec = &exec;
+            let kick = &kick;
+            let role = &role;
+            async move {
+                exec(format!("ALTER ROLE {role} PASSWORD '{password}'")).await;
+                kick().await;
+            }
         };
-
         let manager = DbManager::default();
-        // 1. 初回の接続でコマンドが 1 回走る
-        assert_eq!(manager.with_pool(&server, current_user).await.unwrap(), role);
-        assert_eq!(runs(), 1);
-        // プールがある間は走らない
-        manager.with_pool(&server, current_user).await.unwrap();
-        assert_eq!(runs(), 1);
-
-        // 2. パスワードを変える → 認証エラー → 取り直して再試行で繋がる
-        sqlx::query(&format!("ALTER ROLE {role} PASSWORD 'second-pw'"))
-            .execute(&admin)
-            .await
-            .unwrap();
-        std::fs::write(&password_file, "second-pw\n").unwrap();
-        kick().await;
-        assert_eq!(manager.with_pool(&server, current_user).await.unwrap(), role);
-        assert_eq!(runs(), 2);
-
-        // 3. 取り直しても違えば 1 回だけ再試行して失敗を返す
-        std::fs::write(&password_file, "wrong-pw\n").unwrap();
-        sqlx::query(&format!("ALTER ROLE {role} PASSWORD 'third-pw'"))
-            .execute(&admin)
-            .await
-            .unwrap();
-        kick().await;
-        let err = manager.with_pool(&server, current_user).await.unwrap_err();
-        assert_eq!(db_error_code(&err), DbErrorCode::Postgres("28P01"), "{err}");
-        assert_eq!(runs(), 3);
-        // エラーにパスワード (コマンドの出力) は載らない
-        assert!(!err.to_string().contains("wrong-pw"), "{err}");
-
-        // 4. 静的な password は再試行しない。プールを作った後でパスワードが
-        //    変わると、新しいコネクションの認証エラーをそのまま返す
-        let mut static_server = server.clone();
-        static_server.name = "static".into();
-        static_server.password_command = None;
-        static_server.password = Some("third-pw".into());
-        let calls = std::sync::atomic::AtomicUsize::new(0);
-        let calls = &calls;
-        let counted = |pool: DbPool| async move {
-            calls.fetch_add(1, Ordering::SeqCst);
-            current_user(pool).await
+        // Through the same path as the user's queries (an explicit acquire, then the statement)
+        let run = |server: &'static str, sql: String| {
+            let manager = &manager;
+            let server = if server == "pwcmd" { &server_pwcmd } else { &server_static };
+            async move {
+                manager
+                    .with_pool(server, PasswordRetry::BeforeStatement, |pool| {
+                        let sql = sql.clone();
+                        async move { run_query(&pool, &sql, 10, None, false, false).await }
+                    })
+                    .await
+            }
         };
-        manager.with_pool(&static_server, counted).await.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        sqlx::query(&format!("ALTER ROLE {role} PASSWORD 'fourth-pw'"))
-            .execute(&admin)
+        let current_user = || async {
+            let result = run("pwcmd", "SELECT current_user::text AS u".into()).await?;
+            Ok::<_, AppError>(result.rows[0][0].as_str().unwrap().to_string())
+        };
+
+        // 1. The first connect runs the command once; a cached pool does not run it again
+        assert_eq!(current_user().await.unwrap(), role);
+        assert_eq!(current_user().await.unwrap(), role);
+        assert_eq!(helper.runs(), 1);
+
+        // 2. The password changes (the token expired): opening a connection is rejected, the
+        //    command runs again and the same pool carries on with the new password
+        helper.set_password("second-pw");
+        rotate("second-pw").await;
+        assert_eq!(current_user().await.unwrap(), role);
+        assert_eq!(helper.runs(), 2);
+
+        // 3. A statement that raises 28P01 after a side effect is not re-run, and does not
+        //    trigger a refresh either
+        let err = run("pwcmd", format!("SELECT {role}_probe()")).await.unwrap_err();
+        assert!(matches!(err, AppError::Db(_)), "{err:?}");
+        assert_eq!(db_error_code(&err), DbErrorCode::Postgres("28P01"), "{err}");
+        let calls: i64 = sqlx::query_scalar(&format!("SELECT last_value FROM {role}_seq"))
+            .fetch_one(&admin)
             .await
             .unwrap();
-        kick().await;
-        let err = manager.with_pool(&static_server, counted).await.unwrap_err();
+        assert_eq!(calls, 1, "the function body ran more than once");
+        assert_eq!(current_user().await.unwrap(), role);
+        assert_eq!(helper.runs(), 2);
+
+        // 4. Single-flight: operations that hit the expiry together run the command once
+        helper.set_password("third-pw");
+        rotate("third-pw").await;
+        let results = futures::future::join_all((0..5).map(|_| current_user())).await;
+        for result in results {
+            assert_eq!(result.unwrap(), role);
+        }
+        assert_eq!(helper.runs(), 3);
+
+        // 5. If the refreshed password is wrong too, the command runs once and the auth error
+        //    is returned (without the command's output)
+        helper.set_password("wrong-pw");
+        rotate("fourth-pw").await;
+        let err = current_user().await.unwrap_err();
         assert_eq!(db_error_code(&err), DbErrorCode::Postgres("28P01"), "{err}");
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        // password_command は一度も走っていない
-        assert_eq!(runs(), 3);
+        assert!(!err.to_string().contains("wrong-pw"), "{err}");
+        assert_eq!(helper.runs(), 4);
+
+        // 6. A static password is never refreshed: the auth error comes back as is
+        rotate("fifth-pw").await;
+        run("static", "SELECT 1".into()).await.unwrap();
+        rotate("sixth-pw").await;
+        let err = run("static", "SELECT 1".into()).await.unwrap_err();
+        assert_eq!(db_error_code(&err), DbErrorCode::Postgres("28P01"), "{err}");
+        assert_eq!(helper.runs(), 4);
 
         manager.reset().await;
         kick().await;
-        sqlx::query(&format!("DROP ROLE {role}"))
-            .execute(&admin)
-            .await
-            .unwrap();
+        exec(format!("DROP FUNCTION {role}_probe()")).await;
+        exec(format!("DROP SEQUENCE {role}_seq")).await;
+        exec(format!("DROP ROLE {role}")).await;
     }
 
-    /// password_command が遅くても、確立済みの別の接続のプール取得は待たされない
+    /// The MySQL side of test_password_command_against_postgres (refresh after rotation, and a
+    /// wrong refreshed password tried once). Skipped unless QUERYFOLIO_TEST_MYSQL_URL is set;
+    /// the user needs CREATE USER and PROCESS / CONNECTION_ADMIN (to kill the test user's sessions)
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_slow_password_command_does_not_block_other_connections() {
-        let manager = std::sync::Arc::new(DbManager::default());
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("fast.db");
-        std::fs::File::create(&db_path).unwrap();
-        let fast: ServerConfig = serde_yaml::from_str(&format!(
-            "name: fast\nengine: sqlite\nschema: {}\n",
-            db_path.display()
-        ))
-        .unwrap();
-        manager.get_pool(&fast).await.unwrap();
+    async fn test_password_command_against_mysql() {
+        use std::str::FromStr;
 
-        // 3 秒かかる password_command (接続先は存在しないが、コマンドの完了前に
-        // 試されることはない)
-        let slow: ServerConfig = serde_yaml::from_str(
-            "name: slow\nengine: postgres\nhost: 127.0.0.1\nport: 1\n\
-             password_command: /bin/sleep 3\n",
-        )
-        .unwrap();
-        let slow_manager = manager.clone();
-        let slow_task = tokio::spawn(async move { slow_manager.get_pool(&slow).await });
-        // slow 側がコマンドを走らせ始めるのを待つ
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let Ok(url) = std::env::var("QUERYFOLIO_TEST_MYSQL_URL") else {
+            return;
+        };
+        let admin = MySqlPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+        let target = sqlx::mysql::MySqlConnectOptions::from_str(&url).unwrap();
+        let user = format!("qf_pwcmd_{}", std::process::id());
+        let exec = |sql: String| {
+            let admin = admin.clone();
+            async move { sqlx::query(&sql).execute(&admin).await.unwrap() }
+        };
+        exec(format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'first-pw'")).await;
+        let kick = || {
+            let admin = admin.clone();
+            let user = user.clone();
+            async move {
+                let ids: Vec<u64> = sqlx::query_scalar(
+                    "SELECT id FROM information_schema.processlist WHERE user = ?",
+                )
+                .bind(&user)
+                .fetch_all(&admin)
+                .await
+                .unwrap();
+                for id in ids {
+                    let _ = sqlx::query(&format!("KILL {id}")).execute(&admin).await;
+                }
+            }
+        };
+        let rotate = |password: &'static str| {
+            let exec = &exec;
+            let kick = &kick;
+            let user = &user;
+            async move {
+                exec(format!("ALTER USER '{user}'@'%' IDENTIFIED BY '{password}'")).await;
+                kick().await;
+            }
+        };
 
-        let started = std::time::Instant::now();
-        manager.get_pool(&fast).await.unwrap();
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "fast connection waited {:?}",
-            started.elapsed()
+        let helper = CountingPasswordCommand::new("first-pw");
+        let yaml = format!(
+            "name: pwcmd\nengine: mysql\nhost: {}\nport: {}\nuser: {user}\n\
+             password_command: \"{}\"\n",
+            target.get_host(),
+            target.get_port(),
+            helper.command().replace('"', "\\\"")
         );
-        slow_task.abort();
+        let server: ServerConfig = serde_yaml::from_str(&yaml).unwrap();
+        let manager = DbManager::default();
+        let select_one = || async {
+            let result = manager
+                .with_pool(&server, PasswordRetry::BeforeStatement, |pool| async move {
+                    run_query(&pool, "SELECT 1 AS one", 10, None, false, false).await
+                })
+                .await?;
+            Ok::<_, AppError>(result.rows[0][0].as_i64().unwrap())
+        };
+
+        assert_eq!(select_one().await.unwrap(), 1);
+        assert_eq!(helper.runs(), 1);
+
+        helper.set_password("second-pw");
+        rotate("second-pw").await;
+        assert_eq!(select_one().await.unwrap(), 1);
+        assert_eq!(helper.runs(), 2);
+
+        helper.set_password("wrong-pw");
+        rotate("third-pw").await;
+        let err = select_one().await.unwrap_err();
+        assert_eq!(db_error_code(&err), DbErrorCode::MySql(1045), "{err}");
+        assert_eq!(helper.runs(), 3);
+
+        manager.reset().await;
+        kick().await;
+        exec(format!("DROP USER '{user}'@'%'")).await;
     }
 }

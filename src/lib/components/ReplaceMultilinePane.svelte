@@ -7,18 +7,18 @@
   } from "$lib/lineReplace";
 
   interface Props {
-    /// 開いた時点でエディタで選択されていた行 (Lines 欄の初期値)
+    /// The lines selected in the editor when the pane was opened (initial value of the Lines field)
     initialLines: string;
-    /// 生成結果をエディタの選択範囲へ差し込む
+    /// Insert the generated result into the editor's selection
     onReplace: (result: string) => void;
-    /// ペインを閉じる
+    /// Close the pane
     onClose: () => void;
   }
 
   let { initialLines, onReplace, onClose }: Props = $props();
 
-  // テンプレートは localStorage に保存し、開き直しても保持する。
-  // 既定はタスクの主目的である KILL 文の例にしておく
+  // The template is saved to localStorage and kept after reopening.
+  // The default is the KILL statement example, which is the main purpose of the task
   const TEMPLATE_KEY = "queryfolio.replaceMultiline.template";
   const loadTemplate = (): string => {
     try {
@@ -29,8 +29,8 @@
   };
 
   let template = $state(loadTemplate());
-  // 開いた時点の選択行で初期化する。親は #key で再マウントするため、
-  // prop の初期値をそのまま使えばよい (以後は編集可能なローカル状態)
+  // Initialize with the lines selected at open time. The parent remounts via #key,
+  // so the prop's initial value can be used as-is (it is local editable state afterwards)
   // svelte-ignore state_referenced_locally
   let linesText = $state(initialLines);
   let copied = $state(false);
@@ -39,7 +39,7 @@
     try {
       localStorage.setItem(TEMPLATE_KEY, template);
     } catch {
-      // localStorage が使えなくても動作は継続する
+      // Keep working even if localStorage is unavailable
     }
   });
 
@@ -58,15 +58,15 @@
   };
 
   const replace = () => {
-    // 空出力 (全行スキップ) では何もしない。ボタンの disabled と挙動を揃え、
-    // Cmd+Enter で選択が空文字置換 (= 削除) されるのを防ぐ
+    // Do nothing for empty output (all lines skipped). Match the button's disabled state, and
+    // prevent Cmd+Enter from replacing the selection with an empty string (= deleting it)
     if (output === "") {
       return;
     }
     onReplace(output);
   };
 
-  // Cmd+Enter で差し込み (エディタと同じ実行系ショートカットに寄せる)
+  // Insert with Cmd+Enter (aligned with the editor's execute shortcut)
   const onKeydown = (e: KeyboardEvent) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
@@ -79,7 +79,7 @@
   class="flex h-full min-h-0 flex-col bg-zinc-900 text-xs text-zinc-300"
   data-annotate="pane-replace-multiline"
 >
-  <!-- ヘッダ -->
+  <!-- Header -->
   <div
     class="flex shrink-0 items-center gap-2 border-b border-zinc-700 px-3 py-1.5"
   >
@@ -99,7 +99,7 @@
   </div>
 
   <div class="flex min-h-0 flex-1 flex-col gap-2 overflow-auto p-3">
-    <!-- テンプレート -->
+    <!-- Template -->
     <label class="flex flex-col gap-1">
       <span class="text-zinc-500">
         Template (use <code class="text-sky-400">{PLACEHOLDER}</code> as the placeholder)
@@ -114,7 +114,7 @@
       />
     </label>
 
-    <!-- 入力行 (選択行で初期化。編集可) -->
+    <!-- Input lines (initialized with the selected lines; editable) -->
     <label class="flex min-h-0 flex-1 flex-col gap-1">
       <span class="text-zinc-500">
         Lines (empty lines and lines starting with # or // are skipped)
@@ -128,7 +128,7 @@
       ></textarea>
     </label>
 
-    <!-- 生成結果プレビュー -->
+    <!-- Preview of the generated result -->
     <div class="flex min-h-0 flex-1 flex-col gap-1">
       <span class="text-zinc-500">Result ({resultCount} lines)</span>
       <textarea
@@ -141,7 +141,7 @@
     </div>
   </div>
 
-  <!-- フッタ操作 -->
+  <!-- Footer actions -->
   <div
     class="flex shrink-0 items-center gap-2 border-t border-zinc-700 px-3 py-2"
   >

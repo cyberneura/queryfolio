@@ -2,13 +2,13 @@
   import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
   interface Props {
-    /// 表示対象のセル値 (result.rows の値そのまま)
+    /// The cell value to display (the value from result.rows as is)
     value: unknown;
-    /// カラム名 (ヘッダ表示用)
+    /// Column name (for the header display)
     column: string;
-    /// 行インデックス (0 始まり。表示は 1 始まりに変換)
+    /// Row index (0-based; converted to 1-based for display)
     rowIndex: number;
-    /// 閉じるボタン / ESC で呼ばれるコールバック
+    /// Callback invoked by the close button / ESC
     onclose: () => void;
   }
 
@@ -16,17 +16,17 @@
 
   let copiedKind = $state<"raw" | "pretty" | null>(null);
 
-  // これを超えるサイズはトークン分解が重くなるためハイライトを諦める
+  // Above this size, tokenizing gets heavy, so give up highlighting
   const HIGHLIGHT_MAX_CHARS = 200_000;
 
-  // トークン (= span 要素) 数の上限。文字数が上限内でも短い要素が
-  // 大量に並ぶ JSON は DOM ノードが膨れて描画が固まるため、
-  // これを超えたらハイライト無しの plain 表示にフォールバックする
+  // Upper limit on the number of tokens (= span elements). Even when the character count is
+  // within the limit, JSON with a huge number of short elements bloats the DOM nodes and freezes
+  // rendering, so beyond this we fall back to plain display without highlighting
   const HIGHLIGHT_MAX_TOKENS = 5_000;
 
   const isNull = $derived(value === null || value === undefined);
 
-  // セルの生テキスト表現 (テーブル表示と同じルール)
+  // Raw text representation of the cell (same rules as the table display)
   const rawText = $derived.by(() => {
     if (value === null || value === undefined) {
       return "NULL";
@@ -37,9 +37,9 @@
     return String(value);
   });
 
-  // JSON として解釈できる場合はパース結果 (それ以外は undefined)。
-  // 数値や true 単体などのスカラーは整形する意味が無いので
-  // オブジェクト / 配列のみ JSON 扱いにする
+  // The parse result if it can be interpreted as JSON (otherwise undefined).
+  // Scalars such as a bare number or true are pointless to pretty-print,
+  // so only objects / arrays are treated as JSON
   const parsedJson = $derived.by((): unknown => {
     if (value !== null && typeof value === "object") {
       return value;
@@ -71,9 +71,9 @@
     type: TokenType;
   }
 
-  // JSON.stringify(_, null, 2) の出力を前提にした簡易トークナイザ。
-  // 文字列 (キー / 値)・数値・true/false/null と、それ以外 (括弧や
-  // カンマ等の構造文字) に分類する
+  // A simple tokenizer that assumes the output of JSON.stringify(_, null, 2).
+  // It classifies into strings (keys / values), numbers, true/false/null, and everything else
+  // (structural characters such as brackets and commas)
   const JSON_TOKEN_RE =
     /("(?:\\.|[^"\\])*")(\s*:)|("(?:\\.|[^"\\])*")|\b(true|false|null)\b|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g;
 
@@ -87,7 +87,7 @@
         tokens.push({ text: text.slice(last, match.index), type: "plain" });
       }
       if (match[1] !== undefined) {
-        // キー文字列 + 後続のコロン
+        // Key string + the following colon
         tokens.push({ text: match[1], type: "key" });
         tokens.push({ text: match[2], type: "plain" });
       } else if (match[3] !== undefined) {
@@ -105,7 +105,7 @@
     return tokens;
   };
 
-  // ハイライト用トークン列 (巨大な値は null にして無地で表示する)
+  // Token list for highlighting (null for huge values, which are shown plain)
   const tokens = $derived.by(() => {
     if (prettyText === null || prettyText.length > HIGHLIGHT_MAX_CHARS) {
       return null;
@@ -127,8 +127,8 @@
 
   const copy = async (kind: "raw" | "pretty") => {
     const text = kind === "pretty" ? (prettyText ?? rawText) : rawText;
-    // navigator.clipboard は Tauri 2 で OS のパーミッションプロンプトが
-    // 出ることがあるため、公式プラグイン経由で書き込む
+    // navigator.clipboard can trigger an OS permission prompt in Tauri 2,
+    // so write through the official plugin
     await writeText(text);
     copiedKind = kind;
     setTimeout(() => {
@@ -136,7 +136,7 @@
     }, 1500);
   };
 
-  // ESC でインスペクタを閉じる
+  // Close the inspector with ESC
   const onWindowKeydown = (event: KeyboardEvent) => {
     if (event.key === "Escape") {
       onclose();
@@ -150,7 +150,7 @@
   class="flex w-96 shrink-0 flex-col border-l border-zinc-700 bg-zinc-900"
   data-annotate="panel-cell-inspector"
 >
-  <!-- ヘッダ: カラム名・行番号・閉じるボタン -->
+  <!-- Header: column name, row number, close button -->
   <div
     class="flex shrink-0 items-center gap-2 border-b border-zinc-700 px-3 py-1.5 text-xs text-zinc-400"
   >
@@ -180,7 +180,7 @@
     </button>
   </div>
 
-  <!-- コピー操作 -->
+  <!-- Copy actions -->
   <div
     class="flex shrink-0 items-center gap-1 border-b border-zinc-700 px-3 py-1 text-xs text-zinc-400"
   >
@@ -204,7 +204,7 @@
     {/if}
   </div>
 
-  <!-- 本文: JSON は整形 + ハイライト、それ以外は折り返しテキスト -->
+  <!-- Body: JSON is pretty-printed + highlighted, anything else is wrapped text -->
   <div
     class="min-h-0 flex-1 overflow-auto px-3 py-2"
     data-annotate="text-cell-inspector-value"
@@ -213,7 +213,7 @@
       <p class="font-mono text-xs text-zinc-600 italic">NULL</p>
     {:else if prettyText !== null}
       {#if tokens !== null}
-        <!-- pre 内は空白がそのまま表示されるため 1 行で書く -->
+        <!-- Whitespace inside pre is displayed as is, so write it on one line -->
         <!-- prettier-ignore -->
         <pre class="font-mono text-xs break-all whitespace-pre-wrap">{#each tokens as token, i (i)}<span class={TOKEN_CLASSES[token.type]}>{token.text}</span>{/each}</pre>
       {:else}

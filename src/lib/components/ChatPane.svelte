@@ -5,13 +5,13 @@
   import { splitMarkdownSegments } from "$lib/markdown";
 
   interface Props {
-    /// 選択中の接続のエンジンが AI 機能に対応しているか
-    /// (redis / elasticsearch / dynamodb は非対応。接続未選択なら false)
+    /// Whether the selected connection's engine supports AI features
+    /// (redis / elasticsearch / dynamodb are unsupported. false when no connection is selected)
     supportsAi: boolean;
-    /// ペインを閉じる (ツールバーのトグルと同じ状態を切る)
+    /// Close the pane (flips the same state as the toolbar toggle)
     onClose: () => void;
-    /// コードブロックをエディタへ挿入する (挿入できない状況では呼ばれても
-    /// ストア側が warning を出す)
+    /// Insert a code block into the editor (even if called when insertion is not possible,
+    /// the store side shows a warning)
     onInsert: (sql: string) => void;
   }
 
@@ -19,10 +19,10 @@
 
   let input = $state("");
   let listEl: HTMLDivElement | undefined = $state();
-  /// Copy を押したコードブロックの識別子 ("<messageId>:<index>")
+  /// Identifier of the code block whose Copy was pressed ("<messageId>:<index>")
   let copiedKey = $state<string | null>(null);
 
-  /// チャットを使える状態か (接続選択済み + AI 設定済み + エンジンが AI 対応)
+  /// Whether chat is usable (connection selected + AI configured + engine supports AI)
   const chatAvailable = $derived(
     appStore.selectedConnection !== null &&
       (appStore.aiInfo?.configured ?? false) &&
@@ -35,7 +35,7 @@
       appStore.selectedConnection !== null,
   );
 
-  /// メッセージが増えたら最下部へスクロールする (送信直後・応答受信時)
+  /// Scroll to the bottom when messages are added (right after sending / on receiving a response)
   $effect(() => {
     void appStore.chatMessages.length;
     void appStore.chatSending;
@@ -56,7 +56,7 @@
   };
 
   const onKeydown = (e: KeyboardEvent) => {
-    // Enter で送信、Shift+Enter で改行 (IME 変換中の Enter は送信しない)
+    // Enter sends, Shift+Enter inserts a newline (Enter during IME composition does not send)
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       void send();
@@ -123,8 +123,8 @@
     data-annotate="list-chat-messages"
   >
     {#if appStore.selectedConnection === null}
-      <!-- 接続未選択と「エンジンが AI 非対応」を混同しない
-           (どちらも supportsAi は false になるため、先に接続の有無を見る) -->
+      <!-- Do not confuse "no connection selected" with "engine does not support AI"
+           (supportsAi is false in both cases, so check whether a connection exists first) -->
       <p class="text-xs leading-relaxed text-zinc-500">
         Select a connection first.
       </p>
@@ -166,8 +166,8 @@
           </p>
         {:else}
           {#if message.toolCalls && message.toolCalls.length > 0}
-            <!-- エージェントが実際に実行した読み取りクエリ。何を見て答えたかを
-                 隠さないために常に出す -->
+            <!-- Read queries the agent actually ran. Always shown so that
+                 what it looked at to answer is not hidden -->
             <div class="flex w-full flex-col gap-1">
               {#each message.toolCalls as call, i (i)}
                 <details
@@ -249,8 +249,8 @@
           class="inline-block size-3 animate-spin rounded-full border-2 border-zinc-500 border-t-transparent"
         ></span>
         Thinking...
-        <!-- エージェントが重いクエリを回している時に止める手段。
-             会話は残し、中断されたことはメッセージとして表示される -->
+        <!-- A way to stop the agent when it is running a heavy query.
+             The conversation is kept, and the interruption is shown as a message -->
         <button
           type="button"
           class="rounded border border-zinc-600 px-1.5 py-0.5 text-[10px] text-zinc-300 hover:bg-zinc-800"

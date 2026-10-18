@@ -10,8 +10,8 @@ const cellToString = (value: unknown): string => {
   return String(value);
 };
 
-// 表計算ソフトへの貼り付けで数式として解釈される文字。
-// DB 由来の文字列値のみエスケープ対象とし、数値型 (-1 等) は壊さない。
+// Characters that a spreadsheet interprets as a formula when pasted.
+// Only string values from the DB are escaped, so numeric values (e.g. -1) are not broken.
 const FORMULA_TRIGGER = /^[=+\-@\t\r]/;
 
 const escapeFormulaInjection = (value: unknown, text: string): string => {
@@ -21,7 +21,7 @@ const escapeFormulaInjection = (value: unknown, text: string): string => {
   return text;
 };
 
-// ヘッダ (カラム名 / エイリアス) は常に文字列なので無条件に判定する
+// Headers (column names / aliases) are always strings, so check them unconditionally
 const escapeHeaderFormula = (header: string): string =>
   FORMULA_TRIGGER.test(header) ? `'${header}` : header;
 
@@ -46,7 +46,7 @@ export const toCsv = (result: QueryResult): string => {
   return lines.join("\n");
 };
 
-// 結果テーブルの矩形選択範囲。行・列とも 0 始まりの閉区間 (両端を含む)。
+// Rectangular selection range of the result table. Rows and columns are 0-based closed intervals (both ends included).
 export interface CellRange {
   rowStart: number;
   rowEnd: number;
@@ -54,8 +54,8 @@ export interface CellRange {
   colEnd: number;
 }
 
-// 選択範囲だけを CSV 化する (Cmd+C コピー用)。withHeaders でヘッダ行を含める。
-// 範囲は呼び出し側で結果サイズにクランプ済みである前提。
+// Convert only the selected range to CSV (for Cmd+C copy). withHeaders includes the header row.
+// The range is assumed to be already clamped to the result size by the caller.
 export const toCsvRange = (
   result: QueryResult,
   range: CellRange,
@@ -88,8 +88,8 @@ export const toCsvRange = (
 const sanitizeTsv = (field: string) =>
   field.replace(/\t/g, " ").replace(/\r?\n/g, " ");
 
-// 選択範囲だけを TSV 化する (Cmd+C コピー用)。withHeaders でヘッダ行を含める。
-// 範囲は呼び出し側で結果サイズにクランプ済みである前提。
+// Convert only the selected range to TSV (for Cmd+C copy). withHeaders includes the header row.
+// The range is assumed to be already clamped to the result size by the caller.
 export const toTsvRange = (
   result: QueryResult,
   range: CellRange,
@@ -119,23 +119,23 @@ export const toTsvRange = (
   return lines.join("\n");
 };
 
-/// 総文字数とセルあたりの文字数に上限を設けた TSV 化。
-/// 打ち切ったかどうかを一緒に返す。
+/// TSV conversion with limits on the total character count and on characters per cell.
+/// Also returns whether it was truncated.
 ///
-/// `db.rs` は sqlx 経路でセルの文字数を切り詰めないため、100KB の TEXT や
-/// 長い JSON がそのままフロントへ届く。全セルを走査する処理は行数ではなく
-/// **総文字数**にコストが比例するので、行数の上限だけでは足りない
-/// (499 行 × 100KB のセルでも数百 MB になりうる)。
+/// `db.rs` does not truncate cell text on the sqlx path, so a 100KB TEXT or a long JSON
+/// reaches the frontend as is. Processing that scans every cell costs in proportion to the
+/// **total character count**, not the row count, so a row limit alone is not enough
+/// (even 499 rows x 100KB cells can reach hundreds of MB).
 ///
-/// 上限の効かせ方に 2 つの要点がある:
-/// - **切り詰めは sanitize より先に行う。** 後で切ると、捨てる分まで
-///   正規表現で走査することになり、上限を付けた意味が無くなる。
-/// - **予算の判定はセル単位で行う。** 行の頭でだけ見ると、列数の多い結果
-///   (1,600 列 × 2,000 字) で 1 行ぶんまるごと予算を超過する。
+/// The limits work in two key ways:
+/// - **Truncate before sanitizing.** Truncating afterwards would scan the discarded part with
+///   the regex too, defeating the purpose of the limit.
+/// - **Check the budget per cell.** Checking only at the start of a row lets a wide result
+///   (1,600 columns x 2,000 chars) overshoot the budget by a whole row.
 ///
-/// 残る限界: オブジェクト値の `JSON.stringify` だけは切り詰めより先に走る
-/// (途中で打ち切れる標準の直列化が無いため)。予算を使い切った時点で以降の
-/// セルには触らないので、全体のコストは「予算 ÷ セル上限」個ぶんに収まる。
+/// Remaining limitation: `JSON.stringify` for object values is the one thing that runs before
+/// truncation (there is no standard serializer that can stop midway). Once the budget is used
+/// up, later cells are not touched, so the total cost stays within "budget / cell limit" cells.
 export const toTsvCapped = (
   result: QueryResult,
   maxChars: number,
@@ -144,8 +144,8 @@ export const toTsvCapped = (
   let truncated = false;
   let total = 0;
 
-  // 数式インジェクション対策は先頭 1 文字の判定なので、切り詰めの前に済ませる
-  // (先頭に `'` を足すだけなので、後ろを切る操作と順序が入れ替わらない)
+  // Formula-injection protection checks only the first character, so do it before truncation
+  // (it just prepends `'`, so the order relative to cutting the tail does not matter)
   const field = (escaped: string): string => {
     if (escaped.length <= maxCellChars) {
       return sanitizeTsv(escaped);
@@ -202,8 +202,8 @@ export const toTsv = (result: QueryResult): string => {
   return lines.join("\n");
 };
 
-// JOIN 等で同名カラムが並んだ場合に後勝ちで値が消えないよう、
-// 2 個目以降に _2, _3 ... を付けて一意化する。
+// When columns with the same name line up (e.g. in a JOIN), make them unique by appending
+// _2, _3 ... from the second one on, so that a later one does not overwrite and lose a value.
 const uniqueColumnKeys = (columns: string[]): string[] => {
   const counts = new Map<string, number>();
   return columns.map((column) => {
@@ -221,9 +221,9 @@ export const toJson = (result: QueryResult): string => {
   return JSON.stringify(records, null, 2);
 };
 
-// 選択範囲だけを JSON 化する (Cmd+C コピー用)。選択列だけをキーにしたオブジェクト配列。
-// withHeaders は JSON では常にキーを持つため無視する (呼び出し側の分岐を単純化するための引数)。
-// 範囲は呼び出し側で結果サイズにクランプ済みである前提。
+// Convert only the selected range to JSON (for Cmd+C copy). An array of objects keyed by the selected columns only.
+// withHeaders is ignored for JSON because keys are always present (an argument kept to simplify the caller's branching).
+// The range is assumed to be already clamped to the result size by the caller.
 export const toJsonRange = (
   result: QueryResult,
   range: CellRange,

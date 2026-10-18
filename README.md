@@ -2,7 +2,9 @@
 
 SQL client desktop app. A lightweight, multi-purpose SQL GUI client.
 
-One app for several database engines: **MySQL / PostgreSQL / SQLite / DuckDB** on the SQL side,
+Website: https://www.cyberneura.com/app/queryfolio
+
+One app for several database engines: **MySQL / PostgreSQL / SQLite / DuckDB / Microsoft SQL Server** on the SQL side,
 plus **Redis / Elasticsearch / DynamoDB**. The editor language and the unit of execution switch
 per engine, and each engine declares what it supports, so features it lacks are hidden from the
 UI rather than left as dead buttons.
@@ -18,14 +20,16 @@ https://github.com/user-attachments/assets/90439816-49c8-4ebd-a068-b102cfe9c7aa
 - Elasticsearch support (`engine: elasticsearch`): Kibana-Console-style request blocks (`GET /index/_search` + JSON body, NDJSON `_bulk`), hits rendered as a table, an index browser with mapping fields, and guards for destructive requests (index deletion, `_delete_by_query` etc.)
 - DuckDB support (`engine: duckdb`): a local-file SQL engine (like the SQLite support) with the full SQL feature set (meta commands, EXPLAIN, auto LIMIT incl. `FROM`-first queries)
 - DynamoDB support (`engine: dynamodb`): PartiQL statements in the SQL editor, a table browser with key attributes, AWS credentials via static keys / `aws_profile` / the default chain, and the same read-only / dangerous guards
+- Microsoft SQL Server support (`engine: mssql`, via tiberius): T-SQL with the same meta commands, schema browser and guards; auto LIMIT becomes `TOP (n)`, `EXPLAIN` becomes the estimated plan (`SET SHOWPLAN_ALL`), `ssl_mode` / `tls` / `ssl_root_cert` work as for MySQL / PostgreSQL
 - SSH tunnel with known_hosts verification
 - Connection config in YAML, compatible with the sql-agent-mcp-server format
   - Secrets can stay in 1Password: the config YAML is fetched lazily via a getter command like `op read "op://..."`
-  - Per-connection `password_command`: fetch a password when that connection is opened (e.g. AWS RDS IAM auth tokens), with one automatic retry when an expired token is rejected (PostgreSQL / MySQL)
+  - Per-connection `password_command`: fetch a password when that connection is opened (e.g. AWS RDS IAM auth tokens), refreshed automatically when an expired token is rejected (PostgreSQL / MySQL)
 - Query files per connection, auto-saved (`~/.config/queryfolio/sqlfiles/<folder>/*.sql`, where `<folder>` is `folder_name` or `<host>_<engine>_<schema>_<user>`)
 - CodeMirror 6 SQL editor with per-engine dialect, statement highlighting, Cmd+Enter to run the statement under the cursor, and schema-based autocompletion (table / column names; Tab or Enter accepts a suggestion)
 - SQL formatting for SELECT statements (conservative: unsupported or unparsable statements are left untouched)
-- Schema browser (TABLES pane) with lazy-loaded columns
+- Schema browser (TABLES pane) with lazy-loaded columns. When a MySQL / PostgreSQL / SQL Server connection has no database set, the pane lists the databases (SCHEMAS) first and shows the tables of the one you pick
+- Dump a database or a table (MySQL / PostgreSQL): right-click a table or database in the TABLES pane (or use the download button in its header). Queryfolio runs your `mysqldump` / `pg_dump` with the connection's host, user, TLS settings and SSH tunnel filled in, finds the binary for you (PATH, Homebrew's keg-only `mysql-client` / `libpq`, Postgres.app, MySQL Workbench; the newest `pg_dump` first, since it must not be older than the server), and offers the common options (structure / data, `--single-transaction`, routines, DROP statements, owners, plain or custom archive) plus free-form extra arguments. The password is never put on the command line (an option file readable only by you for mysqldump, `PGPASSWORD` in the child's environment for pg_dump), and a failed or cancelled dump leaves no half-written file
 - Results in tabs with pinning, a cell inspector, and CSV / TSV / JSON copy (formula-injection safe)
 - Query cancellation while running
 - Per-connection query history (searchable, stored locally with restrictive file permissions)
@@ -234,7 +238,7 @@ fab -l                       # list all tasks (dev / check / unittest / build_lo
 The script requires a clean `main` in sync with `origin/main`. It bumps the version in
 `src-tauri/tauri.conf.json` and `package.json`, pushes the bump commit, follows the run that
 push started, and checks that the Release was actually published. The workflow creates one
-**draft** Release, builds the macOS universal dmg (Developer ID signed + notarized + stapled)
+**draft** Release, builds the macOS universal dmg (the app and the dmg are both Developer ID signed, notarized and stapled)
 and the Windows NSIS installer in parallel, uploads both to that draft, and publishes it only
 after every platform succeeded (a missing signing
 secret fails the macOS job up front, so an unsigned or un-notarized build is never

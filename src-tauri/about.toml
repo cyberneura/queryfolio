@@ -1,6 +1,6 @@
-# cargo-about の設定。scripts/generate-third-party-notices.sh が読む。
-# 配布物に入る crate だけを対象にする: ビルド時・テスト時だけの依存と、配布しない
-# ターゲット (Linux) にしか入らない crate は除く。
+# cargo-about configuration, read by scripts/generate-third-party-notices.sh.
+# Only crates that ship in the distributed build are covered: dependencies used only at build
+# or test time, and crates that only land in targets we do not distribute (Linux), are excluded.
 accepted = [
     "MIT",
     "Apache-2.0",
@@ -16,7 +16,7 @@ accepted = [
     "CC0-1.0",
     "BSL-1.0",
     "MPL-2.0",
-    # webpki-roots (Mozilla の CA 証明書データ)。表示義務のみの許容的なデータライセンス
+    # webpki-roots (Mozilla CA certificate data). A permissive data license with attribution only
     "CDLA-Permissive-2.0",
 ]
 ignore-build-dependencies = true
@@ -24,15 +24,17 @@ ignore-dev-dependencies = true
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"]
 workarounds = ["rustls"]
 
-# queryfolio 自身 (publish = false) を一覧に載せない
+# Do not list queryfolio itself (publish = false)
 [private]
 ignore = true
 
-# 以下の crate は、ライセンスの注記が先頭にあるソースファイルを cargo-about がライセンス本文と
-# 判定し、ソースファイルを丸ごと載せてしまう。本文にするファイルを明示する。
-# checksum は各ファイルの sha256 で、crate を上げてファイルが変わると cargo-about が
-# 警告してこの指定を使わなくなる (その時は新しい version のファイルで取り直す)。
-# ring は cargo-about 組み込みの "ring" workaround が 0.17 の構成に合わないので使わない。
+# For the crates below, cargo-about treats a source file that starts with a license notice as
+# the license text and ends up embedding the whole source file. Name the files to use as the
+# license text explicitly.
+# Each checksum is the sha256 of the file; if a crate upgrade changes the file, cargo-about
+# warns and stops using this entry (then re-take it from the file in the new version).
+# ring does not use cargo-about's built-in "ring" workaround because it does not match the
+# 0.17 layout.
 [ring.clarify]
 license = "Apache-2.0 AND ISC"
 

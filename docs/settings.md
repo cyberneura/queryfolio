@@ -48,7 +48,10 @@ save. (On Windows, the platform's default file permissions apply.)
 You can edit the file with any text editor, or from inside the app:
 
 - Menu bar **Config → Edit config.yml** opens a built-in editor (with YAML
-  syntax highlighting and lint errors shown inline).
+  syntax highlighting and lint errors shown inline). While there are no
+  connections, the same editor is also one click away from the **Edit
+  config.yml** button in the CONNECTIONS pane and from the "Created a config
+  file" notification shown on first launch.
 - Inside that editor, **Cmd/Ctrl+F** opens a find bar (Cmd/Ctrl+G or F3 jumps to
   the next match, Escape closes the find bar).
 - Saving from the in-app editor validates that the content still parses as a YAML
@@ -56,6 +59,31 @@ You can edit the file with any text editor, or from inside the app:
 
 After editing the file directly, reload connections (reopen the app or use the
 menu) to pick up the changes.
+
+### Adding a SQLite / DuckDB file without writing YAML
+
+While there are no connections, the CONNECTIONS pane shows **Open SQLite /
+DuckDB file…**. Pick a `.sqlite`, `.sqlite3`, `.db` or `.duckdb` file and
+Queryfolio appends one entry to `servers` and selects it:
+
+```yaml
+servers:
+  - name: "example.sqlite3"
+    engine: sqlite
+    schema: "/Users/you/data/example.sqlite3"
+```
+
+- The entry is appended as text, so existing comments and key order are kept.
+  A starter `servers: []` is turned into a block list; otherwise the entry goes
+  after the last item of the top-level `servers` list (outside any group).
+- `name` is the file name. If a connection with that name already exists, a
+  number is added (`example.sqlite3 (2)`). Picking a file that is already
+  registered with the same engine just selects the existing connection.
+- If `servers` is written in a form that cannot be extended safely as text
+  (a non-empty `[...]` flow list, an anchor, ...), nothing is written and you
+  are asked to use **Edit config.yml** instead.
+- If `config_override_command` replaces `servers`, the appended entry is saved
+  but does not show up in the list.
 
 ## Connections (`servers`)
 
@@ -84,16 +112,16 @@ servers:
 | Key | Required | Description |
 |-----|----------|-------------|
 | `name` | yes | Display name shown in the connections list. |
-| `engine` | yes | `postgres` (aliases: `postgresql`), `mysql` (aliases: `mariadb`), `sqlite` (aliases: `sqlite3`), `duckdb`, `redis` (aliases: `valkey`), `elasticsearch` (aliases: `es`, `opensearch`), or `dynamodb`. |
+| `engine` | yes | `postgres` (aliases: `postgresql`), `mysql` (aliases: `mariadb`), `sqlite` (aliases: `sqlite3`), `duckdb`, `mssql` (aliases: `sqlserver`), `redis` (aliases: `valkey`), `elasticsearch` (aliases: `es`, `opensearch`), or `dynamodb`. |
 | `description` | no | Free-text note shown in the UI. |
 | `host` | no | Database host. Defaults to `localhost` when omitted. Not needed for SQLite / DuckDB. For DynamoDB it is an **endpoint override** (dynamodb-local); omit it to use the standard AWS endpoint. When using an SSH tunnel, this is the DB host **as seen from the SSH endpoint** (often `localhost`). |
-| `port` | no | Database port. Defaults per engine when omitted: `5432` (PostgreSQL) / `3306` (MySQL) / `6379` (Redis) / `9200` (Elasticsearch) / `8000` (DynamoDB endpoint override). |
+| `port` | no | Database port. Defaults per engine when omitted: `5432` (PostgreSQL) / `3306` (MySQL) / `1433` (SQL Server) / `6379` (Redis) / `9200` (Elasticsearch) / `8000` (DynamoDB endpoint override). |
 | `schema` | depends | The database / schema to connect to. For SQLite / DuckDB, this is the **path to the database file** (queryfolio extension; `~` is expanded; if `schema` is omitted, `host` is used as the file path instead). For DynamoDB, this is the **AWS region** (required, e.g. `ap-northeast-1`). |
 | `user` | no | Database user. For DynamoDB, a static **access key ID** (paired with `password` as the secret access key). |
 | `password` | no | Database password. |
 | `password_command` | no | A command whose stdout is the password, run when the connection is opened (queryfolio extension). Cannot be combined with `password`, and not allowed for SQLite / DuckDB. See [Fetching a password at connect time](#fetching-a-password-at-connect-time-password_command). |
-| `tls` | no | For HTTP-based engines (Elasticsearch, and the DynamoDB endpoint override) use `https`. For SQL engines (MySQL / PostgreSQL) it makes the default `ssl_mode` `verify-full` — TLS is required and the certificate is verified. Default `false` (queryfolio extension). See [TLS for SQL engines](#tls-for-sql-engines). |
-| `ssl_mode` | no | MySQL / PostgreSQL only (queryfolio extension): `disable` / `prefer` / `require` / `verify-ca` / `verify-full`. Takes precedence over `tls`. See [TLS for SQL engines](#tls-for-sql-engines). |
+| `tls` | no | For HTTP-based engines (Elasticsearch, and the DynamoDB endpoint override) use `https`. For SQL engines (MySQL / PostgreSQL / SQL Server) it makes the default `ssl_mode` `verify-full` — TLS is required and the certificate is verified. Default `false` (queryfolio extension). See [TLS for SQL engines](#tls-for-sql-engines). |
+| `ssl_mode` | no | MySQL / PostgreSQL / SQL Server only (queryfolio extension): `disable` / `prefer` / `require` / `verify-ca` / `verify-full`. Takes precedence over `tls`. See [TLS for SQL engines](#tls-for-sql-engines). |
 | `ssl_root_cert` | no | MySQL / PostgreSQL only (queryfolio extension): path to a root CA certificate (PEM) used for verification (`~` is expanded). |
 | `aws_profile` | no | DynamoDB only (queryfolio extension): the AWS profile name (`~/.aws/config` / `credentials`) used for credentials. Ignored when `user` / `password` are set. SSO-based profiles (`sso_session` etc.) are not supported yet — use static keys or the default credential chain. |
 | `readonly` | no | See [Safety guards](#safety-guards). Default `false`. |
@@ -131,6 +159,40 @@ servers:
   - name: local-duckdb
     engine: duckdb
     schema: ~/data/example.duckdb
+  ```
+
+- **Microsoft SQL Server** — `engine: mssql` (alias: `sqlserver`; queryfolio
+  extension). T-SQL over the TDS protocol (the pure-Rust `tiberius` driver).
+  `schema` is the **database** to open (`master` when omitted); `user` /
+  `password` are **SQL Server authentication** and are required — Windows
+  integrated authentication, Azure AD and named instances (SQL Browser) are
+  not supported. The SQL editor, meta commands (`\l` `\dt` `\dv` `\dn` `\du`
+  `\d [table]`), `\c` / `USE` (reconnects to the database), Format, AI
+  features, the TABLES pane and SSH tunnels work as for the other SQL engines,
+  with two translations: auto LIMIT inserts `TOP (n)` after `SELECT` (not when
+  the statement already has `TOP` / `OFFSET` / `FETCH`, a set operator, `INTO`,
+  `FOR XML` / `FOR JSON` or starts with `WITH`), and `EXPLAIN <select>` runs
+  `SET SHOWPLAN_ALL ON` around the statement and returns the **estimated** plan
+  without executing it (the login needs `SHOWPLAN` permission). `tls` /
+  `ssl_mode` / `ssl_root_cert` work as described under
+  [TLS for SQL engines](#tls-for-sql-engines), except that `verify-ca` behaves
+  like `verify-full` (SQL Server's TLS cannot verify the chain without the host
+  name); through an SSH tunnel the certificate is checked against the
+  configured `host`. Cell editing in the results grid is not available. The AI
+  assistant's queries run on a connection of their own, inside
+  `BEGIN TRANSACTION ... ROLLBACK`, because SQL Server has no read-only
+  transaction — writes that slip past the statement guard are undone (and a
+  transaction you left open in the editor is not touched), but `NEXT VALUE FOR`
+  and identity values are consumed.
+
+  ```yaml
+  - name: dev-mssql
+    engine: mssql
+    host: localhost
+    schema: AdventureWorks
+    user: sa
+    password: your_password
+    # tls: true
   ```
 
 - **Redis** — `engine: redis` (alias: `valkey`; queryfolio extension). The
@@ -305,6 +367,18 @@ would be silently ignored, **setting `ssl_root_cert` together with `disable` /
 Use `ssl_root_cert` to point at a root CA certificate (PEM) when the server uses
 a private CA (for example the RDS bundle); it must be a readable file. On MySQL,
 `verify-full` maps to the driver's `VerifyIdentity`.
+
+SQL Server (`engine: mssql`) takes the same keys, mapped onto the TDS
+encryption negotiation: `disable` offers no TLS (the server can still insist),
+`prefer` always encrypts the login packet and encrypts the rest only when the
+server offers it, `require` insists on full encryption (neither `prefer` nor
+`require` verifies the certificate), and `verify-ca` / `verify-full` both verify
+the chain **and** the host name (the driver has no chain-only mode). SQL Server
+installs commonly run with a self-signed certificate, which is why the default
+`prefer` does not verify — set `tls: true` and `ssl_root_cert` once the server
+has a certificate you trust. TLS is done with a statically linked OpenSSL
+(`vendored-openssl`), the same one the SSH tunnel uses; the system TLS library
+is not used because macOS's Security Framework does not work with SQL Server.
 
 ```yaml
 - name: prod-postgres
@@ -481,6 +555,9 @@ Notes:
   plus Touch ID), and cleared on reload.
 - If the key exists but is not a non-empty string, that is an error (Queryfolio
   will not silently fall back to the local-only config).
+- The fetched YAML can contain `password_command` entries, which Queryfolio
+  runs. See the warning in
+  [Fetching a password at connect time](#fetching-a-password-at-connect-time-password_command).
 - Menu bar **Config → View override config yaml (Copy only)** appears when
   this key is set. It runs the command every time and shows the fetched YAML for
   inspection/copying. You can edit the text in the modal (handy for reformatting
@@ -512,20 +589,24 @@ servers:
 
 When it runs:
 
-- Only when Queryfolio has to open a new connection pool for that connection:
-  the first query, opening a file, or opening the TABLES pane. It does **not**
-  run when the config is loaded, when you select the connection (selecting a
-  connection does not connect), or for any other connection.
-- Once per pool. The password is only kept in that pool's connect options. It
-  is fetched again after the pool is dropped (all editor tabs of the connection
+- When Queryfolio opens a new connection pool for that connection: the first
+  query, opening a file, or opening the TABLES pane. It does **not** run when the
+  config is loaded, when you select the connection (selecting a connection does
+  not connect), or for any other connection.
+- Once per pool. The password is kept only in that pool's connect options. It is
+  fetched again after the pool is dropped (all editor tabs of the connection
   closed, a schema switch, a config reload).
+- For every dump (mysqldump / pg_dump connect on their own, not through the pool).
+- When an expired password is detected (PostgreSQL / MySQL, below).
 
 Output and errors:
 
 - The password is stdout with the trailing `\r` / `\n` removed. Nothing else is
-  changed, so tokens containing `&`, `=` or `%` work as-is.
+  changed, so tokens containing `&`, `=` or `%`, and passwords with leading or
+  trailing spaces, work as-is.
 - Empty output, output that is not UTF-8, and a non-zero exit are errors. Error
-  messages show the command, the exit code and stderr, never stdout.
+  messages show the command, the exit code and stderr, never stdout. Keep that in
+  mind if your helper prints sensitive details to stderr.
 - The command runs the same way as `config_override_command`: no shell (shlex
   split, so no pipes or redirects), the GUI `PATH` supplemented with
   `/opt/homebrew/bin` and `/usr/local/bin`, and a 60-second timeout. Use a
@@ -536,16 +617,29 @@ Output and errors:
 Expiring credentials (PostgreSQL / MySQL): an RDS IAM token is valid for 15
 minutes and is checked only when a database connection is opened. Existing
 connections keep working after it expires, but the connections the pool opens
-later would fail. When a query, a table listing or a cell edit fails with an
-authentication error (PostgreSQL SQLSTATE `28P01` / `28000`, MySQL error `1045`),
-Queryfolio runs `password_command` again, gives the new password to the existing
-pool, and retries **once**. If the retry fails too, you get that error. The SSH
-tunnel and the pool's already authenticated connections are kept. An
-authentication error happens before any statement runs, so the retry cannot run a
-statement twice. Connections with a static `password` are never retried.
+later would be rejected. When the server rejects such a login (PostgreSQL
+SQLSTATE `28P01` / `28000`, MySQL error `1045`), Queryfolio runs
+`password_command` again, gives the new password to the existing pool and tries
+the operation **once** more. Operations that hit the expiry at the same time
+share one run of the command, so a helper that prompts (SSO, Touch ID) prompts
+once, and a helper that fails is not run again for each of them. If the new
+password is rejected too, you get that error. The SSH tunnel and the pool's
+already authenticated connections are kept. Connections with a static
+`password` are never refreshed.
 
-For Redis, Elasticsearch and DynamoDB there is no automatic retry: the password
-is fetched when the pool is created and used until the pool is dropped.
+Your queries, cell edits and AI tool calls are retried only when opening the
+connection failed, before the statement was sent. A statement that fails is
+never re-run, even with one of the codes above — a function can raise `28P01`
+itself after it has already written something. Table listings, completion and
+cancelling (which run no SQL of yours and are safe to repeat) are retried on any
+of these codes.
+
+For SQL Server, Redis, Elasticsearch and DynamoDB there is no automatic refresh:
+the password is fetched when the pool is created and used until the pool is
+dropped. If it expires, close the connection's editor tabs (this drops the pool)
+or reload the config, and the next query fetches a new one. (SQL Server also
+reconnects with the original password after a cancelled query and for AI tool
+calls.)
 
 Rules:
 
@@ -558,6 +652,15 @@ Rules:
   setting errors. They do not hide the rest of the connection list.
 - **Config → View override config yaml (Copy only)** runs only
   `config_override_command`, never `password_command`.
+
+> [!WARNING]
+> `password_command` can also come from the YAML that
+> [`config_override_command`](#overriding-config-from-an-external-source-config_override_command)
+> returns, and Queryfolio runs it. That means **whoever can change that YAML
+> (for example, anyone who can edit the 1Password item) can run commands on
+> your machine** with your user's permissions. Without `password_command`, that
+> YAML could only change connection settings. Keep the source of
+> `config_override_command` as trusted as the local `config.yml`.
 
 ## AI features (`ai`)
 

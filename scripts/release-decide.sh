@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# VERSION をいまリリースしてよいかを判定し、stdout に true / false を 1 行で出す。
-# 判定できない時 (API 障害・想定外の形) は exit 1。理由は stderr に出す。
+# Decide whether VERSION may be released now, and print true / false on a single line to stdout.
+# Exits 1 when it cannot decide (API failure, unexpected shape). The reason goes to stderr.
 #
-# release.yml の plan (ビルドするか) と publish (公開する直前) の両方から呼ぶ。
-# publish でもう一度訊くのは、Actions の「Re-run failed jobs」が成功済みの plan を
-# 再実行せず、その時の判定結果を使い回すため。plan から publish までの間に新しい
-# version が公開されていると、そのまま --latest で最新を巻き戻してしまう。
+# Called from both plan (whether to build) and publish (just before publishing) in release.yml.
+# Publish asks again because Actions' "Re-run failed jobs" does not re-run a plan that already
+# succeeded and reuses its earlier result. If a newer version was published between plan and
+# publish, --latest would roll the latest back.
 #
-# 必要な env: GH_TOKEN, GH_REPO (owner/repo), VERSION (X.Y.Z)
+# Required env: GH_TOKEN, GH_REPO (owner/repo), VERSION (X.Y.Z)
 set -euo pipefail
 
 : "${GH_REPO:?GH_REPO is required}"
 : "${VERSION:?VERSION is required}"
 
-# 新旧比較を X.Y.Z 同士の sort -V に頼るので、それ以外の形は判定しない。
+# The newer/older comparison relies on sort -V between X.Y.Z values, so other shapes are not judged.
 semver='^[0-9]+\.[0-9]+\.[0-9]+$'
 if ! [[ "$VERSION" =~ $semver ]]; then
   echo "::error::version is not X.Y.Z: '${VERSION}'" >&2
@@ -24,19 +24,19 @@ http_status() {
   gh api "$1" --silent --include 2>/dev/null | head -n 1 | awk '{print $2}' || true
 }
 
-# 訊きたいのは「公開済みか」。draft は未リリースとして扱う: 失敗した run が残した
-# draft は同じ version で再実行して埋め直すし、publish はビルドが作った draft を
-# 前にしてこの判定を呼ぶ。このエンドポイントは draft に 404 を返す (ドキュメントは
-# "Get a published release"、実測でもそう) が、200 で draft が返ってきた場合に
-# 公開済みと読むと publish が永久に止まるので、200 の時は draft かどうかも見る。
+# What we want to know is "is it published". A draft counts as unreleased: a draft left by a failed
+# run is refilled by re-running the same version, and publish calls this decision with the draft the
+# build created in front of it. This endpoint returns 404 for a draft (the docs say
+# "Get a published release", and it does in practice too), but if a 200 with a draft came back and
+# we read it as published, publish would stop forever, so on 200 we also check whether it is a draft.
 #
-# 404 だけを「見つからない」と読む。rate limit や障害をそう読むと、公開済みの
-# version をもう一度ビルドして二重に公開しにいく。
+# Only 404 is read as "not found". Reading a rate limit or an outage that way would rebuild an
+# already published version and try to publish it twice.
 status=$(http_status "repos/${GH_REPO}/releases/tags/v${VERSION}")
 case "$status" in
   404) ;;
   200)
-    # 代入で受ける: `[ "$(gh ...)" ]` の中だと gh の失敗が空文字になり、set -e が効かない。
+    # Capture via assignment: inside `[ "$(gh ...)" ]` a gh failure becomes an empty string and set -e does not fire.
     draft=$(gh api "repos/${GH_REPO}/releases/tags/v${VERSION}" --jq '.draft')
     if [ "$draft" != "true" ] && [ "$draft" != "false" ]; then
       echo "::error::could not read whether v${VERSION} is a draft (got '${draft}'). Not guessing." >&2
@@ -54,11 +54,11 @@ case "$status" in
     ;;
 esac
 
-# 未リリースでも、公開中の最新より古い version は出さない。publish は --latest を
-# 付けるので、出すと最新が巻き戻り、Homebrew tap もダウングレードする。
-# 起こり得るのは、version を上げた commit の revert (一度も出していない 0.2.0 等に
-# 戻る) と、pending の run が push 順と逆に消化された時。後者で飛ばされた version は
-# それより新しい version に含まれているので、改めて出す必要は無い。
+# Even if unreleased, never emit a version older than the latest published one. Publish passes
+# --latest, so doing so would roll the latest back and downgrade the Homebrew tap too.
+# This can happen when a version-bump commit is reverted (returning to e.g. 0.2.0, which was never
+# released) and when pending runs are processed in the opposite order of the pushes. In the latter
+# case the skipped version is contained in the newer version, so it need not be released again.
 status=$(http_status "repos/${GH_REPO}/releases/latest")
 case "$status" in
   404)

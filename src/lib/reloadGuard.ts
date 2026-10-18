@@ -1,33 +1,33 @@
-/// WebView が既定で持つ「ページのリロード」ショートカットを潰すためのガード
-/// (CYBERNEURA-DEV-648)。
+/// Guard that disables the "reload page" shortcuts the WebView has by default
+/// (CYBERNEURA-DEV-648).
 ///
-/// Queryfolio は SPA で、接続・実行中のクエリ・エディタタブ・結果テーブルを
-/// すべてメモリ上に持っている。ページが再読込されるとアプリ全体が初期状態へ
-/// 戻り、編集中のクエリと取得済みの結果が黙って消える。ブラウザのページと
-/// 違って「戻る」手段が無いので、この機能ごと無効化する。
+/// Queryfolio is a SPA and keeps connections, running queries, editor tabs and result tables
+/// all in memory. If the page is reloaded, the whole app returns to its initial state, and
+/// the query being edited and the fetched results silently vanish. Unlike a browser page,
+/// there is no way to go back, so this feature is disabled altogether.
 ///
-/// Cmd+R でアプリが初期化されていた主因はこれではなく、ネイティブメニューの
-/// `Reload config file` に付いていた CmdOrCtrl+R アクセラレータで、そちらは
-/// lib.rs 側でアクセラレータごと外してある。ネイティブメニューのキーは
-/// WebView まで届かないため、preventDefault では止められない。
-/// このガードが効くのは WebView 自身が持つリロード
-/// (Windows の WebView2 は Ctrl+R / F5 を既定のアクセラレータとして持つ) の方で、
-/// メニュー側の対処とは経路が別なので両方が要る。
+/// The main cause of the app being reset by Cmd+R was not this, but the CmdOrCtrl+R accelerator
+/// on the native menu item `Reload config file`, which has been removed together with its
+/// accelerator on the lib.rs side. Native menu keys do not reach the WebView, so
+/// preventDefault cannot stop them.
+/// This guard is effective against the WebView's own reload
+/// (WebView2 on Windows has Ctrl+R / F5 as default accelerators). It takes a different path
+/// from the menu-side fix, so both are needed.
 
-/// リロードを起こすキー操作か判定する。
+/// Determines whether a key press would trigger a reload.
 ///
-/// macOS の Cmd+R / Windows・Linux の Ctrl+R に加え、同じくリロードに割り当て
-/// られている F5 と、キャッシュ無視のリロード (Shift 併用) も対象にする。
-/// いずれも Queryfolio 側では何にも使っていないので、素通しする理由が無い。
+/// Besides Cmd+R on macOS / Ctrl+R on Windows and Linux, this also covers F5, which is
+/// likewise bound to reload, and cache-bypassing reloads (with Shift).
+/// Queryfolio uses none of them, so there is no reason to let them through.
 export function isReloadShortcut(e: KeyboardEvent): boolean {
-  // Alt が付くものは別の操作なので触らない (F5 単体との取り違えを避ける)
+  // Keys with Alt are different operations, so leave them alone (avoids confusing them with plain F5)
   if (e.altKey) {
     return false;
   }
   if (e.key === "F5") {
     return true;
   }
-  // e.key は Shift の有無で "r" / "R" になるため小文字化して比べる。
-  // Cmd と Ctrl はどちらか一方だけを見る (両方同時押しは別の操作扱い)
+  // e.key is "r" / "R" depending on Shift, so compare after lowercasing.
+  // Look at only one of Cmd and Ctrl (pressing both at once is treated as a different operation)
   return (e.metaKey !== e.ctrlKey) && e.key.toLowerCase() === "r";
 }

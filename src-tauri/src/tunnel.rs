@@ -12,19 +12,19 @@ use crate::config::SshTunnelConfig;
 use crate::error::AppError;
 use crate::config::expand_tilde;
 
-/// SSH の blocking 操作 (handshake / auth 等) のタイムアウト (ミリ秒)。
+/// Timeout (in milliseconds) for SSH blocking operations (handshake / auth, etc.).
 const SSH_TIMEOUT_MS: u32 = 30_000;
 
-/// 非同期ポンプループのアイドル時スリープ。
+/// Sleep while idle in the async pump loop.
 const PUMP_IDLE_SLEEP: Duration = Duration::from_millis(5);
 
-/// SSH ローカルポートフォワードトンネル。
+/// SSH local port forwarding tunnel.
 ///
-/// 127.0.0.1 の空きポートで listen し、接続を受けるたびに新しい SSH セッションを
-/// 確立して direct-tcpip チャンネルで転送先へ中継する。
-/// libssh2 のセッションはスレッド間の同時操作が安全でないため、
-/// 転送 1 本ごとに独立したセッションを持たせる (sqlx のプールは少数接続なので
-/// セッション確立のオーバーヘッドは許容範囲)。
+/// Listens on a free port on 127.0.0.1 and, for each accepted connection, establishes a new
+/// SSH session and relays to the destination over a direct-tcpip channel.
+/// libssh2 sessions are not safe for concurrent use across threads, so each forwarded
+/// connection gets its own independent session (sqlx pools hold few connections, so the
+/// session setup overhead is acceptable).
 pub struct SshTunnel {
     pub local_port: u16,
     shutdown: Arc<AtomicBool>,
@@ -50,15 +50,15 @@ struct ForwardTarget {
 }
 
 impl SshTunnel {
-    /// トンネルを開始する。認証エラーを早期に検出するため、
-    /// 最初に 1 度セッション確立を試してから listener を立てる。
+    /// Starts the tunnel. To detect authentication errors early,
+    /// first try establishing a session once, then set up the listener.
     pub fn start(
         ssh_config: &SshTunnelConfig,
         target_host: &str,
         target_port: u16,
     ) -> Result<Self, AppError> {
-        // ssh_tunnel.ssh_config が設定されていれば system ssh に委譲する
-        // (ProxyJump / 多段トンネル / ~/.ssh/config 解決のため)。
+        // If ssh_tunnel.ssh_config is set, delegate to the system ssh
+        // (for ProxyJump / multi-hop tunnels / ~/.ssh/config resolution).
         if let Some(alias) = ssh_config.ssh_config.as_deref() {
             let alias = alias.trim();
             if alias.is_empty() {
@@ -66,11 +66,11 @@ impl SshTunnel {
                     "ssh_tunnel.ssh_config must not be empty".into(),
                 ));
             }
-            // `-` 始まりのエイリアスは ssh にオプションとして解釈される
-            // (`-oProxyCommand=...` で任意コマンド実行になる)。ssh_config は
-            // config_override_command が取得する YAML からも設定できるため、
-            // 取得 YAML にコマンドを実行させないという境界を守るために弾く。
-            // argv 側でも `--` で区切っている (start_system_ssh 参照)。
+            // An alias starting with `-` would be interpreted by ssh as an option
+            // (`-oProxyCommand=...` would execute an arbitrary command). ssh_config can also be set from
+            // the YAML fetched by config_override_command, so reject it to keep the boundary that
+            // fetched YAML must not make us execute commands.
+            // The argv is also separated with `--` (see start_system_ssh).
             if alias.starts_with('-') {
                 return Err(AppError::Config(
                     "ssh_tunnel.ssh_config must not start with '-'".into(),
@@ -79,9 +79,9 @@ impl SshTunnel {
             return start_system_ssh(alias, target_host, target_port);
         }
 
-        // libssh2 経路: host / user は必須 (ssh_config 委譲時のみ省略可)。
-        // serde default で空文字になり得るため明示的に弾く。空のまま進むと
-        // userauth で分かりにくい認証失敗になり、設定漏れだと気付けない。
+        // libssh2 path: host / user are required (they may be omitted only when delegating to ssh_config).
+        // They can be empty strings via the serde default, so reject them explicitly. Proceeding empty
+        // would give a confusing authentication failure at userauth, hiding the missing config.
         if ssh_config.host.trim().is_empty() {
             return Err(AppError::Config(
                 "ssh_tunnel requires 'host' (or set 'ssh_config' to delegate to system ssh)"
@@ -95,7 +95,7 @@ impl SshTunnel {
             ));
         }
 
-        // 認証情報の検証を兼ねた接続テスト
+        // Connection test that doubles as credential validation
         establish_session(ssh_config)?;
 
         let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -122,32 +122,32 @@ impl SshTunnel {
     }
 }
 
-/// system の `ssh` クライアントで `-N -L` ローカルフォワードトンネルを張る。
+/// Sets up a `-N -L` local forward tunnel with the system `ssh` client.
 ///
-/// `ssh_tunnel.ssh_config` (=~/.ssh/config の Host エイリアス) 指定時に使う。
-/// HostName / User / Port / ProxyJump / 多段トンネルの解決は OpenSSH と
-/// ~/.ssh/config に委譲する (libssh2 経路は使わない)。認証・ホスト鍵検証も
-/// OpenSSH 任せ。BatchMode=yes でパスワード/パスフレーズ/ホスト鍵確認の
-/// 対話プロンプトを禁じ (GUI 起動で TTY が無く固まるのを防ぐ)、agent 認証
-/// (1Password 等) は agent 側で処理されるため影響しない。
+/// Used when `ssh_tunnel.ssh_config` (= a Host alias in ~/.ssh/config) is specified.
+/// Resolution of HostName / User / Port / ProxyJump / multi-hop tunnels is delegated to
+/// OpenSSH and ~/.ssh/config (the libssh2 path is not used). Authentication and host key
+/// verification are also left to OpenSSH. BatchMode=yes forbids interactive prompts for
+/// password / passphrase / host key confirmation (to avoid hanging without a TTY when launched
+/// from the GUI); agent authentication (1Password, etc.) is handled by the agent and unaffected.
 fn start_system_ssh(
     alias: &str,
     target_host: &str,
     target_port: u16,
 ) -> Result<SshTunnel, AppError> {
-    // ローカルの空きポートを自分で確保してから ssh に渡す。
-    // (ssh -L の port 0 動的割当は割当ポートの読み取りが面倒なため)
+    // Allocate a free local port ourselves and then pass it to ssh.
+    // (Reading back the port from ssh -L's dynamic port 0 allocation is cumbersome)
     let local_port = {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
-        // listener を閉じてから ssh に bind させる (わずかな race はあるが許容)
+        // Close the listener before letting ssh bind (a slight race exists but is acceptable)
         drop(listener);
         port
     };
 
-    // IPv6 リテラル (`::1` / `fd00::10` 等) の転送先は `-L` 仕様上ブラケットで
-    // 囲む必要がある (`[::1]`)。囲まないと `...:::1:...` となり OpenSSH が不正な
-    // local-forward として拒否する。ホスト名 / IPv4 は `:` を含まないので素通し。
+    // For an IPv6 literal destination (`::1` / `fd00::10`, etc.), the `-L` syntax requires
+    // brackets (`[::1]`). Without them it becomes `...:::1:...` and OpenSSH rejects it as an invalid
+    // local-forward. Host names / IPv4 contain no `:` and pass through unchanged.
     let forward_host = if target_host.contains(':') && !target_host.starts_with('[') {
         format!("[{target_host}]")
     } else {
@@ -166,7 +166,7 @@ fn start_system_ssh(
         .arg(format!("ConnectTimeout={connect_timeout_secs}"))
         .arg("-L")
         .arg(&forward)
-        // これ以降をオプションとして解釈させない (エイリアスによる引数注入の防止)
+        // Prevent anything after this from being interpreted as options (prevents argument injection via an alias)
         .arg("--")
         .arg(alias)
         .stdin(Stdio::null())
@@ -176,8 +176,8 @@ fn start_system_ssh(
         .spawn()
         .map_err(|e| AppError::SshTunnel(format!("Failed to launch ssh: {e}")))?;
 
-    // stderr は別スレッドで吸い出す (パイプ詰まりで ssh が止まるのを防ぎ、
-    // 失敗時の診断メッセージも拾えるようにする)。
+    // Drain stderr in a separate thread (to keep ssh from stalling on a full pipe
+    // and to capture diagnostic messages on failure).
     let stderr_buf = Arc::new(Mutex::new(String::new()));
     let mut drain = child.stderr.take().map(|mut err| {
         let buf = Arc::clone(&stderr_buf);
@@ -190,10 +190,10 @@ fn start_system_ssh(
         })
     });
 
-    // 失敗時の診断メッセージを組む前に drain スレッドの完了を待つ。
-    // ssh が即終了すると try_wait() が drain スレッドの書き込みより先に exit を
-    // 観測し得るため、join せずに読むとメッセージが空になる (診断が最も要る場面で)。
-    // 呼び出し時点で child は既に終了 (= stderr が EOF) しているので join は即返る。
+    // Wait for the drain thread to finish before building the failure diagnostic.
+    // If ssh exits immediately, try_wait() may observe the exit before the drain thread writes,
+    // so reading without a join would yield an empty message (exactly when the diagnostic is needed most).
+    // At this point the child has already exited (= stderr is at EOF), so the join returns immediately.
     let collect_stderr = |drain: &mut Option<std::thread::JoinHandle<()>>| {
         if let Some(handle) = drain.take() {
             let _ = handle.join();
@@ -205,11 +205,11 @@ fn start_system_ssh(
             .unwrap_or_default()
     };
 
-    // ローカルのフォワードポートが接続を受け付けるまで待つ。
-    // OpenSSH は接続先への認証・フォワード確立に成功して初めてローカルの
-    // listen ソケットを開く (ExitOnForwardFailure=yes で失敗時は即終了する)
-    // ため、接続できた時点で認証成功とみなせる (libssh2 経路の
-    // establish_session による事前検証と同じ役割)。
+    // Wait until the local forward port accepts connections.
+    // OpenSSH opens the local listen socket only after it has succeeded in authenticating to the
+    // target and establishing the forward (ExitOnForwardFailure=yes makes it exit immediately on
+    // failure), so a successful connection means authentication succeeded (the same role as the
+    // up-front verification by establish_session on the libssh2 path).
     let start = Instant::now();
     let timeout = Duration::from_millis(SSH_TIMEOUT_MS as u64);
     let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], local_port));
@@ -279,11 +279,11 @@ fn accept_loop(
     }
 }
 
-/// SSH セッションを確立して認証まで行う。
+/// Establishes an SSH session and performs authentication.
 fn establish_session(config: &SshTunnelConfig) -> Result<Session, AppError> {
-    // session.set_timeout は接続確立後にしか効かないため、
-    // TCP 接続自体にも同じタイムアウトを適用する (ブラックホール化した
-    // ホストで OS の TCP タイムアウトまで待たされるのを防ぐ)
+    // session.set_timeout only takes effect after the connection is established, so
+    // apply the same timeout to the TCP connection itself (to avoid waiting for the OS TCP
+    // timeout on a blackholed host)
     let addr = format!("{}:{}", config.host, config.port);
     let socket_addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&addr)
         .map_err(|e| AppError::SshTunnel(format!("Failed to resolve {addr}: {e}")))?
@@ -324,9 +324,9 @@ fn establish_session(config: &SshTunnelConfig) -> Result<Session, AppError> {
     Ok(session)
 }
 
-/// ホストキーを ~/.ssh/known_hosts と照合する。
-/// 不一致は MITM の可能性があるためエラー。未登録ホストは known_hosts に
-/// 追記して許可する (OpenSSH の StrictHostKeyChecking=accept-new 相当)。
+/// Checks the host key against ~/.ssh/known_hosts.
+/// A mismatch is an error since it may be a MITM. An unknown host is appended to known_hosts
+/// and allowed (equivalent to OpenSSH's StrictHostKeyChecking=accept-new).
 fn verify_host_key(session: &Session, config: &SshTunnelConfig) -> Result<(), AppError> {
     let (key, key_type) = session.host_key().ok_or_else(|| {
         AppError::SshTunnel("Could not obtain the host key".into())
@@ -361,8 +361,8 @@ fn verify_host_key(session: &Session, config: &SshTunnelConfig) -> Result<(), Ap
             config.host
         ))),
         ssh2::CheckResult::NotFound => {
-            // known_hosts のエントリ形式: 標準ポートはホスト名のみ、
-            // 非標準ポートは [host]:port
+            // known_hosts entry format: the host name only for the standard port,
+            // [host]:port for a non-standard port
             let entry_host = if config.port == 22 {
                 config.host.clone()
             } else {
@@ -418,9 +418,9 @@ fn authenticate(session: &Session, config: &SshTunnelConfig) -> Result<(), AppEr
         return Ok(());
     }
 
-    // password も private_key_path も無い場合は ssh-agent を試す。
-    // GUI 起動時はシェルの SSH_AUTH_SOCK を継承しないことがあるため、使う agent socket を
-    // config の identity_agent → ~/.ssh/config の IdentityAgent → SSH_AUTH_SOCK の順で解決する。
+    // If there is neither a password nor private_key_path, try ssh-agent.
+    // A GUI launch may not inherit the shell's SSH_AUTH_SOCK, so resolve the agent socket to use in the order
+    // config identity_agent -> IdentityAgent in ~/.ssh/config -> SSH_AUTH_SOCK.
     match resolve_agent_socket(config) {
         AgentSocket::Disabled => Err(AppError::SshTunnel(format!(
             "The SSH agent is disabled for {} (IdentityAgent none) and no \
@@ -432,26 +432,26 @@ fn authenticate(session: &Session, config: &SshTunnelConfig) -> Result<(), AppEr
     }
 }
 
-/// どの ssh-agent socket を使うか。
+/// Which ssh-agent socket to use.
 enum AgentSocket {
-    /// 明示的な socket パス (libssh2 の set_identity_path で指定)。
+    /// An explicit socket path (specified via libssh2's set_identity_path).
     Path(PathBuf),
-    /// IdentityAgent none 相当。agent 認証を行わない。
+    /// Equivalent to IdentityAgent none. Do not perform agent authentication.
     Disabled,
-    /// 解決できなかった。libssh2 の既定 (SSH_AUTH_SOCK) に任せる。
+    /// Could not be resolved. Leave it to libssh2's default (SSH_AUTH_SOCK).
     Default,
 }
 
-/// 使用する ssh-agent socket を優先順位に従って解決する。
+/// Resolves the ssh-agent socket to use according to priority.
 ///
-/// 1. config の `ssh_tunnel.identity_agent`
-/// 2. `~/.ssh/config` の `IdentityAgent` (対象ホストにマッチするもの)
+/// 1. `ssh_tunnel.identity_agent` in the config
+/// 2. `IdentityAgent` in `~/.ssh/config` (the one matching the target host)
 /// 3. `SSH_AUTH_SOCK` (= `AgentSocket::Default`)
 fn resolve_agent_socket(config: &SshTunnelConfig) -> AgentSocket {
     if let Some(explicit) = &config.identity_agent {
         let trimmed = explicit.trim();
         if !trimmed.is_empty() {
-            // 空文字は未指定扱いとし、ssh_config へフォールバックする。
+            // An empty string is treated as unspecified and falls back to ssh_config.
             let home = dirs::home_dir().unwrap_or_default();
             return parse_agent_socket_value(trimmed, &home);
         }
@@ -459,8 +459,8 @@ fn resolve_agent_socket(config: &SshTunnelConfig) -> AgentSocket {
     ssh_config_identity_agent(&config.host).unwrap_or(AgentSocket::Default)
 }
 
-/// IdentityAgent の値 (config フィールドまたは ssh_config) を AgentSocket に変換する。
-/// `none` は無効化、`SSH_AUTH_SOCK` は既定 (env)、それ以外はパスとして展開する。
+/// Converts an IdentityAgent value (config field or ssh_config) into an AgentSocket.
+/// `none` disables, `SSH_AUTH_SOCK` means the default (env), anything else is expanded as a path.
 fn parse_agent_socket_value(value: &str, home: &Path) -> AgentSocket {
     if value.eq_ignore_ascii_case("none") {
         AgentSocket::Disabled
@@ -471,9 +471,9 @@ fn parse_agent_socket_value(value: &str, home: &Path) -> AgentSocket {
     }
 }
 
-/// ssh-agent 経由で認証する。socket が Some ならその unix socket を使う。
-/// libssh2 の set_identity_path は SSH_AUTH_SOCK 環境変数を書き換えないので
-/// スレッド間で安全に呼べる。
+/// Authenticates via ssh-agent. If socket is Some, uses that unix socket.
+/// libssh2's set_identity_path does not modify the SSH_AUTH_SOCK environment variable,
+/// so it is safe to call across threads.
 fn authenticate_with_agent(
     session: &Session,
     user: &str,
@@ -524,18 +524,18 @@ fn authenticate_with_agent(
     )))
 }
 
-/// `~/.ssh/config` を読み、`host` に対する実効的な IdentityAgent を返す。
-/// OpenSSH のセマンティクスに倣い、最初にマッチした値を採用する。
-/// Host の glob パターン・`IdentityAgent none`/`SSH_AUTH_SOCK`・`~`/`%d`/環境変数展開を尊重する。
-/// (Match ブロックは未対応で、その中の設定は無視する。)
+/// Reads `~/.ssh/config` and returns the effective IdentityAgent for `host`.
+/// Following OpenSSH semantics, the first matching value is used.
+/// Honors Host glob patterns, `IdentityAgent none` / `SSH_AUTH_SOCK`, and `~` / `%d` / environment variable expansion.
+/// (Match blocks are unsupported; settings inside them are ignored.)
 fn ssh_config_identity_agent(host: &str) -> Option<AgentSocket> {
     let home = dirs::home_dir()?;
     let config_path = home.join(".ssh").join("config");
     ssh_config_identity_agent_at(&config_path, host, &home)
 }
 
-/// `ssh_config_identity_agent` の本体。config パスと home を注入できるようにして
-/// テスト可能にしたもの。
+/// The body of `ssh_config_identity_agent`. Made testable by allowing the config path and
+/// home to be injected.
 fn ssh_config_identity_agent_at(
     config_path: &Path,
     host: &str,
@@ -547,15 +547,15 @@ fn ssh_config_identity_agent_at(
     result
 }
 
-/// ssh_config を 1 ファイル解析し、最初にマッチした IdentityAgent を `result` に書き込む。
+/// Parses one ssh_config file and writes the first matching IdentityAgent into `result`.
 ///
-/// OpenSSH のセマンティクス (`ssh -G` で確認) に忠実に:
-/// - Host/Match ブロックの外 (冒頭) の設定は全ホストに適用される。
-/// - `Include` は **enclosing block がマッチする時だけ** 展開する。マッチしない
-///   Host ブロック内の Include は、たとえ include 先が自前の `Host *` を持っていても
-///   適用しない (Case A で確認)。
-/// - include 先の Host コンテキストは return 後の親には波及しない (再帰の局所変数で自然に実現)。
-/// - Match ブロックは未対応で、その中の設定は無視する。
+/// Faithful to OpenSSH semantics (verified with `ssh -G`):
+/// - Settings outside Host/Match blocks (at the top) apply to all hosts.
+/// - `Include` is expanded **only when the enclosing block matches**. An Include inside a
+///   non-matching Host block is not applied, even if the included file has its own `Host *`
+///   (verified in Case A).
+/// - The Host context of an included file does not leak to the parent after returning (achieved naturally by recursion-local variables).
+/// - Match blocks are unsupported; settings inside them are ignored.
 fn parse_ssh_config_file(
     path: &Path,
     host: &str,
@@ -580,7 +580,7 @@ fn parse_ssh_config_file(
             let (keyword, rest) = split_ssh_config_line(line);
             match keyword.to_ascii_lowercase().as_str() {
                 "host" => block_matches = host_patterns_match(rest, host),
-                // Match ブロックは未対応。誤判定を避けるためブロックごと無視する。
+                // Match blocks are unsupported. Ignore the whole block to avoid misjudging.
                 "match" => block_matches = false,
                 "include" if block_matches => {
                     for inc in expand_include_paths(rest, home) {
@@ -600,13 +600,13 @@ fn parse_ssh_config_file(
     *depth -= 1;
 }
 
-/// OpenSSH に倣い行内コメントを除去する。`#` はダブルクオートの外側かつ
-/// 直前が空白 (または行頭) のときだけコメント開始とみなす。
-/// (`/a#b.sock` の `#` は値の一部、`"/a#b.sock"` の `#` はクオート内なので残す。
-///  `ssh -G` の挙動で確認済み。)
+/// Strips inline comments following OpenSSH. A `#` starts a comment only when it is outside
+/// double quotes and preceded by whitespace (or at the line start).
+/// (The `#` in `/a#b.sock` is part of the value, and the `#` in `"/a#b.sock"` is inside quotes so it is kept.
+///  Verified with the behavior of `ssh -G`.)
 fn strip_inline_comment(line: &str) -> &str {
     let mut in_quotes = false;
-    let mut prev_is_ws = true; // 行頭は「空白の後」とみなす
+    let mut prev_is_ws = true; // the line start counts as "after whitespace"
     for (i, ch) in line.char_indices() {
         match ch {
             '"' => in_quotes = !in_quotes,
@@ -618,8 +618,8 @@ fn strip_inline_comment(line: &str) -> &str {
     line
 }
 
-/// ssh_config の 1 行を「キーワード」と「残り」に分割する。
-/// OpenSSH は `Keyword value` と `Keyword=value` の両方を許す。
+/// Splits one ssh_config line into a "keyword" and the "rest".
+/// OpenSSH allows both `Keyword value` and `Keyword=value`.
 fn split_ssh_config_line(line: &str) -> (&str, &str) {
     let end = line
         .find(|c: char| c.is_whitespace() || c == '=')
@@ -630,8 +630,8 @@ fn split_ssh_config_line(line: &str) -> (&str, &str) {
     (keyword, rest)
 }
 
-/// Host 行のパターン列 (空白区切り、`!` 否定あり) が host にマッチするか。
-/// ホスト名は OpenSSH に倣い大文字小文字を区別しない。
+/// Whether the pattern list on a Host line (whitespace-separated, `!` negation allowed) matches host.
+/// Host names are case-insensitive, following OpenSSH.
 fn host_patterns_match(patterns: &str, host: &str) -> bool {
     let host = host.to_ascii_lowercase();
     let mut matched = false;
@@ -647,7 +647,7 @@ fn host_patterns_match(patterns: &str, host: &str) -> bool {
     matched
 }
 
-/// `*` と `?` のみ対応するワイルドカードマッチ。
+/// Wildcard matching that supports only `*` and `?`.
 fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
@@ -675,7 +675,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
-/// 前後のダブルクオートを除去する。
+/// Strips surrounding double quotes.
 fn unquote(value: &str) -> &str {
     value
         .strip_prefix('"')
@@ -683,12 +683,12 @@ fn unquote(value: &str) -> &str {
         .unwrap_or(value)
 }
 
-/// IdentityAgent の値のパスを展開する:
-/// バックスラッシュエスケープ復号 → 環境変数 (`${VAR}`/`$VAR`) → `%d` (ホーム) → `~`。
+/// Expands the path in an IdentityAgent value:
+/// backslash-escape decoding -> environment variables (`${VAR}`/`$VAR`) -> `%d` (home) -> `~`.
 ///
-/// 接続依存の percent トークン (`%h`/`%n`/`%r`/`%u`/`%l`/`%C`) は IdentityAgent の
-/// socket パスでは実質使われず、完全対応には接続コンテキスト一式が要るため、未知の
-/// `%X` はそのまま残す (best-effort)。解決不能時は呼び出し側が SSH_AUTH_SOCK に倒す。
+/// Connection-dependent percent tokens (`%h`/`%n`/`%r`/`%u`/`%l`/`%C`) are practically unused in an
+/// IdentityAgent socket path and full support would need the whole connection context, so unknown
+/// `%X` are left as-is (best-effort). When it cannot be resolved, the caller falls back to SSH_AUTH_SOCK.
 fn expand_ssh_path(value: &str, home: &Path) -> PathBuf {
     let decoded = decode_ssh_escapes(value);
     let mut expanded = expand_env_vars(&decoded);
@@ -704,8 +704,8 @@ fn expand_ssh_path(value: &str, home: &Path) -> PathBuf {
     PathBuf::from(expanded)
 }
 
-/// ssh_config のバックスラッシュエスケープを復号する。OpenSSH は `\ ` (空白) と
-/// `\\` (バックスラッシュ) を復号し、その他の `\X` はそのまま残す (`ssh -G` で確認)。
+/// Decodes ssh_config backslash escapes. OpenSSH decodes `\ ` (space) and
+/// `\\` (backslash) and leaves any other `\X` as-is (verified with `ssh -G`).
 fn decode_ssh_escapes(value: &str) -> String {
     if !value.contains('\\') {
         return value.to_string();
@@ -717,7 +717,7 @@ fn decode_ssh_escapes(value: &str) -> String {
             let mut lookahead = chars.clone();
             if let Some(next @ (' ' | '\\')) = lookahead.next() {
                 out.push(next);
-                chars = lookahead; // エスケープ対象を消費
+                chars = lookahead; // consume the escaped character
                 continue;
             }
         }
@@ -726,8 +726,8 @@ fn decode_ssh_escapes(value: &str) -> String {
     out
 }
 
-/// `${VAR}` と `$VAR` を環境変数で展開する。未定義変数は空文字に展開する
-/// (OpenSSH / シェル準拠)。
+/// Expands `${VAR}` and `$VAR` with environment variables. Undefined variables expand to an empty string
+/// (following OpenSSH / the shell).
 fn expand_env_vars(input: &str) -> String {
     if !input.contains('$') {
         return input.to_string();
@@ -761,7 +761,7 @@ fn expand_env_vars(input: &str) -> String {
             }
         }
         if name.is_empty() {
-            out.push('$'); // `$` 単独等はそのまま残す
+            out.push('$'); // leave a lone `$` etc. as-is
         } else if let Ok(value) = std::env::var(&name) {
             out.push_str(&value);
         }
@@ -769,14 +769,14 @@ fn expand_env_vars(input: &str) -> String {
     out
 }
 
-/// Include のパス列を展開する。相対パスは `~/.ssh/` からの相対とみなす。
-/// glob パターン (`*` `?` `[...]`) は glob crate で展開する (OpenSSH は glob(3) 準拠)。
-/// トークン分割はダブルクオート/バックスラッシュエスケープを尊重するため、
-/// `Include /tmp/with\ space/inc.conf` のような空白入りパスも 1 つとして扱う。
+/// Expands a list of Include paths. Relative paths are taken as relative to `~/.ssh/`.
+/// Glob patterns (`*` `?` `[...]`) are expanded with the glob crate (OpenSSH follows glob(3)).
+/// Token splitting honors double quotes / backslash escapes, so
+/// a path with spaces such as `Include /tmp/with\ space/inc.conf` is treated as a single token.
 fn expand_include_paths(rest: &str, home: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for token in split_config_tokens(rest) {
-        // split_config_tokens はクオート除去・エスケープ復号済みのトークンを返す。
+        // split_config_tokens returns tokens with quotes stripped and escapes decoded.
         let resolved = if let Some(tail) = token.strip_prefix("~/") {
             home.join(tail)
         } else if token.starts_with('/') {
@@ -785,7 +785,7 @@ fn expand_include_paths(rest: &str, home: &Path) -> Vec<PathBuf> {
             home.join(".ssh").join(&token)
         };
         if token.contains(['*', '?', '[']) {
-            // glob crate は既定でソート済みの順で返す。
+            // The glob crate returns results in sorted order by default.
             if let Ok(paths) = glob::glob(&resolved.to_string_lossy()) {
                 out.extend(paths.flatten());
             }
@@ -796,9 +796,9 @@ fn expand_include_paths(rest: &str, home: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// ssh_config の引数リストを空白区切りのトークンに分割する。
-/// ダブルクオートとバックスラッシュエスケープ (`\ `→空白 / `\\`→`\`) を解釈し、
-/// クオート/エスケープされた空白ではトークンを分割しない。
+/// Splits an ssh_config argument list into whitespace-separated tokens.
+/// Interprets double quotes and backslash escapes (`\ ` -> space / `\\` -> `\`),
+/// and does not split a token at quoted/escaped spaces.
 fn split_config_tokens(value: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -839,10 +839,10 @@ fn split_config_tokens(value: &str) -> Vec<String> {
     tokens
 }
 
-/// ローカル TCP 接続 1 本を SSH direct-tcpip チャンネルへ中継する。
+/// Relays one local TCP connection to an SSH direct-tcpip channel.
 ///
-/// libssh2 は同一セッションへの並行操作が安全でないため、
-/// セッションを non-blocking にして単一スレッドで双方向にポンプする。
+/// libssh2 is not safe for concurrent operations on the same session, so
+/// make the session non-blocking and pump both directions from a single thread.
 fn forward_connection(
     tcp: TcpStream,
     target: &ForwardTarget,
@@ -891,7 +891,7 @@ fn forward_connection(
 
         match channel.read(&mut buf) {
             Ok(0) => {
-                // チャンネル側 EOF: 中継終了
+                // EOF on the channel side: end the relay
                 break;
             }
             Ok(n) => {
@@ -912,7 +912,7 @@ fn forward_connection(
     Ok(())
 }
 
-/// non-blocking な writer に対して全バイト書き込む。WouldBlock はリトライする。
+/// Writes all bytes to a non-blocking writer. Retries on WouldBlock.
 fn write_all_nonblocking<W>(mut write: W, data: &[u8]) -> Result<(), std::io::Error>
 where
     W: FnMut(&[u8]) -> Result<usize, std::io::Error>,
@@ -936,7 +936,7 @@ where
     Ok(())
 }
 
-/// non-blocking チャンネルへの EOF 送信。WouldBlock はリトライする。
+/// Sends EOF on a non-blocking channel. Retries on WouldBlock.
 fn write_all_nonblocking_channel_eof(
     channel: &mut ssh2::Channel,
 ) -> Result<(), std::io::Error> {
@@ -976,7 +976,7 @@ mod tests {
     fn host_patterns_match_with_negation() {
         assert!(host_patterns_match("*", "db.example.com"));
         assert!(host_patterns_match("*.example.com", "db.example.com"));
-        // 否定パターンが優先してマッチを打ち消す
+        // A negated pattern takes priority and cancels the match
         assert!(!host_patterns_match("*.example.com !secret.example.com", "secret.example.com"));
         assert!(host_patterns_match("*.example.com !secret.example.com", "db.example.com"));
         assert!(!host_patterns_match("foo bar", "baz"));
@@ -1032,13 +1032,13 @@ mod tests {
     #[test]
     fn first_matching_value_wins_and_none_disables() {
         let home = Path::new("/home/u");
-        // より具体的な Host ブロックが先にあり none を指定していれば、後続の Host * より優先される。
+        // A more specific Host block comes first and specifies none, so it takes priority over the later Host *.
         let body = "Host irene.example.com\n  IdentityAgent none\n\nHost *\n  IdentityAgent ~/agent.sock\n";
         assert!(matches!(
             resolve(body, "irene.example.com", home),
             Some(AgentSocket::Disabled)
         ));
-        // マッチしないホストは Host * にフォールバックする。
+        // A host that does not match falls back to Host *.
         assert!(matches!(
             resolve(body, "other.example.com", home),
             Some(AgentSocket::Path(_))
@@ -1064,8 +1064,8 @@ mod tests {
 
     #[test]
     fn include_inside_non_matching_host_block_is_ignored() {
-        // Include を Host ブロック内に置いた場合、そのブロックがマッチしないホストには
-        // Include 先の IdentityAgent を適用してはならない (OpenSSH のインライン展開)。
+        // When an Include is placed inside a Host block, the IdentityAgent of the included file
+        // must not apply to hosts that do not match that block (OpenSSH inline expansion).
         let home = Path::new("/home/u");
         let inc = unique_temp("ssh_inc");
         std::fs::write(&inc, "IdentityAgent none\n").unwrap();
@@ -1073,12 +1073,12 @@ mod tests {
             "Host prod\n  Include {}\n\nHost *\n  IdentityAgent ~/agent.sock\n",
             inc.display()
         );
-        // dev は Host prod にマッチしないので Host * の agent.sock を得る。
+        // dev does not match Host prod, so it gets agent.sock from Host *.
         assert!(matches!(
             resolve(&body, "dev", home),
             Some(AgentSocket::Path(_))
         ));
-        // prod は Host prod にマッチするので Include 先の none を得る。
+        // prod matches Host prod, so it gets none from the included file.
         assert!(matches!(
             resolve(&body, "prod", home),
             Some(AgentSocket::Disabled)
@@ -1088,8 +1088,8 @@ mod tests {
 
     #[test]
     fn include_in_nonmatching_block_is_not_expanded_even_with_own_host() {
-        // Include が非マッチ Host ブロック内にある場合、include 先が自前の `Host *` を
-        // 持っていても展開してはならない (OpenSSH の実挙動、ssh -G Case A で確認)。
+        // When an Include is inside a non-matching Host block, it must not be expanded even if the included file has
+        // its own `Host *` (actual OpenSSH behavior, verified with ssh -G Case A).
         let home = Path::new("/home/u");
         let inc = unique_temp("ssh_inc_own_host");
         std::fs::write(&inc, "Host *\n  IdentityAgent ~/from-include.sock\n").unwrap();
@@ -1097,12 +1097,12 @@ mod tests {
             "Host prod\n  Include {}\nHost *\n  IdentityAgent ~/main-star.sock\n",
             inc.display()
         );
-        // dev は Host prod 非マッチ → include を無視し main の Host * を得る。
+        // dev does not match Host prod -> ignore the include and get main's Host *.
         match resolve(&body, "dev", home) {
             Some(AgentSocket::Path(p)) => assert_eq!(p, PathBuf::from("/home/u/main-star.sock")),
             other => panic!("expected main-star, resolved={}", other.is_some()),
         }
-        // prod は Host prod マッチ → include を展開しその Host * が勝つ。
+        // prod matches Host prod -> expand the include and its Host * wins.
         match resolve(&body, "prod", home) {
             Some(AgentSocket::Path(p)) => assert_eq!(p, PathBuf::from("/home/u/from-include.sock")),
             other => panic!("expected from-include, resolved={}", other.is_some()),
@@ -1124,7 +1124,7 @@ mod tests {
         let dir = unique_temp("ssh incdir with space");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("inc.conf"), "Host *\n  IdentityAgent ~/spaced.sock\n").unwrap();
-        // ディレクトリ名に空白。バックスラッシュでエスケープして Include。
+        // A space in the directory name. Include it with a backslash escape.
         let escaped = dir.to_string_lossy().replace(' ', "\\ ");
         let body = format!("Include {}/inc.conf\n", escaped);
         match resolve(&body, "any.host", home) {
@@ -1140,18 +1140,18 @@ mod tests {
         std::env::set_var("QF_TEST_AGENT_DIR", "/tmp/qf");
         assert_eq!(expand_env_vars("${QF_TEST_AGENT_DIR}/a.sock"), "/tmp/qf/a.sock");
         assert_eq!(expand_env_vars("$QF_TEST_AGENT_DIR/a.sock"), "/tmp/qf/a.sock");
-        // 未定義変数は空に展開される
+        // An undefined variable expands to empty
         std::env::remove_var("QF_TEST_UNDEFINED");
         assert_eq!(expand_env_vars("x${QF_TEST_UNDEFINED}y"), "xy");
     }
 
     #[test]
     fn strips_inline_comments_like_openssh() {
-        // クオート外かつ空白前の `#` はコメント。
+        // A `#` outside quotes and before whitespace is a comment.
         assert_eq!(strip_inline_comment("IdentityAgent none # disable"), "IdentityAgent none");
-        // トークン途中の `#` は値の一部。
+        // A `#` in the middle of a token is part of the value.
         assert_eq!(strip_inline_comment("IdentityAgent /a#b.sock"), "IdentityAgent /a#b.sock");
-        // クオート内の `#` は残す。
+        // A `#` inside quotes is kept.
         assert_eq!(
             strip_inline_comment("IdentityAgent \"/a#b.sock\" # c"),
             "IdentityAgent \"/a#b.sock\""
@@ -1174,7 +1174,7 @@ mod tests {
 
     #[test]
     fn decodes_backslash_escapes_like_openssh() {
-        // OpenSSH は `\ ` と `\\` のみ復号し、その他の `\X` は残す (ssh -G で確認)。
+        // OpenSSH decodes only `\ ` and `\\` and leaves other `\X` (verified with ssh -G).
         assert_eq!(decode_ssh_escapes("a\\ b"), "a b");
         assert_eq!(decode_ssh_escapes("a\\\\b"), "a\\b");
         assert_eq!(decode_ssh_escapes("plain\\tab"), "plain\\tab");
@@ -1184,7 +1184,7 @@ mod tests {
     #[test]
     fn escaped_space_in_identity_agent_path() {
         let home = Path::new("/home/u");
-        // クオートなしで空白をエスケープした 1Password 風パス。
+        // A 1Password-style path with unquoted escaped spaces.
         match resolve(
             "Host *\n  IdentityAgent ~/Library/Group\\ Containers/x/agent.sock\n",
             "db",
@@ -1219,7 +1219,7 @@ mod tests {
             Some(AgentSocket::Path(p)) => assert_eq!(p, PathBuf::from("/home/u/from-glob.sock")),
             other => panic!("expected star-glob path, resolved={}", other.is_some()),
         }
-        // `[...]` bracket glob (OpenSSH は glob(3) の文字クラスに対応)
+        // `[...]` bracket glob (OpenSSH supports glob(3) character classes)
         let body = format!("Include {}/[0-9]*.conf\n", dir.display());
         match resolve(&body, "any.host", home) {
             Some(AgentSocket::Path(p)) => assert_eq!(p, PathBuf::from("/home/u/from-glob.sock")),
@@ -1249,7 +1249,7 @@ mod tests {
         assert!(matches!(resolve_agent_socket(&cfg), AgentSocket::Path(_)));
     }
 
-    /// ssh_config だけ書いた設定が host / user 無しでデシリアライズできること。
+    /// ssh_config alone must deserialize without host / user.
     #[test]
     fn ssh_config_only_deserializes_without_host_user() {
         let cfg: SshTunnelConfig =
@@ -1259,7 +1259,7 @@ mod tests {
         assert!(cfg.user.is_empty());
     }
 
-    /// ssh_config が空文字なら spawn せずにエラーを返すこと。
+    /// An empty ssh_config must return an error without spawning.
     #[test]
     fn start_rejects_empty_ssh_config() {
         let cfg = SshTunnelConfig {
@@ -1278,8 +1278,8 @@ mod tests {
         ));
     }
 
-    /// `-` 始まりの ssh_config は ssh のオプションとして解釈されるため、
-    /// spawn せずに設定エラーを返すこと (取得 YAML からの引数注入の回帰テスト)。
+    /// An ssh_config starting with `-` would be interpreted as an ssh option, so
+    /// it must return a config error without spawning (regression test for argument injection from fetched YAML).
     #[test]
     fn start_rejects_ssh_config_starting_with_dash() {
         for alias in ["-oProxyCommand=touch /tmp/queryfolio-pwned", "  -F/dev/null"] {
@@ -1301,7 +1301,7 @@ mod tests {
         }
     }
 
-    /// ssh_config も host も無ければ (libssh2 経路で host 必須) エラーを返すこと。
+    /// With neither ssh_config nor host, an error must be returned (host is required on the libssh2 path).
     #[test]
     fn start_requires_host_without_ssh_config() {
         let cfg = SshTunnelConfig {
@@ -1320,8 +1320,8 @@ mod tests {
         ));
     }
 
-    /// ssh_config 無しで user が空なら (libssh2 経路で user 必須) エラーを返すこと。
-    /// serde default で "" になっても userauth まで進ませない。
+    /// With no ssh_config and an empty user, an error must be returned (user is required on the libssh2 path).
+    /// Even if serde default makes it "", do not proceed to userauth.
     #[test]
     fn start_requires_user_without_ssh_config() {
         let cfg = SshTunnelConfig {

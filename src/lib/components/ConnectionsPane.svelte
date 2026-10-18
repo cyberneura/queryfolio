@@ -1,8 +1,96 @@
 <script lang="ts">
   import { toast } from "svelte-sonner";
+  import { open } from "@tauri-apps/plugin-dialog";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import appStore from "$lib/stores/app.svelte";
-  import type { ConnectionInfo } from "$lib/api";
+  import { addFileConnection, type ConnectionInfo } from "$lib/api";
   import { hasFileDragPayload, readFileDragPayload } from "$lib/fileDrag";
+
+  type Props = {
+    /// Open the config editor (ConfigEditorModal). Same as the Edit config.yml menu item
+    onEditConfig: () => void;
+  };
+
+  let { onEditConfig }: Props = $props();
+
+  const SETTINGS_DOC_URL =
+    "https://github.com/cyberneura/queryfolio/blob/main/docs/settings.md";
+
+  /// Whether we are in the middle of: pick a file -> append to config.yml -> reload -> select (prevents double clicks)
+  let addingFile = $state(false);
+
+  /// "Open SQLite / DuckDB file…" on the screen with zero connections. Adds a connection for the
+  /// chosen file to the servers in config.yml (the backend appends while preserving comments),
+  /// then reloads the config and selects that connection.
+  const openDatabaseFile = async () => {
+    if (addingFile) return;
+    addingFile = true;
+    try {
+      let selected;
+      try {
+        selected = await open({
+          multiple: false,
+          directory: false,
+          title: "Open a SQLite / DuckDB file",
+          filters: [
+            {
+              name: "SQLite / DuckDB",
+              extensions: ["sqlite", "sqlite3", "db", "duckdb"],
+            },
+          ],
+        });
+      } catch (e) {
+        toast.error("Failed to open the file dialog", { description: String(e) });
+        return;
+      }
+      // null = cancelled
+      if (typeof selected !== "string") return;
+      let added;
+      try {
+        added = await addFileConnection(selected);
+      } catch (e) {
+        toast.error("Failed to add the connection", { description: String(e) });
+        return;
+      }
+      if (!(await appStore.reloadConnections())) {
+        toast.error("Failed to reload the config", {
+          description: appStore.errorMessage ?? undefined,
+        });
+        return;
+      }
+      if (!appStore.connections.some((c) => c.name === added.name)) {
+        // e.g. config_override_command replaces servers wholesale, so a connection in the local
+        // config.yml does not show up in the list. Whether it was appended or already existed
+        // is told apart by `added`
+        toast.warning(
+          added.added
+            ? `Added "${added.name}" to config.yml, but it is not in the list`
+            : `"${added.name}" is already in config.yml, but it is not in the list`,
+          {
+            description:
+              "config_override_command may be replacing servers. Check the config file.",
+          },
+        );
+        return;
+      }
+      await appStore.selectConnection(added.name);
+      toast.success(
+        added.added
+          ? `Added "${added.name}" to config.yml`
+          : `"${added.name}" is already in config.yml`,
+      );
+    } finally {
+      addingFile = false;
+    }
+  };
+
+  const openSettingsDoc = () => {
+    openUrl(SETTINGS_DOC_URL).catch((e) => {
+      toast.error("Failed to open the settings reference", {
+        description: String(e),
+      });
+    });
+  };
 
   const engineLabel = (engine: string): string => {
     switch (engine.toLowerCase()) {
@@ -23,14 +111,14 @@
   const isSqlite = (engine: string): boolean =>
     engine.toLowerCase() === "sqlite" || engine.toLowerCase() === "sqlite3";
 
-  /// ツールチップに並べる詳細行を接続情報から組み立てる。
-  /// 値が無い項目は省く。SSH トンネル情報は機密を含まない host/port/user のみ。
+  /// Build the detail lines for the tooltip from the connection info.
+  /// Items without a value are omitted. SSH tunnel info is only host/port/user, which contain nothing sensitive.
   const detailRows = (c: ConnectionInfo): { label: string; value: string }[] => {
     const rows: { label: string; value: string }[] = [];
     rows.push({ label: "Engine", value: engineLabel(c.engine) });
     if (isSqlite(c.engine)) {
-      // sqlite は DB ファイルパスを schema に置くが、無ければ host に置いた
-      // 設定も backend (db.rs の connect) がサポートする。同じフォールバックで表示する。
+      // sqlite puts the DB file path in schema, but the backend (connect in db.rs) also supports
+      // a config that puts it in host. Display it with the same fallback.
       const file = c.schema ?? c.host;
       if (file) rows.push({ label: "File", value: file });
     } else {
@@ -43,7 +131,7 @@
         rows.push({ label: "Port", value: String(c.port) });
       }
       if (c.user) rows.push({ label: "User", value: c.user });
-      // password_command の接続は「コマンドで取得する」ことだけを示す
+      // Show only that the password comes from password_command
       if (c.password_from_command) rows.push({ label: "Password", value: "(command)" });
       if (c.schema) rows.push({ label: "Database", value: c.schema });
     }
@@ -61,8 +149,8 @@
     return rows;
   };
 
-  /// 設定順を保ったまま、連続する同一グループ名の接続をセクションにまとめる。
-  /// group_name が無い接続はヘッダ無しのセクションになる。
+  /// Group consecutive connections with the same group name into sections, keeping the config order.
+  /// A connection without group_name becomes a section with no header.
   const sections = $derived.by(() => {
     const result: { group: string | null; items: ConnectionInfo[] }[] = [];
     for (const connection of appStore.connections) {
@@ -77,24 +165,24 @@
     return result;
   });
 
-  /// ホバー中の接続とアンカー (カーソル) 位置・ツールチップ表示位置 (viewport 座標)。
+  /// The hovered connection, the anchor (cursor) position, and the tooltip display position (viewport coordinates).
   let hovered = $state<ConnectionInfo | null>(null);
   let anchorX = $state(0);
   let anchorY = $state(0);
   let tipX = $state(0);
   let tipY = $state(0);
-  /// レンダリング済みツールチップ要素 ($state にすることで bind:this 後に
-  /// clamp の $effect が再実行され、実寸法で位置補正できる)。
+  /// The rendered tooltip element (making it `$state` re-runs the clamp `$effect` after
+  /// bind:this so the position can be corrected with the real dimensions).
   let tipEl = $state<HTMLDivElement | null>(null);
 
   const TIP_MARGIN = 16;
 
-  /// クエリファイルをドラッグして重ねている接続名 (ドロップ先のハイライト用)
+  /// Name of the connection a query file is being dragged over (for highlighting the drop target)
   let dropTarget = $state<string | null>(null);
 
-  // FILES ペインからドラッグしてきたクエリファイルを受ける。
-  // dragover では dataTransfer の中身を読めないので、種別 (MIME タイプ) だけで
-  // 判定する。移動元と同じ接続には落とさせない (no-op なのでハイライトも出さない)。
+  // Accepts query files dragged from the FILES pane.
+  // dragover cannot read the contents of dataTransfer, so decide by the type (MIME type) only.
+  // Do not allow dropping on the same connection as the source (it is a no-op, so no highlight either).
   const canDrop = (e: DragEvent, connection: ConnectionInfo): boolean =>
     hasFileDragPayload(e.dataTransfer) &&
     appStore.selectedConnection !== connection.name;
@@ -103,7 +191,7 @@
     if (!canDrop(e, connection)) {
       return;
     }
-    // preventDefault しないとドロップが許可されない (HTML の DnD 仕様)
+    // Without preventDefault the drop is not allowed (HTML DnD spec)
     e.preventDefault();
     if (e.dataTransfer) {
       e.dataTransfer.dropEffect = "move";
@@ -127,8 +215,8 @@
     if (!payload || payload.connection === connection.name) {
       return;
     }
-    // 移動元はドラッグ開始時の接続 (payload) を使う。ドロップまでの間に
-    // 選択接続が変わっていても、掴んだファイルを取り違えない。
+    // Use the connection at drag start (payload) as the source. Even if the selected
+    // connection changes before the drop, the file that was grabbed is never mixed up.
     const moved = await appStore.moveFileToConnection(
       payload.fileName,
       payload.connection,
@@ -151,8 +239,8 @@
   const setAnchor = (e: MouseEvent) => {
     anchorX = e.clientX;
     anchorY = e.clientY;
-    // 実測クランプ ($effect) の前でもカーソル付近に出しておく (初回表示時に
-    // 前回位置や左上へ一瞬ちらつくのを防ぐ)。溢れ補正は $effect が行う。
+    // Place it near the cursor even before the measured clamp ($effect) (prevents a brief flicker
+    // to the previous position or the top left on first display). The $effect handles overflow correction.
     tipX = e.clientX + TIP_MARGIN;
     tipY = e.clientY + TIP_MARGIN;
   };
@@ -161,12 +249,12 @@
     hovered = null;
   };
 
-  // アンカー位置とレンダリング済みツールチップの実寸法から、ビューポート内に
-  // 収まる表示位置を決める。カーソルの右下に出し、右端・下端で溢れる場合は
-  // 左側・上側へ反転させる。長い値 (SQLite パスや description) で折り返して
-  // 高さ/幅が変わっても、実測サイズを使うので確実に画面内へ収まる。
+  // From the anchor position and the real dimensions of the rendered tooltip, decide a display
+  // position that fits in the viewport. Show it at the lower right of the cursor, and flip to the
+  // left / upper side when it would overflow the right / bottom edge. Even if a long value (SQLite
+  // path or description) wraps and changes the height/width, the measured size is used, so it always fits on screen.
   $effect(() => {
-    // hovered / anchor / tipEl を依存に取る (tipEl 確定後に再実行される)
+    // Depend on hovered / anchor / tipEl (re-runs once tipEl is set)
     if (!hovered || !tipEl) return;
     const w = tipEl.offsetWidth;
     const h = tipEl.offsetHeight;
@@ -200,9 +288,39 @@
     {#if appStore.loadingConnections}
       <p class="px-3 py-2 text-xs text-zinc-500">Loading...</p>
     {:else if appStore.connections.length === 0}
-      <p class="px-3 py-2 text-xs text-zinc-500">
-        No connections. Review your config file.
-      </p>
+      <div class="flex flex-col gap-2 px-3 py-3 text-xs text-zinc-400">
+        <p>No connections yet.</p>
+        <p class="text-zinc-500">
+          Open a SQLite / DuckDB file to try it right away, or add servers to
+          config.yml.
+        </p>
+        <button
+          class="flex items-center gap-1.5 rounded bg-blue-600 px-2 py-1.5 text-left text-xs text-white hover:bg-blue-500 disabled:opacity-50"
+          data-annotate="button-empty-open-db-file"
+          disabled={addingFile}
+          onclick={() => void openDatabaseFile()}
+        >
+          <i class="bi bi-folder2-open" aria-hidden="true"></i>
+          Open SQLite / DuckDB file…
+        </button>
+        <button
+          class="flex items-center gap-1.5 rounded bg-zinc-700 px-2 py-1.5 text-left text-xs text-zinc-200 hover:bg-zinc-600"
+          data-annotate="button-empty-edit-config"
+          onclick={onEditConfig}
+        >
+          <i class="bi bi-pencil-square" aria-hidden="true"></i>
+          Edit config.yml
+        </button>
+        <p class="text-zinc-500">
+          See
+          <button
+            class="text-blue-400 underline hover:text-blue-300"
+            data-annotate="link-empty-settings-doc"
+            onclick={openSettingsDoc}>docs/settings.md</button
+          >
+          for the config format (MySQL, PostgreSQL, SSH tunnels, and more).
+        </p>
+      </div>
     {:else}
       {#each sections as section, sectionIndex (sectionIndex)}
         {#if section.group !== null}
@@ -247,9 +365,9 @@
                 >
               {/if}
               {#if connection.sql_ssl_mode}
-                <!-- 画面には出さない。詳細ツールチップは mouseenter でしか開かない
-                     ため、バッヂを消すとキーボード / スクリーンリーダーからは TLS の
-                     状態を知る手段が無くなる。警告ではなく値そのものを読ませる。 -->
+                <!-- Not shown on screen. The detail tooltip opens only on mouseenter,
+                     so removing the badge would leave keyboard / screen reader users no way to learn the
+                     TLS state. Have them read the value itself, not a warning. -->
                 <span class="sr-only">TLS: {connection.sql_ssl_mode}</span>
               {/if}
             </span>

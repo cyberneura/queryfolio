@@ -1,41 +1,45 @@
-/// 行単位の 3-way マージ (diff3 相当)。クエリファイルが外部で変更された時に、
-/// 手元の未保存編集 (local) と外部の変更 (remote) を共通の元 (base) を基準に
-/// 突き合わせ、変更が別々の行に及んでいれば自動マージし、同じ行を双方が
-/// 別々に変更した場合のみ conflict=true として返す。
+/// Line-based 3-way merge (equivalent to diff3). When a query file is changed externally,
+/// this compares the local unsaved edits (local) with the external changes (remote) against
+/// their common ancestor (base). Changes on different lines are merged automatically, and
+/// conflict=true is returned only when both sides changed the same line differently.
 ///
-/// 純粋関数 (Tauri 非依存) なので単体で検証できる。SQL ファイルは小さいため
-/// LCS は素朴な O(n*m) DP で十分。
+/// It is a pure function (independent of Tauri), so it can be verified in isolation. SQL files
+/// are small, so a naive O(n*m) DP is enough for the LCS.
 
 export interface Merge3Result {
-  /// マージ結果テキスト。conflict=true の時は「片側を選んだだけ」の中途半端な
-  /// 内容になり得るので、呼び出し側は使わないこと。
+  /// The merged text. When conflict=true it may be a half-baked result that merely picks one
+  /// side, so callers must not use it.
   merged: string;
-  /// 同じ領域を local と remote が別々に変更したため自動マージできなかった。
+  /// local and remote changed the same region differently, so it could not be merged
+  /// automatically.
   conflict: boolean;
 }
 
-/// LCS が O(n*m) のため、この行数を超えるファイルはマージを試みず衝突扱いにする
-/// (メインスレッドの長時間停止・巨大な DP 配列によるメモリ圧迫を避ける)。
-/// これを超えるのは通常のクエリファイルでは考えにくく、超えた場合は手動解決に委ねる。
+/// The LCS is O(n*m), so files with more lines than this are not merged and are treated as a
+/// conflict (to avoid long main-thread stalls and memory pressure from a huge DP array).
+/// Normal query files are unlikely to exceed this; if one does, it is left to manual
+/// resolution.
 const MAX_MERGE_LINES = 20000;
 
-/// DP 表は (n+1)*(m+1) のセルを確保するため、行数だけでなく面積 (base×side) でも
-/// 上限を設ける。MAX_MERGE_LINES 単独では base も side も 20000 行のとき約 4 億
-/// セルまで許してしまい、確保時点で UI スレッドを固まらせる/クラッシュさせ得るため。
-/// 4,000,000 セル (例: 2000×2000) を超える組み合わせはマージを諦め衝突扱いにする。
+/// The DP table allocates (n+1)*(m+1) cells, so cap the area (base×side) as well as the line
+/// count. MAX_MERGE_LINES alone would allow about 400 million cells when both base and side
+/// have 20000 lines, which could freeze or crash the UI thread at allocation time.
+/// Combinations above 4,000,000 cells (e.g. 2000×2000) give up on merging and are treated as
+/// a conflict.
 const MAX_MERGE_CELLS = 4_000_000;
 
-/// text を行配列へ分解する。join("\n") で元に戻せる可逆な分割にするため
-/// split("\n") を使う ("a\nb" -> ["a","b"], "a\nb\n" -> ["a","b",""]).
+/// Split text into an array of lines. Uses split("\n") so the split is reversible via
+/// join("\n") ("a\nb" -> ["a","b"], "a\nb\n" -> ["a","b",""]).
 function splitLines(text: string): string[] {
   return text.split("\n");
 }
 
-/// base と other の最長共通部分列に含まれる添字ペア (増加順) を返す。
+/// Return the index pairs (in increasing order) that belong to the longest common
+/// subsequence of base and other.
 function lcsPairs(base: string[], other: string[]): Array<[number, number]> {
   const n = base.length;
   const m = other.length;
-  // dp[i][j] = base[i:] と other[j:] の LCS 長
+  // dp[i][j] = LCS length of base[i:] and other[j:]
   const dp: number[][] = Array.from({ length: n + 1 }, () =>
     new Array<number>(m + 1).fill(0),
   );
@@ -65,15 +69,16 @@ function lcsPairs(base: string[], other: string[]): Array<[number, number]> {
 }
 
 interface DiffRegion {
-  /// base 側で変更された範囲 [oStart, oStart+oLen)
+  /// Range changed on the base side: [oStart, oStart+oLen)
   oStart: number;
   oLen: number;
-  /// other 側の対応する範囲 [tStart, tStart+tLen)
+  /// Corresponding range on the other side: [tStart, tStart+tLen)
   tStart: number;
   tLen: number;
 }
 
-/// base から other への変更領域 (共通部分に挟まれた差分ブロック) を返す。
+/// Return the regions changed from base to other (diff blocks sandwiched between common
+/// parts).
 function diffRegions(base: string[], other: string[]): DiffRegion[] {
   const pairs = lcsPairs(base, other);
   const regions: DiffRegion[] = [];
@@ -100,13 +105,13 @@ function diffRegions(base: string[], other: string[]): DiffRegion[] {
 interface Hunk {
   oStart: number;
   oLen: number;
-  /// 0 = local(A), 2 = remote(B) (diff3 の慣習に合わせる)
+  /// 0 = local(A), 2 = remote(B) (follows the diff3 convention)
   side: 0 | 2;
   sideStart: number;
   sideLen: number;
 }
 
-/// base を共通の元として local と remote を 3-way マージする。
+/// 3-way merge local and remote using base as the common ancestor.
 export function merge3(
   baseText: string,
   localText: string,
@@ -116,9 +121,9 @@ export function merge3(
   const local = splitLines(localText);
   const remote = splitLines(remoteText);
 
-  // 巨大なファイルは自動マージを諦め衝突扱いにする (呼び出し側が警告する)。
-  // 行数上限に加え、DP 表の面積 (base×local / base×remote) でも制限し、
-  // 巨大な二次元配列の確保でメインスレッドを固まらせないようにする。
+  // Give up on automatic merging for huge files and treat them as a conflict (the caller
+  // warns). In addition to the line cap, limit the DP table area (base×local / base×remote)
+  // so allocating a huge 2D array does not freeze the main thread.
   if (
     base.length > MAX_MERGE_LINES ||
     local.length > MAX_MERGE_LINES ||
@@ -129,7 +134,7 @@ export function merge3(
     return { merged: localText, conflict: true };
   }
 
-  // base に対する両側の変更領域を hunk として集め、base 座標順に並べる。
+  // Collect both sides' changed regions relative to base as hunks, ordered by base position.
   const hunks: Hunk[] = [];
   for (const r of diffRegions(base, local)) {
     hunks.push({
@@ -153,15 +158,16 @@ export function merge3(
 
   const out: string[] = [];
   let conflict = false;
-  let cursor = 0; // 未出力の base 位置
+  let cursor = 0; // next base position not yet output
 
   let k = 0;
   while (k < hunks.length) {
-    // base 座標で重なり合う hunk 群を 1 つの領域にまとめる。端点で接するだけ
-    // (隣接する別々の行への変更) は重なりとみなさず別領域として扱う (< で判定)。
-    // ただし同じ点への挿入 (oLen=0 同士が同じ oStart) は < では捕まらないので、
-    // 開始位置が同一の hunk も同一領域に含める (双方が同じ箇所へ別内容を挿入した
-    // ケースを衝突として検出するため)。
+    // Group hunks that overlap in base coordinates into a single region. Hunks that merely
+    // touch at an endpoint (changes to adjacent, separate lines) are not treated as
+    // overlapping and form separate regions (decided with <). However, insertions at the
+    // same point (oLen=0 with the same oStart) are not caught by <, so hunks with the same
+    // start position are also included in the same region (to detect the case where both
+    // sides insert different content at the same place as a conflict).
     const regionStart = hunks[k].oStart;
     let regionEnd = hunks[k].oStart + hunks[k].oLen;
     const group: Hunk[] = [hunks[k]];
@@ -175,14 +181,15 @@ export function merge3(
       k++;
     }
 
-    // 領域より前の未変更 base をそのまま出力する。
+    // Output the unchanged base before the region as is.
     if (regionStart > cursor) {
       for (let i = cursor; i < regionStart; i++) out.push(base[i]);
     }
 
-    // 各側の、領域 [regionStart, regionEnd) に対応する内容を復元する。
-    // 側の hunk が無ければ base のまま。hunk があれば、変更ブロックの前後の
-    // 一致行は base と 1:1 対応する性質を使い、side 座標へ換算する。
+    // Reconstruct each side's content for the region [regionStart, regionEnd). If the side
+    // has no hunk, it is the same as base. If it has hunks, convert to side coordinates using
+    // the property that the matching lines before and after a changed block correspond 1:1
+    // with base.
     const sideContent = (side: 0 | 2, src: string[]): string[] => {
       const parts = group.filter((h) => h.side === side);
       if (parts.length === 0) {
@@ -198,8 +205,8 @@ export function merge3(
         sMin = Math.min(sMin, h.sideStart);
         sMax = Math.max(sMax, h.sideStart + h.sideLen);
       }
-      const lead = oMin - regionStart; // 領域先頭〜変更開始の一致行数
-      const trail = regionEnd - oMax; // 変更終端〜領域末尾の一致行数
+      const lead = oMin - regionStart; // number of matching lines from the region start to the change start
+      const trail = regionEnd - oMax; // number of matching lines from the change end to the region end
       return src.slice(sMin - lead, sMax + trail);
     };
 
@@ -210,10 +217,10 @@ export function merge3(
 
     if (hasA && hasB) {
       if (aContent.join("\n") === bContent.join("\n")) {
-        // 双方が同じ変更 → どちらでもよい
+        // Both sides made the same change -> either one will do
         for (const line of aContent) out.push(line);
       } else {
-        // 同じ領域を別々に変更 → コンフリクト。呼び出し側は merged を使わない。
+        // Same region changed differently -> conflict. The caller must not use merged.
         conflict = true;
         for (const line of aContent) out.push(line);
       }
@@ -225,7 +232,7 @@ export function merge3(
     cursor = regionEnd;
   }
 
-  // 残りの未変更 base を出力する。
+  // Output the remaining unchanged base.
   for (let i = cursor; i < base.length; i++) out.push(base[i]);
 
   return { merged: out.join("\n"), conflict };

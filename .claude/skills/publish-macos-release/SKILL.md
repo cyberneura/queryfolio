@@ -41,7 +41,7 @@ pnpm release major     # 0.1.0 -> 1.0.0
    (リリースを始めるのは push であってスクリプトではない)
 
 ワークフローは `draft` ジョブで `v<version>` の **draft** Release を 1 つ用意し、matrix で
-macOS (universal dmg / Developer ID 署名 + 公証 + staple) と Windows (NSIS exe / 署名なし) を
+macOS (universal dmg / .app と dmg の両方を Developer ID 署名 + 公証 + staple) と Windows (NSIS exe / 署名なし) を
 並列ビルドしてその draft にアップロードする。全プラットフォームが成功すると `publish` ジョブが
 公開直前にリリース判定をやり直し、draft を公開する (tag はその run の commit に作られる)。
 所要 15〜25 分程度。
@@ -58,7 +58,10 @@ DMG を落として署名・公証・universal を実機確認する:
 ```shell
 VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
 gh release download "v${VERSION}" --pattern '*.dmg' --dir /tmp/qf-release --clobber
-hdiutil attach -nobrowse -quiet /tmp/qf-release/Queryfolio_${VERSION}_universal.dmg
+DMG=/tmp/qf-release/Queryfolio_${VERSION}_universal.dmg
+spctl -a -vv -t open --context context:primary-signature "$DMG"   # → accepted / source=Notarized Developer ID
+xcrun stapler validate "$DMG"        # → The validate action worked!
+hdiutil attach -nobrowse -quiet "$DMG"
 APP=/Volumes/Queryfolio/Queryfolio.app
 codesign -dv --verbose=2 "$APP"      # Authority=Developer ID Application: Cyberneura K.K. (2YN5TLNQ9J) / flags=...runtime
 spctl -a -vvv "$APP"                 # → accepted / source=Notarized Developer ID
@@ -114,8 +117,10 @@ printf '2YN5TLNQ9J' | gh secret set APPLE_TEAM_ID
   で確認し、不要な方を `gh api -X DELETE repos/cyberneura/queryfolio/releases/<id>` で消して再実行する。
 - **push したのにリリースされない (plan が release=false)** → その version が公開済みか、
   公開中の最新より古い。plan ジョブのログに理由が出る。
-- **`spctl` が `source=Developer ID` (Notarized でない)** → 公証が走っていない。macOS ジョブのログで
-  tauri-action の notarize ステップを確認し、`APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` を疑う。
+- **`spctl` が `source=Developer ID` / `Unnotarized Developer ID` (Notarized でない)** → 公証が走っていない。
+  .app なら macOS ジョブの "Build" ステップ (tauri CLI の notarize)、dmg なら "Notarize the dmg"
+  ステップのログ (`notarytool` の結果と、Invalid の時の `notarytool log`) を確認し、
+  `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` を疑う。
   app 用パスワードは通常の Apple ID パスワードでは代用できない。
 - **macOS ジョブが署名で失敗する** → `APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` 未設定か、
   `.p12` に秘密鍵が入っていない。"Import Apple Developer certificate" ステップの
