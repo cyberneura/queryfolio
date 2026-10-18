@@ -219,6 +219,18 @@ Grab the latest installer from the [Releases page](https://github.com/cyberneura
 - **Windows**: `Queryfolio_<version>_x64-setup.exe` (NSIS installer). It is *not* code signed,
   so SmartScreen shows "Windows protected your PC" — choose **More info › Run anyway**.
 
+### Updating
+
+**Check for Updates…** (in the application menu on macOS, the Help menu on Windows) asks GitHub
+for the latest release and tells you whether a newer version is out. Nothing is checked in the
+background: Queryfolio contacts GitHub (`api.github.com`, sending only your IP address and a
+User-Agent) only when you pick the menu item.
+
+- Installed with Homebrew: **Update with Homebrew** runs `brew upgrade --cask queryfolio` and
+  offers to restart. The tap follows new releases within an hour, so right after a release
+  brew may not see it yet.
+- Otherwise: **Open Release Page** opens the Releases page to download the new installer.
+
 ## Release
 
 Releases are built on GitHub Actions (`.github/workflows/release.yml`) and published as a
