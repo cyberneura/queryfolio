@@ -1572,11 +1572,16 @@ async fn run_ai_chat(
                                             // Merely dropping the future does not stop engines that run via spawn_blocking
                                             // (DuckDB). At this point registration should be done, so request the
                                             // engine-specific cancellation (DuckDB's InterruptHandle etc.)
-                                            // again and then stop waiting
-                                            let _ = state
-                                                .query_cancels
-                                                .cancel(&cancel_key)
-                                                .await;
+                                            // again and then stop waiting. Through the password refresh:
+                                            // dropping the future does not stop a Postgres / MySQL
+                                            // query either, and an expired token would reject the
+                                            // cancellation's connection
+                                            let _ = cancel_with_password_refresh(
+                                                &state,
+                                                &server.name,
+                                                cancel_key,
+                                            )
+                                            .await;
                                             break Err(AppError::Cancelled);
                                         }
                                     }
