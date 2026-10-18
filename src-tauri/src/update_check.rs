@@ -269,11 +269,17 @@ async fn run(app: &AppHandle) {
 async fn upgrade_with_brew(app: &AppHandle, brew: PathBuf, newer: String) {
     let result = tauri::async_runtime::spawn_blocking(move || {
         // brew refreshes the tap only when its last update is older than
-        // HOMEBREW_AUTO_UPDATE_SECS (a day by default); 0 makes it look at the tap now
+        // HOMEBREW_AUTO_UPDATE_SECS (a day by default); 0 makes it look at the tap now.
+        // brew quits running cask apps before upgrading them, which would kill this process
+        // before it can verify the result and offer the restart; HOMEBREW_NO_UPGRADE_QUIT_CASKS
+        // (= --no-quit, as a variable for the same reason as HOMEBREW_NO_ASK) prevents that
         run_brew(
             &brew,
             &["upgrade", "--cask", CASK],
-            &[("HOMEBREW_AUTO_UPDATE_SECS", "0")],
+            &[
+                ("HOMEBREW_AUTO_UPDATE_SECS", "0"),
+                ("HOMEBREW_NO_UPGRADE_QUIT_CASKS", "1"),
+            ],
         )?;
         // A successful upgrade does not mean the new version is in: when the tap has not
         // picked up the release yet, brew skips the cask as already up to date
