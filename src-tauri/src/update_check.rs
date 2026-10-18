@@ -139,6 +139,10 @@ fn run_brew(brew: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String,
         .args(args)
         .envs(envs.iter().copied())
         .env("HOMEBREW_NO_ENV_HINTS", "1")
+        // Homebrew's ask mode (the default in current versions) would prompt for confirmation
+        // and, with stdin closed, abort. The variable is used instead of `--no-ask` because
+        // older brew versions reject unknown flags but ignore unknown variables
+        .env("HOMEBREW_NO_ASK", "1")
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("could not run {}: {e}", brew.display()))?;
