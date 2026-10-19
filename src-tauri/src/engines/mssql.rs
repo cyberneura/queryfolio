@@ -418,21 +418,82 @@ pub async fn run_query_cancellable(
 /// `SET NOCOUNT ON` is not a write, so missing it is fine).
 /// A statement written with a bare column name like `update` is wrongly rejected
 /// (it passes if written in square brackets; it can be lifted with Writable ON + allow_dangerous_statements).
+///
+/// How to choose entries: a T-SQL reserved word that can start a statement without a preceding `;`
+/// and that writes data or changes server / session state. Reserved words cannot appear bare as
+/// column names or aliases, so adding them does not create false positives. Non-reserved words
+/// (`enable` / `disable` of ENABLE/DISABLE TRIGGER, Service Broker's `send` / `receive`) are not
+/// needed: after a SELECT they parse as an alias or require the previous statement to end with `;`,
+/// which contains_multiple_statements already catches. `writetext` / `updatetext` overwrite
+/// text / ntext / image columns through a text pointer (CYBERNEURA-DEV-1060); `reconfigure`,
+/// `checkpoint`, `setuser` and `revert` change server state or the execution context, and
+/// `waitfor` can wrap RECEIVE (`WAITFOR (RECEIVE ...)` removes messages from a queue).
+/// `fetch` is not included: it appears in `OFFSET ... FETCH NEXT` within one SELECT.
 const TRAILING_STATEMENT_KEYWORDS: &[&str] = &[
-    "insert", "update", "delete", "merge", "create", "alter", "drop", "truncate", "grant",
-    "revoke", "deny", "exec", "execute", "declare", "use", "begin", "commit", "rollback", "save",
-    "backup", "restore", "bulk", "kill", "go", "dbcc", "shutdown",
+    "insert",
+    "update",
+    "delete",
+    "merge",
+    "create",
+    "alter",
+    "drop",
+    "truncate",
+    "grant",
+    "revoke",
+    "deny",
+    "exec",
+    "execute",
+    "declare",
+    "use",
+    "begin",
+    "commit",
+    "rollback",
+    "save",
+    "backup",
+    "restore",
+    "bulk",
+    "kill",
+    "go",
+    "dbcc",
+    "shutdown",
+    "writetext",
+    "updatetext",
+    "reconfigure",
+    "checkpoint",
+    "setuser",
+    "revert",
+    "waitfor",
 ];
 
 /// Whether another statement starts after the first one (a multi-statement batch with no semicolon).
 /// The check uses word boundaries on cleaned, where literals, comments and brackets are blanked.
+/// `@` is part of a word so that variables named after a keyword (`@update`, `@revert`) are not counted.
+/// The T-SQL lexer ends a number literal where its grammar ends, so `SELECT 1DROP TABLE t` /
+/// `SELECT 0xINSERT INTO t ...` run as two statements; the literal prefix is stripped before matching.
 fn contains_trailing_statement(sql: &str) -> bool {
     let cleaned = scan_sql(sql, Engine::MsSql).cleaned;
     cleaned
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '#')
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '#' && c != '@')
         .filter(|w| !w.is_empty())
         .skip(1)
-        .any(|word| TRAILING_STATEMENT_KEYWORDS.contains(&word))
+        .any(|word| TRAILING_STATEMENT_KEYWORDS.contains(&strip_number_literal(word)))
+}
+
+/// Strips a leading number literal from a word: `0x` + hex digits, or digits + an optional exponent
+/// (`1e5`; a signed exponent is already split at `+` / `-`, and a decimal point at `.`).
+/// Words that do not start with a digit are returned as they are.
+fn strip_number_literal(word: &str) -> &str {
+    if !word.starts_with(|c: char| c.is_ascii_digit()) {
+        return word;
+    }
+    if let Some(hex) = word.strip_prefix("0x") {
+        return hex.trim_start_matches(|c: char| c.is_ascii_hexdigit());
+    }
+    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    match rest.strip_prefix('e') {
+        Some(exp) => exp.trim_start_matches(|c: char| c.is_ascii_digit()),
+        None => rest,
+    }
 }
 
 /// If `EXPLAIN <sql>`, returns the target SQL (leading comments are not kept).
@@ -1186,6 +1247,20 @@ mod tests {
             "SELECT 1 EXEC sp_who",
             "select 1 go",
             "SELECT 1\nDECLARE @x INT",
+            // Overwrites a text / ntext / image column through a text pointer (CYBERNEURA-DEV-1060)
+            "SELECT 1 WRITETEXT t.c 0x00 'x'",
+            "SELECT 1\nUPDATETEXT t.c 0x00 0 NULL 'x'",
+            "SELECT 1 RECONFIGURE",
+            "SELECT 1\nCHECKPOINT",
+            "SELECT 1 SETUSER 'dbo'",
+            "SELECT 1 REVERT",
+            "SELECT 1\nWAITFOR (RECEIVE TOP (1) * FROM dbo.q), TIMEOUT 0",
+            // A number literal ends where its grammar ends, so a keyword glued to it starts a statement
+            "SELECT 1DROP TABLE t",
+            "SELECT 0xINSERT INTO t VALUES (1)",
+            "SELECT 0x00WRITETEXT t.c 0x00 'x'",
+            "SELECT 1.5UPDATE t SET x = 1",
+            "SELECT 1e5DELETE FROM t",
         ] {
             assert!(contains_trailing_statement(sql), "{sql}");
         }
@@ -1197,6 +1272,15 @@ mod tests {
             "SELECT 'drop table t' FROM t",
             "SELECT 1 -- drop table t",
             "SELECT [drop] FROM [update]",
+            "SELECT [writetext], [updatetext] FROM t",
+            "SELECT 'writetext t.c 0x00 x', N'UPDATETEXT' FROM t",
+            "SELECT 1 /* reconfigure */",
+            "SELECT \"checkpoint\" FROM t",
+            "SELECT * FROM t ORDER BY id OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY",
+            // Variables may be named after reserved words
+            "SELECT @update, @revert, @@ROWCOUNT",
+            "SELECT * FROM t WHERE x = @checkpoint",
+            "SELECT 1e5, 0x1F, 2AS x FROM t1",
             "SELECT created, updated_at FROM t",
             // The leading word itself is not counted
             "DELETE FROM t WHERE id = 1",
