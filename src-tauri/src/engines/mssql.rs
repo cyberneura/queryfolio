@@ -471,33 +471,36 @@ const TRAILING_STATEMENT_KEYWORDS: &[&str] = &[
 /// a keyword inside an identifier (`foo$checkpoint`, `@update`, a non-ASCII prefix) is not counted.
 /// The T-SQL lexer ends a number literal where its grammar ends, so `SELECT 1DROP TABLE t` /
 /// `SELECT 0xINSERT INTO t ...` / `SELECT $1DROP TABLE t` run as two statements; the literal
-/// prefix is stripped before matching.
+/// prefix is stripped before matching (is_trailing_keyword).
 fn contains_trailing_statement(sql: &str) -> bool {
     let cleaned = scan_sql(sql, Engine::MsSql).cleaned;
     cleaned
         .split(|c: char| !c.is_alphanumeric() && !matches!(c, '_' | '#' | '@' | '$'))
         .filter(|w| !w.is_empty())
         .skip(1)
-        .any(|word| TRAILING_STATEMENT_KEYWORDS.contains(&strip_number_literal(word)))
+        .any(is_trailing_keyword)
 }
 
-/// Strips a leading number literal from a word: an optional money sign `$` (an identifier cannot
-/// start with it), then `0x` + hex digits, or digits + an optional exponent (`1e5`; a signed
-/// exponent is already split at `+` / `-`, and a decimal point at `.`).
-/// Words that start with neither `$` nor a digit are returned as they are.
-fn strip_number_literal(word: &str) -> &str {
+/// Whether a word is a trailing statement keyword, after stripping a leading number literal: an
+/// optional money sign `$` (an identifier cannot start with it), then `0x` + hex digits, or digits +
+/// an optional exponent (a signed exponent is already split at `+` / `-`, and a decimal point at `.`).
+/// Whether the lexer takes an `e` with no digits after it as an empty exponent (`1EXEC` = `1E` + `XEC`)
+/// or ends the number before it (`1` + `EXEC`) is not something we rely on: both readings are checked,
+/// and a match in either one counts (fail closed).
+fn is_trailing_keyword(word: &str) -> bool {
+    let is_keyword = |w: &str| TRAILING_STATEMENT_KEYWORDS.contains(&w);
     let word = word.strip_prefix('$').unwrap_or(word);
     if !word.starts_with(|c: char| c.is_ascii_digit()) {
-        return word;
+        return is_keyword(word);
     }
     if let Some(hex) = word.strip_prefix("0x") {
-        return hex.trim_start_matches(|c: char| c.is_ascii_hexdigit());
+        return is_keyword(hex.trim_start_matches(|c: char| c.is_ascii_hexdigit()));
     }
     let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
-    match rest.strip_prefix('e') {
-        Some(exp) => exp.trim_start_matches(|c: char| c.is_ascii_digit()),
-        None => rest,
-    }
+    is_keyword(rest)
+        || rest
+            .strip_prefix('e')
+            .is_some_and(|exp| is_keyword(exp.trim_start_matches(|c: char| c.is_ascii_digit())))
 }
 
 /// If `EXPLAIN <sql>`, returns the target SQL (leading comments are not kept).
@@ -1265,6 +1268,8 @@ mod tests {
             "SELECT 0x00WRITETEXT t.c 0x00 'x'",
             "SELECT 1.5UPDATE t SET x = 1",
             "SELECT 1e5DELETE FROM t",
+            "SELECT 1EXEC dbo.write_proc",
+            "SELECT 1EDELETE FROM t",
             "SELECT $1DROP TABLE t",
             "SELECT $DROP TABLE t",
         ] {
