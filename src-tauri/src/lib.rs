@@ -382,8 +382,12 @@ impl AppState {
         if mysql_without_database(server, schema_key) {
             return Ok(Default::default());
         }
-        let pool = self.db.get_pool(server).await?;
-        let all = schema_info::fetch_all_columns(&pool).await?;
+        let all = self
+            .db
+            .with_pool(server, db::PasswordRetry::Idempotent, |pool| async move {
+                schema_info::fetch_all_columns(&pool).await
+            })
+            .await?;
         let map = all
             .iter()
             .map(|(table, columns)| {
@@ -541,18 +545,24 @@ async fn run_query(
         {
             return switch_active_schema(&state, &server, schema, started).await;
         }
-        let pool: DbPool = state.db.get_pool(&server).await?;
-        db::run_query_cancellable(
-            &pool,
-            &state.query_cancels,
-            &connection,
-            &sql,
-            max_rows,
-            auto_limit,
-            readonly_guard,
-            server.allow_dangerous_statements,
-        )
-        .await
+        let (cancels, connection, sql) = (&state.query_cancels, &connection, &sql);
+        let allow_dangerous = server.allow_dangerous_statements;
+        state
+            .db
+            .with_pool(&server, db::PasswordRetry::BeforeStatement, |pool: DbPool| async move {
+                db::run_query_cancellable(
+                    &pool,
+                    cancels,
+                    connection,
+                    sql,
+                    max_rows,
+                    auto_limit,
+                    readonly_guard,
+                    allow_dangerous,
+                )
+                .await
+            })
+            .await
     }
     .await;
 
@@ -681,7 +691,32 @@ async fn cancel_query(
     state: tauri::State<'_, AppState>,
     connection: String,
 ) -> Result<bool, AppError> {
-    state.query_cancels.cancel(&connection).await
+    cancel_with_password_refresh(&state, &connection, &connection).await
+}
+
+/// Cancels the query registered under `key` on `connection`. Postgres / MySQL cancel from another
+/// connection of the pool, which a token that expired while the query ran would get rejected,
+/// so a password_command connection refreshes the password of that query's pool and tries
+/// again. The retry is pinned to the same registration: the helper can take a while (a prompt),
+/// and a query started meanwhile must not be cancelled by it
+async fn cancel_with_password_refresh(
+    state: &AppState,
+    connection: &str,
+    key: &str,
+) -> Result<bool, AppError> {
+    let Some((id, pool)) = state.query_cancels.registration(key) else {
+        return Ok(false);
+    };
+    let cancel = |_: DbPool| state.query_cancels.cancel_registration(key, id);
+    match (pool, state.find_server(connection).await) {
+        (Some(pool), Ok(server)) => {
+            state
+                .db
+                .run_with_password_refresh(&server, pool, db::PasswordRetry::Idempotent, cancel)
+                .await
+        }
+        _ => state.query_cancels.cancel_registration(key, id).await,
+    }
 }
 
 /// Aborts the agent round trip of the AI chat.
@@ -707,10 +742,12 @@ async fn cancel_ai_chat(
     let mut cancelled_query = false;
     let mut first_error: Option<AppError> = None;
     for request_id in &request_ids {
-        match state
-            .query_cancels
-            .cancel(&chat_cancel_key(&connection, request_id))
-            .await
+        match cancel_with_password_refresh(
+            &state,
+            &connection,
+            &chat_cancel_key(&connection, request_id),
+        )
+        .await
         {
             Ok(true) => cancelled_query = true,
             Ok(false) => {}
@@ -935,8 +972,13 @@ async fn list_schemas(
     connection: String,
 ) -> Result<Vec<String>, AppError> {
     let server = state.find_server(&connection).await?;
-    let pool = state.db.get_pool(&server).await?;
-    db::list_schemas(&pool, &server).await
+    let server = &server;
+    state
+        .db
+        .with_pool(server, db::PasswordRetry::Idempotent, |pool| async move {
+            db::list_schemas(&pool, server).await
+        })
+        .await
 }
 
 /// Switches the connection's active schema (database).
@@ -1019,8 +1061,12 @@ async fn list_tables(
     if mysql_without_database(&server, &schema_key) {
         return Ok(vec![]);
     }
-    let pool = state.db.get_pool(&server).await?;
-    let tables = schema_info::fetch_tables(&pool).await?;
+    let tables = state
+        .db
+        .with_pool(&server, db::PasswordRetry::Idempotent, |pool| async move {
+            schema_info::fetch_tables(&pool).await
+        })
+        .await?;
     state
         .schema_cache
         .put_tables(&connection, &schema_key, &tables)
@@ -1045,8 +1091,13 @@ async fn list_columns(
     {
         return Ok(columns);
     }
-    let pool = state.db.get_pool(&server).await?;
-    let columns = schema_info::fetch_columns(&pool, &table).await?;
+    let table_name = &table;
+    let columns = state
+        .db
+        .with_pool(&server, db::PasswordRetry::Idempotent, |pool| async move {
+            schema_info::fetch_columns(&pool, table_name).await
+        })
+        .await?;
     state
         .schema_cache
         .put_columns(&connection, &schema_key, &table, &columns)
@@ -1075,8 +1126,13 @@ async fn get_primary_keys(
     table: String,
 ) -> Result<Vec<String>, AppError> {
     let server = state.find_server(&connection).await?;
-    let pool = state.db.get_pool(&server).await?;
-    schema_info::fetch_primary_keys(&pool, &table).await
+    let table = &table;
+    state
+        .db
+        .with_pool(&server, db::PasswordRetry::Idempotent, |pool| async move {
+            schema_info::fetch_primary_keys(&pool, table).await
+        })
+        .await
 }
 
 /// Applies cell edits in the result grid as a group of UPDATEs in one transaction.
@@ -1097,14 +1153,13 @@ async fn run_statements(
     } else {
         db::ReadonlyGuard::Switch
     };
-    let pool = state.db.get_pool(&server).await?;
-    db::run_statements(
-        &pool,
-        &statements,
-        readonly_guard,
-        server.allow_dangerous_statements,
-    )
-    .await
+    let (statements, allow_dangerous) = (&statements, server.allow_dangerous_statements);
+    state
+        .db
+        .with_pool(&server, db::PasswordRetry::BeforeStatement, |pool| async move {
+            db::run_statements(&pool, statements, readonly_guard, allow_dangerous).await
+        })
+        .await
 }
 
 /// Returns information on the AI config (configured / model). Does not include the api_key.
@@ -1483,16 +1538,26 @@ async fn run_ai_chat(
                             // has no effect. Watch for it ourselves by polling, and when aborted, drop the query's
                             // future and stop waiting (the server side stops if it is registered, and if not it is
                             // a client-side cutoff)
-                            let query = db::run_query_cancellable(
-                                &pool,
-                                &state.query_cancels,
-                                &cancel_key,
-                                &sql,
-                                ai::CHAT_TOOL_MAX_ROWS,
-                                None,
-                                readonly_guard,
-                                // Do not permit dangerous statements for the agent either
-                                false,
+                            let (cancels, cancel_key, sql) =
+                                (&state.query_cancels, &cancel_key, &sql);
+                            let query = state.db.run_with_password_refresh(
+                                &server,
+                                pool,
+                                db::PasswordRetry::BeforeStatement,
+                                |pool| async move {
+                                    db::run_query_cancellable(
+                                        &pool,
+                                        cancels,
+                                        cancel_key,
+                                        sql,
+                                        ai::CHAT_TOOL_MAX_ROWS,
+                                        None,
+                                        readonly_guard,
+                                        // Do not permit dangerous statements for the agent either
+                                        false,
+                                    )
+                                    .await
+                                },
                             );
                             tokio::pin!(query);
                             loop {
@@ -1508,11 +1573,16 @@ async fn run_ai_chat(
                                             // Merely dropping the future does not stop engines that run via spawn_blocking
                                             // (DuckDB). At this point registration should be done, so request the
                                             // engine-specific cancellation (DuckDB's InterruptHandle etc.)
-                                            // again and then stop waiting
-                                            let _ = state
-                                                .query_cancels
-                                                .cancel(&cancel_key)
-                                                .await;
+                                            // again and then stop waiting. Through the password refresh:
+                                            // dropping the future does not stop a Postgres / MySQL
+                                            // query either, and an expired token would reject the
+                                            // cancellation's connection
+                                            let _ = cancel_with_password_refresh(
+                                                &state,
+                                                &server.name,
+                                                cancel_key,
+                                            )
+                                            .await;
                                             break Err(AppError::Cancelled);
                                         }
                                     }

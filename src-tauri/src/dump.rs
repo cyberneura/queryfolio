@@ -575,6 +575,11 @@ fn pg_table_pattern(table: &DumpTable) -> String {
     }
 }
 
+/// Whether the dump will be given a password (password_command is run only when dumping)
+fn has_password(server: &ServerConfig) -> bool {
+    server.password.is_some() || server.password_command.is_some()
+}
+
 /// Contents of the option file given to mysqldump: the password, if any.
 /// Inside double quotes the option file format recognizes backslash escapes.
 fn mysql_option_file_contents(password: Option<&str>) -> String {
@@ -748,7 +753,7 @@ pub fn preview_command(
     }
     let database = resolve_database(request, active_schema);
     let placeholder = (tool == DumpTool::Mysqldump).then(|| {
-        PathBuf::from(if server.password.is_some() {
+        PathBuf::from(if has_password(server) {
             "<temporary file with the password>"
         } else {
             "<temporary empty option file>"
@@ -767,7 +772,7 @@ pub fn preview_command(
         .iter()
         .map(|(k, v)| format!("{k}={}", shell_quote(v)))
         .collect();
-    if tool == DumpTool::PgDump && server.password.is_some() {
+    if tool == DumpTool::PgDump && has_password(server) {
         parts.push("PGPASSWORD=<hidden>".into());
     }
     parts.push(shell_quote(&request.tool_path));
@@ -838,6 +843,24 @@ pub async fn run_dump(
         mariadb,
         None,
     )?;
+
+    // Fetched for every dump: the dump connects on its own, not through the app's pool
+    let with_password;
+    let server = match server.password_command()? {
+        Some(command) => {
+            let mut resolved = server.clone();
+            // A helper waiting on a prompt must stop with the dump (dropping it kills the child)
+            let password = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(AppError::Cancelled),
+                password = crate::config::run_password_command(&server.name, command) => password?,
+            };
+            resolved.password = Some(password);
+            with_password = resolved;
+            &with_password
+        }
+        None => server,
+    };
 
     // A dedicated tunnel that lives exactly as long as this dump
     let mut _tunnel = None;
@@ -1374,6 +1397,88 @@ mod tests {
         // The dump is the database's contents: readable only by the user
         let mode = std::fs::metadata(&output).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn preview_with_password_command_hides_the_command() {
+        // Arrange
+        let mut s = server("postgres");
+        s.password = None;
+        s.password_command = Some("/opt/token-helper --secret-flag".into());
+        let mut req = request();
+        req.tool_path = "/opt/homebrew/opt/libpq/bin/pg_dump".into();
+
+        // Act
+        let line = preview_command(&s, &req, Some("shop"), false).unwrap();
+
+        // Assert
+        assert!(line.contains("PGPASSWORD=<hidden>"), "{line}");
+        assert!(!line.contains("token-helper"), "{line}");
+    }
+
+    /// The dump runs password_command itself and hands its output to the tool
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_dump_passes_the_password_command_output() {
+        use std::os::unix::fs::PermissionsExt;
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("pg_dump");
+        std::fs::write(
+            &tool,
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'pg_dump (PostgreSQL) 16.0'; exit 0; fi\n\
+             echo \"-- pw: $PGPASSWORD\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = dir.path().join("out.sql");
+        let mut req = request();
+        req.tool_path = tool.to_string_lossy().into_owned();
+        req.output_path = output.to_string_lossy().into_owned();
+        let mut s = server("postgres");
+        s.password = None;
+        s.password_command = Some("/bin/echo fresh-token".into());
+
+        // Act
+        run_dump(&s, &req, Some("shop"), CancellationToken::new(), |_| {})
+            .await
+            .unwrap();
+
+        // Assert
+        let text = std::fs::read_to_string(&output).unwrap();
+        assert!(text.contains("-- pw: fresh-token"), "{text}");
+    }
+
+    /// Cancelling while password_command is still running stops the dump right away
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_stops_a_waiting_password_command() {
+        use std::os::unix::fs::PermissionsExt;
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("pg_dump");
+        std::fs::write(&tool, "#!/bin/sh\necho 'pg_dump (PostgreSQL) 16.0'\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut req = request();
+        req.tool_path = tool.to_string_lossy().into_owned();
+        req.output_path = dir.path().join("out.sql").to_string_lossy().into_owned();
+        let mut s = server("postgres");
+        s.password = None;
+        s.password_command = Some("/bin/sleep 30".into());
+        let cancel = CancellationToken::new();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            canceller.cancel();
+        });
+        let started = std::time::Instant::now();
+
+        // Act
+        let err = run_dump(&s, &req, Some("shop"), cancel, |_| {}).await.unwrap_err();
+
+        // Assert
+        assert!(matches!(err, AppError::Cancelled), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[cfg(unix)]

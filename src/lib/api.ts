@@ -53,6 +53,9 @@ export interface ConnectionInfo {
   allow_dangerous_statements: boolean;
   /// Display group name in the connection list (null if not in a group)
   group_name: string | null;
+  /// Whether the password is fetched with password_command (neither the command nor its
+  /// output is passed to the frontend)
+  password_from_command: boolean;
   /// Effective TLS mode of SQL engines (mysql / postgres).
   /// disable / prefer may downgrade to plaintext (prefer is sqlx's default).
   /// null for other engines

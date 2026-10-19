@@ -78,8 +78,12 @@ pub struct QueryResult {
 #[derive(Default)]
 pub struct DbManager {
     inner: tokio::sync::Mutex<DbManagerInner>,
-    /// Per-connection lock held while a pool / tunnel is being established
+    /// Per-connection lock held while a pool / tunnel is being established, and while a
+    /// password_command password is being refreshed
     connecting: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Failed password refreshes per pool, keyed by the pool's current connect options
+    /// (ConnectOptionsSnapshot::key; see refresh_password)
+    password_refresh_failures: std::sync::Mutex<HashMap<usize, u64>>,
 }
 
 #[derive(Default)]
@@ -153,6 +157,10 @@ impl DbManager {
         let connect_lock = self.connect_lock(&server.name);
         let _connecting = connect_lock.lock().await;
 
+        // The output of password_command, fetched at most once per get_pool even when the loop
+        // connects again. It goes only into the cloned ServerConfig (so every engine that reads
+        // server.password works unchanged) and from there into the new pool's connect options
+        let mut password: Option<String> = None;
         loop {
             // Snapshot the state needed to connect, then release `inner` so that
             // other connections are not blocked while this one connects
@@ -173,6 +181,14 @@ impl DbManager {
                 }
                 (server, tunnel_port, generation)
             };
+            let mut server = server;
+            if let Some(command) = server.password_command()? {
+                if password.is_none() {
+                    password =
+                        Some(crate::config::run_password_command(&server.name, command).await?);
+                }
+                server.password = password.clone();
+            }
             let server = &server;
 
             let engine = parse_engine(&server.engine)?;
@@ -260,6 +276,120 @@ impl DbManager {
         }
     }
 
+    /// get_pool + run_with_password_refresh.
+    pub async fn with_pool<T, F, Fut>(
+        &self,
+        server: &ServerConfig,
+        retry: PasswordRetry,
+        op: F,
+    ) -> Result<T, AppError>
+    where
+        F: Fn(DbPool) -> Fut,
+        Fut: std::future::Future<Output = Result<T, AppError>>,
+    {
+        let pool = self.get_pool(server).await?;
+        self.run_with_password_refresh(server, pool, retry, op).await
+    }
+
+    /// Runs `op` on the pool. On a password_command connection (Postgres / MySQL), if it fails
+    /// with an authentication error that `retry` allows, re-runs password_command, gives the new
+    /// password to the pool and runs `op` once more.
+    ///
+    /// sqlx opens later connections with the options the pool was created with, so a pool built
+    /// from a short-lived token (RDS IAM auth: 15 minutes) starts failing on new connections
+    /// while the established ones keep working.
+    ///
+    /// The new password is applied with `Pool::set_connect_options` instead of rebuilding the
+    /// pool, so every copy of the pool (e.g. the one a CancelTarget holds) sees it, established
+    /// connections are kept, and the SSH tunnel is left alone.
+    pub async fn run_with_password_refresh<T, F, Fut>(
+        &self,
+        server: &ServerConfig,
+        pool: DbPool,
+        retry: PasswordRetry,
+        op: F,
+    ) -> Result<T, AppError>
+    where
+        F: Fn(DbPool) -> Fut,
+        Fut: std::future::Future<Output = Result<T, AppError>>,
+    {
+        let refreshable = matches!(pool, DbPool::Postgres(_) | DbPool::MySql(_));
+        if server.password_command.is_none() || !refreshable {
+            return op(pool).await;
+        }
+        let seen = self.refresh_state(&pool);
+        match op(pool.clone()).await {
+            Err(error) if should_refresh_password(retry, &error) => {
+                self.refresh_password(server, &pool, seen, error).await?;
+                op(pool).await
+            }
+            result => result,
+        }
+    }
+
+    /// Re-runs password_command and applies its output to the pool.
+    ///
+    /// Single-flight per pool: operations that hit the expiry together (TABLES pane, completion,
+    /// a query) wait on the connection lock, and only the first one runs the command, so a
+    /// helper that prompts (SSO, Touch ID) prompts once. The others see that the pool was
+    /// refreshed (its connect options were replaced), or that an attempt on it failed, since
+    /// they started, and just retry. Failures count too: otherwise every waiter would run a
+    /// failing helper again (one prompt or one 60-second timeout each).
+    ///
+    /// The state belongs to the pool, not the connection name: an operation can still hold an
+    /// older pool of the connection (dropped by a schema switch / reload), and refreshing that
+    /// one says nothing about the pool another operation is using
+    async fn refresh_password(
+        &self,
+        server: &ServerConfig,
+        pool: &DbPool,
+        seen: RefreshState,
+        auth_error: AppError,
+    ) -> Result<(), AppError> {
+        let connect_lock = self.connect_lock(&server.name);
+        let _refreshing = connect_lock.lock().await;
+        if self.refresh_state(pool) != seen {
+            return Ok(());
+        }
+        let Some(command) = server.password_command()? else {
+            return Err(auth_error);
+        };
+        eprintln!(
+            "[db] '{}': authentication failed, re-running password_command",
+            server.name
+        );
+        let fetched = crate::config::run_password_command(&server.name, command).await;
+        let key = seen.options.key();
+        let mut failures = self.password_refresh_failures.lock().unwrap();
+        match fetched {
+            Ok(password) => {
+                set_pool_password(pool, &password);
+                failures.remove(&key);
+                Ok(())
+            }
+            Err(refresh_error) => {
+                *failures.entry(key).or_insert(0) += 1;
+                // Report the command's failure too: the auth error alone would hide a problem on
+                // the token side (an expired SSO session etc.)
+                Err(AppError::Config(format!(
+                    "{auth_error}\nRe-running password_command failed: {refresh_error}"
+                )))
+            }
+        }
+    }
+
+    fn refresh_state(&self, pool: &DbPool) -> RefreshState {
+        let options = ConnectOptionsSnapshot::of(pool);
+        let failures = self
+            .password_refresh_failures
+            .lock()
+            .unwrap()
+            .get(&options.key())
+            .copied()
+            .unwrap_or(0);
+        RefreshState { options, failures }
+    }
+
     /// Drops all pools and tunnels. Called when the config is reloaded.
     pub async fn reset(&self) {
         let mut inner = self.inner.lock().await;
@@ -267,6 +397,8 @@ impl DbManager {
         inner.tunnels.clear();
         inner.schema_overrides.clear();
         inner.reset_epoch += 1;
+        drop(inner);
+        self.password_refresh_failures.lock().unwrap().clear();
     }
 
     /// Drops the pool and SSH tunnel of the given connection.
@@ -371,9 +503,11 @@ enum DbConnection {
 impl DbConnection {
     async fn acquire(pool: &DbPool) -> Result<Self, AppError> {
         Ok(match pool {
-            DbPool::MySql(p) => DbConnection::MySql(p.acquire().await?),
-            DbPool::Postgres(p) => DbConnection::Postgres(p.acquire().await?),
-            DbPool::Sqlite(p) => DbConnection::Sqlite(p.acquire().await?),
+            DbPool::MySql(p) => DbConnection::MySql(p.acquire().await.map_err(acquire_error)?),
+            DbPool::Postgres(p) => {
+                DbConnection::Postgres(p.acquire().await.map_err(acquire_error)?)
+            }
+            DbPool::Sqlite(p) => DbConnection::Sqlite(p.acquire().await.map_err(acquire_error)?),
             // Engines that do not use sqlx are delegated to their engine modules by
             // run_query_cancellable before acquire, so we never get here
             DbPool::Redis(_)
@@ -394,6 +528,19 @@ impl DbConnection {
             DbConnection::Postgres(_) => Engine::Postgres,
             DbConnection::Sqlite(_) => Engine::Sqlite,
         }
+    }
+}
+
+/// A rejected login while acquiring becomes AppError::ConnectAuth: nothing was sent yet, so
+/// PasswordRetry::BeforeStatement may retry it
+fn acquire_error(error: sqlx::Error) -> AppError {
+    let error = AppError::Db(error);
+    if !is_auth_failure(&error) {
+        return error;
+    }
+    match error {
+        AppError::Db(error) => AppError::ConnectAuth(error),
+        other => other,
     }
 }
 
@@ -467,6 +614,29 @@ impl CancelRegistry {
     /// are no-ops against an idle session, so this is safe (KILL CONNECTION,
     /// which would break the connection, is not used).
     pub async fn cancel(&self, connection: &str) -> Result<bool, AppError> {
+        self.cancel_matching(connection, None).await
+    }
+
+    /// The id of the registration running on a connection, and for Postgres / MySQL the pool
+    /// its cancellation opens a connection from
+    pub(crate) fn registration(&self, connection: &str) -> Option<(u64, Option<DbPool>)> {
+        let running = self.running.lock().unwrap();
+        let query = running.get(connection)?;
+        let pool = match &query.target {
+            CancelTarget::Postgres { pool, .. } => Some(DbPool::Postgres(pool.clone())),
+            CancelTarget::MySql { pool, .. } => Some(DbPool::MySql(pool.clone())),
+            _ => None,
+        };
+        Some((query.id, pool))
+    }
+
+    /// cancel, but only while the registration `id` is still the one running (returns false
+    /// otherwise). For retrying a cancellation, which must not hit a query started meanwhile
+    pub async fn cancel_registration(&self, connection: &str, id: u64) -> Result<bool, AppError> {
+        self.cancel_matching(connection, Some(id)).await
+    }
+
+    async fn cancel_matching(&self, connection: &str, id: Option<u64>) -> Result<bool, AppError> {
         // Take only the information needed for issuing, then release the lock, so
         // the Mutex guard is not held across an await
         enum CancelAction {
@@ -481,6 +651,9 @@ impl CancelRegistry {
             let Some(query) = running.get(connection) else {
                 return Ok(false);
             };
+            if id.is_some_and(|id| id != query.id) {
+                return Ok(false);
+            }
             query.cancelled.store(true, Ordering::SeqCst);
             match &query.target {
                 CancelTarget::Postgres { pid, pool } => CancelAction::Postgres {
@@ -580,6 +753,131 @@ pub fn parse_engine(engine: &str) -> Result<Engine, AppError> {
              elasticsearch / dynamodb)"
         ))),
     }
+}
+
+/// Which authentication failures of an operation may be retried after refreshing the password
+/// (DbManager::run_with_password_refresh).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordRetry {
+    /// Only a failure to open the connection the operation acquires first
+    /// (`AppError::ConnectAuth`, see DbConnection::acquire). For user SQL: an error code alone
+    /// cannot tell a failed login from a statement raising the same SQLSTATE (a PL/pgSQL
+    /// `RAISE ... USING ERRCODE = '28P01'` after side effects would run twice)
+    BeforeStatement,
+    /// Any authentication failure. Only for operations that are safe to run twice and run no
+    /// user code: catalog reads, and pg_cancel_backend / KILL QUERY
+    Idempotent,
+}
+
+fn should_refresh_password(retry: PasswordRetry, error: &AppError) -> bool {
+    match retry {
+        PasswordRetry::BeforeStatement => matches!(error, AppError::ConnectAuth(_)),
+        PasswordRetry::Idempotent => is_auth_failure(error),
+    }
+}
+
+/// What refresh_password compares to tell whether the pool was refreshed, or a refresh of it
+/// failed, since an operation started
+#[derive(PartialEq)]
+struct RefreshState {
+    options: ConnectOptionsSnapshot,
+    failures: u64,
+}
+
+/// The connect options a pool uses right now. set_connect_options replaces the Arc, so a
+/// different Arc means the password was replaced. Holding the Arc keeps its address from being
+/// reused by the replacement, which would make the comparison lie
+enum ConnectOptionsSnapshot {
+    Postgres(Arc<sqlx::postgres::PgConnectOptions>),
+    MySql(Arc<sqlx::mysql::MySqlConnectOptions>),
+    Other,
+}
+
+impl ConnectOptionsSnapshot {
+    fn of(pool: &DbPool) -> Self {
+        match pool {
+            DbPool::Postgres(pool) => Self::Postgres(pool.connect_options()),
+            DbPool::MySql(pool) => Self::MySql(pool.connect_options()),
+            _ => Self::Other,
+        }
+    }
+
+    /// Identifies the options while a pool uses them (the pool holds the Arc meanwhile)
+    fn key(&self) -> usize {
+        match self {
+            Self::Postgres(options) => Arc::as_ptr(options) as usize,
+            Self::MySql(options) => Arc::as_ptr(options) as usize,
+            Self::Other => 0,
+        }
+    }
+}
+
+impl PartialEq for ConnectOptionsSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Postgres(a), Self::Postgres(b)) => Arc::ptr_eq(a, b),
+            (Self::MySql(a), Self::MySql(b)) => Arc::ptr_eq(a, b),
+            (Self::Other, Self::Other) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Replaces the password the pool uses for the connections it opens from now on
+fn set_pool_password(pool: &DbPool, password: &str) {
+    match pool {
+        DbPool::Postgres(pool) => {
+            let options = (*pool.connect_options()).clone().password(password);
+            pool.set_connect_options(options);
+        }
+        DbPool::MySql(pool) => {
+            let options = (*pool.connect_options()).clone().password(password);
+            pool.set_connect_options(options);
+        }
+        _ => {}
+    }
+}
+
+/// Error code of a DB error (for detecting authentication failures).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DbErrorCode<'a> {
+    /// Postgres SQLSTATE
+    Postgres(&'a str),
+    /// MySQL error number (finer-grained than its SQLSTATE)
+    MySql(u16),
+    /// Anything else (not a DB error, or another engine)
+    Other,
+}
+
+/// Whether the code means the login was rejected.
+/// - Postgres: 28P01 (invalid_password; an expired IAM token is this too) /
+///   28000 (invalid_authorization_specification, e.g. rejected by pg_hba)
+/// - MySQL: 1045 (ER_ACCESS_DENIED_ERROR)
+pub(crate) fn is_auth_failure_code(code: DbErrorCode<'_>) -> bool {
+    match code {
+        DbErrorCode::Postgres(sqlstate) => matches!(sqlstate, "28P01" | "28000"),
+        DbErrorCode::MySql(number) => number == 1045,
+        DbErrorCode::Other => false,
+    }
+}
+
+fn is_auth_failure(error: &AppError) -> bool {
+    matches!(error, AppError::ConnectAuth(_)) || is_auth_failure_code(db_error_code(error))
+}
+
+fn db_error_code(error: &AppError) -> DbErrorCode<'_> {
+    let (AppError::Db(sqlx::Error::Database(db_error))
+    | AppError::ConnectAuth(sqlx::Error::Database(db_error))) = error
+    else {
+        return DbErrorCode::Other;
+    };
+    if let Some(pg) = db_error.try_downcast_ref::<sqlx::postgres::PgDatabaseError>() {
+        return DbErrorCode::Postgres(pg.code());
+    }
+    if let Some(mysql) = db_error.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>() {
+        return DbErrorCode::MySql(mysql.number());
+    }
+    DbErrorCode::Other
 }
 
 pub(crate) fn default_port(engine: Engine) -> u16 {
@@ -4248,5 +4546,653 @@ mod tests {
         .to_string();
         // The agent whitelist (agent_rejection_reason) rejects it first
         assert!(err.contains("assistant"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_auth_failure_codes() {
+        // Postgres: 28P01 (wrong password; an expired IAM token is this too) and 28000
+        assert!(is_auth_failure_code(DbErrorCode::Postgres("28P01")));
+        assert!(is_auth_failure_code(DbErrorCode::Postgres("28000")));
+        // Missing privileges, too many connections and starting up are not login failures
+        for code in ["42501", "53300", "57P03", "3D000", "08006"] {
+            assert!(!is_auth_failure_code(DbErrorCode::Postgres(code)), "{code}");
+        }
+        // MySQL: only 1045 (ER_ACCESS_DENIED_ERROR). 1044 is a missing database privilege
+        assert!(is_auth_failure_code(DbErrorCode::MySql(1045)));
+        for number in [1044, 1049, 1142, 2013] {
+            assert!(!is_auth_failure_code(DbErrorCode::MySql(number)), "{number}");
+        }
+        assert!(!is_auth_failure_code(DbErrorCode::Other));
+    }
+
+    #[test]
+    fn test_db_error_code_of_non_database_errors() {
+        assert_eq!(db_error_code(&AppError::Config("x".into())), DbErrorCode::Other);
+        assert_eq!(
+            db_error_code(&AppError::Db(sqlx::Error::PoolTimedOut)),
+            DbErrorCode::Other
+        );
+    }
+
+    /// The command runs when the pool is created, and its failure is what get_pool reports
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_get_pool_reports_password_command_failure() {
+        // Arrange
+        let manager = DbManager::default();
+        let server: ServerConfig = serde_yaml::from_str(
+            "name: c\nengine: postgres\nhost: 127.0.0.1\nport: 1\n\
+             password_command: /bin/sh -c 'echo helper says no >&2; exit 4'\n",
+        )
+        .unwrap();
+
+        // Act
+        let err = manager.get_pool(&server).await.err().unwrap().to_string();
+
+        // Assert
+        assert!(err.contains("password_command of server 'c'"), "{err}");
+        assert!(err.contains("helper says no"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_get_pool_rejects_password_with_password_command() {
+        let manager = DbManager::default();
+        let server: ServerConfig = serde_yaml::from_str(
+            "name: c\nengine: postgres\nhost: 127.0.0.1\nport: 1\npassword: p\n\
+             password_command: /bin/echo x\n",
+        )
+        .unwrap();
+        let err = manager.get_pool(&server).await.err().unwrap().to_string();
+        assert!(err.contains("either password or password_command"), "{err}");
+    }
+
+    use std::sync::atomic::AtomicUsize;
+
+    /// A retried cancellation must not cancel a query that started after the one it was for
+    #[tokio::test]
+    async fn test_cancel_registration_skips_a_newer_query() {
+        // Arrange
+        let registry = CancelRegistry::default();
+        let first = registry.register("c", CancelTarget::Sqlite, Arc::new(AtomicBool::new(false)));
+        let (first_id, pool) = registry.registration("c").unwrap();
+        drop(first);
+        let newer_cancelled = Arc::new(AtomicBool::new(false));
+        let _newer = registry.register("c", CancelTarget::Sqlite, newer_cancelled.clone());
+
+        // Act
+        let cancelled = registry.cancel_registration("c", first_id).await.unwrap();
+
+        // Assert
+        assert!(pool.is_none());
+        assert!(!cancelled);
+        assert!(!newer_cancelled.load(Ordering::SeqCst));
+        let (newer_id, _) = registry.registration("c").unwrap();
+        assert!(registry.cancel_registration("c", newer_id).await.unwrap());
+        assert!(newer_cancelled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_should_refresh_password() {
+        let connect_auth = AppError::ConnectAuth(sqlx::Error::PoolTimedOut);
+        let other = AppError::Db(sqlx::Error::PoolTimedOut);
+        // User SQL: only a rejected login while acquiring the first connection
+        assert!(should_refresh_password(PasswordRetry::BeforeStatement, &connect_auth));
+        assert!(!should_refresh_password(PasswordRetry::BeforeStatement, &other));
+        // Idempotent operations: any auth failure (a plain Db 28P01 is covered by the real-DB
+        // test; the error type cannot be built here)
+        assert!(should_refresh_password(PasswordRetry::Idempotent, &connect_auth));
+        assert!(!should_refresh_password(PasswordRetry::Idempotent, &other));
+        assert!(!should_refresh_password(
+            PasswordRetry::Idempotent,
+            &AppError::Config("x".into())
+        ));
+    }
+
+    /// A Postgres pool that never connects (nothing below opens a connection), and a
+    /// password_command connection whose helper counts its runs
+    #[cfg(unix)]
+    fn lazy_pg_pool_and_server(helper: &CountingPasswordCommand) -> (DbPool, ServerConfig) {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://u@127.0.0.1:1/db")
+            .unwrap();
+        let server: ServerConfig = serde_yaml::from_str(&format!(
+            "name: c\nengine: postgres\npassword_command: \"{}\"\n",
+            helper.command().replace('"', "\\\"")
+        ))
+        .unwrap();
+        (DbPool::Postgres(pool), server)
+    }
+
+    /// An operation that fails with the given errors in turn, then succeeds
+    fn failing_op(
+        calls: &AtomicUsize,
+        errors: Vec<fn() -> AppError>,
+    ) -> impl Fn(DbPool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>>>>
+           + '_ {
+        move |_| {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            let result = match errors.get(call) {
+                Some(error) => Err(error()),
+                None => Ok(()),
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_connect_auth_failure_refreshes_and_retries_once() {
+        // Arrange
+        let helper = CountingPasswordCommand::new("new-pw");
+        let (pool, server) = lazy_pg_pool_and_server(&helper);
+        let manager = DbManager::default();
+        let calls = AtomicUsize::new(0);
+        let connect_auth = || AppError::ConnectAuth(sqlx::Error::PoolTimedOut);
+
+        // Act
+        let result = manager
+            .run_with_password_refresh(
+                &server,
+                pool,
+                PasswordRetry::BeforeStatement,
+                failing_op(&calls, vec![connect_auth]),
+            )
+            .await;
+
+        // Assert
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(helper.runs(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_refresh_is_tried_only_once_per_operation() {
+        // Arrange
+        let helper = CountingPasswordCommand::new("still-wrong");
+        let (pool, server) = lazy_pg_pool_and_server(&helper);
+        let manager = DbManager::default();
+        let calls = AtomicUsize::new(0);
+        let connect_auth = || AppError::ConnectAuth(sqlx::Error::PoolTimedOut);
+
+        // Act
+        let result = manager
+            .run_with_password_refresh(
+                &server,
+                pool,
+                PasswordRetry::BeforeStatement,
+                failing_op(&calls, vec![connect_auth, connect_auth, connect_auth]),
+            )
+            .await;
+
+        // Assert
+        assert!(matches!(result, Err(AppError::ConnectAuth(_))), "{result:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(helper.runs(), 1);
+    }
+
+    /// Errors that are not a rejected login while acquiring are returned as they are: the
+    /// operation is not run again and the command does not run
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_other_errors_are_not_retried() {
+        // Arrange
+        let helper = CountingPasswordCommand::new("pw");
+        let (pool, server) = lazy_pg_pool_and_server(&helper);
+        let manager = DbManager::default();
+        let calls = AtomicUsize::new(0);
+        let other = || AppError::Db(sqlx::Error::PoolTimedOut);
+
+        // Act
+        let result = manager
+            .run_with_password_refresh(
+                &server,
+                pool,
+                PasswordRetry::BeforeStatement,
+                failing_op(&calls, vec![other]),
+            )
+            .await;
+
+        // Assert
+        assert!(matches!(result, Err(AppError::Db(_))), "{result:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(helper.runs(), 0);
+    }
+
+    /// No refresh without password_command, nor for pools whose password cannot be replaced
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_no_refresh_for_static_passwords_or_other_engines() {
+        // Arrange
+        let helper = CountingPasswordCommand::new("pw");
+        let (pg_pool, server) = lazy_pg_pool_and_server(&helper);
+        let mut static_server = server.clone();
+        static_server.password_command = None;
+        static_server.password = Some("pw".into());
+        let sqlite_pool = DbPool::Sqlite(
+            SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        let manager = DbManager::default();
+        let connect_auth = || AppError::ConnectAuth(sqlx::Error::PoolTimedOut);
+
+        for (server, pool) in [(&static_server, pg_pool), (&server, sqlite_pool)] {
+            let calls = AtomicUsize::new(0);
+
+            // Act
+            let result = manager
+                .run_with_password_refresh(
+                    server,
+                    pool,
+                    PasswordRetry::BeforeStatement,
+                    failing_op(&calls, vec![connect_auth]),
+                )
+                .await;
+
+            // Assert
+            assert!(matches!(result, Err(AppError::ConnectAuth(_))), "{result:?}");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(helper.runs(), 0);
+    }
+
+    /// Operations that hit the expiry together run the helper once, whether it succeeds or
+    /// fails (a failing helper must not prompt / time out once per waiting operation)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_refresh_is_single_flight_even_when_it_fails() {
+        for helper_fails in [false, true] {
+            // Arrange
+            let helper = CountingPasswordCommand::new("pw");
+            let last_step = if helper_fails {
+                "exit 1".to_string()
+            } else {
+                format!("cat {}", helper.password_file.display())
+            };
+            let command = format!(
+                "/bin/sh -c 'sleep 0.3; echo x >> {}; {last_step}'",
+                helper.count_file.display()
+            );
+            let (pool, mut server) = lazy_pg_pool_and_server(&helper);
+            server.password_command = Some(command);
+            let manager = DbManager::default();
+            let calls: Vec<AtomicUsize> = (0..4).map(|_| AtomicUsize::new(0)).collect();
+            let connect_auth = || AppError::ConnectAuth(sqlx::Error::PoolTimedOut);
+            // After a failed refresh the retry is rejected again
+            let errors: Vec<fn() -> AppError> = if helper_fails {
+                vec![connect_auth, connect_auth]
+            } else {
+                vec![connect_auth]
+            };
+
+            // Act. join_all polls the first operation into its refresh before the others read
+            // the attempt counter, so this also catches counting an attempt when it starts
+            let results = futures::future::join_all(calls.iter().map(|calls| {
+                manager.run_with_password_refresh(
+                    &server,
+                    pool.clone(),
+                    PasswordRetry::BeforeStatement,
+                    failing_op(calls, errors.clone()),
+                )
+            }))
+            .await;
+
+            // Assert
+            assert_eq!(helper.runs(), 1, "helper_fails: {helper_fails}");
+            for result in results {
+                assert_eq!(result.is_ok(), !helper_fails, "{result:?}");
+            }
+        }
+    }
+
+    /// Refreshing one pool of a connection does not stand in for another: an operation still
+    /// holding an older pool (dropped by a schema switch) refreshes that one, and an operation on
+    /// the current pool still refreshes its own
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_refresh_state_is_per_pool() {
+        // Arrange
+        let helper = CountingPasswordCommand::new("pw");
+        let (old_pool, server) = lazy_pg_pool_and_server(&helper);
+        let (new_pool, _) = lazy_pg_pool_and_server(&helper);
+        let manager = DbManager::default();
+        let seen_new = manager.refresh_state(&new_pool);
+        let old_calls = AtomicUsize::new(0);
+        let new_calls = AtomicUsize::new(0);
+        let connect_auth = || AppError::ConnectAuth(sqlx::Error::PoolTimedOut);
+        manager
+            .run_with_password_refresh(
+                &server,
+                old_pool,
+                PasswordRetry::BeforeStatement,
+                failing_op(&old_calls, vec![connect_auth]),
+            )
+            .await
+            .unwrap();
+
+        // Act
+        let result = manager
+            .run_with_password_refresh(
+                &server,
+                new_pool.clone(),
+                PasswordRetry::BeforeStatement,
+                failing_op(&new_calls, vec![connect_auth]),
+            )
+            .await;
+
+        // Assert
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(helper.runs(), 2);
+        assert!(manager.refresh_state(&new_pool) != seen_new);
+    }
+
+    /// A slow password_command does not delay get_pool for another connection that is open
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_slow_password_command_does_not_block_other_connections() {
+        // Arrange
+        let manager = std::sync::Arc::new(DbManager::default());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fast.db");
+        std::fs::File::create(&db_path).unwrap();
+        let fast: ServerConfig = serde_yaml::from_str(&format!(
+            "name: fast\nengine: sqlite\nschema: {}\n",
+            db_path.display()
+        ))
+        .unwrap();
+        manager.get_pool(&fast).await.unwrap();
+        // The target does not exist, but it is not tried before the command finishes
+        let slow: ServerConfig = serde_yaml::from_str(
+            "name: slow\nengine: postgres\nhost: 127.0.0.1\nport: 1\n\
+             password_command: /bin/sleep 3\n",
+        )
+        .unwrap();
+        let slow_manager = manager.clone();
+        let slow_task = tokio::spawn(async move { slow_manager.get_pool(&slow).await });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Act
+        let started = std::time::Instant::now();
+        manager.get_pool(&fast).await.unwrap();
+
+        // Assert
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "fast connection waited {:?}",
+            started.elapsed()
+        );
+        slow_task.abort();
+    }
+
+    /// A password_command that counts its runs and prints the contents of a file
+    #[cfg(unix)]
+    struct CountingPasswordCommand {
+        _dir: tempfile::TempDir,
+        password_file: std::path::PathBuf,
+        count_file: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl CountingPasswordCommand {
+        fn new(password: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let password_file = dir.path().join("password");
+            let count_file = dir.path().join("count");
+            std::fs::write(&password_file, format!("{password}\n")).unwrap();
+            Self {
+                _dir: dir,
+                password_file,
+                count_file,
+            }
+        }
+
+        fn command(&self) -> String {
+            format!(
+                "/bin/sh -c 'echo x >> {}; cat {}'",
+                self.count_file.display(),
+                self.password_file.display()
+            )
+        }
+
+        fn set_password(&self, password: &str) {
+            std::fs::write(&self.password_file, format!("{password}\n")).unwrap();
+        }
+
+        fn runs(&self) -> usize {
+            std::fs::read_to_string(&self.count_file)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        }
+    }
+
+    /// password_command against a real Postgres. Skipped unless QUERYFOLIO_TEST_PG_URL is set:
+    ///   QUERYFOLIO_TEST_PG_URL=postgres://postgres:pass@127.0.0.1:5432/postgres \
+    ///     cargo test test_password_command_against_postgres
+    /// The user needs CREATEROLE, and the server must use password auth (scram-sha-256 / md5)
+    /// over TCP: with trust, a rotated password is never rejected and nothing is tested.
+    /// Creates a uniquely named role, sequence and function, and drops them at the end.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_password_command_against_postgres() {
+        use std::str::FromStr;
+
+        let Ok(url) = std::env::var("QUERYFOLIO_TEST_PG_URL") else {
+            return;
+        };
+        let admin = PgPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+        let target = PgConnectOptions::from_str(&url).unwrap();
+        let role = format!(
+            "queryfolio_pwcmd_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let exec = |sql: String| {
+            let admin = admin.clone();
+            async move { sqlx::query(&sql).execute(&admin).await.unwrap() }
+        };
+        exec(format!("CREATE ROLE {role} LOGIN PASSWORD 'first-pw'")).await;
+        // Advances a sequence (not rolled back), then raises the SQLSTATE of a failed login
+        exec(format!("CREATE SEQUENCE {role}_seq")).await;
+        exec(format!(
+            "CREATE FUNCTION {role}_probe() RETURNS int SECURITY DEFINER AS $$ BEGIN \
+             PERFORM nextval('{role}_seq'); \
+             RAISE EXCEPTION 'raised by a statement' USING ERRCODE = '28P01'; END $$ \
+             LANGUAGE plpgsql"
+        ))
+        .await;
+
+        let helper = CountingPasswordCommand::new("first-pw");
+        let yaml = format!(
+            "name: pwcmd\nengine: postgres\nhost: {}\nport: {}\nschema: {}\nuser: {role}\n\
+             ssl_mode: disable\npassword_command: \"{}\"\n",
+            target.get_host(),
+            target.get_port(),
+            target.get_database().unwrap_or("postgres"),
+            helper.command().replace('"', "\\\"")
+        );
+        let server_pwcmd: ServerConfig = serde_yaml::from_str(&yaml).unwrap();
+        let mut server_static = server_pwcmd.clone();
+        server_static.name = "static".into();
+        server_static.password_command = None;
+        server_static.password = Some("fifth-pw".into());
+        // Closes every connection of the role, so the pool has to open new ones
+        let kick = || {
+            exec(format!(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{role}'"
+            ))
+        };
+        let rotate = |password: &'static str| {
+            let exec = &exec;
+            let kick = &kick;
+            let role = &role;
+            async move {
+                exec(format!("ALTER ROLE {role} PASSWORD '{password}'")).await;
+                kick().await;
+            }
+        };
+        let manager = DbManager::default();
+        // Through the same path as the user's queries (an explicit acquire, then the statement)
+        let run = |server: &'static str, sql: String| {
+            let manager = &manager;
+            let server = if server == "pwcmd" { &server_pwcmd } else { &server_static };
+            async move {
+                manager
+                    .with_pool(server, PasswordRetry::BeforeStatement, |pool| {
+                        let sql = sql.clone();
+                        async move { run_query(&pool, &sql, 10, None, false, false).await }
+                    })
+                    .await
+            }
+        };
+        let current_user = || async {
+            let result = run("pwcmd", "SELECT current_user::text AS u".into()).await?;
+            Ok::<_, AppError>(result.rows[0][0].as_str().unwrap().to_string())
+        };
+
+        // 1. The first connect runs the command once; a cached pool does not run it again
+        assert_eq!(current_user().await.unwrap(), role);
+        assert_eq!(current_user().await.unwrap(), role);
+        assert_eq!(helper.runs(), 1);
+
+        // 2. The password changes (the token expired): opening a connection is rejected, the
+        //    command runs again and the same pool carries on with the new password
+        helper.set_password("second-pw");
+        rotate("second-pw").await;
+        assert_eq!(current_user().await.unwrap(), role);
+        assert_eq!(helper.runs(), 2);
+
+        // 3. A statement that raises 28P01 after a side effect is not re-run, and does not
+        //    trigger a refresh either
+        let err = run("pwcmd", format!("SELECT {role}_probe()")).await.unwrap_err();
+        assert!(matches!(err, AppError::Db(_)), "{err:?}");
+        assert_eq!(db_error_code(&err), DbErrorCode::Postgres("28P01"), "{err}");
+        let calls: i64 = sqlx::query_scalar(&format!("SELECT last_value FROM {role}_seq"))
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+        assert_eq!(calls, 1, "the function body ran more than once");
+        assert_eq!(current_user().await.unwrap(), role);
+        assert_eq!(helper.runs(), 2);
+
+        // 4. Single-flight: operations that hit the expiry together run the command once
+        helper.set_password("third-pw");
+        rotate("third-pw").await;
+        let results = futures::future::join_all((0..5).map(|_| current_user())).await;
+        for result in results {
+            assert_eq!(result.unwrap(), role);
+        }
+        assert_eq!(helper.runs(), 3);
+
+        // 5. If the refreshed password is wrong too, the command runs once and the auth error
+        //    is returned (without the command's output)
+        helper.set_password("wrong-pw");
+        rotate("fourth-pw").await;
+        let err = current_user().await.unwrap_err();
+        assert_eq!(db_error_code(&err), DbErrorCode::Postgres("28P01"), "{err}");
+        assert!(!err.to_string().contains("wrong-pw"), "{err}");
+        assert_eq!(helper.runs(), 4);
+
+        // 6. A static password is never refreshed: the auth error comes back as is
+        rotate("fifth-pw").await;
+        run("static", "SELECT 1".into()).await.unwrap();
+        rotate("sixth-pw").await;
+        let err = run("static", "SELECT 1".into()).await.unwrap_err();
+        assert_eq!(db_error_code(&err), DbErrorCode::Postgres("28P01"), "{err}");
+        assert_eq!(helper.runs(), 4);
+
+        manager.reset().await;
+        kick().await;
+        exec(format!("DROP FUNCTION {role}_probe()")).await;
+        exec(format!("DROP SEQUENCE {role}_seq")).await;
+        exec(format!("DROP ROLE {role}")).await;
+    }
+
+    /// The MySQL side of test_password_command_against_postgres (refresh after rotation, and a
+    /// wrong refreshed password tried once). Skipped unless QUERYFOLIO_TEST_MYSQL_URL is set;
+    /// the user needs CREATE USER and PROCESS / CONNECTION_ADMIN (to kill the test user's sessions)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_password_command_against_mysql() {
+        use std::str::FromStr;
+
+        let Ok(url) = std::env::var("QUERYFOLIO_TEST_MYSQL_URL") else {
+            return;
+        };
+        let admin = MySqlPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+        let target = sqlx::mysql::MySqlConnectOptions::from_str(&url).unwrap();
+        let user = format!("qf_pwcmd_{}", std::process::id());
+        let exec = |sql: String| {
+            let admin = admin.clone();
+            async move { sqlx::query(&sql).execute(&admin).await.unwrap() }
+        };
+        exec(format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'first-pw'")).await;
+        let kick = || {
+            let admin = admin.clone();
+            let user = user.clone();
+            async move {
+                let ids: Vec<u64> = sqlx::query_scalar(
+                    "SELECT id FROM information_schema.processlist WHERE user = ?",
+                )
+                .bind(&user)
+                .fetch_all(&admin)
+                .await
+                .unwrap();
+                for id in ids {
+                    let _ = sqlx::query(&format!("KILL {id}")).execute(&admin).await;
+                }
+            }
+        };
+        let rotate = |password: &'static str| {
+            let exec = &exec;
+            let kick = &kick;
+            let user = &user;
+            async move {
+                exec(format!("ALTER USER '{user}'@'%' IDENTIFIED BY '{password}'")).await;
+                kick().await;
+            }
+        };
+
+        let helper = CountingPasswordCommand::new("first-pw");
+        let yaml = format!(
+            "name: pwcmd\nengine: mysql\nhost: {}\nport: {}\nuser: {user}\n\
+             password_command: \"{}\"\n",
+            target.get_host(),
+            target.get_port(),
+            helper.command().replace('"', "\\\"")
+        );
+        let server: ServerConfig = serde_yaml::from_str(&yaml).unwrap();
+        let manager = DbManager::default();
+        let select_one = || async {
+            let result = manager
+                .with_pool(&server, PasswordRetry::BeforeStatement, |pool| async move {
+                    run_query(&pool, "SELECT 1 AS one", 10, None, false, false).await
+                })
+                .await?;
+            Ok::<_, AppError>(result.rows[0][0].as_i64().unwrap())
+        };
+
+        assert_eq!(select_one().await.unwrap(), 1);
+        assert_eq!(helper.runs(), 1);
+
+        helper.set_password("second-pw");
+        rotate("second-pw").await;
+        assert_eq!(select_one().await.unwrap(), 1);
+        assert_eq!(helper.runs(), 2);
+
+        helper.set_password("wrong-pw");
+        rotate("third-pw").await;
+        let err = select_one().await.unwrap_err();
+        assert_eq!(db_error_code(&err), DbErrorCode::MySql(1045), "{err}");
+        assert_eq!(helper.runs(), 3);
+
+        manager.reset().await;
+        kick().await;
+        exec(format!("DROP USER '{user}'@'%'")).await;
     }
 }

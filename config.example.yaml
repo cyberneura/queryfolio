@@ -247,6 +247,36 @@ servers:
 #     engine: sqlite
 #     schema: ~/data/example.sqlite3
 
+# --- servers: fetching the password at connect time (password_command, queryfolio extension) ---
+# Write password_command instead of password to run a command when the connection is opened
+# and use its stdout (minus the trailing newline) as the password. It is not run when the config
+# is loaded, when the connection is only selected, or for other connections.
+# Meant for short-lived credentials such as RDS IAM auth tokens (valid for 15 minutes).
+#
+# - Setting both password and password_command is an error (write password: null to drop a
+#   template's password)
+# - Not allowed for sqlite / duckdb (they do not use a password)
+# - postgres / mysql: when the server rejects the password while the pool opens a connection
+#   (an expired token), the command is run again and the operation is retried once (the SSH
+#   tunnel and the pool are kept). A statement that was already sent is never re-run. mssql / redis / elasticsearch / dynamodb
+#   keep the password until the pool is dropped (close the connection's tabs or reload)
+# - The command is run without a shell (no pipes or redirects; write a wrapper script if
+#   needed). The timeout is 60 seconds
+#
+# servers:
+#   - name: staging-iam
+#     engine: postgres
+#     host: mydb.example.com
+#     port: 5432
+#     schema: appdb
+#     user: iam_user
+#     password_command: aws rds generate-db-auth-token --hostname mydb.example.com --port 5432 --username iam_user --region us-east-1 --profile staging
+#     ssl_mode: require
+#     ssh_tunnel:
+#       host: bastion.example.com
+#       user: ec2-user
+#       private_key_path: ~/.ssh/id_rsa
+
 # --- Overriding the configuration from outside (optional) ---
 # Runs the command written in config_override_command and recursively merges its stdout (YAML)
 # into this configuration. The fetched YAML takes precedence.
@@ -258,6 +288,8 @@ servers:
 #
 # Even if the fetched YAML contains config_override_command, it is not fetched recursively.
 # The command is run without a shell (pipes and redirects cannot be used).
+# password_command entries in the fetched YAML are run too, so whoever can edit its source can
+# run commands on this machine: keep the source as trusted as this file.
 #
 # Example of fetching from 1Password:
 # config_override_command: op read "op://development/queryfolio/config-yaml"

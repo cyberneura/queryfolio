@@ -19,6 +19,7 @@ in the repository root.
 - [Connection groups](#connection-groups)
 - [Connection templates](#connection-templates)
 - [Overriding config from an external source (`config_override_command`)](#overriding-config-from-an-external-source-config_override_command)
+- [Fetching a password at connect time (`password_command`)](#fetching-a-password-at-connect-time-password_command)
 - [AI features (`ai`)](#ai-features-ai)
 - [Auto `LIMIT` (`default_limit`)](#auto-limit-default_limit)
 - [Query file storage (`sqlfiles_dir`, `folder_name`)](#query-file-storage-sqlfiles_dir-folder_name)
@@ -118,6 +119,7 @@ servers:
 | `schema` | depends | The database / schema to connect to. For SQLite / DuckDB, this is the **path to the database file** (queryfolio extension; `~` is expanded; if `schema` is omitted, `host` is used as the file path instead). For DynamoDB, this is the **AWS region** (required, e.g. `ap-northeast-1`). |
 | `user` | no | Database user. For DynamoDB, a static **access key ID** (paired with `password` as the secret access key). |
 | `password` | no | Database password. |
+| `password_command` | no | A command whose stdout is the password, run when the connection is opened (queryfolio extension). Cannot be combined with `password`, and not allowed for SQLite / DuckDB. See [Fetching a password at connect time](#fetching-a-password-at-connect-time-password_command). |
 | `tls` | no | For HTTP-based engines (Elasticsearch, and the DynamoDB endpoint override) use `https`. For SQL engines (MySQL / PostgreSQL / SQL Server) it makes the default `ssl_mode` `verify-full` — TLS is required and the certificate is verified. Default `false` (queryfolio extension). See [TLS for SQL engines](#tls-for-sql-engines). |
 | `ssl_mode` | no | MySQL / PostgreSQL / SQL Server only (queryfolio extension): `disable` / `prefer` / `require` / `verify-ca` / `verify-full`. Takes precedence over `tls`. See [TLS for SQL engines](#tls-for-sql-engines). |
 | `ssl_root_cert` | no | MySQL / PostgreSQL only (queryfolio extension): path to a root CA certificate (PEM) used for verification (`~` is expanded). |
@@ -553,11 +555,112 @@ Notes:
   plus Touch ID), and cleared on reload.
 - If the key exists but is not a non-empty string, that is an error (Queryfolio
   will not silently fall back to the local-only config).
+- The fetched YAML can contain `password_command` entries, which Queryfolio
+  runs. See the warning in
+  [Fetching a password at connect time](#fetching-a-password-at-connect-time-password_command).
 - Menu bar **Config → View override config yaml (Copy only)** appears when
   this key is set. It runs the command every time and shows the fetched YAML for
   inspection/copying. You can edit the text in the modal (handy for reformatting
   before copying it into 1Password), but those edits stay in memory only — there
   is no Save, so the changes are never written back.
+
+## Fetching a password at connect time (`password_command`)
+
+`password_command` fetches a connection's password by running a command **when
+the connection is opened**, so the password never sits in `config.yml`. It suits
+short-lived credentials such as AWS RDS IAM auth tokens, and passwords that a
+script reads from somewhere else (Terraform state, a secrets manager).
+
+```yaml
+servers:
+  - name: staging-iam
+    engine: postgres
+    host: mydb.example.com
+    port: 5432
+    schema: appdb
+    user: iam_user
+    password_command: aws rds generate-db-auth-token --hostname mydb.example.com --port 5432 --username iam_user --region us-east-1 --profile staging
+    ssl_mode: require
+    ssh_tunnel:
+      host: bastion.example.com
+      user: ec2-user
+      private_key_path: ~/.ssh/id_rsa
+```
+
+When it runs:
+
+- When Queryfolio opens a new connection pool for that connection: the first
+  query, opening a file, or opening the TABLES pane. It does **not** run when the
+  config is loaded, when you select the connection (selecting a connection does
+  not connect), or for any other connection.
+- Once per pool. The password is kept only in that pool's connect options. It is
+  fetched again after the pool is dropped (all editor tabs of the connection
+  closed, a schema switch, a config reload).
+- For every dump (mysqldump / pg_dump connect on their own, not through the pool).
+- When an expired password is detected (PostgreSQL / MySQL, below).
+
+Output and errors:
+
+- The password is stdout with the trailing `\r` / `\n` removed. Nothing else is
+  changed, so tokens containing `&`, `=` or `%`, and passwords with leading or
+  trailing spaces, work as-is.
+- Empty output, output that is not UTF-8, and a non-zero exit are errors. Error
+  messages show the command, the exit code and stderr, never stdout. Keep that in
+  mind if your helper prints sensitive details to stderr.
+- The command runs the same way as `config_override_command`: no shell (shlex
+  split, so no pipes or redirects), the GUI `PATH` supplemented with
+  `/opt/homebrew/bin` and `/usr/local/bin`, and a 60-second timeout. Use a
+  wrapper script if you need a pipeline.
+- The output never reaches the UI, logs, query history or the AI features. The
+  connection's hover details show `Password: (command)`.
+
+Expiring credentials (PostgreSQL / MySQL): an RDS IAM token is valid for 15
+minutes and is checked only when a database connection is opened. Existing
+connections keep working after it expires, but the connections the pool opens
+later would be rejected. When the server rejects such a login (PostgreSQL
+SQLSTATE `28P01` / `28000`, MySQL error `1045`), Queryfolio runs
+`password_command` again, gives the new password to the existing pool and tries
+the operation **once** more. Operations that hit the expiry at the same time
+share one run of the command, so a helper that prompts (SSO, Touch ID) prompts
+once, and a helper that fails is not run again for each of them. If the new
+password is rejected too, you get that error. The SSH tunnel and the pool's
+already authenticated connections are kept. Connections with a static
+`password` are never refreshed.
+
+Your queries, cell edits and AI tool calls are retried only when opening the
+connection failed, before the statement was sent. A statement that fails is
+never re-run, even with one of the codes above — a function can raise `28P01`
+itself after it has already written something. Table listings, completion and
+cancelling (which run no SQL of yours and are safe to repeat) are retried on any
+of these codes.
+
+For SQL Server, Redis, Elasticsearch and DynamoDB there is no automatic refresh:
+the password is fetched when the pool is created and used until the pool is
+dropped. If it expires, close the connection's editor tabs (this drops the pool)
+or reload the config, and the next query fetches a new one. (SQL Server also
+reconnects with the original password after a cancelled query and for AI tool
+calls.)
+
+Rules:
+
+- `password` and `password_command` together are an error, including when one
+  of them comes from a [template](#connection-templates). To drop a template's
+  `password` in a server that uses `password_command`, write `password: null`.
+- SQLite and DuckDB do not use a password, so `password_command` is an error
+  there.
+- These errors are reported when you connect, like the other per-connection
+  setting errors. They do not hide the rest of the connection list.
+- **Config → View override config yaml (Copy only)** runs only
+  `config_override_command`, never `password_command`.
+
+> [!WARNING]
+> `password_command` can also come from the YAML that
+> [`config_override_command`](#overriding-config-from-an-external-source-config_override_command)
+> returns, and Queryfolio runs it. That means **whoever can change that YAML
+> (for example, anyone who can edit the 1Password item) can run commands on
+> your machine** with your user's permissions. Without `password_command`, that
+> YAML could only change connection settings. Keep the source of
+> `config_override_command` as trusted as the local `config.yml`.
 
 ## AI features (`ai`)
 

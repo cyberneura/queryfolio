@@ -49,6 +49,12 @@ pub enum AppError {
     #[error("Database error: {0}")]
     Db(#[from] sqlx::Error),
 
+    /// The database rejected the login while a pooled connection was being opened, before any
+    /// statement was sent (DbManager::run_with_password_refresh may retry it). Shown the same
+    /// way as Db
+    #[error("Database error: {0}")]
+    ConnectAuth(sqlx::Error),
+
     #[error("Redis error: {0}")]
     Redis(String),
 

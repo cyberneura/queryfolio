@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 
-/// Timeout (seconds) for running config_override_command.
+/// Timeout (seconds) for running config_override_command / password_command.
 /// Required because a command that hangs forever waiting for authentication (1Password etc.) would
 /// freeze the caller.
 const SOURCE_COMMAND_TIMEOUT_SECS: u64 = 60;
@@ -263,6 +263,12 @@ pub struct ServerConfig {
     pub user: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
+    /// queryfolio extension: a command whose stdout (minus trailing newlines) is used as the
+    /// password. It is not run when the config is loaded or the connection is selected, only
+    /// when DbManager::get_pool creates a new pool (and when an expired password is refreshed).
+    /// See password_command() for the combinations that are rejected.
+    #[serde(default)]
+    pub password_command: Option<String>,
     #[serde(default)]
     pub ssh_tunnel: Option<SshTunnelConfig>,
     /// queryfolio extension: if true, use https for connections of HTTP-based engines
@@ -455,6 +461,44 @@ impl ServerConfig {
         Ok(Some(raw))
     }
 
+    /// Returns the password_command setting value (None if unset).
+    ///
+    /// Checked at connect time like ssl_root_cert (rejecting it while loading the config would
+    /// take the whole connection list down for one bad entry). Errors when:
+    /// - password is also set. Silently preferring one would hide that the other has no effect
+    ///   (a password inherited from a template can be dropped with `password: null`)
+    /// - the engine does not use a password (sqlite / duckdb)
+    /// - it is empty (a key that was written should not quietly mean "unset")
+    pub fn password_command(&self) -> Result<Option<&str>, AppError> {
+        let Some(raw) = self.password_command.as_deref() else {
+            return Ok(None);
+        };
+        let command = raw.trim();
+        if command.is_empty() {
+            return Err(AppError::Config(format!(
+                "Server '{}': password_command is empty",
+                self.name
+            )));
+        }
+        if self.password.is_some() {
+            return Err(AppError::Config(format!(
+                "Server '{}': set either password or password_command, not both \
+                 (to drop a password inherited from a template, write `password: null`)",
+                self.name
+            )));
+        }
+        if let Ok(crate::db::Engine::Sqlite | crate::db::Engine::DuckDb) =
+            crate::db::parse_engine(&self.engine)
+        {
+            return Err(AppError::Config(format!(
+                "Server '{}': password_command cannot be used with {} \
+                 (the engine does not use a password)",
+                self.name, self.engine
+            )));
+        }
+        Ok(Some(command))
+    }
+
     /// Returns the folder name for saved query files.
     /// Uses folder_name if set; otherwise builds <host>_<engine>_<schema>_<user> (name is not
     /// used).
@@ -557,6 +601,9 @@ pub struct ConnectionInfo {
     pub allow_dangerous_statements: bool,
     /// Display group name in the connection list (null if not in a group)
     pub group_name: Option<String>,
+    /// Whether the password is fetched with password_command. Neither the command nor its
+    /// output is passed on, only this fact
+    pub password_from_command: bool,
     /// Effective TLS mode (string representation of SqlSslMode).
     /// For mysql / postgres / mssql it is the value resolved from ssl_mode / tls; for redis it is
     /// verify-full when tls: true (certificate and host name are both verified) and disable when
@@ -585,6 +632,7 @@ impl From<&ServerConfig> for ConnectionInfo {
             readonly: server.readonly,
             allow_dangerous_statements: server.allow_dangerous_statements,
             group_name: server.group_name.clone(),
+            password_from_command: server.password_command.is_some(),
             // Go through parse_engine so engine name aliases (mariadb / postgresql) are also picked
             // up.
             // A config with an invalid engine name or ssl_mode value errors at connect time, so
@@ -1382,26 +1430,87 @@ fn parse_server_entry(
 }
 
 /// Runs config_override_command and returns stdout.
+async fn run_source_command(command: &str) -> Result<String, AppError> {
+    let stdout = run_setting_command(
+        command,
+        CONFIG_OVERRIDE_COMMAND_KEY,
+        Duration::from_secs(SOURCE_COMMAND_TIMEOUT_SECS),
+    )
+    .await?;
+    let stdout = String::from_utf8_lossy(&stdout).to_string();
+    if stdout.trim().is_empty() {
+        return Err(no_output_error(CONFIG_OVERRIDE_COMMAND_KEY, command));
+    }
+    Ok(stdout)
+}
+
+/// Runs the password_command of a connection and returns the password.
+///
+/// The password is stdout with only trailing `\r` / `\n` removed. Nothing else is touched:
+/// RDS IAM auth tokens contain `&` `=` `%`, and a password may legitimately be or contain
+/// spaces, so trimming or decoding would produce a different string.
+///
+/// **stdout never appears in error messages** (it is the password). Errors carry the command,
+/// the exit code and stderr only.
+pub async fn run_password_command(server_name: &str, command: &str) -> Result<String, AppError> {
+    run_password_command_with_timeout(
+        server_name,
+        command,
+        Duration::from_secs(SOURCE_COMMAND_TIMEOUT_SECS),
+    )
+    .await
+}
+
+async fn run_password_command_with_timeout(
+    server_name: &str,
+    command: &str,
+    timeout: Duration,
+) -> Result<String, AppError> {
+    let setting = format!("password_command of server '{server_name}'");
+    let stdout = run_setting_command(command, &setting, timeout).await?;
+    // A lossy conversion would turn invalid bytes into U+FFFD and try a different password
+    let stdout = String::from_utf8(stdout)
+        .map_err(|_| AppError::Config(format!("{setting} printed non-UTF-8 output: {command}")))?;
+    let password = stdout.trim_end_matches(['\r', '\n']);
+    if password.is_empty() {
+        return Err(no_output_error(&setting, command));
+    }
+    Ok(password.to_string())
+}
+
+fn no_output_error(setting: &str, command: &str) -> AppError {
+    AppError::Config(format!("{setting} produced no output: {command}"))
+}
+
+/// Runs a command written in the config (config_override_command / password_command) and
+/// returns its stdout. `setting` names the setting in error messages.
 ///
 /// Splits into argv with shlex and runs without a shell. Even if shell metacharacters slip in
 /// they are not interpreted, so there is no room for command injection. In exchange,
 /// pipes, redirects and variable expansion are unavailable (a single command is assumed).
-async fn run_source_command(command: &str) -> Result<String, AppError> {
+///
+/// Error messages carry the command and stderr but **never stdout** (the stdout of
+/// password_command is the password). Whether empty output is an error is up to the caller.
+async fn run_setting_command(
+    command: &str,
+    setting: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>, AppError> {
     let argv = shlex::split(command).ok_or_else(|| {
         AppError::Config(format!(
-            "Failed to parse config_override_command (unbalanced quotes?): {command}"
+            "Failed to parse {setting} (unbalanced quotes?): {command}"
         ))
     })?;
     if argv.is_empty() {
-        return Err(AppError::Config("config_override_command is empty".into()));
+        return Err(AppError::Config(format!("{setting} is empty")));
     }
 
     let output = tokio::time::timeout(
-        Duration::from_secs(SOURCE_COMMAND_TIMEOUT_SECS),
+        timeout,
         tokio::process::Command::new(&argv[0])
             .args(&argv[1..])
             // The PATH of a GUI launched from Finder / Dock is minimal (/usr/bin:/bin etc.) and
-            // Homebrew's op etc. would not be found, so add the usual paths
+            // Homebrew's op / aws etc. would not be found, so add the usual paths
             .env("PATH", supplemented_path())
             // Do not leave the child process behind when the future is dropped on timeout
             // (prevents an `op` hung waiting for authentication from becoming an orphan and being
@@ -1412,30 +1521,22 @@ async fn run_source_command(command: &str) -> Result<String, AppError> {
     .await
     .map_err(|_| {
         AppError::Config(format!(
-            "config_override_command timed out ({SOURCE_COMMAND_TIMEOUT_SECS}s): {command} \
-             (it may be hanging on 1Password or another auth prompt)"
+            "{setting} timed out ({}s): {command} \
+             (it may be hanging on 1Password or another auth prompt)",
+            timeout.as_secs_f64()
         ))
     })?
-    .map_err(|e| {
-        AppError::Config(format!("Failed to run config_override_command: {command}: {e}"))
-    })?;
+    .map_err(|e| AppError::Config(format!("Failed to run {setting}: {command}: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(AppError::Config(format!(
-            "config_override_command exited with an error (code={:?}): {command}\nstderr: {}",
+            "{setting} exited with an error (code={:?}): {command}\nstderr: {}",
             output.status.code(),
             stderr.trim()
         )));
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    if stdout.trim().is_empty() {
-        return Err(AppError::Config(format!(
-            "config_override_command produced no output: {command}"
-        )));
-    }
-    Ok(stdout)
+    Ok(output.stdout)
 }
 
 /// Returns PATH with usual directories such as Homebrew's added.
@@ -2697,6 +2798,7 @@ servers:
             schema: Some("db".into()),
             user: Some("u".into()),
             password: Some("secret".into()),
+            password_command: None,
             ssh_tunnel: None,
             tls: false,
             ssl_mode: None,
@@ -2709,6 +2811,212 @@ servers:
         let info = ConnectionInfo::from(&server);
         let json = serde_json::to_string(&info).unwrap();
         assert!(!json.contains("secret"));
+    }
+
+    /// Resolves the first entry of servers (templates expanded)
+    fn first_server(yaml: &str) -> ServerConfig {
+        config_from_yaml(yaml)
+            .resolve_servers()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_password_command_is_read() {
+        // Arrange / Act
+        let server = first_server(
+            "servers:\n  - name: iam\n    engine: postgres\n    host: h\n    user: u\n    \
+             password_command: aws rds generate-db-auth-token --hostname h\n",
+        );
+        let plain = first_server(
+            "servers:\n  - name: p\n    engine: postgres\n    password: secret\n",
+        );
+
+        // Assert
+        assert_eq!(
+            server.password_command().unwrap(),
+            Some("aws rds generate-db-auth-token --hostname h")
+        );
+        assert!(server.password.is_none());
+        assert_eq!(plain.password_command().unwrap(), None);
+    }
+
+    #[test]
+    fn test_password_and_password_command_together_is_error() {
+        // Arrange
+        let server = first_server(
+            "servers:\n  - name: both\n    engine: mysql\n    password: secret\n    \
+             password_command: /bin/echo x\n",
+        );
+
+        // Act
+        let err = server.password_command().unwrap_err().to_string();
+
+        // Assert
+        assert!(err.contains("either password or password_command"), "{err}");
+        assert!(err.contains("'both'"), "{err}");
+    }
+
+    #[test]
+    fn test_password_command_is_rejected_for_file_engines() {
+        for engine in ["sqlite", "sqlite3", "duckdb"] {
+            let server = first_server(&format!(
+                "servers:\n  - name: f\n    engine: {engine}\n    schema: /tmp/x.db\n    \
+                 password_command: /bin/echo x\n"
+            ));
+            let err = server.password_command().unwrap_err().to_string();
+            assert!(err.contains("cannot be used with"), "{engine}: {err}");
+        }
+        for engine in ["mysql", "postgres", "mssql", "redis", "elasticsearch", "dynamodb"] {
+            let server = first_server(&format!(
+                "servers:\n  - name: n\n    engine: {engine}\n    \
+                 password_command: /bin/echo x\n"
+            ));
+            assert!(server.password_command().unwrap().is_some(), "{engine}");
+        }
+    }
+
+    #[test]
+    fn test_blank_password_command_is_error() {
+        let server = first_server(
+            "servers:\n  - name: b\n    engine: postgres\n    password_command: \"  \"\n",
+        );
+        assert!(server.password_command().unwrap_err().to_string().contains("is empty"));
+    }
+
+    #[test]
+    fn test_password_command_is_inherited_from_template() {
+        // Arrange
+        let inherited = "servers:\n  - name: qa\n    template: iam\n    host: qa-db\n\
+                         server_templates:\n  - name: iam\n    engine: postgres\n    \
+                         user: iam_ro\n    password_command: /usr/local/bin/token --user iam_ro\n";
+        let base = "server_templates:\n  - name: t\n    engine: postgres\n    password: shared\n";
+        let both = format!(
+            "servers:\n  - name: s\n    template: t\n    password_command: /bin/echo x\n{base}"
+        );
+        let overridden = format!(
+            "servers:\n  - name: s\n    template: t\n    password: null\n    \
+             password_command: /bin/echo x\n{base}"
+        );
+
+        // Act
+        let inherited = first_server(inherited);
+        let both = first_server(&both);
+        let overridden = first_server(&overridden);
+
+        // Assert
+        assert_eq!(
+            inherited.password_command().unwrap(),
+            Some("/usr/local/bin/token --user iam_ro")
+        );
+        // A template's password plus the server's password_command counts as both set;
+        // `password: null` drops the inherited one
+        assert!(both.password_command().is_err());
+        assert_eq!(overridden.password_command().unwrap(), Some("/bin/echo x"));
+    }
+
+    #[test]
+    fn test_connection_info_marks_password_command_without_the_command() {
+        // Arrange
+        let server = first_server(
+            "servers:\n  - name: iam\n    engine: postgres\n    \
+             password_command: /opt/secret-fetcher --token-for prod\n",
+        );
+        let plain = first_server("servers:\n  - name: p\n    engine: postgres\n");
+
+        // Act
+        let info = ConnectionInfo::from(&server);
+        let json = serde_json::to_string(&info).unwrap();
+
+        // Assert
+        assert!(info.password_from_command);
+        assert!(!json.contains("secret-fetcher"), "{json}");
+        assert!(!ConnectionInfo::from(&plain).password_from_command);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_password_command_trims_only_trailing_newlines() {
+        // A value with & = % like an RDS IAM token; leading / trailing spaces are kept
+        let password = run_password_command(
+            "iam",
+            r"/usr/bin/printf ' tok&en=a%%2Fb?X-Amz-Signature=ab== \r\n\n'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(password, " tok&en=a%2Fb?X-Amz-Signature=ab== ");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_whitespace_only_password_is_kept() {
+        let password = run_password_command("ws", r"/usr/bin/printf ' \t \n'")
+            .await
+            .unwrap();
+        assert_eq!(password, " \t ");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_password_command_empty_output_is_error() {
+        for command in ["/usr/bin/true", r"/usr/bin/printf '\n'", r"/usr/bin/printf '\r\n'"] {
+            let err = run_password_command("iam", command).await.unwrap_err().to_string();
+            assert!(err.contains("produced no output"), "{command}: {err}");
+            assert!(err.contains("password_command of server 'iam'"), "{err}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_config_override_command_whitespace_output_is_still_error() {
+        let err = run_source_command(r"/usr/bin/printf ' \n'").await.unwrap_err().to_string();
+        assert!(err.contains("config_override_command produced no output"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_password_command_failure_shows_stderr_but_not_stdout() {
+        // stdout is "hunter2". The command itself may appear in the error, so it is built so
+        // that "hunter2" does not occur in the command string
+        let err = run_password_command(
+            "iam",
+            "/bin/sh -c 'printf %s%s hunter 2; echo token expired >&2; exit 3'",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("password_command of server 'iam'"), "{err}");
+        assert!(err.contains("code=Some(3)"), "{err}");
+        assert!(err.contains("token expired"), "{err}");
+        assert!(!err.contains("hunter2"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_password_command_timeout() {
+        let started = std::time::Instant::now();
+        let err = run_password_command_with_timeout(
+            "iam",
+            "/bin/sleep 10",
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("timed out (0.2s)"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_password_command_rejects_non_utf8_output() {
+        let err = run_password_command("iam", r"/usr/bin/printf '\377\376'")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-UTF-8"), "{err}");
     }
 
     fn server_with(
@@ -2728,6 +3036,7 @@ servers:
             schema: schema.map(|s| s.to_string()),
             user: user.map(|s| s.to_string()),
             password: None,
+            password_command: None,
             ssh_tunnel: None,
             tls: false,
             ssl_mode: None,
@@ -2890,6 +3199,7 @@ servers:
             schema: Some("ap-northeast-1".into()),
             user: Some("AKIAEXAMPLEKEYID".into()),
             password: Some("secret".into()),
+            password_command: None,
             ssh_tunnel: None,
             readonly: false,
             allow_dangerous_statements: false,

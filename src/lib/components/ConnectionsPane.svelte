@@ -131,6 +131,8 @@
         rows.push({ label: "Port", value: String(c.port) });
       }
       if (c.user) rows.push({ label: "User", value: c.user });
+      // Show only that the password comes from password_command
+      if (c.password_from_command) rows.push({ label: "Password", value: "(command)" });
       if (c.schema) rows.push({ label: "Database", value: c.schema });
     }
     if (c.ssh_tunnel) {
