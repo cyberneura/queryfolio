@@ -467,22 +467,26 @@ const TRAILING_STATEMENT_KEYWORDS: &[&str] = &[
 
 /// Whether another statement starts after the first one (a multi-statement batch with no semicolon).
 /// The check uses word boundaries on cleaned, where literals, comments and brackets are blanked.
-/// `@` is part of a word so that variables named after a keyword (`@update`, `@revert`) are not counted.
+/// Words follow the regular identifier rules (Unicode letters and digits, `_`, `@`, `#`, `$`), so
+/// a keyword inside an identifier (`foo$checkpoint`, `@update`, a non-ASCII prefix) is not counted.
 /// The T-SQL lexer ends a number literal where its grammar ends, so `SELECT 1DROP TABLE t` /
-/// `SELECT 0xINSERT INTO t ...` run as two statements; the literal prefix is stripped before matching.
+/// `SELECT 0xINSERT INTO t ...` / `SELECT $1DROP TABLE t` run as two statements; the literal
+/// prefix is stripped before matching.
 fn contains_trailing_statement(sql: &str) -> bool {
     let cleaned = scan_sql(sql, Engine::MsSql).cleaned;
     cleaned
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '#' && c != '@')
+        .split(|c: char| !c.is_alphanumeric() && !matches!(c, '_' | '#' | '@' | '$'))
         .filter(|w| !w.is_empty())
         .skip(1)
         .any(|word| TRAILING_STATEMENT_KEYWORDS.contains(&strip_number_literal(word)))
 }
 
-/// Strips a leading number literal from a word: `0x` + hex digits, or digits + an optional exponent
-/// (`1e5`; a signed exponent is already split at `+` / `-`, and a decimal point at `.`).
-/// Words that do not start with a digit are returned as they are.
+/// Strips a leading number literal from a word: an optional money sign `$` (an identifier cannot
+/// start with it), then `0x` + hex digits, or digits + an optional exponent (`1e5`; a signed
+/// exponent is already split at `+` / `-`, and a decimal point at `.`).
+/// Words that start with neither `$` nor a digit are returned as they are.
 fn strip_number_literal(word: &str) -> &str {
+    let word = word.strip_prefix('$').unwrap_or(word);
     if !word.starts_with(|c: char| c.is_ascii_digit()) {
         return word;
     }
@@ -1261,6 +1265,8 @@ mod tests {
             "SELECT 0x00WRITETEXT t.c 0x00 'x'",
             "SELECT 1.5UPDATE t SET x = 1",
             "SELECT 1e5DELETE FROM t",
+            "SELECT $1DROP TABLE t",
+            "SELECT $DROP TABLE t",
         ] {
             assert!(contains_trailing_statement(sql), "{sql}");
         }
@@ -1281,6 +1287,10 @@ mod tests {
             "SELECT @update, @revert, @@ROWCOUNT",
             "SELECT * FROM t WHERE x = @checkpoint",
             "SELECT 1e5, 0x1F, 2AS x FROM t1",
+            // Identifiers may contain `$` and Unicode letters after the first character
+            "SELECT foo$checkpoint, a_update FROM t",
+            "SELECT 名前checkpoint FROM t",
+            "SELECT $1.50 AS price",
             "SELECT created, updated_at FROM t",
             // The leading word itself is not counted
             "DELETE FROM t WHERE id = 1",
