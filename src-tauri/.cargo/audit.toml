@@ -40,4 +40,39 @@ ignore = [
   # Or, as soon as there is a reason to enable this feature, **delete this ignore** and
   # verify that rkyv has actually been upgraded.
   "RUSTSEC-2026-0235",
+
+  # zip 6.0.0 — symlink / permission handling in `ZipArchive::extract` (RUSTSEC-2026-0367 / 0368 / 0369)
+  #
+  # Path: libduckdb-sys 1.10504.0 **build-dependency** only (`cargo tree -i zip@6.0.0 --target all -e all`
+  # shows `[build-dependencies] libduckdb-sys`). It is used at build time to unpack the DuckDB
+  # source archive that ships inside the libduckdb-sys crate from crates.io, and nothing from it
+  # goes into the application binary. The archive it extracts is bundled with the pinned
+  # libduckdb-sys crate (checksum in Cargo.lock); it is not supplied by application users, so
+  # the symlink / permission issues these advisories describe have no untrusted input to act on.
+  #
+  # The fixed version (zip >= 9) cannot be selected by `cargo update -p zip` because libduckdb-sys
+  # pins the 6.x range.
+  #
+  # Condition for removal: when libduckdb-sys requires zip >= 9. Delete these three lines then and
+  # verify the upgrade actually happened.
+  "RUSTSEC-2026-0367",
+  "RUSTSEC-2026-0368",
+  "RUSTSEC-2026-0369",
+
+  # webpki-roots 0.26.11 — bundled root certificates trust distrusted emSign intermediates (RUSTSEC-2026-0381)
+  #
+  # Path: sqlx-core 0.8.6 > webpki-roots 0.26.11. The advisory's fixed range is >= 1.0.10 only, so
+  # cargo audit keeps flagging the 0.26 line. But 0.26.11 (the last 0.26 release) is a semver trick:
+  # its only dependency is `webpki-roots = "1"` and it re-exports that crate's root store
+  # (see its lib.rs: "This crate version is a semver trick to webpki-roots v1"). The roots actually
+  # compiled in come from webpki-roots 1.0.10, which has the fix, so the app is not affected.
+  #
+  # How to verify:
+  #   cargo tree -i webpki-roots@0.26.11 --target all   (reached from sqlx-core only)
+  #   grep -A3 'name = "webpki-roots"' Cargo.lock       (the 1.x entry must be >= 1.0.10)
+  #
+  # Condition for removal: when sqlx-core depends on webpki-roots 1.x directly and 0.26.11
+  # disappears from Cargo.lock. **If webpki-roots 1.x in Cargo.lock drops below 1.0.10, this
+  # judgment becomes invalid.**
+  "RUSTSEC-2026-0381",
 ]
