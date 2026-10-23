@@ -160,11 +160,18 @@
     filterQuery = "";
   };
 
-  /// Connections matching the filter: name, description, group and engine
+  /// Connections matching the filter: name, description, group and engine (both the configured
+  /// value such as `mariadb` / `sqlite3` and its display label)
   const visibleConnections = $derived.by(() => {
     const terms = filterTerms(filterQuery);
     return appStore.connections.filter((c) =>
-      matchesFilter(terms, [c.name, c.description, c.group_name, engineLabel(c.engine)]),
+      matchesFilter(terms, [
+        c.name,
+        c.description,
+        c.group_name,
+        c.engine,
+        engineLabel(c.engine),
+      ]),
     );
   });
 
