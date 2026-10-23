@@ -324,8 +324,12 @@
     {:else}
       {#each sections as section, sectionIndex (sectionIndex)}
         {#if section.group !== null}
+          <!-- WKWebView snaps a stuck top-0 header to device pixels while the list scrolls by
+               fractional amounts, so a ~1px strip of the rows underneath showed above it. Stick
+               1px above the scrollport instead (-top-px) so that strip is always covered;
+               -mt-px + 5px top padding keep the visible box identical to py-1 in every state. -->
           <div
-            class="sticky top-0 z-10 bg-zinc-700 px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-200"
+            class="sticky -top-px z-10 -mt-px bg-zinc-700 px-3 pb-1 pt-[5px] text-[10px] font-semibold uppercase tracking-wide text-zinc-200"
             data-annotate="connection-group-{section.group}"
           >
             {section.group}
