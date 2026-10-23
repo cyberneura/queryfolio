@@ -3,6 +3,8 @@
   import appStore from "$lib/stores/app.svelte";
   import { setFileDragPayload } from "$lib/fileDrag";
   import { formatFileSize, formatModifiedAt, formatRelativeTime } from "$lib/fileMeta";
+  import { filterTerms, matchesFilter } from "$lib/paneFilter";
+  import PaneFilterInput from "./PaneFilterInput.svelte";
 
   interface Props {
     /// Switch to the HISTORY / TABLES tab (the tab state is held by +page.svelte)
@@ -23,6 +25,29 @@
   let renameValue = $state("");
   /// The file being dragged to the CONNECTIONS pane (to show the drag source dimmed)
   let draggingFile = $state<string | null>(null);
+
+  /// The filter input under the header (opened by the magnifier button)
+  let filterOpen = $state(false);
+  let filterQuery = $state("");
+
+  const closeFilter = () => {
+    filterOpen = false;
+    filterQuery = "";
+  };
+
+  /// Files whose name matches the filter (kept in the list order)
+  const visibleEntries = $derived.by(() => {
+    const terms = filterTerms(filterQuery);
+    return appStore.fileEntries.filter((entry) => matchesFilter(terms, [entry.file_name]));
+  });
+
+  /// Enter in the filter opens the first match
+  const openFirstMatch = () => {
+    const first = visibleEntries[0];
+    if (first && appStore.selectedFile !== first.file_name) {
+      void appStore.selectFile(first.file_name);
+    }
+  };
 
   /// Reference time for relative notation (`3 days ago`). Advanced every minute so the notation does not go stale even if left open
   let clock = $state(Date.now());
@@ -226,7 +251,19 @@
       </button>
     {/if}
     <button
-      class="ml-auto rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
+      class="ml-auto rounded px-1.5 py-0.5 text-xs hover:bg-zinc-700 hover:text-zinc-200 {filterOpen
+        ? 'bg-zinc-700 text-zinc-200'
+        : 'text-zinc-400'}"
+      title="Filter files"
+      aria-label="Filter files"
+      aria-pressed={filterOpen}
+      data-annotate="button-filter-files"
+      onclick={() => (filterOpen ? closeFilter() : (filterOpen = true))}
+    >
+      <i class="bi bi-search" aria-hidden="true"></i>
+    </button>
+    <button
+      class="rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
       title="New query file"
       aria-label="New query file"
       data-annotate="button-create-file"
@@ -239,6 +276,15 @@
       <i class="bi bi-plus-lg" aria-hidden="true"></i>
     </button>
   </div>
+  {#if filterOpen}
+    <PaneFilterInput
+      bind:value={filterQuery}
+      placeholder="Filter files"
+      annotate="input-filter-files"
+      onClose={closeFilter}
+      onSubmit={openFirstMatch}
+    />
+  {/if}
   <div class="min-h-0 flex-1 overflow-y-auto">
     {#if !appStore.selectedConnection}
       <p class="px-3 py-2 text-xs text-zinc-500">Select a connection</p>
@@ -270,11 +316,15 @@
         <p class="px-3 py-2 text-xs text-zinc-500">
           Click + to create a query file
         </p>
+      {:else if visibleEntries.length === 0 && appStore.fileEntries.length > 0}
+        <p class="px-3 py-2 text-xs text-zinc-500" data-annotate="files-no-match">
+          No matching files
+        </p>
       {/if}
       <!-- To give the rows with drag & drop handlers a proper ARIA role,
                  wrap only the list part with role="list" (the create form and empty message are not included) -->
       <div role="list">
-        {#each appStore.fileEntries as { file_name: fileName, modified_ms, size } (fileName)}
+        {#each visibleEntries as { file_name: fileName, modified_ms, size } (fileName)}
           <div
             role="listitem"
             class="group relative flex items-center gap-1 pr-1 hover:bg-zinc-800 {appStore.selectedFile ===
