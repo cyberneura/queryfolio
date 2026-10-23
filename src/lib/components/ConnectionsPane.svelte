@@ -5,6 +5,8 @@
   import appStore from "$lib/stores/app.svelte";
   import { addFileConnection, type ConnectionInfo } from "$lib/api";
   import { hasFileDragPayload, readFileDragPayload } from "$lib/fileDrag";
+  import { filterTerms, matchesFilter } from "$lib/paneFilter";
+  import PaneFilterInput from "./PaneFilterInput.svelte";
 
   type Props = {
     /// Open the config editor (ConfigEditorModal). Same as the Edit config.yml menu item
@@ -149,11 +151,37 @@
     return rows;
   };
 
+  /// The filter input under the header (opened by the magnifier button)
+  let filterOpen = $state(false);
+  let filterQuery = $state("");
+
+  const closeFilter = () => {
+    filterOpen = false;
+    filterQuery = "";
+  };
+
+  /// Connections matching the filter: name, description, group and engine
+  const visibleConnections = $derived.by(() => {
+    const terms = filterTerms(filterQuery);
+    return appStore.connections.filter((c) =>
+      matchesFilter(terms, [c.name, c.description, c.group_name, engineLabel(c.engine)]),
+    );
+  });
+
+  /// Enter in the filter selects the first match
+  const selectFirstMatch = () => {
+    const first = visibleConnections[0];
+    if (first) {
+      void appStore.selectConnection(first.name);
+    }
+  };
+
   /// Group consecutive connections with the same group name into sections, keeping the config order.
   /// A connection without group_name becomes a section with no header.
+  /// While filtering, a group header is shown only above the connections that matched.
   const sections = $derived.by(() => {
     const result: { group: string | null; items: ConnectionInfo[] }[] = [];
-    for (const connection of appStore.connections) {
+    for (const connection of visibleConnections) {
       const group = connection.group_name;
       const last = result[result.length - 1];
       if (last && last.group === group) {
@@ -272,8 +300,20 @@
 </script>
 
 <div class="flex h-full w-full flex-col border-r border-zinc-700 bg-zinc-900">
-  <div class="flex items-center justify-between border-b border-zinc-700 px-3 py-2">
+  <div class="flex items-center gap-1 border-b border-zinc-700 px-3 py-2">
     <span class="text-xs font-semibold tracking-wide text-zinc-400">CONNECTIONS</span>
+    <button
+      class="ml-auto rounded px-1.5 py-0.5 text-xs hover:bg-zinc-700 hover:text-zinc-200 {filterOpen
+        ? 'bg-zinc-700 text-zinc-200'
+        : 'text-zinc-400'}"
+      title="Filter connections"
+      aria-label="Filter connections"
+      aria-pressed={filterOpen}
+      data-annotate="button-filter-connections"
+      onclick={() => (filterOpen ? closeFilter() : (filterOpen = true))}
+    >
+      <i class="bi bi-search" aria-hidden="true"></i>
+    </button>
     <button
       class="rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200"
       title="Reload connections"
@@ -284,6 +324,15 @@
       <i class="bi bi-arrow-clockwise" aria-hidden="true"></i>
     </button>
   </div>
+  {#if filterOpen}
+    <PaneFilterInput
+      bind:value={filterQuery}
+      placeholder="Filter connections"
+      annotate="input-filter-connections"
+      onClose={closeFilter}
+      onSubmit={selectFirstMatch}
+    />
+  {/if}
   <div class="min-h-0 flex-1 overflow-y-auto">
     {#if appStore.loadingConnections}
       <p class="px-3 py-2 text-xs text-zinc-500">Loading...</p>
@@ -321,6 +370,10 @@
           for the config format (MySQL, PostgreSQL, SSH tunnels, and more).
         </p>
       </div>
+    {:else if visibleConnections.length === 0}
+      <p class="px-3 py-2 text-xs text-zinc-500" data-annotate="connections-no-match">
+        No matching connections
+      </p>
     {:else}
       {#each sections as section, sectionIndex (sectionIndex)}
         {#if section.group !== null}
