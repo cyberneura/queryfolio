@@ -14,7 +14,10 @@ The result tab lists each statement with its status (`ok` / `error` /
 `cancelled` / `running` / `not run`), row count and error message, filling in as
 each one finishes. If one fails, the run stops and asks whether to stop there or
 ignore errors and run the rest. A run that started with Writable on stops if
-Writable goes off — including by switching to another connection. The `📝` Run and Log marker is not written back
+Writable goes off — including by switching to another connection. Each
+statement runs on its own connection, so a selection containing transaction or
+session statements (`BEGIN`, `COMMIT`, `ROLLBACK`, `SET`, `LOCK`, temporary
+tables) is refused: a `ROLLBACK` would not undo the statements before it. The `📝` Run and Log marker is not written back
 for a multi-statement run.
 
 `SELECT` without a `LIMIT` gets one appended automatically — 500 rows unless the

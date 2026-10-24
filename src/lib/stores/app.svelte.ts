@@ -9,6 +9,7 @@ import type {
   QueryResult,
 } from "$lib/api";
 import { merge3 } from "$lib/mergeText";
+import { sessionStatementReason } from "$lib/batchSession";
 import { planRunLogWrite } from "$lib/runLog";
 import type { RunLogOutcome, RunTarget } from "$lib/runLog";
 import {
@@ -2218,6 +2219,18 @@ const runBatch = async (statements: string[]) => {
   }
   if (statements.length === 0) {
     return;
+  }
+  // Each statement takes its own pooled connection, so a transaction or session setting would
+  // not carry over to the next one (BEGIN; UPDATE; ROLLBACK; would commit the UPDATE)
+  for (const statement of statements) {
+    const reason = sessionStatementReason(statement);
+    if (reason) {
+      toast.warning(
+        `A multi-statement run cannot include ${reason}: each statement runs on its own ` +
+          "connection, so transactions and session settings do not carry over.",
+      );
+      return;
+    }
   }
   if (isConnectionRunning(connection)) {
     toast.warning(
