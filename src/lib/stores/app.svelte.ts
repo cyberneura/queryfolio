@@ -2222,8 +2222,11 @@ const runBatch = async (statements: string[]) => {
   }
   // Each statement takes its own pooled connection, so a transaction or session setting would
   // not carry over to the next one (BEGIN; UPDATE; ROLLBACK; would commit the UPDATE)
+  const isMssql = /^(mssql|sqlserver)$/i.test(
+    connections.find((c) => c.name === connection)?.engine ?? "",
+  );
   for (const statement of statements) {
-    const reason = sessionStatementReason(statement);
+    const reason = sessionStatementReason(statement, isMssql);
     if (reason) {
       toast.warning(
         `A multi-statement run cannot include ${reason}: each statement runs on its own ` +
