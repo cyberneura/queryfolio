@@ -87,6 +87,7 @@
   const canAnalyzePlan = $derived(
     activeTab !== null &&
       activeTab.result !== null &&
+      activeTab.batch === null &&
       isExplainSql(activeTab.sql) &&
       (appStore.aiInfo?.configured ?? false),
   );
@@ -840,8 +841,11 @@
       activeTab.schema === appStore.activeSchema,
   );
 
+  // A batch tab is never editable: its result is the per-statement summary built on the frontend
   const activeEditContext = $derived(
-    activeTab ? (editContexts.get(activeTab.id) ?? null) : null,
+    activeTab && activeTab.batch === null
+      ? (editContexts.get(activeTab.id) ?? null)
+      : null,
   );
   const activePending = $derived(
     activeTab ? (pendingEdits.get(activeTab.id) ?? null) : null,
@@ -870,7 +874,12 @@
       }
       if (editingCell?.tabId === tab.id) editingCell = null;
     }
-    if (canEditActiveConnection && tab.result && !editContexts.has(tab.id)) {
+    if (
+      canEditActiveConnection &&
+      tab.result &&
+      tab.batch === null &&
+      !editContexts.has(tab.id)
+    ) {
       void deriveEditContext(tab);
     }
   });
@@ -1219,7 +1228,14 @@
         {formatTime(activeTab.executedAt)}
       </span>
       {#if activeTab.running}
-        <span class="text-blue-400">Running...</span>
+        <span class="text-blue-400">
+          Running...{#if activeTab.batch && activeTab.result}
+            {@const done = activeTab.result.rows.filter(
+              (row) => row[1] !== "running" && row[1] !== "not run",
+            ).length}
+            ({done}/{activeTab.batch.length})
+          {/if}
+        </span>
       {:else if activeTab.cancelled}
         <span class="text-amber-400" data-annotate="text-result-cancelled">
           Cancelled
@@ -1442,7 +1458,8 @@
         <pre
           class="whitespace-pre-wrap px-3 py-2 font-mono text-xs text-red-400"
           data-annotate="text-error-message">{appStore.errorMessage}</pre>
-      {:else if activeTab?.running}
+      {:else if activeTab?.running && activeTab.batch === null}
+        <!-- A batch keeps its per-statement summary visible while it runs -->
         <p class="px-3 py-2 text-xs text-blue-400">Running...</p>
       {:else if activeTab?.error}
         <div class="px-3 py-2">

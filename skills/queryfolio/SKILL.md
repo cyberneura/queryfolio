@@ -180,7 +180,9 @@ the SQL-editor counterpart of the `runandlog` skill, with the same idea: you wri
 the user runs it, the result is written back into the same file, you read the file again.
 
 Put `📝` in a line comment immediately above a statement. When the user runs that statement,
-the result is written back as a block comment right below it.
+the result is written back as a block comment right below it. Only a single-statement run
+writes back: selecting several statements runs them one by one and writes nothing, so ask
+the user to run each marked statement on its own (cursor in it, Cmd+Enter).
 
 What you write:
 

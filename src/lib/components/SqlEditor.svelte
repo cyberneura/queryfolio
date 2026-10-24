@@ -14,7 +14,13 @@
   import type { DecorationSet } from "@codemirror/view";
   import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
   import { search, searchKeymap } from "@codemirror/search";
-  import { syntaxTree, HighlightStyle, syntaxHighlighting } from "@codemirror/language";
+  import {
+    ensureSyntaxTree,
+    syntaxTree,
+    HighlightStyle,
+    syntaxHighlighting,
+  } from "@codemirror/language";
+  import { toast } from "svelte-sonner";
   import { tags as t } from "@lezer/highlight";
   import { acceptCompletion, autocompletion, completionKeymap } from "@codemirror/autocomplete";
   import { sql, MSSQL, MySQL, PostgreSQL, SQLite } from "@codemirror/lang-sql";
@@ -38,6 +44,9 @@
     /// Passes the execution target (the SQL, its range in the editor, and whether there is a 📝 marker).
     /// After the result comes back, the caller returns the same target via writeRunLog()
     onRun: (target: RunTarget) => void;
+    /// Called instead of onRun when the selection spans two or more SQL statements.
+    /// The statements are passed in document order and run one by one
+    onRunBatch: (statements: string[]) => void;
     /// Called every time the selection changes. Notifies whether it spans multiple lines (the display
     /// condition of the Replace Multiline button). The selected text itself is snapshotted with
     /// getMainSelection() at the time the dialog opens, so it is not passed here
@@ -51,6 +60,7 @@
     schemaMap,
     onChange,
     onRun,
+    onRunBatch,
     onSelectionChange,
   }: Props = $props();
 
@@ -72,6 +82,9 @@
   /// Upper limit on the number of tables used for schema completion. Beyond it, columns are not
   /// passed and only table names are used (limits the build cost and memory of completion candidates)
   const MAX_SCHEMA_TABLES_WITH_COLUMNS = 2000;
+
+  /// How long a multi-statement run may block to finish parsing the document before splitting it
+  const PARSE_BEFORE_RUN_TIMEOUT_MS = 1000;
 
   const dialectFor = (engineName: string | null) => {
     switch ((engineName ?? "").toLowerCase()) {
@@ -300,6 +313,77 @@
     return range;
   };
 
+  // Return the statements touched by a non-empty selection, as whole statements (a selection that
+  // starts or ends inside a statement still runs that statement entirely, so what runs is what
+  // is highlighted). null unless it covers two or more statements: a selection inside one
+  // statement keeps the usual "statement at the cursor" behavior.
+  // SQL only: redis / es already send a selection as is and the backend splits it.
+  //
+  // `tree` must reach the end of the selection when the result is run: the parser works in the
+  // background, and a statement past the parsed part would be dropped or cut off. The highlight
+  // passes the current tree (it only draws)
+  const batchTargetRanges = (
+    state: EditorState,
+    tree: ReturnType<typeof syntaxTree>,
+  ): { from: number; to: number }[] | null => {
+    if (!isSqlLanguage()) {
+      return null;
+    }
+    const sel = state.selection.main;
+    if (sel.empty) {
+      return null;
+    }
+    // Strict comparison: selecting whole lines ends the selection at the start of the next
+    // line, which must not pull in the statement that starts there
+    const touchesSelection = (range: { from: number; to: number }) =>
+      range.to > sel.from && range.from < sel.to;
+    const ranges: { from: number; to: number }[] = [];
+    for (
+      let node = tree.topNode.firstChild;
+      node !== null;
+      node = node.nextSibling
+    ) {
+      if (node.name !== "Statement" || !touchesSelection(node)) {
+        continue;
+      }
+      // Same backslash correction as executionTargetRange (lezer splits "\d" off the statement)
+      const startLine = state.doc.lineAt(node.from);
+      const match = state
+        .sliceDoc(startLine.from, node.from)
+        .match(/^(\s*)\\+$/);
+      let from = match ? startLine.from + match[1].length : node.from;
+      // A meta command has no `;`, so lezer folds it into the statement on the following lines
+      // (`\c db` + `SELECT 1;` would run as one broken statement). A meta command is always one
+      // line: split each one off
+      while (
+        state.sliceDoc(from, from + 1) === "\\" &&
+        state.doc.lineAt(from).to < node.to
+      ) {
+        const meta = trimmedLineRange(state, from);
+        if (meta && touchesSelection(meta)) {
+          ranges.push(meta);
+        }
+        // Move to the next line holding something other than whitespace or a line comment
+        // (a comment between two meta commands must not end the splitting)
+        let next = state.doc.lineAt(from).to;
+        while (next < node.to) {
+          const rest = state.sliceDoc(next, node.to);
+          next += rest.length - rest.trimStart().length;
+          if (next >= node.to || state.sliceDoc(next, next + 2) !== "--") {
+            break;
+          }
+          next = state.doc.lineAt(next).to;
+        }
+        from = next;
+      }
+      const range = { from, to: node.to };
+      if (state.sliceDoc(range.from, range.to).trim() && touchesSelection(range)) {
+        ranges.push(range);
+      }
+    }
+    return ranges.length >= 2 ? ranges : null;
+  };
+
   // Notify whether the current main selection spans multiple lines
   const emitSelectionChange = (state: EditorState) => {
     if (!onSelectionChange) {
@@ -431,29 +515,38 @@
       }
 
       build(view: EditorView): DecorationSet {
-        // Highlight the same range as the execution target (prevents display and execution from diverging)
-        const range = executionTargetRange(
+        // Highlight the same ranges as the execution target (prevents display and execution from diverging)
+        const single = executionTargetRange(
           view.state,
           view.state.selection.main.head,
         );
-        if (!range) {
-          return Decoration.none;
-        }
+        const ranges =
+          batchTargetRanges(view.state, syntaxTree(view.state)) ??
+          (single ? [single] : []);
         const decorations = [];
-        const firstLine = view.state.doc.lineAt(range.from);
-        const lastLine = view.state.doc.lineAt(range.to);
-        for (let n = firstLine.number; n <= lastLine.number; n++) {
-          const line = view.state.doc.line(n);
-          let className = "cm-active-statement";
-          if (n === firstLine.number) {
-            className += " cm-active-statement-first";
+        // Two statements can share a line (`KILL 1; KILL 2;`); a line decoration is added once
+        let lastDecorated = 0;
+        for (const range of ranges) {
+          const firstLine = view.state.doc.lineAt(range.from);
+          const lastLine = view.state.doc.lineAt(range.to);
+          for (
+            let n = Math.max(firstLine.number, lastDecorated + 1);
+            n <= lastLine.number;
+            n++
+          ) {
+            const line = view.state.doc.line(n);
+            let className = "cm-active-statement";
+            if (n === firstLine.number) {
+              className += " cm-active-statement-first";
+            }
+            if (n === lastLine.number) {
+              className += " cm-active-statement-last";
+            }
+            decorations.push(
+              Decoration.line({ class: className }).range(line.from),
+            );
           }
-          if (n === lastLine.number) {
-            className += " cm-active-statement-last";
-          }
-          decorations.push(
-            Decoration.line({ class: className }).range(line.from),
-          );
+          lastDecorated = Math.max(lastDecorated, lastLine.number);
         }
         return Decoration.set(decorations);
       }
@@ -461,14 +554,38 @@
     { decorations: (plugin) => plugin.decorations },
   );
 
-  // Public method to be called from the toolbar's Run button
-  export function runCurrentStatement() {
-    if (!view) {
+  // Run the selected statements one by one if the selection spans several, otherwise the
+  // statement at the cursor
+  const runFromState = (state: EditorState) => {
+    let batch: { from: number; to: number }[] | null = null;
+    if (isSqlLanguage() && !state.selection.main.empty) {
+      const tree = ensureSyntaxTree(
+        state,
+        state.doc.length,
+        PARSE_BEFORE_RUN_TIMEOUT_MS,
+      );
+      if (!tree) {
+        toast.warning(
+          "The selection is too large to split into statements. Select fewer statements.",
+        );
+        return;
+      }
+      batch = batchTargetRanges(state, tree);
+    }
+    if (batch) {
+      onRunBatch(batch.map((range) => state.sliceDoc(range.from, range.to)));
       return;
     }
-    const target = runTargetAt(view.state);
+    const target = runTargetAt(state);
     if (target) {
       onRun(target);
+    }
+  };
+
+  // Public method to be called from the toolbar's Run button
+  export function runCurrentStatement() {
+    if (view) {
+      runFromState(view.state);
     }
   }
 
@@ -509,10 +626,7 @@
     {
       key: "Mod-Enter",
       run: (editorView) => {
-        const target = runTargetAt(editorView.state);
-        if (target) {
-          onRun(target);
-        }
+        runFromState(editorView.state);
         return true;
       },
     },

@@ -27,6 +27,7 @@
   import LicensesModal from "$lib/components/LicensesModal.svelte";
   import AiAnalysisModal from "$lib/components/AiAnalysisModal.svelte";
   import DangerousConfirmModal from "$lib/components/DangerousConfirmModal.svelte";
+  import BatchErrorModal from "$lib/components/BatchErrorModal.svelte";
   import RunLogConfirmModal from "$lib/components/RunLogConfirmModal.svelte";
   import SearchModal from "$lib/components/SearchModal.svelte";
   import ChatPane from "$lib/components/ChatPane.svelte";
@@ -68,6 +69,7 @@
     appStore.aiAnalysis !== null ||
     appStore.aiExplanation !== null ||
     appStore.dangerousConfirmReason !== null ||
+    appStore.batchErrorPrompt !== null ||
     runLogConfirm !== null;
 
   /// Global shortcuts.
@@ -625,6 +627,7 @@
                     schemaMap={appStore.schemaMap}
                     onChange={(content) => appStore.updateEditorContent(content)}
                     onRun={(target) => void runStatement(target)}
+                    onRunBatch={(statements) => void appStore.runBatch(statements)}
                     onSelectionChange={(info) => {
                       hasMultilineSelection = info.hasMultilineSelection;
                     }}
@@ -786,6 +789,18 @@
     reason={appStore.dangerousConfirmReason}
     onConfirm={() => appStore.confirmDangerous()}
     onCancel={() => appStore.cancelDangerous()}
+  />
+{/if}
+
+{#if appStore.batchErrorPrompt}
+  <BatchErrorModal
+    connection={appStore.batchErrorPrompt.connection}
+    index={appStore.batchErrorPrompt.index}
+    total={appStore.batchErrorPrompt.total}
+    statement={appStore.batchErrorPrompt.statement}
+    error={appStore.batchErrorPrompt.error}
+    onStop={() => appStore.resolveBatchErrorPrompt(false)}
+    onIgnoreErrors={() => appStore.resolveBatchErrorPrompt(true)}
   />
 {/if}
 
