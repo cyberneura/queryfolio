@@ -51,6 +51,9 @@ export interface ResultTab {
   /// Fix suggestion SQL returned by the AI (null if none). It is never run automatically;
   /// the user inserts it into the editor with Apply.
   fixSuggestion: string | null;
+  /// Statements of a selection run one by one (null for a single statement). `sql` holds them all
+  /// joined (display only) and `result` is the per-statement summary built on the frontend
+  batch: string[] | null;
 }
 
 /// One message shown in the AI chat pane.
@@ -164,6 +167,19 @@ let dangerousConfirm = $state<{
   reason: string;
   resolve: (ok: boolean) => void;
 } | null>(null);
+/// Batches waiting, after a failed statement, for "stop" or "ignore errors and run the rest".
+/// Queued rather than replaced: batches on different connections can fail at the same time, and
+/// replacing would stop the first one without asking and apply a click meant for it to the other.
+/// The modal shows the head of the queue
+let batchErrorPrompts = $state<{
+  tabId: number;
+  connection: string;
+  index: number;
+  total: number;
+  statement: string;
+  error: string;
+  resolve: (continueRunning: boolean) => void;
+}[]>([]);
 
 // Sequence number for result tab IDs (unique within the session is enough, so not persisted)
 let nextTabId = 1;
@@ -280,7 +296,21 @@ const loadAiInfo = async () => {
 /// Clear the selection state of the old settings first, and reselect only if a connection with
 /// the same name still exists (the file list is also re-fetched with the new settings).
 /// Returns false on failure (errorMessage has been set).
+/// Number of settings reloads in progress. A batch must not start then: the backend reset drops
+/// the schema override, and its next statement would go to the default database. A counter,
+/// because reloads can overlap and the first to finish must not lift the guard for the others
+let reloadsInProgress = 0;
+
 const reloadConnections = async (): Promise<boolean> => {
+  reloadsInProgress++;
+  try {
+    return await reloadConnectionsUnguarded();
+  } finally {
+    reloadsInProgress--;
+  }
+};
+
+const reloadConnectionsUnguarded = async (): Promise<boolean> => {
   // A reload discards all editor tabs. Conflicted tabs are not saved by saveAllDirtyTabs
   // (so external changes are not silently overwritten), so proceeding as is would lose local edits
   // without saving or an explicit discard. While a conflict remains, abort the reload and
@@ -301,6 +331,15 @@ const reloadConnections = async (): Promise<boolean> => {
   // arrives. If deferred / fire-and-forget, an agent still holding the pre-reload connection config
   // could reopen the discarded pool and keep running tools with stale credentials / schema.
   await clearChatAndWait();
+  // Stop running batches **before** the backend reset: it drops the schema override and pools,
+  // and a batch's next statement could otherwise be sent before its tab is discarded below.
+  // A statement already in flight still runs where it was sent
+  for (const tab of resultTabs) {
+    if (tab.running && tab.batch !== null) {
+      batchCancelRequests.add(tab.id);
+    }
+  }
+  stopBatchErrorPrompts(() => true);
   try {
     await api.resetConnections();
   } catch (e) {
@@ -341,6 +380,9 @@ const reloadConnections = async (): Promise<boolean> => {
   // The settings are replaced wholesale, so discard all tabs including pinned ones
   resultTabs = [];
   activeTabId = null;
+  // Batches waiting on their error prompt have lost their tabs; stop them instead of leaving the
+  // prompts up
+  stopBatchErrorPrompts(() => true);
   schemas = [];
   activeSchema = null;
   aiInfo = null;
@@ -778,6 +820,12 @@ const changeActiveSchema = async (schema: string): Promise<boolean> => {
   if (!connection || schema === activeSchema) {
     return true;
   }
+  // Each statement of a batch reaches the database through the connection's current schema, so
+  // a switch would send the rest of the batch to another database
+  if (isBatchRunning(connection)) {
+    toast.warning("Wait for the running statements to finish before switching the database.");
+    return false;
+  }
   // Save unsaved tabs best-effort (a failure does not stop the schema switch)
   await flushPendingSave();
   // Discard the AI chat conversation **before** the switch and wait until the abort arrives.
@@ -785,7 +833,19 @@ const changeActiveSchema = async (schema: string): Promise<boolean> => {
   // came first, a round trip awaiting a response would run queries on the new schema's pool
   // with the old prompt
   await clearChatAndWait();
+  let switching = false;
   try {
+    // A batch may have started during the awaits above. From here on the switch and a batch
+    // start exclude each other: runBatch / rerunTab refuse while the connection is switching
+    if (isBatchRunning(connection)) {
+      toast.warning("Wait for the running statements to finish before switching the database.");
+      return false;
+    }
+    switching = true;
+    schemaSwitchingConnections.set(
+      connection,
+      (schemaSwitchingConnections.get(connection) ?? 0) + 1,
+    );
     await api.setActiveSchema(connection, schema);
     // If we moved to another connection during the switch, do not apply that schema display to the new connection
     if (selectedConnection !== connection) {
@@ -800,6 +860,14 @@ const changeActiveSchema = async (schema: string): Promise<boolean> => {
     errorMessage = toErrorMessage(e);
     return false;
   } finally {
+    if (switching) {
+      const remaining = (schemaSwitchingConnections.get(connection) ?? 1) - 1;
+      if (remaining > 0) {
+        schemaSwitchingConnections.set(connection, remaining);
+      } else {
+        schemaSwitchingConnections.delete(connection);
+      }
+    }
     // End the transition regardless of success (so that input does not stay blocked on failure)
     endChatTransition();
   }
@@ -1613,6 +1681,28 @@ const isConnectionRunning = (connection: string): boolean =>
   // untracked tunnel
   chatRunningConnections.has(connection);
 
+/// Number of database switches (setActiveSchema) in flight per connection. A count, because two
+/// switches can overlap and the first to finish must not lift the guard for the other
+const schemaSwitchingConnections = new Map<string, number>();
+
+/// Why a batch cannot start on the connection right now (null = it can). Checked synchronously
+/// right before executeBatchInTab marks the tab running, so nothing can slip in between
+const batchStartBlocker = (connection: string): string | null => {
+  if (reloadsInProgress > 0) {
+    return "The config is reloading. Run the statements again once it finishes.";
+  }
+  if (schemaSwitchingConnections.has(connection)) {
+    return "The database is being switched. Run the statements again once it finishes.";
+  }
+  return null;
+};
+
+/// Whether a batch of selected statements is running on the connection
+const isBatchRunning = (connection: string): boolean =>
+  resultTabs.some(
+    (t) => t.running && t.batch !== null && t.connection === connection,
+  );
+
 /// Decide the tab to write the execution result to.
 /// If there is an active non-pinned tab that is not running, reuse it; otherwise create a new tab.
 /// On reaching the limit, discard the oldest non-pinned tab that is not running.
@@ -1655,6 +1745,7 @@ const prepareTargetTab = (): ResultTab | null => {
     running: false,
     fixing: false,
     fixSuggestion: null,
+    batch: null,
   };
   resultTabs = [...resultTabs, tab];
   // Return a reference via the $state proxy, not the raw object
@@ -1745,10 +1836,15 @@ const cancelQuery = async (id: number) => {
   if (!tab || !tab.running) {
     return;
   }
+  if (tab.batch) {
+    batchCancelRequests.add(tab.id);
+    stopBatchErrorPrompts((prompt) => prompt.tabId === tab.id);
+  }
   try {
     const requested = await api.cancelQuery(tab.connection);
-    // Notification for when there was no cancel target, e.g. execution had just completed
-    if (!requested) {
+    // Notification for when there was no cancel target, e.g. execution had just completed.
+    // A batch between two statements has none either, and stops before the next one
+    if (!requested && !tab.batch) {
       toast.info("No running query to cancel. It may have just finished.");
     }
   } catch (e) {
@@ -1902,7 +1998,257 @@ const runQuery = async (sql: string): Promise<QueryResult | null> => {
   tab.sql = sql;
   tab.connection = connection;
   tab.schema = activeSchema;
+  tab.batch = null;
   return await executeTab(tab);
+};
+
+/// Ask whether to go on after a statement of a batch failed (true = ignore errors and run the rest)
+const requestBatchErrorDecision = (
+  tab: ResultTab,
+  index: number,
+  total: number,
+  statement: string,
+  error: string,
+): Promise<boolean> =>
+  new Promise((resolve) => {
+    batchErrorPrompts = [
+      ...batchErrorPrompts,
+      { tabId: tab.id, connection: tab.connection, index, total, statement, error, resolve },
+    ];
+  });
+
+/// Answer the prompt shown (the head of the queue)
+const resolveBatchErrorPrompt = (continueRunning: boolean) => {
+  const [head, ...rest] = batchErrorPrompts;
+  batchErrorPrompts = rest;
+  head?.resolve(continueRunning);
+};
+
+/// Answer "stop" to every queued prompt matching the predicate
+const stopBatchErrorPrompts = (
+  matches: (prompt: { tabId: number }) => boolean,
+) => {
+  const stopped = batchErrorPrompts.filter(matches);
+  batchErrorPrompts = batchErrorPrompts.filter((p) => !matches(p));
+  for (const prompt of stopped) {
+    prompt.resolve(false);
+  }
+};
+
+type BatchStatus = "ok" | "error" | "cancelled" | "running" | "not run";
+
+interface BatchOutcome {
+  status: BatchStatus;
+  rows: number | null;
+  elapsedMs: number | null;
+  message: string;
+}
+
+/// Build the per-statement summary shown in a batch tab. It is rebuilt after every statement so
+/// the table fills in while the batch runs, and lists the statements that never ran so it is
+/// visible where the batch stopped and which errors were ignored
+const batchSummary = (
+  statements: string[],
+  outcomes: BatchOutcome[],
+): QueryResult => ({
+  columns: ["#", "status", "rows", "elapsed_ms", "statement", "message"],
+  rows: statements.map((statement, i) => {
+    const outcome = outcomes[i] ?? {
+      status: "not run",
+      rows: null,
+      elapsedMs: null,
+      message: "",
+    };
+    return [
+      i + 1,
+      outcome.status,
+      outcome.rows,
+      outcome.elapsedMs,
+      statement.trim(),
+      outcome.message,
+    ];
+  }),
+  row_count: statements.length,
+  affected_rows: null,
+  truncated: false,
+  applied_limit: null,
+  elapsed_ms: outcomes.reduce((sum, o) => sum + (o.elapsedMs ?? 0), 0),
+  switched_schema: null,
+});
+
+/// Result tabs whose batch was asked to stop. The backend cancel only reaches the statement
+/// running at that moment, so a cancel that lands between two statements is picked up here
+const batchCancelRequests = new Set<number>();
+
+/// Run the statements of a batch one by one, filling the tab's summary as each one finishes.
+/// The tab stays `running` for the whole batch (including while waiting on the error prompt),
+/// which keeps other runs off the connection and the tunnel open between statements.
+/// A failed statement stops the batch until the user chooses to ignore errors (after which later
+/// failures no longer stop it); a cancel or a declined dangerous-statement confirmation stops it
+const executeBatchInTab = async (tab: ResultTab, statements: string[]) => {
+  const tabExists = () => resultTabs.some((t) => t.id === tab.id);
+  const connection = tab.connection;
+  const outcomes: BatchOutcome[] = [];
+  const publish = () => {
+    tab.result = batchSummary(statements, outcomes);
+  };
+  batchCancelRequests.delete(tab.id);
+  tab.batch = statements;
+  tab.sql = statements.map((s) => s.trim()).join("\n");
+  tab.error = null;
+  tab.cancelled = false;
+  tab.fixSuggestion = null;
+  tab.executedAt = Date.now();
+  tab.running = true;
+  activeTabId = tab.id;
+  publish();
+  // Writes are only allowed on the selected connection, and selecting another one turns Writable
+  // off. A batch started writable would then send its remaining statements read-only and fail
+  // each of them, so stop it instead (writes do not move to a connection the user is not on)
+  const writableAtStart = effectiveWritable(connection);
+  let lostWritable = false;
+  let ignoreErrors = false;
+  try {
+    for (let i = 0; i < statements.length; i++) {
+      const statement = statements[i];
+      if (batchCancelRequests.has(tab.id)) {
+        break;
+      }
+      if (!(await confirmIfDangerous(connection, statement))) {
+        break;
+      }
+      if (!tabExists() || batchCancelRequests.has(tab.id)) {
+        break;
+      }
+      // Checked after the confirmation, which may have been open while the user switched
+      if (writableAtStart && !effectiveWritable(connection)) {
+        lostWritable = true;
+        break;
+      }
+      outcomes[i] = { status: "running", rows: null, elapsedMs: null, message: "" };
+      publish();
+      let result: QueryResult | null = null;
+      let error: string | null = null;
+      try {
+        result = await api.runQuery(
+          connection,
+          statement,
+          undefined,
+          effectiveWritable(connection),
+        );
+      } catch (e) {
+        error = toErrorMessage(e);
+      }
+      queryCompletions += 1;
+      // The tab was discarded during execution (settings reload): nowhere to report to
+      if (!tabExists()) {
+        return;
+      }
+      if (error === api.CANCELLED_ERROR_MESSAGE) {
+        outcomes[i] = { status: "cancelled", rows: null, elapsedMs: null, message: "" };
+        break;
+      }
+      if (error !== null) {
+        outcomes[i] = { status: "error", rows: null, elapsedMs: null, message: error };
+        publish();
+        // A statement cancelled just as it failed reports the error; the cancel still stops the
+        // batch, without asking first
+        if (batchCancelRequests.has(tab.id)) {
+          break;
+        }
+        // No prompt after the last statement: there is nothing left to decide
+        if (!ignoreErrors && i < statements.length - 1) {
+          ignoreErrors = await requestBatchErrorDecision(
+            tab,
+            i + 1,
+            statements.length,
+            statement,
+            error,
+          );
+          if (!ignoreErrors) {
+            break;
+          }
+        }
+        continue;
+      }
+      if (result?.switched_schema) {
+        tab.schema = result.switched_schema;
+        applySwitchedSchema(connection, result.switched_schema);
+      }
+      outcomes[i] = {
+        status: "ok",
+        rows: result ? (result.affected_rows ?? result.row_count) : null,
+        elapsedMs: result?.elapsed_ms ?? null,
+        message: "",
+      };
+      publish();
+    }
+  } finally {
+    batchCancelRequests.delete(tab.id);
+    tab.running = false;
+  }
+  if (!tabExists()) {
+    return;
+  }
+  publish();
+  maybeDisconnectIfIdle(connection);
+  const failed = outcomes.filter((o) => o.status === "error").length;
+  const succeeded = outcomes.filter((o) => o.status === "ok").length;
+  if (lostWritable) {
+    toast.warning(
+      `Stopped after ${succeeded} of ${statements.length} statements: Writable was turned off ` +
+        "(switching connections turns it off)",
+    );
+  } else if (succeeded === statements.length) {
+    toast.success(`Ran ${statements.length} statements`);
+  } else {
+    toast.warning(
+      `Ran ${succeeded} of ${statements.length} statements` +
+        (failed > 0 ? ` (${failed} failed)` : ""),
+    );
+  }
+};
+
+/// Run the statements of a selection one by one on the selected connection
+const runBatch = async (statements: string[]) => {
+  const connection = selectedConnection;
+  if (!connection) {
+    toast.warning("Select a connection first");
+    return;
+  }
+  if (statements.length === 0) {
+    return;
+  }
+  if (isConnectionRunning(connection)) {
+    toast.warning(
+      "A query is already running on this connection. Cancel it or wait for it to finish.",
+    );
+    return;
+  }
+  await flushPendingSave();
+  // Same post-await checks as runQuery
+  if (selectedConnection !== connection) {
+    return;
+  }
+  if (isConnectionRunning(connection)) {
+    toast.warning(
+      "A query is already running on this connection. Cancel it or wait for it to finish.",
+    );
+    return;
+  }
+  const blocker = batchStartBlocker(connection);
+  if (blocker) {
+    toast.warning(blocker);
+    return;
+  }
+  errorMessage = null;
+  const tab = prepareTargetTab();
+  if (!tab) {
+    return;
+  }
+  tab.connection = connection;
+  tab.schema = activeSchema;
+  await executeBatchInTab(tab, statements);
 };
 
 /// Run the statement at the cursor with an engine-specific EXPLAIN prefix.
@@ -2206,8 +2552,8 @@ const rerunTab = async (id: number) => {
     );
     return;
   }
-  // Confirm dangerous statements on re-run too (same guard as normal execution)
-  if (!(await confirmIfDangerous(tab.connection, tab.sql))) {
+  // A batch confirms each statement as it reaches it (executeBatchInTab)
+  if (!tab.batch && !(await confirmIfDangerous(tab.connection, tab.sql))) {
     return;
   }
   errorMessage = null;
@@ -2223,6 +2569,15 @@ const rerunTab = async (id: number) => {
     toast.warning(
       "A query is already running on this connection. Cancel it or wait for it to finish.",
     );
+    return;
+  }
+  if (tab.batch) {
+    const blocker = batchStartBlocker(tab.connection);
+    if (blocker) {
+      toast.warning(blocker);
+      return;
+    }
+    await executeBatchInTab(tab, tab.batch);
     return;
   }
   await executeTab(tab);
@@ -2697,6 +3052,25 @@ export default {
   },
   /// "Run" was chosen in the confirmation dialog
   confirmDangerous: () => resolveDangerousConfirm(true),
+  /// A statement of a batch failed and the batch waits for a decision (null when hidden)
+  get batchErrorPrompt() {
+    const head = batchErrorPrompts[0];
+    return head === undefined
+      ? null
+      : {
+          connection: head.connection,
+          index: head.index,
+          total: head.total,
+          statement: head.statement,
+          error: head.error,
+        };
+  },
+  /// A batch is running on the selected connection (the Database selector is locked meanwhile)
+  get selectedConnectionBatchRunning() {
+    return selectedConnection !== null && isBatchRunning(selectedConnection);
+  },
+  /// true = ignore errors and run the rest of the batch, false = stop it
+  resolveBatchErrorPrompt,
   /// "Cancel" was chosen in the confirmation dialog
   cancelDangerous: () => resolveDangerousConfirm(false),
   loadConnections,
@@ -2729,6 +3103,7 @@ export default {
   dismissFixSuggestion,
   isConnectionRunning,
   runQuery,
+  runBatch,
   fetchResultWithoutDefaultLimit,
   explainQuery,
   analyzeExplainTab,

@@ -1,7 +1,21 @@
 # SQL
 
-Cmd+Enter (Ctrl+Enter) runs the statement under the cursor. With a selection it
-runs the selection instead, so you can execute part of a longer file.
+Cmd+Enter (Ctrl+Enter) runs the statement under the cursor. Select several
+statements to run them one by one, in order — every statement the selection
+touches runs in full:
+
+```
+KILL 1382992;
+KILL 1383560;
+KILL 1383088;
+```
+
+The result tab lists each statement with its status (`ok` / `error` /
+`cancelled` / `running` / `not run`), row count and error message, filling in as
+each one finishes. If one fails, the run stops and asks whether to stop there or
+ignore errors and run the rest. A run that started with Writable on stops if
+Writable goes off — including by switching to another connection. The `📝` Run and Log marker is not written back
+for a multi-statement run.
 
 `SELECT` without a `LIMIT` gets one appended automatically — 500 rows unless the
 connection sets `default_limit`. The result header says when that happened.

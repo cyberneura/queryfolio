@@ -193,9 +193,13 @@
       </span>
     {:else}
       <select
-        class="max-w-64 rounded border border-zinc-600 bg-zinc-800 px-1.5 py-0.5 font-mono text-xs text-zinc-200 outline-none focus:border-blue-400"
+        class="max-w-64 rounded border border-zinc-600 bg-zinc-800 px-1.5 py-0.5 font-mono text-xs text-zinc-200 outline-none focus:border-blue-400 disabled:opacity-50"
         data-annotate="select-active-schema"
         value={appStore.activeSchema ?? ""}
+        disabled={appStore.selectedConnectionBatchRunning}
+        title={appStore.selectedConnectionBatchRunning
+          ? "Locked while the selected statements run"
+          : undefined}
         onchange={onSchemaChange}
       >
         {#if appStore.activeSchema && !appStore.schemas.includes(appStore.activeSchema)}
