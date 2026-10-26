@@ -5,6 +5,9 @@
 //! statements. Both are counted here from `~/.config/queryfolio/history/*.jsonl`, and nothing
 //! is sent anywhere.
 //!
+//! The history holds the statements run from the editor. The AI assistant's queries are
+//! not written to it (they are shown in the chat pane only), so they are not counted here.
+//!
 //! **Only counts are printed.** No SQL text, no connection names, no hosts -- the output is
 //! meant to be pasted into a task or chat as it is. Connections are reduced to a number per
 //! engine. Keep to this when adding columns (a unit test checks it).

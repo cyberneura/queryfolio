@@ -180,7 +180,8 @@ WEEK OF     RUNS  FAILED  READONLY STOPS  DANGEROUS STOPS  DAYS  CONNECTIONS
 ```
 
 - RUNS counts every execution; FAILED excludes the statements that a guard stopped.
-- READONLY STOPS / DANGEROUS STOPS count the statements the read-only guard (config `readonly`, the Writable switch, the AI assistant) and the dangerous-statement guard refused to run. These are recorded from 0.12.0 on; earlier stops are in FAILED.
+- READONLY STOPS / DANGEROUS STOPS count the statements the read-only guard (config `readonly`, the Writable switch) and the dangerous-statement guard refused to run. These are recorded from 0.12.0 on; earlier stops are in FAILED.
+- The numbers cover what is in the query history, that is the statements run from the editor. Queries the AI assistant runs in the chat pane (and the ones its guard refuses) are shown in the chat but not written to the history, so they are not counted.
 - DAYS and CONNECTIONS count the days and connections with at least one execution; connections are broken down by engine (`unknown` for a history file whose connection is no longer configured).
 
 Only numbers are printed — no SQL, no connection names, no hosts — so the output can be pasted as is. Nothing is sent anywhere; the history stays on the machine.
