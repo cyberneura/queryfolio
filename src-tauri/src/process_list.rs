@@ -170,12 +170,14 @@ fn pg_process(fields: Vec<ProcessField>) -> ProcessInfo {
     let state = get("state");
     let backend_type = get("backend_type");
     // Background processes (autovacuum, walwriter, ...) have no state and are not serving a
-    // client. A client backend with no state is another user's session that this role may
-    // not inspect (query reads "<insufficient privilege>"): its state is unknown, not idle,
-    // so it stays visible. "idle in transaction" stays visible too: it holds locks and a snapshot
-    let idle = match state.as_deref() {
-        Some(s) => s == "idle",
-        None => backend_type.as_deref() != Some("client backend"),
+    // client. Sessions of other users that this role may not inspect have neither state nor
+    // backend_type (query reads "<insufficient privilege>"): their state is unknown, not
+    // idle, so they stay visible. So do client backends without a state, and "idle in
+    // transaction" (it holds locks and a snapshot)
+    let idle = match (state.as_deref(), backend_type.as_deref()) {
+        (Some(s), _) => s == "idle",
+        (None, Some(kind)) => kind != "client backend",
+        (None, None) => false,
     };
     ProcessInfo {
         id: get("pid").unwrap_or_default(),
@@ -332,15 +334,24 @@ mod tests {
         let background = with_state(None);
         assert!(background.idle);
         assert_eq!(background.command.as_deref(), Some("autovacuum launcher"));
-        // Another user's client session hidden from this role: unknown, so not hidden
+        // Another user's session hidden from this role: pg_stat_activity returns NULL for
+        // both state and backend_type. Unknown, so not hidden
         let restricted = pg_process(fields(&[
             ("pid", Some("2")),
             ("state", None),
-            ("backend_type", Some("client backend")),
+            ("backend_type", None),
             ("query", Some("<insufficient privilege>")),
         ]));
         assert!(!restricted.idle);
-        assert_eq!(restricted.command.as_deref(), Some("client backend"));
+        assert_eq!(restricted.command, None);
+        assert_eq!(restricted.info.as_deref(), Some("<insufficient privilege>"));
+        // A client backend without a state is not treated as background either
+        let stateless_client = pg_process(fields(&[
+            ("pid", Some("3")),
+            ("state", None),
+            ("backend_type", Some("client backend")),
+        ]));
+        assert!(!stateless_client.idle);
         // Holding a transaction open is worth seeing
         assert!(!with_state(Some("idle in transaction")).idle);
         assert!(!with_state(Some("active")).idle);
