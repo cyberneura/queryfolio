@@ -8,6 +8,9 @@
     /// Visibility state and toggle of the AI chat pane (right)
     chatOpen: boolean;
     onToggleChat: () => void;
+    /// Visibility state and toggle of the process list pane (right, exclusive with the chat)
+    processListOpen: boolean;
+    onToggleProcessList: () => void;
     /// Visibility state and toggle of the help pane (rightmost)
     helpOpen: boolean;
     onToggleHelp: () => void;
@@ -19,6 +22,8 @@
     onOpenSettings,
     chatOpen,
     onToggleChat,
+    processListOpen,
+    onToggleProcessList,
     helpOpen,
     onToggleHelp,
   }: Props = $props();
@@ -111,6 +116,22 @@
         <i class="bi bi-play-fill" aria-hidden="true"></i> Run
       </button>
     {/if}
+    <!-- Toggle the process list pane (right). Enabled while a query is running too: the list
+         is fetched on another pooled connection -->
+    <button
+      class="flex items-center gap-1 rounded border px-2 py-1 text-xs transition-colors disabled:opacity-40 {processListOpen
+        ? 'border-blue-500 bg-blue-600/20 text-blue-300 hover:bg-blue-600/30'
+        : 'border-zinc-600 text-zinc-400 hover:bg-zinc-800'}"
+      title="Toggle the process list pane (running server processes)"
+      aria-label="Toggle the process list pane"
+      aria-pressed={processListOpen}
+      data-annotate="toggle-process-list-pane"
+      disabled={!processListOpen &&
+        appStore.selectedCapabilities?.supports_process_list !== true}
+      onclick={onToggleProcessList}
+    >
+      <i class="bi bi-activity" aria-hidden="true"></i> Processes
+    </button>
     <!-- Toggle the AI chat pane (right) -->
     <button
       class="flex items-center gap-1 rounded border px-2 py-1 text-xs transition-colors {chatOpen

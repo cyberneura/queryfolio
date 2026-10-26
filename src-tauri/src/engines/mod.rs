@@ -47,6 +47,10 @@ pub struct EngineCapabilities {
     /// Whether the database / tables can be dumped with the engine's CLI tool
     /// (mysqldump / pg_dump; dump.rs)
     pub supports_dump: bool,
+    /// Whether the PROCESS LIST pane is supported (SHOW FULL PROCESSLIST / pg_stat_activity;
+    /// process_list.rs). Needs a pool with more than one connection so that it works while a
+    /// query is running, which rules out the single-connection engines (SQL Server, DuckDB)
+    pub supports_process_list: bool,
 }
 
 /// Common capabilities of the SQL engines (mysql / postgres / sqlite).
@@ -61,11 +65,13 @@ const SQL_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_editable_cells: true,
     supports_ai: true,
     supports_dump: false,
+    supports_process_list: false,
 };
 
-/// MySQL / PostgreSQL additionally have a dump tool (mysqldump / pg_dump)
+/// MySQL / PostgreSQL additionally have a dump tool (mysqldump / pg_dump) and a process list
 const SQL_DUMP_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_dump: true,
+    supports_process_list: true,
     ..SQL_CAPABILITIES
 };
 
@@ -82,6 +88,7 @@ const REDIS_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_editable_cells: false,
     supports_ai: false,
     supports_dump: false,
+    supports_process_list: false,
 };
 
 /// Elasticsearch works with Kibana Console-style request blocks in the editor, and the
@@ -97,6 +104,7 @@ const ELASTICSEARCH_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_editable_cells: false,
     supports_ai: false,
     supports_dump: false,
+    supports_process_list: false,
 };
 
 /// DuckDB is a SQL engine, but the path that applies cell edits (run_statements) assumes
@@ -191,7 +199,13 @@ mod tests {
         ];
         for engine in others {
             assert!(!capabilities_for_name(engine).supports_dump, "{engine}");
+            assert!(
+                !capabilities_for_name(engine).supports_process_list,
+                "{engine}"
+            );
         }
+        assert!(sql.supports_process_list);
+        assert!(capabilities_for_name("postgres").supports_process_list);
 
         let redis = capabilities_for_name("redis");
         assert_eq!(redis.editor_language, "redis");

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { toast } from "svelte-sonner";
   import { ensureConfigFile, frontendReady } from "$lib/api";
@@ -31,6 +31,7 @@
   import RunLogConfirmModal from "$lib/components/RunLogConfirmModal.svelte";
   import SearchModal from "$lib/components/SearchModal.svelte";
   import ChatPane from "$lib/components/ChatPane.svelte";
+  import ProcessListPane from "$lib/components/ProcessListPane.svelte";
   import HelpPane from "$lib/components/HelpPane.svelte";
   import PaneDivider from "$lib/components/PaneDivider.svelte";
 
@@ -274,6 +275,8 @@
   /// The AI chat pane has long content, so allow a wider range than the sidebar
   const CHAT_MIN = 240;
   const CHAT_MAX = 720;
+  const PROCESS_MIN = 240;
+  const PROCESS_MAX = 900;
   const HELP_MIN = 260;
   const HELP_MAX = 720;
   const EDITOR_FRAC_MIN = 0.15;
@@ -302,6 +305,34 @@
     return Math.min(max, Math.max(min, value));
   }
 
+  function setChatOpen(open: boolean) {
+    showChat = open;
+    saveLayoutValue("chatOpen", open ? 1 : 0);
+    if (open && showProcessList) {
+      setProcessListOpen(false);
+    }
+  }
+
+  function setProcessListOpen(open: boolean, connection?: string | null) {
+    if (open) {
+      processConnection = connection ?? appStore.selectedConnection;
+    }
+    showProcessList = open;
+    saveLayoutValue("processOpen", open ? 1 : 0);
+    if (open && showChat) {
+      setChatOpen(false);
+    }
+  }
+
+  // Follow the selected connection (opening from the results pane can point it elsewhere
+  // until the selection changes again)
+  $effect(() => {
+    const selected = appStore.selectedConnection;
+    untrack(() => {
+      processConnection = selected;
+    });
+  });
+
   /// Width of the connection list pane (px). The default is the previous w-56 = 224px
   let connectionsWidth = $state(
     clamp(loadLayoutValue("connectionsWidth", 224), SIDEBAR_MIN, SIDEBAR_MAX),
@@ -324,7 +355,20 @@
     clamp(loadLayoutValue("chatWidth", 360), CHAT_MIN, CHAT_MAX),
   );
   /// Whether the AI chat pane is open (the visibility is also carried over to the next launch)
-  let showChat = $state(loadLayoutValue("chatOpen", 0) === 1);
+  const initialChatOpen = loadLayoutValue("chatOpen", 0) === 1;
+  let showChat = $state(initialChatOpen);
+  /// Width of the process list pane (px). Kept apart from chatWidth: resizing one pane does
+  /// not resize the other
+  let processWidth = $state(
+    clamp(loadLayoutValue("processWidth", 420), PROCESS_MIN, PROCESS_MAX),
+  );
+  /// The process list pane takes the chat pane's place: the two are exclusive
+  let showProcessList = $state(
+    !initialChatOpen && loadLayoutValue("processOpen", 0) === 1,
+  );
+  /// Connection whose processes are listed. Opening from the results pane picks the tab's
+  /// connection; otherwise it follows the selected connection
+  let processConnection = $state<string | null>(appStore.selectedConnection);
   let helpWidth = $state(
     clamp(loadLayoutValue("helpWidth", 380), HELP_MIN, HELP_MAX),
   );
@@ -336,6 +380,7 @@
   let dragBaseSidebar = 0;
   let dragBaseEditorFrac = 0;
   let dragBaseChat = 0;
+  let dragBaseProcess = 0;
   let dragBaseHelp = 0;
 
   const selectedConnectionInfo = $derived(
@@ -513,10 +558,9 @@
       saveLayoutValue("helpOpen", showHelp ? 1 : 0);
     }}
     chatOpen={showChat}
-    onToggleChat={() => {
-      showChat = !showChat;
-      saveLayoutValue("chatOpen", showChat ? 1 : 0);
-    }}
+    onToggleChat={() => setChatOpen(!showChat)}
+    processListOpen={showProcessList}
+    onToggleProcessList={() => setProcessListOpen(!showProcessList)}
   />
 
   <!-- overflow-x-auto: the connection list / sidebar / chat are fixed-width with shrink-0, so
@@ -681,7 +725,10 @@
         style="flex-grow: {1 - editorFrac}"
         bind:this={resultsPaneEl}
       >
-        <ResultsPane />
+        <ResultsPane
+          onOpenProcessList={(connection) =>
+            setProcessListOpen(true, connection)}
+        />
       </div>
     </div>
 
@@ -702,11 +749,34 @@
       <div class="shrink-0" style="width: {chatWidth}px">
         <ChatPane
           supportsAi={selectedCapabilities?.supports_ai ?? false}
-          onClose={() => {
-            showChat = false;
-            saveLayoutValue("chatOpen", 0);
-          }}
+          onClose={() => setChatOpen(false)}
           onInsert={(sql) => appStore.insertSqlSnippet(sql)}
+        />
+      </div>
+    {/if}
+
+    <!-- Process list pane. Takes the chat pane's place (the two are exclusive), with its own width -->
+    {#if showProcessList}
+      <PaneDivider
+        direction="vertical"
+        annotate="pane-divider-process-list"
+        onDragStart={() => {
+          dragBaseProcess = processWidth;
+        }}
+        onDrag={(delta) => {
+          // The pane is at the right edge, so the drag direction and the width change are inverted
+          processWidth = clamp(
+            dragBaseProcess - delta,
+            PROCESS_MIN,
+            PROCESS_MAX,
+          );
+        }}
+        onDragEnd={() => saveLayoutValue("processWidth", processWidth)}
+      />
+      <div class="shrink-0" style="width: {processWidth}px">
+        <ProcessListPane
+          connection={processConnection}
+          onClose={() => setProcessListOpen(false)}
         />
       </div>
     {/if}

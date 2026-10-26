@@ -2541,7 +2541,7 @@ fn format_naive_datetime(v: chrono::NaiveDateTime) -> serde_json::Value {
     serde_json::Value::String(v.format("%Y-%m-%d %H:%M:%S%.f").to_string())
 }
 
-fn mysql_value_to_json(row: &MySqlRow, i: usize) -> serde_json::Value {
+pub(crate) fn mysql_value_to_json(row: &MySqlRow, i: usize) -> serde_json::Value {
     let type_name = row.column(i).type_info().name().to_string();
     match type_name.as_str() {
         "BOOLEAN" => {
@@ -2683,7 +2683,7 @@ fn pg_binary_array_to_json(
     buf.is_empty().then_some(value)
 }
 
-fn pg_value_to_json(row: &PgRow, i: usize) -> serde_json::Value {
+pub(crate) fn pg_value_to_json(row: &PgRow, i: usize) -> serde_json::Value {
     // User-defined enum types (and their arrays) are not included in the types compatible with
     // sqlx's String decoder (TEXT / VARCHAR, etc.), so as is they would hit decode_fallback
     // `<undecodable>`. An enum value is the label's UTF-8 in both text and binary

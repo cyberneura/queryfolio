@@ -31,6 +31,8 @@ export interface EngineCapabilities {
   supports_ai: boolean;
   /// Whether the database / tables can be dumped (mysqldump / pg_dump)
   supports_dump: boolean;
+  /// Whether the PROCESS LIST pane is supported (mysql / postgres)
+  supports_process_list: boolean;
 }
 
 export interface ConnectionInfo {
@@ -279,6 +281,36 @@ export const listColumns = (connection: string, table: string) =>
 /// Returns a map of table name -> column name list (for SQL completion).
 export const getSchemaMap = (connection: string) =>
   invoke<Record<string, string[]>>("get_schema_map", { connection });
+
+/// One column of a process row as returned by the server (for the detail view)
+export interface ProcessField {
+  name: string;
+  value: string | null;
+}
+
+/// One server process / session (SHOW FULL PROCESSLIST / pg_stat_activity), normalized
+export interface ProcessInfo {
+  id: string;
+  user: string | null;
+  host: string | null;
+  db: string | null;
+  /// MySQL Command / PostgreSQL state (or backend_type for background processes)
+  command: string | null;
+  /// Seconds in the current state
+  time_secs: number | null;
+  /// MySQL State / PostgreSQL wait event
+  state: string | null;
+  /// The statement being run
+  info: string | null;
+  /// Not using the server (Sleep / idle / background). Hidden by default
+  idle: boolean;
+  fields: ProcessField[];
+}
+
+/// Returns the server's process list, busiest first. Works while a query is running on the
+/// same connection (it uses another pooled connection)
+export const listProcesses = (connection: string) =>
+  invoke<ProcessInfo[]>("list_processes", { connection });
 
 /// Returns the column names that make up the table's primary key (for cell editing in the result grid).
 /// An empty array for a table with no primary key.

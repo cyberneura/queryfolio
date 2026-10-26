@@ -7,6 +7,7 @@ mod engines;
 mod history;
 mod history_stats;
 mod meta_commands;
+mod process_list;
 mod error;
 mod folder_meta;
 mod query_files;
@@ -1233,6 +1234,23 @@ async fn get_schema_map(
     let server = state.find_server(&connection).await?;
     let schema_key = state.active_schema_key(&server).await;
     state.resolve_schema_map(&server, &schema_key).await
+}
+
+/// Returns the server's process list, busiest first (the PROCESS LIST pane).
+/// Not registered with QueryRuns: it runs on another pooled connection, so it works while a
+/// query is running on the same connection.
+#[tauri::command]
+async fn list_processes(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+) -> Result<Vec<process_list::ProcessInfo>, AppError> {
+    let server = state.find_server(&connection).await?;
+    state
+        .db
+        .with_pool(&server, db::PasswordRetry::Idempotent, |pool| async move {
+            process_list::fetch_processes(&pool).await
+        })
+        .await
 }
 
 /// Returns the column names that make up the table's primary key (for cell editing in the result grid).
@@ -2625,6 +2643,7 @@ pub fn run() {
             list_columns,
             get_schema_map,
             get_primary_keys,
+            list_processes,
             run_statements,
             get_ai_info,
             ai_generate_sql,
