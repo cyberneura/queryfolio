@@ -25,17 +25,21 @@ take_lock() {
     mkdir "$lock" 2>/dev/null || return 1
     echo $$ > "$lock/pid"
 }
-if ! take_lock; then
+lock_owner_is_gone() {
     owner="$(cat "$lock/pid" 2>/dev/null || true)"
     # No pid yet means its owner has only just created it
-    if [ -z "$owner" ] || kill -0 "$owner" 2>/dev/null; then
-        echo "Another local deploy is running (remove $lock if it is not)." >&2
-        exit 1
-    fi
-    # Renaming is atomic, so of two runs reclaiming the same stale lock only one gets it
-    stale="${lock}.stale.$$"
-    if mv "$lock" "$stale" 2>/dev/null; then
-        rm -rf "$stale"
+    [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null
+}
+if ! take_lock; then
+    # Reclaiming is checked and done under its own lock: two runs that both saw the dead owner
+    # would otherwise each remove "the stale lock", the second one removing the lock the first
+    # had just taken
+    reclaim="${lock}.reclaim"
+    if lock_owner_is_gone && mkdir "$reclaim" 2>/dev/null; then
+        if lock_owner_is_gone; then
+            rm -rf "$lock"
+        fi
+        rmdir "$reclaim"
     fi
     if ! take_lock; then
         echo "Another local deploy is running (remove $lock if it is not)." >&2
