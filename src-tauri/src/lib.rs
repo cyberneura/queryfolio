@@ -5,6 +5,7 @@ mod db;
 mod dump;
 mod engines;
 mod history;
+mod history_stats;
 mod meta_commands;
 mod error;
 mod folder_meta;
@@ -571,17 +572,13 @@ async fn run_query(
     // (The append is small synchronous I/O, so it is done as is in the async context.
     //  Only on rotation does a full read and rewrite run, but with the 10,000-line limit =
     //  at most a few MB, so this is accepted)
-    let entry = history::HistoryEntry {
-        time: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false),
+    let entry = history_entry(
+        chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false),
         sql,
         schema,
-        row_count: result.as_ref().ok().map(|r| match r.affected_rows {
-            Some(affected) => affected,
-            None => r.row_count as u64,
-        }),
-        elapsed_ms: started.elapsed().as_millis() as u64,
-        success: result.is_ok(),
-    };
+        &result,
+        started.elapsed().as_millis() as u64,
+    );
     match history::default_history_dir() {
         Ok(dir) => {
             if let Err(e) = state.history.append(&dir, &connection, &entry) {
@@ -592,6 +589,34 @@ async fn run_query(
     }
 
     result
+}
+
+/// Builds the history record of one execution from its result.
+/// A guard stop (read-only / dangerous statement) is marked in `blocked` so that
+/// `queryfolio --stats` can count it apart from other failures.
+fn history_entry(
+    time: String,
+    sql: String,
+    schema: Option<String>,
+    result: &Result<QueryResult, AppError>,
+    elapsed_ms: u64,
+) -> history::HistoryEntry {
+    history::HistoryEntry {
+        time,
+        sql,
+        schema,
+        row_count: result.as_ref().ok().map(|r| match r.affected_rows {
+            Some(affected) => affected,
+            None => r.row_count as u64,
+        }),
+        elapsed_ms,
+        success: result.is_ok(),
+        blocked: result
+            .as_ref()
+            .err()
+            .and_then(history::blocked_kind)
+            .map(str::to_string),
+    }
 }
 
 /// Actual processing of `\c <database>` / `USE <database>`. Switches the active schema and
@@ -2297,7 +2322,53 @@ fn run_info_command(command: cli::InfoCommand) -> i32 {
                 }
             }
         }
+        cli::InfoCommand::Stats { weeks } => match run_stats(weeks) {
+            Ok(text) => {
+                print!("{text}");
+                0
+            }
+            Err(e) => {
+                eprintln!("[cli] failed to read the query history: {e}");
+                1
+            }
+        },
+        cli::InfoCommand::Invalid(message) => {
+            eprintln!("[cli] {message}");
+            2
+        }
     }
+}
+
+/// Reads the history and the config for `--stats` (the counting itself is pure, in history_stats.rs).
+///
+/// The config is read only to map connection names to engines. If it cannot be read (an
+/// override command that fails, a broken file), the numbers are still printed with the
+/// engines as `unknown` and a warning on stderr -- the history is what is being measured.
+fn run_stats(weeks: u32) -> Result<String, AppError> {
+    let dir = history::default_history_dir()?;
+    let entries = history::read_all_history(&dir)?;
+    let engines: std::collections::HashMap<String, String> =
+        match tauri::async_runtime::block_on(async {
+            let config = AppConfig::load_merged().await?;
+            config.resolve_servers()
+        }) {
+            Ok(servers) => servers
+                .iter()
+                .map(|s| (s.name.trim().to_string(), s.engine.clone()))
+                .collect(),
+            // The error is not printed: an override command's error carries its command line
+            // and stderr, and this output is meant to be pasted. --list-servers shows it.
+            Err(_) => {
+                eprintln!(
+                    "[cli] could not read the config, so engines are shown as unknown \
+                     (run queryfolio --list-servers to see why)"
+                );
+                Default::default()
+            }
+        };
+    let (weeks, total) =
+        history_stats::weekly_stats(&entries, &engines, chrono::Local::now().date_naive(), weeks);
+    Ok(history_stats::format_stats(&weeks, &total))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2314,7 +2385,7 @@ pub fn run() {
     // (do not run config_override_command twice per launch).
     let preflight_config = {
         let argv: Vec<String> = std::env::args().skip(1).collect();
-        // --help / --version / --license / --list-servers only display and exit
+        // --help / --version / --license / --list-servers / --stats only display and exit
         // (neither the GUI nor a window is launched). Look at them before the write.
         if let Some(command) = cli::info_command_from_args(&argv) {
             std::process::exit(run_info_command(command));
@@ -2488,6 +2559,75 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod history_entry_tests {
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    async fn memory_pool() -> DbPool {
+        // :memory: is a separate DB per connection, so pin the pool to 1 connection
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .in_memory(true),
+            )
+            .await
+            .unwrap();
+        let pool = DbPool::Sqlite(pool);
+        db::run_query(&pool, "CREATE TABLE t (id INTEGER)", 10, None, false, false)
+            .await
+            .unwrap();
+        pool
+    }
+
+    fn record(sql: &str, result: &Result<QueryResult, AppError>) -> history::HistoryEntry {
+        history_entry(
+            "2026-10-21T10:00:00+09:00".into(),
+            sql.into(),
+            None,
+            result,
+            1,
+        )
+    }
+
+    #[tokio::test]
+    async fn readonly_stop_is_recorded_as_blocked() {
+        let pool = memory_pool().await;
+        let sql = "INSERT INTO t VALUES (1)";
+        let result = db::run_query(&pool, sql, 10, None, true, false).await;
+        let entry = record(sql, &result);
+        assert!(!entry.success);
+        assert_eq!(entry.blocked.as_deref(), Some("readonly"));
+    }
+
+    #[tokio::test]
+    async fn dangerous_stop_is_recorded_as_blocked() {
+        let pool = memory_pool().await;
+        let sql = "DELETE FROM t";
+        let result = db::run_query(&pool, sql, 10, None, false, false).await;
+        let entry = record(sql, &result);
+        assert!(!entry.success);
+        assert_eq!(entry.blocked.as_deref(), Some("dangerous"));
+    }
+
+    #[tokio::test]
+    async fn other_results_are_not_blocked() {
+        let pool = memory_pool().await;
+        let ok = db::run_query(&pool, "SELECT * FROM t", 10, None, true, false).await;
+        let entry = record("SELECT * FROM t", &ok);
+        assert!(entry.success);
+        assert_eq!(entry.blocked, None);
+
+        let sql = "SELECT * FROM no_such_table";
+        let failed = db::run_query(&pool, sql, 10, None, true, false).await;
+        let entry = record(sql, &failed);
+        assert!(!entry.success);
+        assert_eq!(entry.blocked, None);
+    }
 }
 
 #[cfg(test)]

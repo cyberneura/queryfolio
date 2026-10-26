@@ -26,6 +26,7 @@ queryfolio --list-servers   # query files directory + one row per connection
 queryfolio --help           # usage, including the open / write subcommands
 queryfolio --version
 queryfolio --license        # licenses of the bundled third-party libraries
+queryfolio --stats          # weekly usage numbers from the local query history (counts only)
 ```
 
 `--list-servers` prints `Query files directory: <path>` first, then a table:
