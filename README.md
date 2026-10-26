@@ -30,7 +30,8 @@ What this means in practice:
 - Release download counts, stars and product-page traffic are not tracked as success numbers.
   The measure is whether the developer keeps reaching for Queryfolio instead of other clients,
   and whether the safety guards (readonly / Writable, dangerous-statement checks) keep doing
-  their job.
+  their job. Check both with `queryfolio --stats`, which counts the local query history
+  (see [Usage numbers from the query history](#usage-numbers-from-the-query-history)).
 
 ## Features
 
@@ -162,11 +163,27 @@ queryfolio --help           # usage, including the open / write subcommands
 queryfolio --version
 queryfolio --license        # licenses of the bundled third-party libraries
 queryfolio --list-servers   # the configured connections
+queryfolio --stats          # weekly usage numbers from the query history
 ```
 
 `--list-servers` prints the resolved query files directory, then one row per connection: name, engine, host, port, user, database, TLS, whether an SSH tunnel is used, and the query file folder. **Passwords and SSH keys or passphrases are never printed** — the row is built from the same non-secret projection (`ConnectionInfo`) that is handed to the frontend.
 
 The TLS column shows the effective mode for mysql / postgres / redis (`disable` / `prefer` / `require` / `verify-ca` / `verify-full`) rather than a yes/no, because the default `prefer` falls back to plaintext without verifying the certificate; collapsing it into "enabled" would hide that. Other engines show the `tls` flag as `on` / `off`. A connection shows `invalid` when it cannot connect at all with the setting it has: an unresolvable `engine`, an unsupported `ssl_mode` on mysql / postgres, or an `ssl_root_cert` combined with a mode that does not verify it (`disable` / `prefer` / `require`, including the `prefer` you get by leaving `ssl_mode` out) — that combination is rejected rather than silently ignored. Whether the certificate file exists is not checked here. An unsupported `ssl_mode` on an engine that never reads it (elasticsearch / sqlite / duckdb / dynamodb) is not reported as `invalid`, because those connections work — `invalid` means "this will not connect", not "there is a stray value in the config". A dynamodb connection without a `host` shows the scheme the AWS SDK will actually use: `host` / `port` / `tls` there override the endpoint for dynamodb-local, and without that override the SDK resolves the regional endpoint over HTTPS unless `AWS_ENDPOINT_URL_DYNAMODB` / `AWS_ENDPOINT_URL` point somewhere else (both are honoured here, as is `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS`). An `endpoint_url` set in `~/.aws/config` rather than in the environment is not read, so such a connection is shown as `on`.
+
+### Usage numbers from the query history
+
+`queryfolio --stats [--weeks N]` reads the local query history (`~/.config/queryfolio/history/*.jsonl`) and prints one row per week (Monday to Sunday, newest first, 8 weeks unless `--weeks` says otherwise, up to 520) and a total:
+
+```text
+WEEK OF     RUNS  FAILED  READONLY STOPS  DANGEROUS STOPS  DAYS  CONNECTIONS
+2026-10-19    42       3               2                1     4  3 (mysql 1, postgres 2)
+```
+
+- RUNS counts every execution; FAILED excludes the statements that a guard stopped.
+- READONLY STOPS / DANGEROUS STOPS count the statements the read-only guard (config `readonly`, the Writable switch, the AI assistant) and the dangerous-statement guard refused to run. These are recorded from 0.12.0 on; earlier stops are in FAILED.
+- DAYS and CONNECTIONS count the days and connections with at least one execution; connections are broken down by engine (`unknown` for a history file whose connection is no longer configured).
+
+Only numbers are printed — no SQL, no connection names, no hosts — so the output can be pasted as is. Nothing is sent anywhere; the history stays on the machine.
 
 The USER column shows `(hidden)` for dynamodb, because that `user` is the AWS access key ID rather than a database user name. It is deliberately not the same as `-` (not configured): a connection using static keys and one falling back to `aws_profile` or the default credential chain are different things to know about.
 

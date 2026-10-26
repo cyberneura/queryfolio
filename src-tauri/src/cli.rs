@@ -1,4 +1,4 @@
-//! CLI options that finish without launching the GUI (`--help` / `--version` / `--license` / `--list-servers`).
+//! CLI options that finish without launching the GUI (`--help` / `--version` / `--license` / `--list-servers` / `--stats`).
 //!
 //! The `open` / `write` subcommands ([`crate::router`]) are for "launching the app and
 //! opening a file", whereas what is handled here only **writes to standard output and exits**,
@@ -24,6 +24,34 @@ pub enum InfoCommand {
     License,
     /// Print the list of configured connections.
     ListServers,
+    /// Print weekly usage numbers from the local query history (`--stats [--weeks N]`).
+    Stats { weeks: u32 },
+    /// The arguments of an info option were invalid. Printed to stderr, exit status 2.
+    Invalid(&'static str),
+}
+
+/// Error for a `--weeks` value that is missing or out of range.
+const INVALID_WEEKS: &str = "--weeks needs a number from 1 to 520";
+
+/// Reads `--weeks N` / `--weeks=N` among the arguments after `--stats`.
+fn stats_command<S: AsRef<str>>(rest: &[S]) -> InfoCommand {
+    use crate::history_stats::{DEFAULT_WEEKS, MAX_WEEKS};
+    let parse = |value: Option<&str>| match value.and_then(|v| v.parse::<u32>().ok()) {
+        Some(weeks) if (1..=MAX_WEEKS).contains(&weeks) => InfoCommand::Stats { weeks },
+        _ => InfoCommand::Invalid(INVALID_WEEKS),
+    };
+    let mut iter = rest.iter().map(AsRef::as_ref);
+    while let Some(arg) = iter.next() {
+        if arg == "--weeks" {
+            return parse(iter.next());
+        }
+        if let Some(value) = arg.strip_prefix("--weeks=") {
+            return parse(Some(value));
+        }
+    }
+    InfoCommand::Stats {
+        weeks: DEFAULT_WEEKS,
+    }
 }
 
 /// Extract an [`InfoCommand`] from the startup arguments.
@@ -37,7 +65,7 @@ pub enum InfoCommand {
 /// `-psn_0_12345` at the front when launching the `.app`
 /// (`router::route_from_cli_args` scans for the same reason).
 pub fn info_command_from_args<S: AsRef<str>>(args: &[S]) -> Option<InfoCommand> {
-    for arg in args {
+    for (i, arg) in args.iter().enumerate() {
         match arg.as_ref() {
             // If a subcommand comes first, everything after it is its arguments, so do not look at them
             "open" | "write" => return None,
@@ -45,6 +73,7 @@ pub fn info_command_from_args<S: AsRef<str>>(args: &[S]) -> Option<InfoCommand> 
             "--version" | "-V" => return Some(InfoCommand::Version),
             "--license" => return Some(InfoCommand::License),
             "--list-servers" => return Some(InfoCommand::ListServers),
+            "--stats" => return Some(stats_command(&args[i + 1..])),
             _ => {}
         }
     }
@@ -70,6 +99,7 @@ USAGE:
     queryfolio open <path>                           Open a saved query file by path
     queryfolio write <connection> <file> [content]   Write a query file and open it
     queryfolio --list-servers                        List the configured connections
+    queryfolio --stats [--weeks N]                   Weekly usage numbers from the query history
     queryfolio --help                                Show this help
     queryfolio --version                             Show the version
     queryfolio --license                             Show the licenses of the bundled libraries
@@ -92,6 +122,13 @@ WRITE
 CONFIG
     ~/.config/queryfolio/config.yml (config.yaml is used when it is missing).
     QUERYFOLIO_CONFIG_YAML overrides it with the YAML in the variable itself.
+
+STATS
+    Counts the local query history (~/.config/queryfolio/history) per week:
+    executions, failures, statements stopped by the read-only / dangerous-statement
+    guards, days used and connections used per engine. Only numbers are printed
+    (no SQL, no connection names, no hosts), and nothing is sent anywhere.
+    --weeks defaults to 8.
 
 On macOS the app bundle takes the same arguments after --args:
 
@@ -470,6 +507,40 @@ mod tests {
     }
 
     #[test]
+    fn test_stats_arguments() {
+        assert_eq!(
+            info_command_from_args(&["--stats"]),
+            Some(InfoCommand::Stats { weeks: 8 })
+        );
+        assert_eq!(
+            info_command_from_args(&["--stats", "--weeks", "4"]),
+            Some(InfoCommand::Stats { weeks: 4 })
+        );
+        assert_eq!(
+            info_command_from_args(&["--stats", "--weeks=12"]),
+            Some(InfoCommand::Stats { weeks: 12 })
+        );
+        for bad in [
+            &["--stats", "--weeks"][..],
+            &["--stats", "--weeks", "0"],
+            &["--stats", "--weeks", "521"],
+            &["--stats", "--weeks", "four"],
+            &["--stats", "--weeks=-1"],
+        ] {
+            assert_eq!(
+                info_command_from_args(bad),
+                Some(InfoCommand::Invalid(INVALID_WEEKS)),
+                "{bad:?}"
+            );
+        }
+        // Not taken from the content of write
+        assert_eq!(
+            info_command_from_args(&["write", "conn", "a.sql", "--stats"]),
+            None
+        );
+    }
+
+    #[test]
     fn test_subcommand_wins_over_option_like_argument() {
         // Even if the content of write contains something that looks like an option, it is just the content
         assert_eq!(
@@ -509,6 +580,7 @@ mod tests {
             "queryfolio open <path>",
             "queryfolio write <connection> <file> [content]",
             "--list-servers",
+            "--stats [--weeks N]",
             "--help",
             "--version",
             "--license",

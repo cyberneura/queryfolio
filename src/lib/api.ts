@@ -87,6 +87,8 @@ export interface QueryHistoryEntry {
   row_count: number | null;
   elapsed_ms: number;
   success: boolean;
+  /// Set when a safety guard stopped the statement before it ran (absent otherwise)
+  blocked?: "readonly" | "dangerous";
 }
 
 /// Table / view info (corresponds to schema_info::TableInfo in the backend)

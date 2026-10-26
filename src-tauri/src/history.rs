@@ -42,6 +42,27 @@ pub struct HistoryEntry {
     /// Elapsed time (milliseconds)
     pub elapsed_ms: u64,
     pub success: bool,
+    /// Set when a safety guard stopped the statement before it ran: `"readonly"` or
+    /// `"dangerous"` (see [`blocked_kind`]). Lets `queryfolio --stats` tell guard stops apart
+    /// from other failures such as syntax errors. Lines written before this field existed
+    /// have no key and read as `None`, and `None` is not written, so ordinary lines keep
+    /// their old shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<String>,
+}
+
+/// Value of [`HistoryEntry::blocked`] for a guard stop.
+pub const BLOCKED_READONLY: &str = "readonly";
+pub const BLOCKED_DANGEROUS: &str = "dangerous";
+
+/// Which guard, if any, produced this error: the read-only guard ([`AppError::Readonly`])
+/// or the dangerous-statement guard ([`AppError::Dangerous`]). Other errors return `None`.
+pub fn blocked_kind(error: &AppError) -> Option<&'static str> {
+    match error {
+        AppError::Readonly(_) => Some(BLOCKED_READONLY),
+        AppError::Dangerous(_) => Some(BLOCKED_DANGEROUS),
+        _ => None,
+    }
 }
 
 /// Manager that caches the history file line count per connection.
@@ -188,6 +209,40 @@ fn rotate_file(path: &Path, keep_lines: usize) -> Result<usize, AppError> {
     Ok(kept.len())
 }
 
+/// Reads the history of every connection, for `queryfolio --stats`.
+///
+/// Returns `(connection name, entry)` pairs in no particular order. The connection name is
+/// the file stem (history files are named after the connection, see [`history_file`]).
+/// Only `*.jsonl` files are read, so a rotation's leftover `*.jsonl.tmp` is not counted twice.
+/// Broken lines are skipped as in [`list_history`]. A missing directory means no history yet.
+pub fn read_all_history(history_dir: &Path) -> Result<Vec<(String, HistoryEntry)>, AppError> {
+    if !history_dir.exists() {
+        return Ok(vec![]);
+    }
+    let mut entries = vec![];
+    for dir_entry in fs::read_dir(history_dir)? {
+        let path = dir_entry?.path();
+        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(connection) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let connection = connection.to_string();
+        let reader = BufReader::new(fs::File::open(&path)?);
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(entry) = serde_json::from_str::<HistoryEntry>(&line) {
+                entries.push((connection.clone(), entry));
+            }
+        }
+    }
+    Ok(entries)
+}
+
 /// Returns the history newest first. If search is given, filters by substring match
 /// on the SQL (case-insensitive).
 pub fn list_history(
@@ -239,7 +294,74 @@ mod tests {
             row_count: if success { Some(3) } else { None },
             elapsed_ms: 12,
             success,
+            blocked: None,
         }
+    }
+
+    #[test]
+    fn test_blocked_is_written_only_when_set() {
+        let plain = serde_json::to_string(&entry("SELECT 1", true)).unwrap();
+        assert!(!plain.contains("blocked"), "{plain}");
+
+        let mut stopped = entry("DELETE FROM t", false);
+        stopped.blocked = blocked_kind(&AppError::Dangerous("no".into())).map(str::to_string);
+        let line = serde_json::to_string(&stopped).unwrap();
+        assert!(line.contains(r#""blocked":"dangerous""#), "{line}");
+    }
+
+    #[test]
+    fn test_old_lines_without_blocked_are_read() {
+        // A line written before the blocked field existed
+        let line = r#"{"time":"2026-07-11T12:00:00+09:00","sql":"SELECT 1","schema":null,"row_count":1,"elapsed_ms":3,"success":true}"#;
+        let entry: HistoryEntry = serde_json::from_str(line).unwrap();
+        assert_eq!(entry.blocked, None);
+        assert!(entry.success);
+    }
+
+    #[test]
+    fn test_blocked_kind() {
+        assert_eq!(
+            blocked_kind(&AppError::Readonly("x".into())),
+            Some("readonly")
+        );
+        assert_eq!(
+            blocked_kind(&AppError::Dangerous("x".into())),
+            Some("dangerous")
+        );
+        assert_eq!(blocked_kind(&AppError::Config("syntax error".into())), None);
+    }
+
+    #[test]
+    fn test_read_all_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = HistoryManager::default();
+        manager
+            .append(dir.path(), "a", &entry("SELECT 1", true))
+            .unwrap();
+        manager
+            .append(dir.path(), "a", &entry("SELECT 2", true))
+            .unwrap();
+        manager
+            .append(dir.path(), "b", &entry("SELECT 3", false))
+            .unwrap();
+        // A rotation leftover and an unrelated file are not read
+        fs::write(dir.path().join("a.jsonl.tmp"), "{}\n").unwrap();
+        fs::write(dir.path().join("notes.txt"), "x\n").unwrap();
+
+        let mut entries = read_all_history(dir.path()).unwrap();
+        entries.sort_by(|x, y| x.1.sql.cmp(&y.1.sql));
+        let pairs: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(c, e)| (c.as_str(), e.sql.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![("a", "SELECT 1"), ("a", "SELECT 2"), ("b", "SELECT 3")]
+        );
+
+        assert!(read_all_history(&dir.path().join("missing"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

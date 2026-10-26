@@ -65,7 +65,8 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
 | router.rs | `queryfolio://` deep link と CLI サブコマンドを共通の `Route` に落とす。`parse_uri` (URI パース。書き込みを伴う `write` は受け付けない) / `route_from_cli_args` (`open <path>` / `write <connection> <file-name> [content]` サブコマンド) / `resolve_open_target` (生パス → 接続 + ファイル名。保存ディレクトリ配下の接続フォルダにあるクエリファイル拡張子 (`.sql` / `.redis` / `.es`) だけを許可し、`..` トラバーサル・領域外を字句正規化で拒否)。Tauri 非依存の純 std + 単体テストで境界を固める。lib.rs が `Route` を解決してフロントへ `open-query-file` イベント / `frontend_ready` で届ける |
 | folder_meta.rs | クエリファイル保存フォルダに接続を説明するメタファイル (`_queryfolio.md`) を生成する (エージェント/人間がフォルダを見て「どの DB 用のクエリか」を理解できるように)。非機密のみ (パスワード・SSH 鍵は含めない)。`create_query_file` / `write_query_file` / `list_query_files` の後に lib.rs (refresh_folder_meta) が書き出す。フォルダ未作成なら何もしない・内容が同じなら書かない (mtime churn 回避)。`.sql` でないため一覧・検索には出ない |
 | meta_commands.rs | psql 風メタコマンド (\l \dt \dv \dn \du \d) をエンジン別カタログ SQL に変換 (MetaCommand::Sql)。識別子バリデーションでインジェクション拒否。`\c <database>` と `USE <database>` (MySQL / PostgreSQL / SQL Server のみ) だけは SQL にならずアクティブスキーマ切替 (MetaCommand::Connect) として lib.rs が処理する |
-| history.rs | クエリ実行履歴。接続ごとに JSONL (~/.config/queryfolio/history/<connection>.jsonl) へ追記、上限 10,000 行でローテーション。SQL に機密が含まれ得るためディレクトリ 700 / ファイル 600 |
+| history.rs | クエリ実行履歴。接続ごとに JSONL (~/.config/queryfolio/history/<connection>.jsonl) へ追記、上限 10,000 行でローテーション。SQL に機密が含まれ得るためディレクトリ 700 / ファイル 600。ガードで止めた実行は `blocked` (`readonly` / `dangerous`。`AppError::Readonly` / `Dangerous` から `blocked_kind` で決める。None は書かないので従来の行と同じ形) を持つ |
+| history_stats.rs | `queryfolio --stats [--weeks N]` の集計と表 (CYBERNEURA-DEV-1128。README の goal 節の尺度 = 使い続けているか / ガードが働いたかを手元の履歴だけで数える)。週 (月曜始まり、記録時のオフセットの日付) ごとに RUNS / FAILED (ガード停止を除く) / READONLY・DANGEROUS STOPS / DAYS / CONNECTIONS (エンジン別。設定に無い接続は unknown)。**出すのは件数だけ** — SQL・接続名・ホストは出さない (テストで担保)。純粋な関数で、履歴と設定の読み込みは lib.rs の `run_stats` (設定が読めなくても engine を unknown にして出す) |
 | schema_info.rs | テーブル・カラムのカタログ照会と SchemaCache (接続+スキーマ単位のキャッシュ。スキーマブラウザと SQL 補完用 get_schema_map で共有) |
 | ai.rs | AI 基盤 (AiConfig の解決・OpenAI Chat Completions 呼び出し chat_complete・SQL 生成 / EXPLAIN 解説 / 選択 SQL 解説プロンプト整形・フェンス剥がし)。API キーはフロントに渡さない (get_ai_info は configured / model のみ)。チャット (エージェント) 用に function calling 対応の request_chat_completion / chat_step とツール定義 (chat_tools_spec = 読み取り専用の run_sql のみ)・履歴の整形 (chat_history_messages は user / assistant 以外の role を落とし、フロント経由で system を差し込ませない)・ツール引数のパース・結果の切り詰めを持つ |
 | error.rs | AppError (フロントには文字列でシリアライズ) |
@@ -103,7 +104,7 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
 
 ## CLI (GUI を起動しないオプション)
 
-`--help` / `--version` / `--license` / `--list-servers` は標準出力に書いて `std::process::exit` で終わる。
+`--help` / `--version` / `--license` / `--list-servers` / `--stats` は標準出力に書いて `std::process::exit` で終わる (`--stats` の `--weeks` が不正なら stderr に書いて 2)。
 `cli.rs` にまとめてあり、`run()` が Tauri を組み立てる前 (write の書き出しよりも前) に
 `cli::info_command_from_args` で判定する。
 
