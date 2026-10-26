@@ -24,6 +24,7 @@ pnpm check              # svelte-check (型チェック)
 cd src-tauri && cargo test   # Rust ユニットテスト
 cd src-tauri && cargo check  # Rust 型チェック
 pnpm tauri build        # リリースビルド
+pnpm local-deploy       # .app をビルド → Developer ID で署名 (公証なし・timestamp なし) → /Applications へ置き換え (Homebrew で入れた版を置き換える。brew upgrade で戻るのは、より新しい版が公開されてから)
 pnpm release            # version 採番 → main へ push (これがリリースを始める) → watch (patch|minor|major)
 fab release             # 同上 (fab release:minor 等)
 fab -l                  # fab タスク一覧 (dev / check / unittest / build_local / release / releases)
