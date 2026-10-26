@@ -765,22 +765,24 @@ async fn cancel_query(
     }
     match server_side {
         // Give the server-side cancel time to end the query normally (its connection goes back
-        // to the pool intact). Still running after that means it is not going to answer
+        // to the pool intact). Still running after that means the connection is not answering
         Ok(true) => {
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(STUCK_RUN_GRACE).await;
                 use tauri::Manager;
                 let state = app.state::<AppState>();
-                abort_stuck_runs(&state, &connection, &runs).await;
+                abort_runs(&state, &connection, &runs, true).await;
             });
         }
-        // Nothing to cancel on the server: the run has not reached the query yet (it is getting
-        // a connection), or the cancel itself failed
-        Ok(false) | Err(_) => {
-            if let Err(e) = server_side {
-                eprintln!("[cancel] '{connection}': server-side cancel failed: {e}");
-            }
-            abort_stuck_runs(&state, &connection, &runs).await;
+        // Nothing to cancel on the server: the run has not sent its query yet. That is not
+        // evidence of a dead connection, since it may just be queued behind healthy work on the
+        // same connection (a full pool, the SQL Server client lock), so only the run is dropped
+        // and the connection is left alone. Its waits for a connection are bounded anyway
+        Ok(false) => abort_runs(&state, &connection, &runs, false).await,
+        // The cancel itself got no answer from the server through this connection
+        Err(e) => {
+            eprintln!("[cancel] '{connection}': server-side cancel failed: {e}");
+            abort_runs(&state, &connection, &runs, true).await;
         }
     }
     Ok(true)
@@ -792,19 +794,21 @@ const SERVER_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// How long a run may keep going after a successful server-side cancel before it is aborted
 const STUCK_RUN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Aborts the runs still in flight and drops the connection's pool and tunnel. A run that does
-/// not end by itself is waiting on a connection that stopped answering (typically a tunnel
-/// whose SSH session went silent), and the pool would hand the same connections to the next
-/// query. Dropping the tunnel also closes its local sockets, which ends the pool's own
-/// on-release ping of the aborted connection instead of leaving it waiting forever
-async fn abort_stuck_runs(state: &AppState, connection: &str, runs: &[u64]) {
+/// Aborts the runs still in flight; with `disconnect`, first drops the connection's pool and
+/// tunnel. That is for a connection that stopped answering (typically a tunnel whose SSH
+/// session went silent): the pool would hand the same connections to the next query, and
+/// dropping the tunnel also closes its local sockets, which ends the pool's own on-release ping
+/// of the aborted connection instead of leaving it waiting forever
+async fn abort_runs(state: &AppState, connection: &str, runs: &[u64], disconnect: bool) {
     if !state.query_runs.claim_abort(connection, runs) {
         return;
     }
-    eprintln!("[cancel] '{connection}': aborting a query that did not stop, reconnecting");
-    // Disconnect before waking the run: once it returns, the frontend can start the next query
-    // on this connection, and a disconnect after that would cut the new query's pool
-    state.db.disconnect(connection).await;
+    if disconnect {
+        eprintln!("[cancel] '{connection}': aborting a query that did not stop, reconnecting");
+        // Disconnect before waking the run: once it returns, the frontend can start the next
+        // query on this connection, and a disconnect after that would cut the new query's pool
+        state.db.disconnect(connection).await;
+    }
     state.query_runs.abort(connection, runs);
 }
 
@@ -2798,7 +2802,7 @@ mod cancel_tests {
         );
         let abort = async {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            abort_stuck_runs(&state, "stuck", &ids).await;
+            abort_runs(&state, "stuck", &ids, false).await;
         };
         let (result, ()) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
