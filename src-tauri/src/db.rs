@@ -707,6 +707,187 @@ impl CancelRegistry {
     }
 }
 
+/// Every result-table `run_query` in flight, registered on entry, with a token that aborts it
+/// on the client.
+///
+/// CancelRegistry only learns of a query once it holds a connection and knows the server-side
+/// id, so a query stuck before that (a connection through a stalled tunnel never answering
+/// `SELECT CONNECTION_ID()`, say) could not be cancelled while the frontend still showed it
+/// running and refused new queries on the connection. Cancel falls back to this token
+#[derive(Default)]
+pub struct QueryRuns {
+    runs: std::sync::Mutex<HashMap<String, HashMap<u64, QueryRun>>>,
+    next_id: AtomicU64,
+}
+
+struct QueryRun {
+    /// Claimed by an abort (only one abort tears a run's connection down)
+    aborting: bool,
+    /// Wakes the run (it stops waiting and returns AppError::Cancelled). Cancelled only after
+    /// the disconnect, so a claimed run that finished by itself waits on it in `finish`
+    token: tokio_util::sync::CancellationToken,
+}
+
+impl QueryRuns {
+    pub fn start(&self, connection: &str) -> QueryRunGuard<'_> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let token = tokio_util::sync::CancellationToken::new();
+        self.runs
+            .lock()
+            .unwrap()
+            .entry(connection.to_string())
+            .or_default()
+            .insert(
+                id,
+                QueryRun {
+                    aborting: false,
+                    token: token.clone(),
+                },
+            );
+        QueryRunGuard {
+            runs: self,
+            connection: connection.to_string(),
+            id,
+            token,
+        }
+    }
+
+    /// Ids of the runs in flight on the connection
+    pub fn active(&self, connection: &str) -> Vec<u64> {
+        self.runs
+            .lock()
+            .unwrap()
+            .get(connection)
+            .map(|runs| runs.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// First step of an abort: claims those of `ids` still in flight and not claimed by another
+    /// abort. Returns whether it claimed any; the caller must then disconnect and call `abort`,
+    /// since a claimed run does not return before that
+    pub fn claim_abort(&self, connection: &str, ids: &[u64]) -> bool {
+        let mut runs = self.runs.lock().unwrap();
+        let Some(runs) = runs.get_mut(connection) else {
+            return false;
+        };
+        let mut claimed = false;
+        for id in ids {
+            if let Some(run) = runs.get_mut(id) {
+                if !run.aborting {
+                    run.aborting = true;
+                    claimed = true;
+                }
+            }
+        }
+        claimed
+    }
+
+    /// Wakes those of `ids` still in flight, which then return AppError::Cancelled
+    pub fn abort(&self, connection: &str, ids: &[u64]) {
+        let runs = self.runs.lock().unwrap();
+        let Some(runs) = runs.get(connection) else {
+            return;
+        };
+        for run in ids.iter().filter_map(|id| runs.get(id)) {
+            run.token.cancel();
+        }
+    }
+}
+
+pub struct QueryRunGuard<'a> {
+    runs: &'a QueryRuns,
+    connection: String,
+    id: u64,
+    token: tokio_util::sync::CancellationToken,
+}
+
+impl QueryRunGuard<'_> {
+    /// Runs `work` unless the run is aborted (then AppError::Cancelled). Called several times
+    /// per run; an abort that came before a call applies to it without starting `work`
+    pub async fn run<T>(
+        &self,
+        work: impl std::future::Future<Output = Result<T, AppError>>,
+    ) -> Result<T, AppError> {
+        if self.token.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        tokio::select! {
+            // A result that is already there wins: a write that went through must not be
+            // reported as cancelled
+            biased;
+            result = work => result,
+            _ = self.token.cancelled() => Err(AppError::Cancelled),
+        }
+    }
+
+    fn unregister(&self) {
+        let mut runs = self.runs.runs.lock().unwrap();
+        if let Some(connection_runs) = runs.get_mut(&self.connection) {
+            connection_runs.remove(&self.id);
+            if connection_runs.is_empty() {
+                runs.remove(&self.connection);
+            }
+        }
+    }
+}
+
+impl Drop for QueryRunGuard<'_> {
+    fn drop(&mut self) {
+        self.unregister();
+    }
+}
+
+/// `work` under `run`'s abort, or as is when there is no run (a Copy / Export fetch)
+pub async fn abortable<T>(
+    run: Option<&QueryRunGuard<'_>>,
+    work: impl std::future::Future<Output = Result<T, AppError>>,
+) -> Result<T, AppError> {
+    match run {
+        Some(run) => run.run(work).await,
+        None => work.await,
+    }
+}
+
+/// Ends a run with its result, before the frontend can start the next query on the connection.
+///
+/// Whether an abort claimed the run is decided and the run unregistered under the lock that
+/// `claim_abort` takes, so either the run is gone before an abort can claim it (the abort
+/// then leaves the connection alone), or the abort claimed it and this waits for its
+/// disconnect. Returning while that disconnect is still to come would let it cut the pool of
+/// the next query. The disconnect is also why a failure of a claimed run reads as cancelled
+pub async fn finish_run<T>(
+    run: Option<QueryRunGuard<'_>>,
+    result: Result<T, AppError>,
+) -> Result<T, AppError> {
+    let Some(run) = run else {
+        return result;
+    };
+    let claimed = {
+        let mut runs = run.runs.runs.lock().unwrap();
+        let claimed = runs
+            .get(&run.connection)
+            .and_then(|connection_runs| connection_runs.get(&run.id))
+            .is_some_and(|entry| entry.aborting);
+        if !claimed {
+            if let Some(connection_runs) = runs.get_mut(&run.connection) {
+                connection_runs.remove(&run.id);
+                if connection_runs.is_empty() {
+                    runs.remove(&run.connection);
+                }
+            }
+        }
+        claimed
+    };
+    if !claimed {
+        return result;
+    }
+    run.token.cancelled().await;
+    match result {
+        Err(_) => Err(AppError::Cancelled),
+        result => result,
+    }
+}
+
 /// Guard that removes the registration from the registry when the execution ends.
 /// If a new execution was registered again on the same connection after
 /// registration (id mismatch), it does nothing so as not to remove the new registration.
@@ -3679,6 +3860,157 @@ mod tests {
         let registry = CancelRegistry::default();
         // false if no query is running
         assert!(!registry.cancel("nothing").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_query_runs_abort_ends_a_run_that_never_finishes() {
+        let runs = QueryRuns::default();
+        let run = runs.start("conn-a");
+        let ids = runs.active("conn-a");
+        assert_eq!(ids.len(), 1);
+        let waiting = run.run(std::future::pending::<Result<(), AppError>>());
+        let abort = async {
+            tokio::task::yield_now().await;
+            runs.abort("conn-a", &ids);
+        };
+        let (result, ()) = tokio::join!(waiting, abort);
+        assert!(matches!(result, Err(AppError::Cancelled)));
+        drop(run);
+        assert!(runs.active("conn-a").is_empty());
+        // A finished run is no longer abortable (a later run on the connection is not hit)
+        assert!(!runs.claim_abort("conn-a", &ids));
+    }
+
+    #[tokio::test]
+    async fn test_query_runs_abort_before_run_skips_the_work() {
+        // Arrange
+        let runs = QueryRuns::default();
+        let run = runs.start("conn-a");
+        runs.abort("conn-a", &runs.active("conn-a"));
+        let started = AtomicBool::new(false);
+
+        // Act
+        let result = run
+            .run(async {
+                started.store(true, Ordering::SeqCst);
+                Ok(1)
+            })
+            .await;
+
+        // Assert
+        assert!(matches!(result, Err(AppError::Cancelled)));
+        assert!(!started.load(Ordering::SeqCst));
+    }
+
+    /// The disconnect that ends a stuck run makes its query fail with a connection error,
+    /// which must read as the cancellation it is. The run returns only after the abort is
+    /// complete (the disconnect is done)
+    #[tokio::test]
+    async fn test_query_runs_claimed_run_waits_for_the_abort() {
+        // Arrange
+        let runs = QueryRuns::default();
+        let run = runs.start("conn-a");
+        let ids = runs.active("conn-a");
+        assert!(runs.claim_abort("conn-a", &ids));
+        let aborted = AtomicBool::new(false);
+        let finish_abort = async {
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            aborted.store(true, Ordering::SeqCst);
+            runs.abort("conn-a", &ids);
+        };
+
+        // Act
+        let (result, ()) = tokio::join!(
+            async {
+                let result = finish_run(
+                    Some(run),
+                    Err::<(), _>(AppError::Config("connection reset".into())),
+                )
+                .await;
+                assert!(aborted.load(Ordering::SeqCst), "returned before the abort finished");
+                result
+            },
+            finish_abort,
+        );
+
+        // Assert
+        assert!(matches!(result, Err(AppError::Cancelled)));
+        assert!(runs.active("conn-a").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_query_runs_claimed_run_keeps_a_result_that_made_it() {
+        // Arrange
+        let runs = QueryRuns::default();
+        let run = runs.start("conn-a");
+        let ids = runs.active("conn-a");
+        assert!(runs.claim_abort("conn-a", &ids));
+
+        // Act
+        let (result, ()) = tokio::join!(finish_run(Some(run), Ok(1)), async {
+            tokio::task::yield_now().await;
+            runs.abort("conn-a", &ids);
+        });
+
+        // Assert
+        assert_eq!(result.unwrap(), 1);
+    }
+
+    /// A finished run is unregistered in the same step, so an abort arriving after it claims
+    /// nothing (and does not disconnect the connection the next query is about to use)
+    #[tokio::test]
+    async fn test_query_runs_finished_run_cannot_be_claimed() {
+        // Arrange
+        let runs = QueryRuns::default();
+        let run = runs.start("conn-a");
+        let ids = runs.active("conn-a");
+
+        // Act
+        let result = finish_run(Some(run), Ok(1)).await;
+
+        // Assert
+        assert_eq!(result.unwrap(), 1);
+        assert!(!runs.claim_abort("conn-a", &ids));
+    }
+
+    /// Repeated Cancels must not disconnect twice: the second disconnect could land after the
+    /// run returned and the next query started
+    #[test]
+    fn test_query_runs_only_one_abort_claims_a_run() {
+        // Arrange
+        let runs = QueryRuns::default();
+        let _run = runs.start("conn-a");
+        let ids = runs.active("conn-a");
+
+        // Act
+        let first = runs.claim_abort("conn-a", &ids);
+        let second = runs.claim_abort("conn-a", &ids);
+
+        // Assert
+        assert!(first);
+        assert!(!second);
+    }
+
+    #[test]
+    fn test_query_runs_abort_only_targets_the_given_runs() {
+        // Arrange
+        let runs = QueryRuns::default();
+        let old = runs.start("conn-a");
+        let ids = runs.active("conn-a");
+        let other = runs.start("conn-b");
+        drop(old);
+        let newer = runs.start("conn-a");
+
+        // Act
+        let claimed = runs.claim_abort("conn-a", &ids);
+        runs.abort("conn-a", &ids);
+
+        // Assert
+        assert!(!claimed);
+        assert!(!newer.token.is_cancelled());
+        assert!(!other.token.is_cancelled());
     }
 
     #[tokio::test]

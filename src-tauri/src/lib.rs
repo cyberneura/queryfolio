@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use config::{AppConfig, ConfigInfo, ConnectionInfo, ServerConfig};
-use db::{CancelRegistry, DbManager, DbPool, QueryResult, DEFAULT_MAX_ROWS};
+use db::{CancelRegistry, DbManager, DbPool, QueryResult, QueryRuns, DEFAULT_MAX_ROWS};
 use error::AppError;
 
 /// State for handing "targets to open" that arrive while running over to the frontend.
@@ -52,6 +52,8 @@ struct AppState {
     db: DbManager,
     /// Cancel registry for running queries (per connection name).
     query_cancels: CancelRegistry,
+    /// Every run_query in flight (the fallback of cancel_query, see QueryRuns)
+    query_runs: QueryRuns,
     /// Query execution history recording (holds a per-connection line count cache).
     history: history::HistoryManager,
     /// Cache of schema information (tables and columns).
@@ -488,7 +490,35 @@ async fn run_query(
     // Copy / Export want all rows rather than the display for the result table, so they call with false.
     apply_default_limit: Option<bool>,
 ) -> Result<QueryResult, AppError> {
-    let server = state.find_server(&connection).await?;
+    // Row handling is separated between the display for the result table (apply_default_limit)
+    // and the fetch of all rows for Copy / Export (apply_default_limit = false)
+    let apply_default_limit = apply_default_limit.unwrap_or(true);
+    // Only the result-table execution is registered: it is what the frontend shows as running
+    // and what Cancel is for. Copy / Export re-fetch all rows outside that guard and can run
+    // alongside it, so a Cancel must not abort them or drop the tunnel they use.
+    // Registered before anything can wait, so that cancel_query reaches this run even while it
+    // is still getting a connection
+    let run_guard = apply_default_limit.then(|| state.query_runs.start(&connection));
+    let run = run_guard.as_ref();
+    let prepared = db::abortable(run, async {
+        let server = state.find_server(&connection).await?;
+        // Note the active schema at execution time for history recording
+        let schema = match state.db.schema_override(&connection).await {
+            Some(schema) => Some(schema),
+            None => server.schema.clone(),
+        };
+        let default_limit = if apply_default_limit {
+            state.resolve_default_limit().await?
+        } else {
+            0
+        };
+        Ok((server, schema, default_limit))
+    })
+    .await;
+    let (server, schema, default_limit) = match prepared {
+        Ok(prepared) => prepared,
+        Err(e) => return db::finish_run(run_guard, Err(e)).await,
+    };
     // The config's readonly is the highest-priority hard lock. Next is the switch.
     let readonly_guard = if server.readonly {
         db::ReadonlyGuard::Config
@@ -496,19 +526,6 @@ async fn run_query(
         db::ReadonlyGuard::Off
     } else {
         db::ReadonlyGuard::Switch
-    };
-    // Note the active schema at execution time for history recording
-    let schema = match state.db.schema_override(&connection).await {
-        Some(schema) => Some(schema),
-        None => server.schema.clone(),
-    };
-    // Row handling is separated between the display for the result table (apply_default_limit)
-    // and the fetch of all rows for Copy / Export (apply_default_limit = false)
-    let apply_default_limit = apply_default_limit.unwrap_or(true);
-    let default_limit = if apply_default_limit {
-        state.resolve_default_limit().await?
-    } else {
-        0
     };
     let auto_limit = match default_limit {
         0 => None,
@@ -544,11 +561,19 @@ async fn run_query(
         if let Some(meta_commands::MetaCommand::Connect(schema)) =
             meta_commands::translate(engine, &sql)?
         {
-            return switch_active_schema(&state, &server, schema, started).await;
+            return switch_active_schema(&state, &server, schema, started, run).await;
         }
-        let (cancels, connection, sql) = (&state.query_cancels, &connection, &sql);
+        // Copy / Export get their own key: the registry keeps one query per key, so sharing
+        // the connection's would hide the result-table query from Cancel (which would then
+        // take it for one not sent yet and drop the connection without stopping it on the server)
+        let cancel_key = if apply_default_limit {
+            connection.clone()
+        } else {
+            format!("{connection}\u{1}full-fetch")
+        };
+        let (cancels, connection, sql) = (&state.query_cancels, &cancel_key, &sql);
         let allow_dangerous = server.allow_dangerous_statements;
-        state
+        let work = state
             .db
             .with_pool(&server, db::PasswordRetry::BeforeStatement, |pool: DbPool| async move {
                 db::run_query_cancellable(
@@ -562,10 +587,13 @@ async fn run_query(
                     allow_dangerous,
                 )
                 .await
-            })
-            .await
+            });
+        db::abortable(run, work).await
     }
     .await;
+    // Before the history write: a Cancel arriving during it would find no server-side target
+    // and abort this already finished run, dropping a healthy pool
+    let result = db::finish_run(run_guard, result).await;
 
     // Record the execution history regardless of success or failure.
     // Recording failures only go to the log so that they do not spoil the query result.
@@ -625,16 +653,19 @@ fn history_entry(
 /// If the switch fails (a nonexistent database, etc.), return to the original schema.
 /// If not restored, all subsequent queries would be left in a state where they cannot connect.
 async fn switch_active_schema(
-    state: &tauri::State<'_, AppState>,
+    state: &AppState,
     server: &ServerConfig,
     schema: String,
     started: std::time::Instant,
+    run: Option<&db::QueryRunGuard<'_>>,
 ) -> Result<QueryResult, AppError> {
     let previous = state.db.schema_override(&server.name).await;
     state.db.set_schema_override(&server.name, schema.clone()).await;
 
-    // Confirm that it can actually connect with the switched connection. If it fails here, roll back
-    let confirm = async {
+    // Confirm that it can actually connect with the switched connection. If it fails here, roll back.
+    // Only this part is abortable: an abort that dropped the whole function would skip the
+    // rollback and leave the backend on the new database while the frontend shows the old one
+    let confirm = db::abortable(run, async {
         let pool: DbPool = state.db.get_pool(server).await?;
         let sql = match db::parse_engine(&server.engine)? {
             db::Engine::MySql => "SELECT DATABASE() AS `database`",
@@ -669,7 +700,7 @@ async fn switch_active_schema(
             false,
         )
         .await
-    }
+    })
     .await;
 
     match confirm {
@@ -713,10 +744,72 @@ async fn switch_active_schema(
 /// ("Query cancelled").
 #[tauri::command]
 async fn cancel_query(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     connection: String,
 ) -> Result<bool, AppError> {
-    cancel_with_password_refresh(&state, &connection, &connection).await
+    let runs = state.query_runs.active(&connection);
+    // The cancel goes through the same tunnel / server as the query, so it can stall the same way
+    let server_side = tokio::time::timeout(
+        SERVER_CANCEL_TIMEOUT,
+        cancel_with_password_refresh(&state, &connection, &connection),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(AppError::Config(
+            "The cancel request did not get a response from the server".into(),
+        ))
+    });
+    if runs.is_empty() {
+        return server_side;
+    }
+    match server_side {
+        // Give the server-side cancel time to end the query normally (its connection goes back
+        // to the pool intact). Still running after that means the connection is not answering
+        Ok(true) => {
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(STUCK_RUN_GRACE).await;
+                use tauri::Manager;
+                let state = app.state::<AppState>();
+                abort_runs(&state, &connection, &runs, true).await;
+            });
+        }
+        // Nothing to cancel on the server: the run has not sent its query yet. That is not
+        // evidence of a dead connection, since it may just be queued behind healthy work on the
+        // same connection (a full pool, the SQL Server client lock), so only the run is dropped
+        // and the connection is left alone. Its waits for a connection are bounded anyway
+        Ok(false) => abort_runs(&state, &connection, &runs, false).await,
+        // The cancel itself got no answer from the server through this connection
+        Err(e) => {
+            eprintln!("[cancel] '{connection}': server-side cancel failed: {e}");
+            abort_runs(&state, &connection, &runs, true).await;
+        }
+    }
+    Ok(true)
+}
+
+/// How long cancel_query waits for the server-side cancel (KILL QUERY etc.) itself
+const SERVER_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a run may keep going after a successful server-side cancel before it is aborted
+const STUCK_RUN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Aborts the runs still in flight; with `disconnect`, first drops the connection's pool and
+/// tunnel. That is for a connection that stopped answering (typically a tunnel whose SSH
+/// session went silent): the pool would hand the same connections to the next query, and
+/// dropping the tunnel also closes its local sockets, which ends the pool's own on-release ping
+/// of the aborted connection instead of leaving it waiting forever
+async fn abort_runs(state: &AppState, connection: &str, runs: &[u64], disconnect: bool) {
+    if !state.query_runs.claim_abort(connection, runs) {
+        return;
+    }
+    if disconnect {
+        eprintln!("[cancel] '{connection}': aborting a query that did not stop, reconnecting");
+        // Disconnect before waking the run: once it returns, the frontend can start the next
+        // query on this connection, and a disconnect after that would cut the new query's pool
+        state.db.disconnect(connection).await;
+    }
+    state.query_runs.abort(connection, runs);
 }
 
 /// Cancels the query registered under `key` on `connection`. Postgres / MySQL cancel from another
@@ -2669,5 +2762,61 @@ mod export_encoding_tests {
         // Characters that cannot be converted turn into numeric character references, so return an error instead of silently writing
         assert!(encode_export_contents("a🍣b", "cp932").is_err());
         assert!(encode_export_contents("🍣", "euc-jp").is_err());
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+
+    /// Aborting `\c` while it connects to the new database must restore the previous one:
+    /// the frontend never hears of the switch, so a backend left on the new database would
+    /// send the next query somewhere other than what the UI shows
+    #[tokio::test]
+    async fn test_aborted_schema_switch_rolls_back() {
+        // Arrange: a server that accepts TCP but never answers the handshake
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let server: ServerConfig = serde_yaml::from_str(&format!(
+            "{{name: stuck, engine: mysql, host: 127.0.0.1, port: {port}, ssl_mode: disable}}"
+        ))
+        .unwrap();
+        let state = AppState::default();
+        state.db.set_schema_override("stuck", "previous".into()).await;
+        let run = state.query_runs.start("stuck");
+        let ids = state.query_runs.active("stuck");
+
+        // Act
+        let switch = switch_active_schema(
+            &state,
+            &server,
+            "next".into(),
+            std::time::Instant::now(),
+            Some(&run),
+        );
+        let abort = async {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            abort_runs(&state, "stuck", &ids, false).await;
+        };
+        let (result, ()) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async { tokio::join!(switch, abort) },
+        )
+        .await
+        .expect("the abort did not end the switch");
+
+        // Assert
+        assert!(matches!(result, Err(AppError::Cancelled)));
+        assert_eq!(
+            state.db.schema_override("stuck").await.as_deref(),
+            Some("previous")
+        );
+        accept.abort();
     }
 }
