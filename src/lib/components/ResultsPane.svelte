@@ -25,6 +25,13 @@
   import CellInspector from "./CellInspector.svelte";
   import AiAnalysisModal from "./AiAnalysisModal.svelte";
 
+  interface Props {
+    /// Open the process list pane for the given connection
+    onOpenProcessList?: (connection: string) => void;
+  }
+
+  let { onOpenProcessList }: Props = $props();
+
   // Output format shared by Copy / Export / Cmd+C copy.
   type CopyFormat = "csv" | "tsv" | "json";
   const COPY_FORMAT_KEY = "queryfolio.results.copyFormat";
@@ -1287,6 +1294,18 @@
         >
           <i class="bi bi-arrow-repeat" aria-hidden="true"></i> Re-run
         </button>
+        {#if onOpenProcessList && appStore.connections.find((c) => c.name === activeTab.connection)?.capabilities.supports_process_list}
+          <!-- Show the server's processes (useful while this query is running) -->
+          <button
+            class="rounded border border-zinc-700 px-1.5 py-0.5 hover:bg-zinc-700 hover:text-zinc-200"
+            title="Show the process list of {activeTab.connection}"
+            aria-label="Show the process list"
+            data-annotate="button-open-process-list"
+            onclick={() => onOpenProcessList(activeTab.connection)}
+          >
+            <i class="bi bi-activity" aria-hidden="true"></i> Processes
+          </button>
+        {/if}
         {#if canAnalyzePlan}
           <!-- Have AI explain the EXPLAIN plan (only for tabs where AI is configured) -->
           <button
