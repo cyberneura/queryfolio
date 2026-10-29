@@ -555,21 +555,7 @@ pub fn write_run_log_output(
     file_name: &str,
     content: &str,
 ) -> Result<String, AppError> {
-    let name = validate_component(file_name)?;
-    let lower = name.to_ascii_lowercase();
-    if let Some(ext) = QUERY_FILE_EXTENSIONS
-        .iter()
-        .find(|ext| lower.ends_with(&format!(".{ext}")))
-    {
-        return Err(AppError::QueryFile(format!(
-            "The output file cannot be a query file (.{ext}): {name}"
-        )));
-    }
-    if lower == crate::folder_meta::META_FILE_NAME.to_ascii_lowercase() {
-        return Err(AppError::QueryFile(format!(
-            "The output file cannot replace the folder description: {name}"
-        )));
-    }
+    let name = run_log_output_name(file_name)?;
     let path = connection_dir(sqlfiles_dir, connection)?.join(name);
     match fs::symlink_metadata(&path) {
         Ok(meta) if !meta.is_file() => {
@@ -586,6 +572,27 @@ pub fn write_run_log_output(
     }
     write_file_atomic(&path, content)?;
     Ok(name.to_string())
+}
+
+/// Validate a Run and Log output file name (the rules are on `write_run_log_output`) and return
+/// it trimmed. Checked before the statement runs as well, so a bad name does not cost a query
+pub fn run_log_output_name(file_name: &str) -> Result<&str, AppError> {
+    let name = validate_component(file_name)?;
+    let lower = name.to_ascii_lowercase();
+    if let Some(ext) = QUERY_FILE_EXTENSIONS
+        .iter()
+        .find(|ext| lower.ends_with(&format!(".{ext}")))
+    {
+        return Err(AppError::QueryFile(format!(
+            "The output file cannot be a query file (.{ext}): {name}"
+        )));
+    }
+    if lower == crate::folder_meta::META_FILE_NAME.to_ascii_lowercase() {
+        return Err(AppError::QueryFile(format!(
+            "The output file cannot replace the folder description: {name}"
+        )));
+    }
+    Ok(name)
 }
 
 /// Write with optimistic locking. Writes only when the base the caller knows (expected_base)

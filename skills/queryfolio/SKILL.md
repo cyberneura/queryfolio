@@ -246,10 +246,14 @@ SELECT * FROM orders WHERE created_at >= '2026-10-01';
   nothing is written (the user sees an error).
 - The format follows the extension: `.csv` is CSV, `.json` is a JSON array of objects, anything
   else is TSV with a header row. The same formula guard as the inline body applies to TSV / CSV.
-  No character caps and no confirmation dialog; the re-fetch goes up to 1,000,000 rows.
+  No character caps and no confirmation dialog; the second run (same read-only rules as above)
+  goes up to 1,000,000 rows and is written by Queryfolio's backend without passing through the
+  editor. JSON has one object per line, keys in column order.
 - `out=…` is removed from the heading. Re-running overwrites the file and replaces the block.
 - The file is written when the run finishes, even if the write-back below the statement is then
-  skipped (see the next section).
+  skipped (see the next section). It is **not** written — the previous file stays — when the
+  second run fails or is cancelled, or the active database changed during the run.
+- A statement without a result set (INSERT etc.) writes no file, only `(N rows affected)`.
 
 ### How the write-back behaves
 
@@ -263,8 +267,10 @@ SELECT * FROM orders WHERE created_at >= '2026-10-01';
   inside a log block as a verbatim value.
 - **The log carries the whole result, not just the rows in the table.** The table stops at the
   automatic `LIMIT` (`default_limit`, 500 by default); when a marked statement hits it, Queryfolio
-  runs the statement again without the limit (up to 100,000 rows) and logs that. Only statements
-  judged read-only are run again — for anything else the rows shown are logged, with the
+  runs the statement again without the limit (up to 20,000 rows inline; use `out=` below for
+  more) and logs that. The second run is **always read-only** (a read-only transaction, whatever
+  the Writable switch says) and only happens for statements judged read-only — otherwise, or
+  when it fails (a `SELECT nextval(...)` is refused), the rows shown are logged with the
   `(the query was limited to N rows)` note. The table itself keeps showing at most 500 rows.
 - Results larger than **200 rows** trigger a confirmation dialog first: write everything /
   write only the first 200 rows / write nothing (the dialog counts the re-fetched rows, so a

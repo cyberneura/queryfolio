@@ -160,7 +160,8 @@ follow it, but a blank line in between detaches it.
 
 The log carries the whole result even though the table stops at the automatic
 `LIMIT` (500 rows by default): a read-only statement that reached it is run once
-more without the limit (up to 100,000 rows) for the log. Results of more than
+more without the limit (up to 20,000 rows), always in a read-only transaction,
+for the log. Results of more than
 200 rows ask for confirmation before the write, since a large paste fills the
 file. Declining still leaves the result in the table.
 
@@ -173,7 +174,8 @@ statement:
 SELECT * FROM orders;
 ```
 
-`.csv` and `.json` names get CSV and JSON; anything else is TSV.
+`.csv` and `.json` names get CSV and JSON; anything else is TSV. The file takes
+up to 1,000,000 rows.
 
 ## Editing results
 

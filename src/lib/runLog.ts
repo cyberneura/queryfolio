@@ -1,5 +1,5 @@
-import type { QueryResult } from "$lib/api";
-import { toCsv, toJson, toTsv, toTsvCapped } from "$lib/export";
+import type { QueryResult, RunLogFile } from "$lib/api";
+import { toTsvCapped } from "$lib/export";
 
 /// Marker placed at the start of a written-back log block (U+1F5D2 + variation selector).
 /// Existing blocks are detected with U+1F5D2 without the selector, so they are still found even if the selector is removed by hand
@@ -28,14 +28,11 @@ const MAX_BODY_CHARS = 1_000_000;
 
 /// Upper limit on rows when re-fetching a result for an inline write-back.
 /// The table shows only up to default_limit (500) rows, so a statement that hit that limit is run
-/// again without it (`runLogNeedsFullFetch`). A log the size of this is already far beyond what
-/// fits in the editor, and without a cap a mistakenly marked full-table SELECT would pull the whole
-/// table into memory before the user is even asked
-export const RUN_LOG_FETCH_MAX_ROWS = 100_000;
-
-/// Upper limit on rows when re-fetching a result for an output file (`out=`).
-/// Same as the Copy / Export re-fetch: a file is where a large result is meant to go
-export const RUN_LOG_FILE_MAX_ROWS = 1_000_000;
+/// again without it (`runLogNeedsFullFetch`). The rows pass through the WebView, so the cap is kept
+/// near what the body (`MAX_BODY_CHARS`) can hold anyway — a mistakenly marked full-table SELECT
+/// must not pull the whole table into memory before the user is even asked. Results meant to be
+/// larger go to an output file (`out=`), which the backend fills without the WebView
+export const RUN_LOG_FETCH_MAX_ROWS = 20_000;
 
 /// Upper limit on the number of characters per cell of the TSV to write back.
 /// The total limit alone cannot prevent a single huge row (number of columns x long TEXT)
@@ -93,29 +90,19 @@ export const runLogNeedsFullFetch = (result: QueryResult): boolean =>
   (result.applied_limit !== null && result.rows.length >= result.applied_limit) ||
   result.truncated;
 
-/// The content of an output file. The format follows the extension (`.csv` / `.json`, anything
-/// else TSV), with the same conversion and formula guard as Export. Unlike the inline body, nothing
-/// is cut: the file is the place for the full result
-export const runLogFileContent = (result: QueryResult, fileName: string): string => {
-  const lower = fileName.toLowerCase();
-  if (lower.endsWith(".json")) {
-    return `${toJson(result)}\n`;
+/// The log body written below the statement when the result went to an output file: the row
+/// count, the file name, and the same notes as the inline body when the result is not complete.
+/// limitedTo is the automatic LIMIT when it cut the rows written (a statement that could not be
+/// run again keeps the displayed rows)
+export const runLogFileBody = (
+  file: RunLogFile,
+  limitedTo: number | null,
+): string => {
+  const lines = [`(${file.row_count} rows written to ${file.file_name})`];
+  if (limitedTo !== null) {
+    lines.push(`(the query was limited to ${limitedTo} rows)`);
   }
-  // End with a newline like any text file (the converters join lines without a trailing one)
-  return `${lower.endsWith(".csv") ? toCsv(result) : toTsv(result)}\n`;
-};
-
-/// The log body written below the statement when the result went to an output file: the row count,
-/// the file name, and the same notes as the inline body when the result is not complete
-export const runLogFileBody = (result: QueryResult, fileName: string): string => {
-  if (result.columns.length === 0) {
-    return runLogBody(result);
-  }
-  const lines = [`(${result.rows.length} rows written to ${fileName})`];
-  if (result.applied_limit !== null && result.rows.length >= result.applied_limit) {
-    lines.push(`(the query was limited to ${result.applied_limit} rows)`);
-  }
-  if (result.truncated) {
+  if (file.truncated) {
     lines.push("(the result itself was truncated)");
   }
   return lines.join("\n");

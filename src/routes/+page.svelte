@@ -3,18 +3,14 @@
   import { listen } from "@tauri-apps/api/event";
   import { toast } from "svelte-sonner";
   import { ensureConfigFile, frontendReady, writeRunLogOutput } from "$lib/api";
-  import type { OpenTarget } from "$lib/api";
+  import type { OpenTarget, RunLogFile } from "$lib/api";
   import {
     RUN_LOG_CONFIRM_ROWS,
-    RUN_LOG_FETCH_MAX_ROWS,
-    RUN_LOG_FILE_MAX_ROWS,
     formatRunLogBlock,
     formatRunLogTimestamp,
     parseRunLogLabel,
     runLogBody,
     runLogFileBody,
-    runLogFileContent,
-    runLogNeedsFullFetch,
   } from "$lib/runLog";
   import type { RunLogChoice, RunLogOutcome, RunTarget } from "$lib/runLog";
   import appStore from "$lib/stores/app.svelte";
@@ -162,10 +158,7 @@
     // (CYBERNEURA-DEV-1167): if the displayed result was cut, the run fetches it again without the
     // limit. A statement involving writes is not run again, and the displayed result is logged with
     // its "limited" note, as before
-    const ran = await appStore.runQueryForLog(
-      target.sql,
-      output !== null ? RUN_LOG_FILE_MAX_ROWS : RUN_LOG_FETCH_MAX_ROWS,
-    );
+    const ran = await appStore.runQueryForLog(target.sql, output);
     if (!ran) {
       return;
     }
@@ -174,9 +167,13 @@
     // left open, it would become the approval time, so take it before waiting
     const executedAt = formatRunLogTimestamp(new Date());
     let logged = result;
+    let writtenFile: RunLogFile | null = null;
     switch (logFetch.kind) {
       case "full":
         logged = logFetch.result;
+        break;
+      case "file":
+        writtenFile = logFetch.file;
         break;
       case "cancelled":
         toast.info("Cancelled while fetching every row — the log was not written.");
@@ -198,36 +195,48 @@
     // is considered "unchanged" (this result belongs to the post-switch schema)
     const expectedSchema = result.switched_schema ?? schema;
     let buildBlock: (label: string) => string;
-    if (output !== null) {
+    // A statement without a result set (INSERT etc.) has nothing to put in a file: its affected
+    // row count goes inline as usual
+    if (output !== null && logged.columns.length > 0) {
       if (connection === null) {
         return;
       }
-      // The file gets every row, so there is nothing to confirm. It is written before the block
-      // (a block pointing at a file that failed to be written would be a false record), so the
-      // schema check the block gets when it is written is done here too: a result of another
-      // database must not replace the file
-      if ((await appStore.currentSchemaOf(connection)) !== expectedSchema) {
-        toast.warning(`The database changed while the query was running — ${output} was not written.`);
-        return;
+      // The file gets every row, so there is nothing to confirm. When the displayed result was
+      // complete (or cannot be run again) it is the one written; the backend serializes it.
+      // The file is written before the block (a block pointing at a file that failed to be
+      // written would be a false record), so the schema check the block gets when it is written
+      // is done here too: a result of another database must not replace the file. A file the
+      // re-fetch wrote has been checked by the backend already
+      let file = writtenFile;
+      if (file === null) {
+        if ((await appStore.currentSchemaOf(connection)) !== expectedSchema) {
+          toast.warning(
+            `The database changed while the query was running — ${output} was not written.`,
+          );
+          return;
+        }
+        try {
+          file = await writeRunLogOutput(connection, output, logged);
+        } catch (e) {
+          toast.error(`Could not write the log file ${output}`, {
+            description: e instanceof Error ? e.message : String(e),
+          });
+          return;
+        }
       }
-      let fileName: string;
-      try {
-        fileName = await writeRunLogOutput(
-          connection,
-          output,
-          runLogFileContent(logged, output),
-        );
-      } catch (e) {
-        toast.error(`Could not write the log file ${output}`, {
-          description: e instanceof Error ? e.message : String(e),
-        });
-        return;
-      }
+      // The automatic LIMIT cut the rows written only when the displayed result went to the file
+      const limitedTo =
+        writtenFile === null &&
+        logged.applied_limit !== null &&
+        logged.rows.length >= logged.applied_limit
+          ? logged.applied_limit
+          : null;
+      const written = file;
       buildBlock = (label: string) =>
         formatRunLogBlock(
           parseRunLogLabel(label).label,
           executedAt,
-          runLogFileBody(logged, fileName),
+          runLogFileBody(written, limitedTo),
         );
     } else {
       // A large number of rows would fill the editor, so before writing back let the user choose

@@ -204,12 +204,23 @@ export const toTsv = (result: QueryResult): string => {
 
 // When columns with the same name line up (e.g. in a JOIN), make them unique by appending
 // _2, _3 ... from the second one on, so that a later one does not overwrite and lose a value.
+// A generated key skips names already taken, so `id, id, id_2` gives `id, id_3, id_2` rather
+// than two `id_2` (same rule as the backend's Run and Log output, run_log_output.rs)
 const uniqueColumnKeys = (columns: string[]): string[] => {
-  const counts = new Map<string, number>();
+  const taken = new Set(columns);
+  const seen = new Set<string>();
   return columns.map((column) => {
-    const seen = counts.get(column) ?? 0;
-    counts.set(column, seen + 1);
-    return seen === 0 ? column : `${column}_${seen + 1}`;
+    if (!seen.has(column)) {
+      seen.add(column);
+      return column;
+    }
+    let n = 2;
+    while (taken.has(`${column}_${n}`)) {
+      n++;
+    }
+    const key = `${column}_${n}`;
+    taken.add(key);
+    return key;
   });
 };
 
