@@ -136,12 +136,15 @@ export const resetConnections = () => invoke<void>("reset_connections");
 /// For a config connection with readonly: true, writes are rejected regardless of writable.
 /// If applyDefaultLimit is false, the default_limit from the config is not added automatically
 /// (to get all rows for Copy / Export). When omitted, it is added as before.
+/// registerRun makes a run without default_limit cancellable as the connection's running query
+/// (the Run and Log re-fetch); omitted = only runs with default_limit are.
 export const runQuery = (
   connection: string,
   sql: string,
   maxRows?: number,
   writable?: boolean,
   applyDefaultLimit?: boolean,
+  registerRun?: boolean,
 ) =>
   invoke<QueryResult>("run_query", {
     connection,
@@ -149,6 +152,7 @@ export const runQuery = (
     maxRows,
     writable,
     applyDefaultLimit,
+    registerRun,
   });
 
 /// Request cancellation of the query running on a connection. false if nothing is running.
@@ -169,6 +173,15 @@ export const checkDangerousStatement = (connection: string, sql: string) =>
 /// Only statements judged read-only return true, so a statement with writes is never run twice.
 export const canRerunForOutput = (connection: string, sql: string) =>
   invoke<boolean>("can_rerun_for_output", { connection, sql });
+
+/// Write the output file of a Run and Log statement (`-- 📝 label out=<name>`) into the
+/// connection's query folder. Returns the normalized file name
+export const writeRunLogOutput = (
+  connection: string,
+  fileName: string,
+  content: string,
+) =>
+  invoke<string>("write_run_log_output", { connection, fileName, content });
 
 /// Returns the query execution history, newest first. search is a substring match on SQL (case-insensitive).
 export const listQueryHistory = (

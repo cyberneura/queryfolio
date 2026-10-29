@@ -10,7 +10,7 @@ import type {
 } from "$lib/api";
 import { merge3 } from "$lib/mergeText";
 import { sessionStatementReason } from "$lib/batchSession";
-import { planRunLogWrite } from "$lib/runLog";
+import { planRunLogWrite, runLogNeedsFullFetch } from "$lib/runLog";
 import type { RunLogOutcome, RunTarget } from "$lib/runLog";
 import {
   buildCycleOrder,
@@ -1457,6 +1457,27 @@ const updateEditorContent = (content: string) => {
   }
 };
 
+/// The active schema of a connection, whether or not it is the selected one.
+/// undefined when it cannot be determined (the backend could not be asked)
+const currentSchemaOf = async (
+  connection: string,
+): Promise<string | null | undefined> => {
+  if (selectedConnection === connection) {
+    return activeSchema;
+  }
+  // Same resolution as applyConnectionContext (the config default if there is no override)
+  const defaultSchema =
+    connections.find((c) => c.name === connection)?.schema ?? null;
+  let schema: string | null;
+  try {
+    schema = (await api.getActiveSchema(connection)) ?? defaultSchema;
+  } catch {
+    return undefined;
+  }
+  // If we returned to that connection while waiting, the frontend's value is the latest
+  return selectedConnection === connection ? activeSchema : schema;
+};
+
 /// Write the `-- 📝` result log back to a tab that **became inactive** after execution
 /// (CYBERNEURA-DEV-858). Writing back to the active tab is done by SqlEditor.writeRunLog
 /// (as a CodeMirror change to keep the cursor while editing).
@@ -1488,20 +1509,9 @@ const writeRunLogToInactiveTab = async (
   if (!findTab()) {
     return "stale";
   }
-  let schema: string | null = activeSchema;
-  if (selectedConnection !== connection) {
-    // Same resolution as applyConnectionContext (the config default if there is no override)
-    const defaultSchema =
-      connections.find((c) => c.name === connection)?.schema ?? null;
-    try {
-      schema = (await api.getActiveSchema(connection)) ?? defaultSchema;
-    } catch {
-      return "stale";
-    }
-    // If we returned to that connection while waiting, the frontend's value is the latest
-    if (selectedConnection === connection) {
-      schema = activeSchema;
-    }
+  const schema = await currentSchemaOf(connection);
+  if (schema === undefined) {
+    return "stale";
   }
   const tab = findTab();
   if (!tab) {
@@ -1757,7 +1767,14 @@ const prepareTargetTab = (): ResultTab | null => {
 /// Run a query with the connection / SQL recorded in the tab and write the result to the tab.
 /// On success returns that result (null on error, cancel, or tab discard).
 /// Used by the caller to post-process the result (writing back the 📝 marker log etc.)
-const executeTab = async (tab: ResultTab): Promise<QueryResult | null> => {
+///
+/// afterRun runs after a successful query **while the tab is still running**, so that work the
+/// run depends on (the Run and Log re-fetch) keeps the connection marked as running and can be
+/// stopped by Cancel. It must handle its own errors (a throw would be taken for a query failure)
+const executeTab = async (
+  tab: ResultTab,
+  afterRun?: (result: QueryResult) => Promise<void>,
+): Promise<QueryResult | null> => {
   tab.running = true;
   // Clear before running so a failure does not lead to mistaking or wrongly exporting the previous result
   tab.result = null;
@@ -1777,6 +1794,9 @@ const executeTab = async (tab: ResultTab): Promise<QueryResult | null> => {
       undefined,
       effectiveWritable(tab.connection),
     );
+    if (afterRun) {
+      await afterRun(result);
+    }
   } catch (e) {
     const message = toErrorMessage(e);
     // An abort by cancel is not an error; show it as "Query cancelled"
@@ -1951,7 +1971,68 @@ const fetchResultWithoutDefaultLimit = async (
 /// Run SQL from the editor. Returns its result on success
 /// (null if not run, failed, or cancelled).
 /// The caller looks at the return value to decide on writing back the 📝 marker log
-const runQuery = async (sql: string): Promise<QueryResult | null> => {
+const runQuery = (sql: string): Promise<QueryResult | null> =>
+  runQueryInTab(sql);
+
+/// What the Run and Log re-fetch produced (see runQueryForLog).
+/// shown = the displayed result is the whole result, or the statement is not safe to run again
+/// (log the displayed one) / full = the result fetched without default_limit /
+/// cancelled = Cancel stopped the re-fetch (log nothing) / failed = the re-fetch failed
+export type RunLogFetch =
+  | { kind: "shown" }
+  | { kind: "full"; result: QueryResult }
+  | { kind: "cancelled" }
+  | { kind: "failed"; error: string };
+
+/// Run SQL from the editor for Run and Log (a statement with a 📝 marker). Same as runQuery, plus:
+/// when the displayed result was cut by default_limit, the statement is run once more without it
+/// (up to maxRows) so that the log can carry every row while the table keeps showing the cut
+/// result (CYBERNEURA-DEV-1167).
+///
+/// The re-fetch is part of the run: the result tab stays running, Cancel stops it, and the
+/// active schema cannot drift between the two runs unnoticed any more than for a plain run (the
+/// caller checks it before writing anything). Like the Copy / Export re-fetch, **a statement
+/// involving writes is not run again** (the backend's `can_rerun_for_output`)
+const runQueryForLog = async (
+  sql: string,
+  maxRows: number,
+): Promise<{ result: QueryResult; logFetch: RunLogFetch } | null> => {
+  let logFetch: RunLogFetch = { kind: "shown" };
+  const afterRun = async (result: QueryResult, connection: string) => {
+    if (!runLogNeedsFullFetch(result)) {
+      return;
+    }
+    try {
+      if (!(await api.canRerunForOutput(connection, sql))) {
+        return;
+      }
+      const full = await api.runQuery(
+        connection,
+        sql,
+        maxRows,
+        // Same privileges as the run itself (judged read-only, so no writes happen)
+        effectiveWritable(connection),
+        false,
+        true,
+      );
+      logFetch = { kind: "full", result: full };
+    } catch (e) {
+      const message = toErrorMessage(e);
+      logFetch =
+        message === api.CANCELLED_ERROR_MESSAGE
+          ? { kind: "cancelled" }
+          : { kind: "failed", error: message };
+    }
+  };
+  const result = await runQueryInTab(sql, afterRun);
+  return result ? { result, logFetch } : null;
+};
+
+/// runQuery / runQueryForLog: the guards, the result tab, and the run (afterRun: see executeTab)
+const runQueryInTab = async (
+  sql: string,
+  afterRun?: (result: QueryResult, connection: string) => Promise<void>,
+): Promise<QueryResult | null> => {
   // Fix the target connection before the await. Even if the connection switches during later awaits (save,
   // dangerous-statement confirmation modal), the confirmed connection and the executing connection must not diverge
   // (prevents the accident of running old SQL on the new DB).
@@ -2000,7 +2081,10 @@ const runQuery = async (sql: string): Promise<QueryResult | null> => {
   tab.connection = connection;
   tab.schema = activeSchema;
   tab.batch = null;
-  return await executeTab(tab);
+  return await executeTab(
+    tab,
+    afterRun && ((result) => afterRun(result, connection)),
+  );
 };
 
 /// Ask whether to go on after a statement of a batch failed (true = ignore errors and run the rest)
@@ -3113,6 +3197,8 @@ export default {
   overwriteActiveFileConflict,
   updateEditorContent,
   writeRunLogToInactiveTab,
+  runQueryForLog,
+  currentSchemaOf,
   insertSqlSnippet,
   fixSqlWithAi,
   applyFixSuggestion,

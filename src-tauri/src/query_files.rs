@@ -535,6 +535,59 @@ pub fn write_query_file(
     Ok(())
 }
 
+/// Extensions that make a file show up in the FILES pane as a query file (every engine's
+/// `EngineCapabilities.file_extension`). A Run and Log output file must not use one: it would be
+/// listed, opened and possibly run as a query.
+const QUERY_FILE_EXTENSIONS: [&str; 3] = ["sql", "redis", "es"];
+
+/// Write a Run and Log output file (`-- 📝 label out=<name>`) into the connection's query folder
+/// and return the normalized name.
+///
+/// The destination is limited to a **plain file name in the same folder as the query files**:
+/// the name comes from the query file body, which an agent may have written (CLI `write`), so a
+/// path that can leave the folder is not accepted. Query-file extensions and the folder's meta
+/// file are refused as well, and an existing entry that is not a regular file (a directory, a
+/// broken link) is not replaced. The write is atomic like a query file save, and a new file is
+/// created 600 because it holds query results.
+pub fn write_run_log_output(
+    sqlfiles_dir: &Path,
+    connection: &str,
+    file_name: &str,
+    content: &str,
+) -> Result<String, AppError> {
+    let name = validate_component(file_name)?;
+    let lower = name.to_ascii_lowercase();
+    if let Some(ext) = QUERY_FILE_EXTENSIONS
+        .iter()
+        .find(|ext| lower.ends_with(&format!(".{ext}")))
+    {
+        return Err(AppError::QueryFile(format!(
+            "The output file cannot be a query file (.{ext}): {name}"
+        )));
+    }
+    if lower == crate::folder_meta::META_FILE_NAME.to_ascii_lowercase() {
+        return Err(AppError::QueryFile(format!(
+            "The output file cannot replace the folder description: {name}"
+        )));
+    }
+    let path = connection_dir(sqlfiles_dir, connection)?.join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if !meta.is_file() => {
+            return Err(AppError::QueryFile(format!(
+                "The output path exists and is not a regular file: {name}"
+            )));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    if let Some(parent) = path.parent() {
+        ensure_dir_700(parent)?;
+    }
+    write_file_atomic(&path, content)?;
+    Ok(name.to_string())
+}
+
 /// Write with optimistic locking. Writes only when the base the caller knows (expected_base)
 /// matches the current on-disk content read right before writing.
 /// - Returns Ok(true) if written.
@@ -969,6 +1022,68 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_run_log_output() {
+        let dir = test_dir().join("run-log-output");
+        let connection = "conn";
+
+        let name = write_run_log_output(&dir, connection, "orders.tsv", "a\tb\n1\t2\n").unwrap();
+        assert_eq!(name, "orders.tsv");
+        let path = connection_dir(&dir, connection).unwrap().join("orders.tsv");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a\tb\n1\t2\n");
+        // A re-run replaces the file
+        write_run_log_output(&dir, connection, "orders.tsv", "x\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "x\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        // Nothing that leaves the folder, hides itself or would be listed as a query file
+        for bad in [
+            "../out.tsv",
+            "sub/out.tsv",
+            "/tmp/out.tsv",
+            ".hidden.tsv",
+            "",
+            "next.sql",
+            "keys.REDIS",
+            "req.es",
+            "_queryfolio.md",
+        ] {
+            assert!(
+                write_run_log_output(&dir, connection, bad, "x").is_err(),
+                "{bad} must be refused"
+            );
+        }
+
+        // An existing directory is not replaced
+        fs::create_dir_all(connection_dir(&dir, connection).unwrap().join("adir")).unwrap();
+        assert!(write_run_log_output(&dir, connection, "adir", "x").is_err());
+    }
+
+    /// The refused extensions follow the engines: every engine's query file extension is listed
+    #[test]
+    fn test_query_file_extensions_cover_every_engine() {
+        for engine in [
+            "mysql",
+            "postgres",
+            "sqlite",
+            "duckdb",
+            "mssql",
+            "redis",
+            "elasticsearch",
+            "dynamodb",
+        ] {
+            let ext = crate::engines::capabilities_for_name(engine).file_extension;
+            assert!(QUERY_FILE_EXTENSIONS.contains(&ext), "{engine}: .{ext}");
+        }
     }
 
     /// Writes use a temporary file + rename and do not expose the destination in an intermediate

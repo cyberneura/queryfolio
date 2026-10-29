@@ -490,16 +490,22 @@ async fn run_query(
     // Whether to auto-apply the config's default_limit. Applied when omitted (as before).
     // Copy / Export want all rows rather than the display for the result table, so they call with false.
     apply_default_limit: Option<bool>,
+    // Register a run without default_limit as the connection's running query anyway. Used by the
+    // Run and Log re-fetch (CYBERNEURA-DEV-1167), which the frontend shows as part of the run in
+    // the result tab and which Cancel has to stop. Omitted = registered only when
+    // apply_default_limit is in effect (as before)
+    register_run: Option<bool>,
 ) -> Result<QueryResult, AppError> {
     // Row handling is separated between the display for the result table (apply_default_limit)
     // and the fetch of all rows for Copy / Export (apply_default_limit = false)
     let apply_default_limit = apply_default_limit.unwrap_or(true);
-    // Only the result-table execution is registered: it is what the frontend shows as running
-    // and what Cancel is for. Copy / Export re-fetch all rows outside that guard and can run
-    // alongside it, so a Cancel must not abort them or drop the tunnel they use.
+    // Only executions the frontend shows as running are registered: they are what Cancel is for.
+    // Copy / Export re-fetch all rows outside that guard and can run alongside it, so a Cancel
+    // must not abort them or drop the tunnel they use.
     // Registered before anything can wait, so that cancel_query reaches this run even while it
     // is still getting a connection
-    let run_guard = apply_default_limit.then(|| state.query_runs.start(&connection));
+    let registered = register_run.unwrap_or(apply_default_limit);
+    let run_guard = registered.then(|| state.query_runs.start(&connection));
     let run = run_guard.as_ref();
     let prepared = db::abortable(run, async {
         let server = state.find_server(&connection).await?;
@@ -567,7 +573,7 @@ async fn run_query(
         // Copy / Export get their own key: the registry keeps one query per key, so sharing
         // the connection's would hide the result-table query from Cancel (which would then
         // take it for one not sent yet and drop the connection without stopping it on the server)
-        let cancel_key = if apply_default_limit {
+        let cancel_key = if registered {
             connection.clone()
         } else {
             format!("{connection}\u{1}full-fetch")
@@ -969,6 +975,27 @@ async fn write_query_file(
     // (best effort: a failure to write the meta does not break saving).
     let _ = state.refresh_folder_meta(&server).await;
     Ok(())
+}
+
+/// Write the output file of a Run and Log statement carrying `out=<name>` into the connection's
+/// query folder (next to the query files). Returns the normalized file name.
+/// The name rules are in `query_files::write_run_log_output`
+#[tauri::command]
+async fn write_run_log_output(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    file_name: String,
+    content: String,
+) -> Result<String, AppError> {
+    let server = state.find_server(&connection).await?;
+    let name = query_files::write_run_log_output(
+        &state.resolve_sqlfiles_dir().await?,
+        &server.sqlfiles_folder_name(),
+        &file_name,
+        &content,
+    )?;
+    let _ = state.refresh_folder_meta(&server).await;
+    Ok(name)
 }
 
 /// Save with optimistic locking. Writes only when expected_base matches the current content on disk.
@@ -2650,6 +2677,7 @@ pub fn run() {
             build_explain_sql,
             check_dangerous_statement,
             can_rerun_for_output,
+            write_run_log_output,
             ai_explain_plan,
             ai_explain_sql,
             ai_fix_sql,

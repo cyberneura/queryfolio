@@ -158,8 +158,22 @@ to be the first thing in the comment (`-- 📝 …`), and it has to sit in the r
 of line comments directly above the statement — further comment lines may
 follow it, but a blank line in between detaches it.
 
-Results of 500 rows or more ask for confirmation before the write, since a large
-paste fills the file. Declining still leaves the result in the table.
+The log carries the whole result even though the table stops at the automatic
+`LIMIT` (500 rows by default): a read-only statement that reached it is run once
+more without the limit (up to 100,000 rows) for the log. Results of more than
+200 rows ask for confirmation before the write, since a large paste fills the
+file. Declining still leaves the result in the table.
+
+Add `out=<file name>` to the label to send the full result to a file in the
+same folder as the query file instead, leaving only a pointer under the
+statement:
+
+```sql
+-- 📝 All orders out=orders.tsv
+SELECT * FROM orders;
+```
+
+`.csv` and `.json` names get CSV and JSON; anything else is TSV.
 
 ## Editing results
 

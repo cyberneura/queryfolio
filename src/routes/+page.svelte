@@ -2,13 +2,19 @@
   import { onMount, untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { toast } from "svelte-sonner";
-  import { ensureConfigFile, frontendReady } from "$lib/api";
+  import { ensureConfigFile, frontendReady, writeRunLogOutput } from "$lib/api";
   import type { OpenTarget } from "$lib/api";
   import {
     RUN_LOG_CONFIRM_ROWS,
+    RUN_LOG_FETCH_MAX_ROWS,
+    RUN_LOG_FILE_MAX_ROWS,
     formatRunLogBlock,
     formatRunLogTimestamp,
+    parseRunLogLabel,
     runLogBody,
+    runLogFileBody,
+    runLogFileContent,
+    runLogNeedsFullFetch,
   } from "$lib/runLog";
   import type { RunLogChoice, RunLogOutcome, RunTarget } from "$lib/runLog";
   import appStore from "$lib/stores/app.svelte";
@@ -145,30 +151,104 @@
     // Also remember the connection used for the run (when writing to a tab that has become
     // inactive, check that the tab has not moved to a different connection)
     const connection = appStore.selectedConnection;
-    const result = await appStore.runQuery(target.sql);
-    if (!result || target.logLabel === null) {
+    if (target.logLabel === null) {
+      await appStore.runQuery(target.sql);
       return;
     }
+    // `out=<name>` in the label sends the whole result to a file next to the query file and
+    // writes only a pointer to it below the statement (same idea as runandlog's `out=`)
+    const output = parseRunLogLabel(target.logLabel).output;
+    // The table shows only up to default_limit rows, but the log carries the whole result
+    // (CYBERNEURA-DEV-1167): if the displayed result was cut, the run fetches it again without the
+    // limit. A statement involving writes is not run again, and the displayed result is logged with
+    // its "limited" note, as before
+    const ran = await appStore.runQueryForLog(
+      target.sql,
+      output !== null ? RUN_LOG_FILE_MAX_ROWS : RUN_LOG_FETCH_MAX_ROWS,
+    );
+    if (!ran) {
+      return;
+    }
+    const { result, logFetch } = ran;
     // The heading uses the time when the execution finished. If the confirmation dialog below were
     // left open, it would become the approval time, so take it before waiting
     const executedAt = formatRunLogTimestamp(new Date());
-    // A large number of rows would fill the editor, so before writing back let the user choose
-    // "write all / write only the head / do not write". A result exactly at the limit is the same
-    // amount even if written in full, so do not ask
-    let maxRows: number | undefined;
-    if (result.rows.length > RUN_LOG_CONFIRM_ROWS) {
-      const choice = await confirmRunLog(result.rows.length);
-      if (choice === "cancel") {
+    let logged = result;
+    switch (logFetch.kind) {
+      case "full":
+        logged = logFetch.result;
+        break;
+      case "cancelled":
+        toast.info("Cancelled while fetching every row — the log was not written.");
         return;
-      }
-      maxRows = choice === "limited" ? RUN_LOG_CONFIRM_ROWS : undefined;
+      case "failed":
+        // An output file would be replaced by the cut rows; keep the previous one instead
+        if (output !== null) {
+          toast.error(`Could not fetch every row — ${output} was not written.`, {
+            description: logFetch.error,
+          });
+          return;
+        }
+        toast.warning("Could not fetch every row — logging the rows shown.", {
+          description: logFetch.error,
+        });
+        break;
     }
-    // Use a label re-read from the body right before writing back (passed by SqlEditor)
-    const buildBlock = (label: string) =>
-      formatRunLogBlock(label, executedAt, runLogBody(result, maxRows));
     // `\c` / `USE` is itself a switch by execution, so the schema that statement switched to
     // is considered "unchanged" (this result belongs to the post-switch schema)
     const expectedSchema = result.switched_schema ?? schema;
+    let buildBlock: (label: string) => string;
+    if (output !== null) {
+      if (connection === null) {
+        return;
+      }
+      // The file gets every row, so there is nothing to confirm. It is written before the block
+      // (a block pointing at a file that failed to be written would be a false record), so the
+      // schema check the block gets when it is written is done here too: a result of another
+      // database must not replace the file
+      if ((await appStore.currentSchemaOf(connection)) !== expectedSchema) {
+        toast.warning(`The database changed while the query was running — ${output} was not written.`);
+        return;
+      }
+      let fileName: string;
+      try {
+        fileName = await writeRunLogOutput(
+          connection,
+          output,
+          runLogFileContent(logged, output),
+        );
+      } catch (e) {
+        toast.error(`Could not write the log file ${output}`, {
+          description: e instanceof Error ? e.message : String(e),
+        });
+        return;
+      }
+      buildBlock = (label: string) =>
+        formatRunLogBlock(
+          parseRunLogLabel(label).label,
+          executedAt,
+          runLogFileBody(logged, fileName),
+        );
+    } else {
+      // A large number of rows would fill the editor, so before writing back let the user choose
+      // "write all / write only the head / do not write". A result exactly at the limit is the same
+      // amount even if written in full, so do not ask
+      let maxRows: number | undefined;
+      if (logged.rows.length > RUN_LOG_CONFIRM_ROWS) {
+        const choice = await confirmRunLog(logged.rows.length);
+        if (choice === "cancel") {
+          return;
+        }
+        maxRows = choice === "limited" ? RUN_LOG_CONFIRM_ROWS : undefined;
+      }
+      // Use a label re-read from the body right before writing back (passed by SqlEditor)
+      buildBlock = (label: string) =>
+        formatRunLogBlock(
+          parseRunLogLabel(label).label,
+          executedAt,
+          runLogBody(logged, maxRows),
+        );
+    }
     // If the user moved to another tab during execution, write directly into that tab's body
     // (CYBERNEURA-DEV-858). The matching conditions are the same as the editor path, and if the
     // user returns to the tab while waiting, "active" is returned and it is written via the editor path

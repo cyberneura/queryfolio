@@ -224,6 +224,33 @@ d	count
 - **SQL engines only** (`.sql`). `.redis` and `.es` use different comment syntax and are not
   supported.
 
+### Sending a large result to a file (`out=`)
+
+Add `out=<file name>` to the marker label to have the full result written to a file next to the
+query file, with only a pointer below the statement — use it when the result will not fit (or
+should not sit) in the `.sql` file:
+
+```sql
+-- 📝 All orders this month out=orders-2026-10.tsv
+SELECT * FROM orders WHERE created_at >= '2026-10-01';
+
+/* 🗒️ All orders this month 2026-10-29 14:03:21
+(12345 rows written to orders-2026-10.tsv)
+*/
+```
+
+- The file goes into **the same folder as the query file** (the connection's folder under
+  `sqlfiles_dir`). Read it from there: `<sqlfiles_dir>/<folder>/<file name>`.
+- The name must be a plain file name: no `/`, not starting with `.`, no spaces, and not a query
+  file extension (`.sql` / `.redis` / `.es`) or `_queryfolio.md`. Anything else is refused and
+  nothing is written (the user sees an error).
+- The format follows the extension: `.csv` is CSV, `.json` is a JSON array of objects, anything
+  else is TSV with a header row. The same formula guard as the inline body applies to TSV / CSV.
+  No character caps and no confirmation dialog; the re-fetch goes up to 1,000,000 rows.
+- `out=…` is removed from the heading. Re-running overwrites the file and replaces the block.
+- The file is written when the run finishes, even if the write-back below the statement is then
+  skipped (see the next section).
+
 ### How the write-back behaves
 
 - **Re-running replaces the existing `/* 🗒️ … */` block** — there is never more than one.
@@ -234,9 +261,15 @@ d	count
   close the comment and leave the following data rows to be executed as SQL; PostgreSQL nests
   block comments, so a stray `/*` would swallow the rest of the file). Do not treat the text
   inside a log block as a verbatim value.
+- **The log carries the whole result, not just the rows in the table.** The table stops at the
+  automatic `LIMIT` (`default_limit`, 500 by default); when a marked statement hits it, Queryfolio
+  runs the statement again without the limit (up to 100,000 rows) and logs that. Only statements
+  judged read-only are run again — for anything else the rows shown are logged, with the
+  `(the query was limited to N rows)` note. The table itself keeps showing at most 500 rows.
 - Results larger than **200 rows** trigger a confirmation dialog first: write everything /
-  write only the first 200 rows / write nothing. On top of that the body is capped at roughly
-  **200,000 characters total and 2,000 characters per cell** (both are checked per cell, so
+  write only the first 200 rows / write nothing (the dialog counts the re-fetched rows, so a
+  2,000-row result offers "Write all 2,000 rows"). On top of that the body is capped at roughly
+  **1,000,000 characters total and 2,000 characters per cell** (both are checked per cell, so
   the last one can overshoot a little).
 - Four different notes can appear at the end of the body, and they mean different things:
   - `(limited to N rows)` — the user chose "write only part of it" in the dialog.
