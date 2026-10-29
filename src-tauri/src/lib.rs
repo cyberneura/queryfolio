@@ -12,6 +12,7 @@ mod error;
 mod folder_meta;
 mod query_files;
 mod router;
+mod run_log_output;
 mod schema_info;
 mod third_party_notices;
 mod tunnel;
@@ -490,16 +491,69 @@ async fn run_query(
     // Whether to auto-apply the config's default_limit. Applied when omitted (as before).
     // Copy / Export want all rows rather than the display for the result table, so they call with false.
     apply_default_limit: Option<bool>,
+    // The Run and Log re-fetch (CYBERNEURA-DEV-1167): see QueryMode::LogRefetch
+    log_refetch: Option<LogRefetch>,
+) -> Result<QueryResult, AppError> {
+    let mode = if let Some(LogRefetch { expected_schema }) = log_refetch {
+        QueryMode::LogRefetch { expected_schema }
+    } else if apply_default_limit.unwrap_or(true) {
+        QueryMode::Display
+    } else {
+        QueryMode::FullFetch
+    };
+    run_query_in_mode(&state, connection, sql, max_rows, writable, mode).await
+}
+
+/// run_query's log_refetch argument
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LogRefetch {
+    /// The active schema the displayed run used
+    expected_schema: Option<String>,
+}
+
+/// How run_query runs a statement
+#[derive(Clone, PartialEq, Eq)]
+enum QueryMode {
+    /// The run shown in the result table: default_limit applies, and it is registered as the
+    /// connection's running query (what Cancel stops)
+    Display,
+    /// Copy / Export re-fetching every row: no default_limit, and not registered — it can run
+    /// alongside the displayed run, so a Cancel must not abort it or drop the tunnel it uses
+    FullFetch,
+    /// Run and Log re-running a marked statement whose displayed result was cut, to log every
+    /// row. No default_limit, registered (the frontend shows it as part of the run and Cancel has
+    /// to stop it), and **always under the agent's read-only guard** (statement whitelist + a
+    /// read-only transaction / query_only), whatever the Writable switch says: unlike Copy /
+    /// Export it happens without another user action, so a side-effecting function in a SELECT
+    /// (`nextval`) must not run a second time. Refused when the active schema is no longer
+    /// expected_schema (switched after the displayed run): the log would hold another database's
+    /// result
+    LogRefetch { expected_schema: Option<String> },
+}
+
+impl QueryMode {
+    fn is_log_refetch(&self) -> bool {
+        matches!(self, QueryMode::LogRefetch { .. })
+    }
+}
+
+async fn run_query_in_mode(
+    state: &AppState,
+    connection: String,
+    sql: String,
+    max_rows: Option<usize>,
+    writable: Option<bool>,
+    mode: QueryMode,
 ) -> Result<QueryResult, AppError> {
     // Row handling is separated between the display for the result table (apply_default_limit)
-    // and the fetch of all rows for Copy / Export (apply_default_limit = false)
-    let apply_default_limit = apply_default_limit.unwrap_or(true);
-    // Only the result-table execution is registered: it is what the frontend shows as running
-    // and what Cancel is for. Copy / Export re-fetch all rows outside that guard and can run
-    // alongside it, so a Cancel must not abort them or drop the tunnel they use.
+    // and the fetch of all rows (Copy / Export, Run and Log)
+    let apply_default_limit = mode == QueryMode::Display;
+    // Only executions the frontend shows as running are registered.
     // Registered before anything can wait, so that cancel_query reaches this run even while it
     // is still getting a connection
-    let run_guard = apply_default_limit.then(|| state.query_runs.start(&connection));
+    let registered = mode != QueryMode::FullFetch;
+    let run_guard = registered.then(|| state.query_runs.start(&connection));
     let run = run_guard.as_ref();
     let prepared = db::abortable(run, async {
         let server = state.find_server(&connection).await?;
@@ -513,6 +567,15 @@ async fn run_query(
         } else {
             0
         };
+        if let QueryMode::LogRefetch { expected_schema } = &mode {
+            if schema != *expected_schema {
+                return Err(AppError::Config(
+                    "The active database changed after the query ran, so it was not run again \
+                     for the log"
+                        .into(),
+                ));
+            }
+        }
         Ok((server, schema, default_limit))
     })
     .await;
@@ -520,8 +583,11 @@ async fn run_query(
         Ok(prepared) => prepared,
         Err(e) => return db::finish_run(run_guard, Err(e)).await,
     };
-    // The config's readonly is the highest-priority hard lock. Next is the switch.
-    let readonly_guard = if server.readonly {
+    // The Run and Log re-fetch is read-only whatever the config / switch say (QueryMode).
+    // Otherwise the config's readonly is the highest-priority hard lock. Next is the switch.
+    let readonly_guard = if mode.is_log_refetch() {
+        db::ReadonlyGuard::Agent
+    } else if server.readonly {
         db::ReadonlyGuard::Config
     } else if writable.unwrap_or(false) {
         db::ReadonlyGuard::Off
@@ -558,16 +624,19 @@ async fn run_query(
         // `\c <database>` and `USE <database>` are not SQL execution but changes to the
         // connection state, so they are handled here before acquiring the pool.
         // (Reporting meta command parse errors here as well records them in the history as failures)
+        // The Run and Log re-fetch never switches: under the agent guard run_query_on rejects it
         let engine = db::parse_engine(&server.engine)?;
         if let Some(meta_commands::MetaCommand::Connect(schema)) =
             meta_commands::translate(engine, &sql)?
         {
-            return switch_active_schema(&state, &server, schema, started, run).await;
+            if !mode.is_log_refetch() {
+                return switch_active_schema(state, &server, schema, started, run).await;
+            }
         }
         // Copy / Export get their own key: the registry keeps one query per key, so sharing
         // the connection's would hide the result-table query from Cancel (which would then
         // take it for one not sent yet and drop the connection without stopping it on the server)
-        let cancel_key = if apply_default_limit {
+        let cancel_key = if registered {
             connection.clone()
         } else {
             format!("{connection}\u{1}full-fetch")
@@ -969,6 +1038,84 @@ async fn write_query_file(
     // (best effort: a failure to write the meta does not break saving).
     let _ = state.refresh_folder_meta(&server).await;
     Ok(())
+}
+
+/// Row cap when the output file of a Run and Log statement (`out=<name>`) is filled by running the
+/// statement again (`run_log_to_file`). Same as the Copy / Export re-fetch: a file is where a large
+/// result is meant to go
+const RUN_LOG_FILE_MAX_ROWS: usize = 1_000_000;
+
+/// Serialize rows for a Run and Log output file and write it into the connection's query folder
+/// (next to the query files). Serializing a million rows takes a while, so it is done off the
+/// async runtime
+async fn write_run_log_rows(
+    state: &AppState,
+    connection: &str,
+    file_name: &str,
+    rows: run_log_output::RunLogRows,
+) -> Result<run_log_output::RunLogFile, AppError> {
+    let server = state.find_server(connection).await?;
+    let sqlfiles_dir = state.resolve_sqlfiles_dir().await?;
+    let folder = server.sqlfiles_folder_name();
+    let file_name = query_files::run_log_output_name(file_name)?.to_string();
+    let written = tokio::task::spawn_blocking(move || {
+        let content = run_log_output::serialize(&rows, &file_name);
+        let file_name =
+            query_files::write_run_log_output(&sqlfiles_dir, &folder, &file_name, &content)?;
+        Ok::<_, AppError>(run_log_output::RunLogFile {
+            file_name,
+            row_count: rows.rows.len(),
+            truncated: rows.truncated,
+        })
+    })
+    .await
+    .map_err(|e| AppError::QueryFile(format!("Writing the log file failed: {e}")))??;
+    let _ = state.refresh_folder_meta(&server).await;
+    Ok(written)
+}
+
+/// Write the output file of a Run and Log statement from the result the frontend already has
+/// (the displayed result was complete, or the statement is not safe to run again).
+/// The rules for the name are in `query_files::write_run_log_output`
+#[tauri::command]
+async fn write_run_log_output(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    file_name: String,
+    rows: run_log_output::RunLogRows,
+) -> Result<run_log_output::RunLogFile, AppError> {
+    write_run_log_rows(&state, &connection, &file_name, rows).await
+}
+
+/// Run a Run and Log statement again without default_limit and write the whole result into its
+/// output file, without sending the rows to the frontend (CYBERNEURA-DEV-1167). The run is
+/// QueryMode::LogRefetch: read-only under the agent guard, registered so that Cancel stops it,
+/// and refused if the active schema is no longer the one the displayed run used
+#[tauri::command]
+async fn run_log_to_file(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    sql: String,
+    file_name: String,
+    expected_schema: Option<String>,
+) -> Result<run_log_output::RunLogFile, AppError> {
+    // A bad name is refused before the statement runs
+    query_files::run_log_output_name(&file_name)?;
+    let result = run_query_in_mode(
+        &state,
+        connection.clone(),
+        sql,
+        Some(RUN_LOG_FILE_MAX_ROWS),
+        None,
+        QueryMode::LogRefetch { expected_schema },
+    )
+    .await?;
+    let rows = run_log_output::RunLogRows {
+        columns: result.columns,
+        rows: result.rows,
+        truncated: result.truncated,
+    };
+    write_run_log_rows(&state, &connection, &file_name, rows).await
 }
 
 /// Save with optimistic locking. Writes only when expected_base matches the current content on disk.
@@ -2650,6 +2797,8 @@ pub fn run() {
             build_explain_sql,
             check_dangerous_statement,
             can_rerun_for_output,
+            write_run_log_output,
+            run_log_to_file,
             ai_explain_plan,
             ai_explain_sql,
             ai_fix_sql,

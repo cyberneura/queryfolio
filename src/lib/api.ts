@@ -136,12 +136,16 @@ export const resetConnections = () => invoke<void>("reset_connections");
 /// For a config connection with readonly: true, writes are rejected regardless of writable.
 /// If applyDefaultLimit is false, the default_limit from the config is not added automatically
 /// (to get all rows for Copy / Export). When omitted, it is added as before.
+/// logRefetch is the Run and Log re-fetch (CYBERNEURA-DEV-1167): no default_limit, cancellable as
+/// the connection's running query, always read-only (the agent guard, whatever writable says),
+/// and refused when the active schema is no longer expectedSchema.
 export const runQuery = (
   connection: string,
   sql: string,
   maxRows?: number,
   writable?: boolean,
   applyDefaultLimit?: boolean,
+  logRefetch?: { expectedSchema: string | null },
 ) =>
   invoke<QueryResult>("run_query", {
     connection,
@@ -149,6 +153,7 @@ export const runQuery = (
     maxRows,
     writable,
     applyDefaultLimit,
+    logRefetch: logRefetch ?? null,
   });
 
 /// Request cancellation of the query running on a connection. false if nothing is running.
@@ -169,6 +174,45 @@ export const checkDangerousStatement = (connection: string, sql: string) =>
 /// Only statements judged read-only return true, so a statement with writes is never run twice.
 export const canRerunForOutput = (connection: string, sql: string) =>
   invoke<boolean>("can_rerun_for_output", { connection, sql });
+
+/// What a Run and Log output file (`-- 📝 label out=<name>`) received
+export interface RunLogFile {
+  /// The name as written (trimmed)
+  file_name: string;
+  row_count: number;
+  /// The result itself was cut (the re-fetch's row cap, or the backend's truncation)
+  truncated: boolean;
+}
+
+/// Write a Run and Log output file into the connection's query folder from rows the frontend
+/// already has (the displayed result was complete, or is not safe to run again). The backend
+/// serializes it (CSV / JSON / TSV by extension)
+export const writeRunLogOutput = (
+  connection: string,
+  fileName: string,
+  result: QueryResult,
+) =>
+  invoke<RunLogFile>("write_run_log_output", {
+    connection,
+    fileName,
+    rows: { columns: result.columns, rows: result.rows, truncated: result.truncated },
+  });
+
+/// Run a Run and Log statement again without default_limit (read-only, cancellable, refused if
+/// the active schema is no longer expectedSchema) and write the whole result into its output
+/// file in the backend, so the rows never pass through the WebView
+export const runLogToFile = (
+  connection: string,
+  sql: string,
+  fileName: string,
+  expectedSchema: string | null,
+) =>
+  invoke<RunLogFile>("run_log_to_file", {
+    connection,
+    sql,
+    fileName,
+    expectedSchema,
+  });
 
 /// Returns the query execution history, newest first. search is a substring match on SQL (case-insensitive).
 export const listQueryHistory = (

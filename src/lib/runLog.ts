@@ -1,4 +1,4 @@
-import type { QueryResult } from "$lib/api";
+import type { QueryResult, RunLogFile } from "$lib/api";
 import { toTsvCapped } from "$lib/export";
 
 /// Marker placed at the start of a written-back log block (U+1F5D2 + variation selector).
@@ -21,7 +21,18 @@ export type RunLogChoice = "all" | "limited" | "cancel";
 /// **The row-count confirmation dialog alone is not enough** — cells have no character limit, so even a few
 /// rows with a long TEXT / JSON column can reach hundreds of MB, and inserting into CodeMirror and
 /// auto-saving freeze the app. The excess is cut off and a note to that effect is written in the body
-const MAX_BODY_CHARS = 200_000;
+///
+/// Raised from 200,000 to 1,000,000 in CYBERNEURA-DEV-1167, when the write-back started to carry
+/// every row instead of the 500 shown in the table: a few thousand ordinary rows did not fit
+const MAX_BODY_CHARS = 1_000_000;
+
+/// Upper limit on rows when re-fetching a result for an inline write-back.
+/// The table shows only up to default_limit (500) rows, so a statement that hit that limit is run
+/// again without it (`runLogNeedsFullFetch`). The rows pass through the WebView, so the cap is kept
+/// near what the body (`MAX_BODY_CHARS`) can hold anyway — a mistakenly marked full-table SELECT
+/// must not pull the whole table into memory before the user is even asked. Results meant to be
+/// larger go to an output file (`out=`), which the backend fills without the WebView
+export const RUN_LOG_FETCH_MAX_ROWS = 20_000;
 
 /// Upper limit on the number of characters per cell of the TSV to write back.
 /// The total limit alone cannot prevent a single huge row (number of columns x long TEXT)
@@ -41,6 +52,61 @@ export interface RunTarget {
   /// The label of the 📝 marker if there is one (null if there is no marker; an empty string if the label is omitted)
   logLabel: string | null;
 }
+
+/// The label of a 📝 marker split into the heading and the output file (`out=<name>`).
+/// output is null when the label names no file
+export interface RunLogLabel {
+  label: string;
+  output: string | null;
+}
+
+/// Splits `out=<name>` off a marker label (`-- 📝 Orders per day out=orders.tsv`).
+///
+/// The token may sit anywhere in the label but must be a word of its own, so `layout=wide` is not
+/// taken for it; the first one wins. The name cannot contain whitespace (same as a bare link target
+/// in runandlog's `out=`). Whether the name is acceptable is decided by the backend
+/// (`write_run_log_output`), which refuses anything that is not a plain file name in the
+/// connection's query folder
+export const parseRunLogLabel = (raw: string): RunLogLabel => {
+  const match = raw.match(/(^|\s)out=(\S+)/);
+  if (!match || match.index === undefined) {
+    return { label: raw, output: null };
+  }
+  const label = (
+    raw.slice(0, match.index) +
+    match[1] +
+    raw.slice(match.index + match[0].length)
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+  return { label, output: match[2] };
+};
+
+/// Whether the result in the table is narrowed and has to be fetched again for the log.
+/// Narrowed means the automatic LIMIT actually cut it (the row count reached the limit; exactly at
+/// the limit we cannot tell, so it counts) or the backend truncated it. Same criteria as the
+/// Copy / Export re-fetch (`fetchResultWithoutDefaultLimit`)
+export const runLogNeedsFullFetch = (result: QueryResult): boolean =>
+  (result.applied_limit !== null && result.rows.length >= result.applied_limit) ||
+  result.truncated;
+
+/// The log body written below the statement when the result went to an output file: the row
+/// count, the file name, and the same notes as the inline body when the result is not complete.
+/// limitedTo is the automatic LIMIT when it cut the rows written (a statement that could not be
+/// run again keeps the displayed rows)
+export const runLogFileBody = (
+  file: RunLogFile,
+  limitedTo: number | null,
+): string => {
+  const lines = [`(${file.row_count} rows written to ${file.file_name})`];
+  if (limitedTo !== null) {
+    lines.push(`(the query was limited to ${limitedTo} rows)`);
+  }
+  if (file.truncated) {
+    lines.push("(the result itself was truncated)");
+  }
+  return lines.join("\n");
+};
 
 /// Whether this is a line comment (`--`) line
 const isLineComment = (line: string): boolean => line.trimStart().startsWith("--");
