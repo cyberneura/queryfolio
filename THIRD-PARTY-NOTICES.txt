@@ -3071,7 +3071,7 @@ DEALINGS IN THE SOFTWARE.
 License: MIT License
 
 Used by:
-  libz-sys 1.1.29 (https://github.com/rust-lang/libz-sys)
+  libz-sys 1.1.31 (https://github.com/rust-lang/libz-sys)
 
 Copyright (c) 2014 Alex Crichton
 Copyright (c) 2020 Josh Triplett
@@ -10161,7 +10161,7 @@ Used by:
 License: Zlib
 
 Used by:
-  zlib (bundled by libz-sys 1.1.29)
+  zlib (bundled by libz-sys 1.1.31)
 
 Copyright notice:
 
