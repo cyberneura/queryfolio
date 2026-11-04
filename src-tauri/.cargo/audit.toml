@@ -41,7 +41,8 @@ ignore = [
   # verify that rkyv has actually been upgraded.
   "RUSTSEC-2026-0235",
 
-  # zip 6.0.0 — symlink / permission handling in `ZipArchive::extract` (RUSTSEC-2026-0367 / 0368 / 0369)
+  # zip 6.0.0 — symlink / permission handling in `ZipArchive::extract` (RUSTSEC-2026-0367 / 0368 / 0369),
+  # and a huge allocation (abort) when extracting a symlink entry (RUSTSEC-2026-0429)
   #
   # Path: libduckdb-sys 1.10504.0 **build-dependency** only (`cargo tree -i zip@6.0.0 --target all -e all`
   # shows `[build-dependencies] libduckdb-sys`). It is used at build time to unpack the DuckDB
@@ -53,11 +54,12 @@ ignore = [
   # The fixed version (zip >= 9) cannot be selected by `cargo update -p zip` because libduckdb-sys
   # pins the 6.x range.
   #
-  # Condition for removal: when libduckdb-sys requires zip >= 9. Delete these three lines then and
+  # Condition for removal: when libduckdb-sys requires zip >= 9. Delete these four lines then and
   # verify the upgrade actually happened.
   "RUSTSEC-2026-0367",
   "RUSTSEC-2026-0368",
   "RUSTSEC-2026-0369",
+  "RUSTSEC-2026-0429",
 
   # webpki-roots 0.26.11 — bundled root certificates trust distrusted emSign intermediates (RUSTSEC-2026-0381)
   #
