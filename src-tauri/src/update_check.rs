@@ -109,14 +109,116 @@ fn running_app_bundle() -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Whether the output of `brew list --cask queryfolio` lists `bundle` as an installed
-/// artifact. Artifact lines look like `/Applications/Queryfolio.app (1,234 files, 56.7MB)`.
-fn cask_lists_bundle(list_output: &str, bundle: &Path) -> bool {
-    let bundle = bundle.to_string_lossy();
-    list_output.lines().map(str::trim).any(|line| {
-        line.strip_prefix(bundle.as_ref())
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with(" ("))
-    })
+/// The cask's appdir (where it puts apps). `Caskroom/queryfolio/.metadata/config.json` is the
+/// configuration Homebrew writes at install time; `explicit` (`--appdir`) wins over `env`
+/// (`HOMEBREW_CASK_OPTS`), which wins over `default` (Homebrew's `Cask::Config`). When it cannot
+/// be read, Homebrew's default `/Applications`.
+fn cask_appdir(config_json: Option<&str>, home: Option<&Path>) -> PathBuf {
+    let config = config_json.and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
+    let appdir = config.as_ref().and_then(|config| {
+        ["explicit", "env", "default"].iter().find_map(|level| {
+            config
+                .get(level)?
+                .get("appdir")?
+                .as_str()
+                .filter(|dir| !dir.is_empty())
+        })
+    });
+    match appdir {
+        Some(dir) => match (dir.strip_prefix("~/"), home) {
+            (Some(rest), Some(home)) => home.join(rest),
+            _ => PathBuf::from(dir),
+        },
+        None => PathBuf::from("/Applications"),
+    }
+}
+
+/// Whether the appdir was set by `HOMEBREW_CASK_OPTS` (`env`) alone.
+///
+/// `brew upgrade` carries over only the `explicit` part of the saved configuration and takes
+/// `env` from the environment it runs in (Homebrew's `Cask::Upgrade` / `Config#merge`). A GUI app
+/// does not inherit the shell's variables, so an upgrade started from here would reinstall into
+/// the default `/Applications` and the running location would never get the new version (a
+/// restart would bring back the old one). In that case brew is not offered; the Release page is.
+fn appdir_set_only_by_env(config_json: Option<&str>) -> bool {
+    let Some(config) =
+        config_json.and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+    else {
+        return false;
+    };
+    let appdir = |level: &str| {
+        config
+            .get(level)
+            .and_then(|c| c.get("appdir"))
+            .and_then(|v| v.as_str())
+            .filter(|dir| !dir.is_empty())
+    };
+    appdir("explicit").is_none() && appdir("env").is_some_and(|env| Some(env) != appdir("default"))
+}
+
+/// Where the cask put its app, from `brew info --cask --json=v2 queryfolio` (CYBERNEURA-DEV-1147).
+///
+/// Current Homebrew adds to the `app` artifact a `target` already resolved with the install-time
+/// configuration (`{"app":["Queryfolio.app"],"target":"/Applications/Queryfolio.app"}`). Older
+/// brew versions without it get the path built from the appdir and the artifact name (with
+/// `app "Foo.app", target: "Bar.app"` the installed name is `Bar.app`).
+///
+/// `brew list --cask queryfolio` is not used: its artifact list
+/// (`/Applications/Queryfolio.app (...)`) is printed only when stdout is a terminal. Through a
+/// pipe, which is what `Command::output()` gives it, it prints a `find` of the Caskroom instead,
+/// so the old check never matched and the cask install was always sent to the Release page.
+fn cask_app_paths(info_json: &str, appdir: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let Ok(info) = serde_json::from_str::<serde_json::Value>(info_json) else {
+        return Vec::new();
+    };
+    let artifacts = info["casks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|cask| cask["token"] == CASK)
+        .filter_map(|cask| cask["artifacts"].as_array())
+        .flatten();
+    let mut paths = Vec::new();
+    for artifact in artifacts {
+        let Some(args) = artifact["app"].as_array() else {
+            continue;
+        };
+        if let Some(target) = artifact["target"].as_str().map(Path::new) {
+            if target.is_absolute() {
+                paths.push(target.to_path_buf());
+                continue;
+            }
+        }
+        // The same resolution as Homebrew's Relocated: the target if given (`~/` expanded,
+        // relative ones under the appdir), otherwise the basename of the source under the appdir
+        let source = args.first().and_then(|v| v.as_str()).map(Path::new);
+        let renamed = args
+            .iter()
+            .find_map(|v| v.get("target").and_then(|t| t.as_str()));
+        let path = match (renamed, source) {
+            (Some(target), _) => match (target.strip_prefix("~/"), home) {
+                (Some(rest), Some(home)) => home.join(rest),
+                (Some(_), None) => continue,
+                _ => appdir.join(target),
+            },
+            (None, Some(source)) => match source.file_name() {
+                Some(name) => appdir.join(name),
+                None => continue,
+            },
+            (None, None) => continue,
+        };
+        paths.push(path);
+    }
+    paths
+}
+
+/// Whether one of the places the cask installed to is `bundle`.
+///
+/// Compared exactly, case included: APFS is case-insensitive by default, and a loose match could
+/// send brew to a copy installed under a different name. The running path is canonicalized
+/// (= spelled as on disk).
+fn cask_installs_bundle(app_paths: &[PathBuf], bundle: &Path) -> bool {
+    app_paths.iter().any(|path| path == bundle)
 }
 
 /// Highest version in the output of `brew list --cask --versions queryfolio`
@@ -158,18 +260,35 @@ fn run_brew(brew: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String,
 
 /// `brew` that manages the running app, if any. A Caskroom entry alone is not enough: the
 /// running copy may be a manually installed one elsewhere, and upgrading the cask would then
-/// update a different app. So the cask's installed artifacts must include our own bundle.
-/// Blocking (runs `brew list`).
+/// update a different app. So the place the cask installed to must be our own bundle.
+/// Blocking (runs `brew info`).
 fn homebrew_brew_for_running_app() -> Option<PathBuf> {
     if !cfg!(target_os = "macos") {
         return None;
     }
     let bundle = running_app_bundle()?;
+    let home = dirs::home_dir();
     brew_candidates(&[Path::new("/opt/homebrew"), Path::new("/usr/local")])
         .into_iter()
         .find(|brew| {
-            run_brew(brew, &["list", "--cask", CASK], &[])
-                .is_ok_and(|out| cask_lists_bundle(&out, &bundle))
+            // brew_candidates returns <prefix>/bin/brew
+            let Some(prefix) = brew.parent().and_then(Path::parent) else {
+                return false;
+            };
+            let config = std::fs::read_to_string(
+                prefix
+                    .join("Caskroom")
+                    .join(CASK)
+                    .join(".metadata/config.json"),
+            )
+            .ok();
+            if appdir_set_only_by_env(config.as_deref()) {
+                return false;
+            }
+            let appdir = cask_appdir(config.as_deref(), home.as_deref());
+            run_brew(brew, &["info", "--cask", "--json=v2", CASK], &[]).is_ok_and(|out| {
+                cask_installs_bundle(&cask_app_paths(&out, &appdir, home.as_deref()), &bundle)
+            })
         })
 }
 
@@ -405,25 +524,116 @@ mod tests {
     }
 
     #[test]
-    fn test_cask_lists_bundle() {
-        let out = "==> App\n/Applications/Queryfolio.app (1,234 files, 56.7MB)\n";
-        assert!(cask_lists_bundle(
-            out,
+    fn test_cask_appdir() {
+        let home = Path::new("/Users/me");
+        // explicit > env > default
+        let json = r#"{"default":{"appdir":"/Applications"},"env":{"appdir":"/Env"},"explicit":{"appdir":"/Explicit"}}"#;
+        assert_eq!(
+            cask_appdir(Some(json), Some(home)),
+            PathBuf::from("/Explicit")
+        );
+        let json = r#"{"default":{"appdir":"/Applications"},"env":{"appdir":"~/Applications"},"explicit":{}}"#;
+        assert_eq!(
+            cask_appdir(Some(json), Some(home)),
+            PathBuf::from("/Users/me/Applications")
+        );
+        let json = r#"{"default":{"appdir":"/Applications"},"env":{},"explicit":{}}"#;
+        assert_eq!(
+            cask_appdir(Some(json), Some(home)),
+            PathBuf::from("/Applications")
+        );
+        // Unreadable or broken: Homebrew's default
+        assert_eq!(
+            cask_appdir(None, Some(home)),
+            PathBuf::from("/Applications")
+        );
+        assert_eq!(
+            cask_appdir(Some("{"), Some(home)),
+            PathBuf::from("/Applications")
+        );
+    }
+
+    // Homebrew is macOS-only, and /Users/... is not an absolute path on Windows
+    #[cfg(unix)]
+    #[test]
+    fn test_cask_app_paths() {
+        let appdir = Path::new("/Applications");
+        let home = Some(Path::new("/Users/me"));
+        // Current brew: the resolved target is used as is
+        let json = r#"{"formulae":[],"casks":[{"token":"queryfolio","artifacts":[{"uninstall":[{"quit":"com.cyberneura.queryfolio"}]},{"app":["Queryfolio.app"],"target":"/Users/me/Applications/Queryfolio.app"},{"zap":[{"trash":["~/.config/queryfolio"]}]}]}]}"#;
+        assert_eq!(
+            cask_app_paths(json, appdir, home),
+            vec![PathBuf::from("/Users/me/Applications/Queryfolio.app")]
+        );
+        // Older brew without target: appdir + name
+        let json = r#"{"casks":[{"token":"queryfolio","artifacts":[{"app":["Queryfolio.app"]}]}]}"#;
+        assert_eq!(
+            cask_app_paths(json, appdir, home),
+            vec![PathBuf::from("/Applications/Queryfolio.app")]
+        );
+        let json = r#"{"casks":[{"token":"queryfolio","artifacts":[{"app":["queryfolio.app",{"target":"Renamed.app"}]}]}]}"#;
+        assert_eq!(
+            cask_app_paths(json, appdir, home),
+            vec![PathBuf::from("/Applications/Renamed.app")]
+        );
+        // The source's directory is not part of the installed location (basename only)
+        let json =
+            r#"{"casks":[{"token":"queryfolio","artifacts":[{"app":["dist/Queryfolio.app"]}]}]}"#;
+        assert_eq!(
+            cask_app_paths(json, appdir, home),
+            vec![PathBuf::from("/Applications/Queryfolio.app")]
+        );
+        // ~/ in a target is the home directory
+        let json = r#"{"casks":[{"token":"queryfolio","artifacts":[{"app":["Queryfolio.app",{"target":"~/Apps/Queryfolio.app"}]}]}]}"#;
+        assert_eq!(
+            cask_app_paths(json, appdir, home),
+            vec![PathBuf::from("/Users/me/Apps/Queryfolio.app")]
+        );
+        // Another cask's artifacts are ignored
+        let json = r#"{"casks":[{"token":"other","artifacts":[{"app":["Queryfolio.app"]}]}]}"#;
+        assert!(cask_app_paths(json, appdir, home).is_empty());
+        assert!(cask_app_paths("not json", appdir, None).is_empty());
+    }
+
+    #[test]
+    fn test_appdir_set_only_by_env() {
+        let env_only = r#"{"default":{"appdir":"/Applications"},"env":{"appdir":"/Users/me/Applications"},"explicit":{}}"#;
+        assert!(appdir_set_only_by_env(Some(env_only)));
+        // explicit (--appdir) is carried over by upgrade
+        let explicit = r#"{"default":{"appdir":"/Applications"},"env":{"appdir":"/Users/me/Applications"},"explicit":{"appdir":"/Users/me/Applications"}}"#;
+        assert!(!appdir_set_only_by_env(Some(explicit)));
+        // env equal to the default lands in the same place on upgrade
+        let same = r#"{"default":{"appdir":"/Applications"},"env":{"appdir":"/Applications"},"explicit":{}}"#;
+        assert!(!appdir_set_only_by_env(Some(same)));
+        let plain = r#"{"default":{"appdir":"/Applications"},"env":{},"explicit":{}}"#;
+        assert!(!appdir_set_only_by_env(Some(plain)));
+        assert!(!appdir_set_only_by_env(None));
+    }
+
+    #[test]
+    fn test_cask_installs_bundle() {
+        let paths = vec![PathBuf::from("/Applications/Queryfolio.app")];
+        assert!(cask_installs_bundle(
+            &paths,
             Path::new("/Applications/Queryfolio.app")
         ));
         // A manually installed copy elsewhere is not the cask's
-        assert!(!cask_lists_bundle(
-            out,
+        assert!(!cask_installs_bundle(
+            &paths,
             Path::new("/Users/me/Apps/Queryfolio.app")
         ));
         // Prefix of another path is not a match
-        let out = "/Applications/Queryfolio.app.old (12 files, 1MB)\n";
-        assert!(!cask_lists_bundle(
-            out,
-            Path::new("/Applications/Queryfolio.app")
+        assert!(!cask_installs_bundle(
+            &paths,
+            Path::new("/Applications/Queryfolio.app.old")
         ));
-        assert!(cask_lists_bundle(
-            "/Applications/Queryfolio.app\n",
+        // Case matters (APFS would open either spelling)
+        assert!(!cask_installs_bundle(
+            &paths,
+            Path::new("/Applications/queryfolio.app")
+        ));
+        assert!(!cask_installs_bundle(
+            &[],
             Path::new("/Applications/Queryfolio.app")
         ));
     }
