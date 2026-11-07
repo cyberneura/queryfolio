@@ -48,19 +48,78 @@ const DECIMAL_STRING = /^[+-]?(\d+(\.\d*)?|\.\d+)$/;
 const MAX_NUMERIC_CHARS = 64;
 const MAX_COMPARE_CHARS = 10_000;
 
-/// A value that the sort treats as a number: numbers, booleans (false < true) and numeric strings
-/// (BIGINT / DECIMAL arrive as strings from the backend when they exceed 2^53, see db.rs json_i64).
-function numericValue(v: unknown): number | null {
-  if (typeof v === "number") return v;
-  if (typeof v === "boolean") return v ? 1 : 0;
-  if (
-    typeof v === "string" &&
-    v.length <= MAX_NUMERIC_CHARS &&
-    NUMERIC_STRING.test(v)
-  ) {
-    return Number(v);
+/// Serialize a JSON cell (object / array) to at most `max` characters, stopping as soon as
+/// the budget is spent. `JSON.stringify` would walk a 100KB JSONB value in full for every
+/// row; the sort only needs a bounded prefix. The output is the usual compact JSON up to the
+/// cut, so prefixes of equal values stay equal and order between different values is kept
+/// for everything that differs within the budget
+export function stringifyBounded(value: unknown, max: number): string {
+  const parts: string[] = [];
+  let used = 0;
+  const push = (text: string): boolean => {
+    parts.push(text);
+    used += text.length;
+    return used < max;
+  };
+  const walk = (v: unknown): boolean => {
+    if (v === null || v === undefined) return push("null");
+    if (typeof v === "number" || typeof v === "boolean") return push(String(v));
+    if (typeof v === "string") {
+      // The string itself can be huge; cut it before escaping
+      return push(JSON.stringify(v.length > max ? v.slice(0, max) : v));
+    }
+    if (Array.isArray(v)) {
+      if (!push("[")) return false;
+      for (let i = 0; i < v.length; i++) {
+        if (i > 0 && !push(",")) return false;
+        if (!walk(v[i])) return false;
+      }
+      return push("]");
+    }
+    if (typeof v === "object") {
+      if (!push("{")) return false;
+      let first = true;
+      for (const [k, item] of Object.entries(v as Record<string, unknown>)) {
+        if (item === undefined) continue;
+        if (!first && !push(",")) return false;
+        first = false;
+        if (!push(JSON.stringify(k) + ":")) return false;
+        if (!walk(item)) return false;
+      }
+      return push("}");
+    }
+    return push(String(v));
+  };
+  walk(value);
+  const text = parts.join("");
+  return text.length > max ? text.slice(0, max) : text;
+}
+
+/// The comparison key of one non-null cell, computed once per row by `sortedRowOrder`
+/// (decorate-sort-undecorate), so serialization / numeric parsing is not repeated for every
+/// comparison. `num` is set for numbers, booleans (false < true) and numeric strings (BIGINT /
+/// DECIMAL arrive as strings from the backend when they exceed 2^53, see db.rs json_i64);
+/// `decimal` keeps the exact digits of a plain decimal string; `text` is the bounded text key
+interface CellKey {
+  num: number | null;
+  decimal: string | null;
+  text: string;
+}
+
+function cellKey(v: unknown): CellKey {
+  if (typeof v === "number") return { num: v, decimal: null, text: String(v) };
+  if (typeof v === "boolean") return { num: v ? 1 : 0, decimal: null, text: String(v) };
+  if (typeof v === "string") {
+    const text = v.length > MAX_COMPARE_CHARS ? v.slice(0, MAX_COMPARE_CHARS) : v;
+    if (v.length <= MAX_NUMERIC_CHARS && NUMERIC_STRING.test(v)) {
+      return { num: Number(v), decimal: DECIMAL_STRING.test(v) ? v : null, text };
+    }
+    return { num: null, decimal: null, text };
   }
-  return null;
+  if (typeof v === "object") {
+    return { num: null, decimal: null, text: stringifyBounded(v, MAX_COMPARE_CHARS) };
+  }
+  return { num: null, decimal: null, text: String(v) };
 }
 
 /// Split a plain decimal string into sign, integer digits (no leading zeros) and fraction digits
@@ -96,42 +155,28 @@ function compareDecimalStrings(a: string, b: string): number {
   return pa.neg ? -magnitude : magnitude;
 }
 
-// Text key of a cell for comparison, cut to MAX_COMPARE_CHARS (cells beyond that compare
-// equal on their prefix and keep the fetched order, which is acceptable for a visual sort)
-const textOf = (v: unknown): string => {
-  const text =
-    typeof v === "string"
-      ? v
-      : typeof v === "object"
-        ? JSON.stringify(v)
-        : String(v);
-  return text.length > MAX_COMPARE_CHARS ? text.slice(0, MAX_COMPARE_CHARS) : text;
-};
+function compareKeys(a: CellKey, b: CellKey): number {
+  if (a.num !== null && b.num !== null) {
+    if (a.decimal !== null && b.decimal !== null) {
+      return compareDecimalStrings(a.decimal, b.decimal);
+    }
+    return a.num < b.num ? -1 : a.num > b.num ? 1 : 0;
+  }
+  // Mixed numeric / text: numbers before text, so that a column with a few text values
+  // still groups its numbers together instead of interleaving them lexicographically
+  if (a.num !== null) return -1;
+  if (b.num !== null) return 1;
+  return a.text.localeCompare(b.text);
+}
 
 /// Ascending comparison of two non-null cell values. Both numeric (number / boolean /
 /// numeric string) -> numeric comparison, everything else -> locale-aware string comparison.
 /// null / undefined are not handled here: `sortedRowOrder` always puts them last.
-/// Bounded: numeric detection stops at MAX_NUMERIC_CHARS and text is compared on at most
-/// MAX_COMPARE_CHARS, so a 100KB TEXT cell cannot make one comparison expensive.
+/// Bounded: numeric detection stops at MAX_NUMERIC_CHARS and text (including serialized
+/// JSON cells) is compared on at most MAX_COMPARE_CHARS, so a 100KB cell cannot make one
+/// comparison expensive. `sortedRowOrder` builds the keys once per row instead of calling this.
 export function compareCells(a: unknown, b: unknown): number {
-  const na = numericValue(a);
-  const nb = numericValue(b);
-  if (na !== null && nb !== null) {
-    if (
-      typeof a === "string" &&
-      typeof b === "string" &&
-      DECIMAL_STRING.test(a) &&
-      DECIMAL_STRING.test(b)
-    ) {
-      return compareDecimalStrings(a, b);
-    }
-    return na < nb ? -1 : na > nb ? 1 : 0;
-  }
-  // Mixed numeric / text: numbers before text, so that a column with a few text values
-  // still groups its numbers together instead of interleaving them lexicographically
-  if (na !== null) return -1;
-  if (nb !== null) return 1;
-  return textOf(a).localeCompare(textOf(b));
+  return compareKeys(cellKey(a), cellKey(b));
 }
 
 /// The display order of `rows` as original row indexes. Identity order when `sort` is null.
@@ -146,11 +191,19 @@ export function sortedRowOrder(
   const sign = direction === "desc" ? -1 : 1;
   const nonNull: number[] = [];
   const nulls: number[] = [];
+  // One key per row (not per comparison): parsing / serialization happens N times, not N log N
+  const keys = new Map<number, CellKey>();
   for (const i of order) {
-    (isNullish(rows[i]?.[colIndex]) ? nulls : nonNull).push(i);
+    const v = rows[i]?.[colIndex];
+    if (isNullish(v)) {
+      nulls.push(i);
+    } else {
+      nonNull.push(i);
+      keys.set(i, cellKey(v));
+    }
   }
   // Array.prototype.sort is stable, so equal keys keep their fetched order
-  nonNull.sort((i, j) => sign * compareCells(rows[i][colIndex], rows[j][colIndex]));
+  nonNull.sort((i, j) => sign * compareKeys(keys.get(i)!, keys.get(j)!));
   return nonNull.concat(nulls);
 }
 

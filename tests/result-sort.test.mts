@@ -5,6 +5,7 @@ import {
   nextSort,
   reorderRows,
   sortedRowOrder,
+  stringifyBounded,
 } from "../src/lib/resultSort.ts";
 
 const column = (values: unknown[]): unknown[][] => values.map((v) => [v]);
@@ -73,6 +74,30 @@ test("a long digit run followed by a non-digit is text and does not backtrack", 
   const huge = "a".repeat(100_000);
   assert.equal(compareCells(huge, huge + "b"), 0);
   assert.ok(performance.now() - started < 200, "comparison must stay cheap");
+});
+
+test("stringifyBounded produces compact JSON and stops at the budget", () => {
+  assert.equal(stringifyBounded({ a: 1, b: [true, null, "x"] }, 1000), '{"a":1,"b":[true,null,"x"]}');
+  assert.equal(stringifyBounded({ a: undefined, b: 2 }, 1000), '{"b":2}');
+  const cut = stringifyBounded({ k: "y".repeat(50_000), z: 1 }, 100);
+  assert.equal(cut.length, 100);
+  assert.ok(cut.startsWith('{"k":"yyy'));
+  // Equal prefixes compare equal, differences inside the budget keep their order
+  assert.equal(compareCells({ id: 1, blob: "q".repeat(100_000) }, { id: 2, blob: "q".repeat(100_000) }), -1);
+});
+
+test("sorting 500 large JSON cells is bounded work (keys are built once per row)", () => {
+  const payload = "p".repeat(100_000);
+  // Objects compare by their JSON text, so zero-pad the varying field to make the expected
+  // order unambiguous ("001" < "500")
+  const rows = Array.from({ length: 500 }, (_, i) => [
+    { n: String(500 - i).padStart(3, "0"), payload },
+  ]);
+  const started = performance.now();
+  const order = sortedRowOrder(rows, { colIndex: 0, direction: "asc" });
+  assert.equal(order[0], 499);
+  assert.equal(order[499], 0);
+  assert.ok(performance.now() - started < 1000, "sort must stay cheap");
 });
 
 test("booleans sort as 0 / 1 and objects by their JSON text", () => {
