@@ -1,5 +1,6 @@
 mod ai;
 mod cli;
+mod color;
 mod config;
 mod db;
 mod dump;

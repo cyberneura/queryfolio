@@ -228,6 +228,7 @@ servers:
 #
 # servers:
 #   - group_name: production
+#     color: "#b91c1c"    # marks every server in the group (CONNECTIONS / toolbar / tabs)
 #     servers:
 #       - name: prod-main
 #         engine: mysql

@@ -1229,12 +1229,23 @@
       <!-- Multi-row tabs: when tabs increase, wrap and show them in multiple rows -->
       <div class="flex min-w-0 flex-1 flex-wrap items-center gap-1">
         {#each appStore.resultTabs as tab (tab.id)}
+          {@const color = appStore.connectionColorOf(tab.connection)}
           <div
             class="flex shrink-0 items-center gap-0.5 rounded-t border-t border-r border-l px-1 py-0.5 {tab.id ===
             appStore.activeTabId
               ? 'border-zinc-600 bg-zinc-800 text-zinc-200'
               : 'border-transparent text-zinc-500 hover:bg-zinc-800/60 hover:text-zinc-300'}"
           >
+            {#if color}
+              <!-- Dot in the connection's color (see ConnectionInfo.color) -->
+              <span
+                class="inline-block size-2 shrink-0 rounded-full"
+                style:background-color={color}
+                title={tab.connection}
+                data-annotate="result-tab-color-{tab.id}"
+                aria-hidden="true"
+              ></span>
+            {/if}
             <button
               class="max-w-48 truncate font-mono"
               title={tabTooltip(tab)}

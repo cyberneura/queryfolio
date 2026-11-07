@@ -24,6 +24,7 @@
 >
   {#each appStore.editorTabs as tab (tab.id)}
     {@const active = tab.id === appStore.activeEditorTabId}
+    {@const color = appStore.connectionColorOf(tab.connection)}
     <!-- Let the active tab's bottom border sink into the content side so
          the tab looks connected to the body (-mb-px) -->
     <div
@@ -37,6 +38,16 @@
         data-annotate="button-editor-tab-{tab.id}"
         onclick={() => appStore.activateEditorTab(tab.id)}
       >
+        {#if color}
+          <!-- Dot in the connection's color (see ConnectionInfo.color) -->
+          <span
+            class="inline-block size-2 shrink-0 self-center rounded-full"
+            style:background-color={color}
+            title={tab.connection}
+            data-annotate="editor-tab-color-{tab.id}"
+            aria-hidden="true"
+          ></span>
+        {/if}
         {#if multipleConnections}
           <span
             class="shrink-0 text-[10px] {active

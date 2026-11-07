@@ -396,13 +396,16 @@
           </div>
         {/if}
         {#each section.items as connection (connection.name)}
+          <!-- A colored connection (ConnectionInfo.color, validated by the backend) shows a 3px bar
+               at its left edge, inside the selection border, so production stands out at a glance -->
           <button
-            class="flex w-full flex-col gap-0.5 px-3 py-2 text-left hover:bg-zinc-800 {appStore.selectedConnection ===
+            class="relative flex w-full flex-col gap-0.5 px-3 py-2 text-left hover:bg-zinc-800 {appStore.selectedConnection ===
             connection.name
               ? 'bg-zinc-800 border-l-2 border-blue-400'
               : 'border-l-2 border-transparent'} {dropTarget === connection.name
               ? 'bg-blue-500/20 outline outline-1 outline-blue-400'
               : ''}"
+            style:--connection-color={connection.color ?? undefined}
             data-annotate="button-connection-{connection.name}"
             onclick={() => appStore.selectConnection(connection.name)}
             onmouseenter={(e) => showTip(connection, e)}
@@ -412,6 +415,14 @@
             ondragleave={() => handleDragLeave(connection)}
             ondrop={(e) => void handleDrop(e, connection)}
           >
+            {#if connection.color}
+              <span
+                class="pointer-events-none absolute top-0 bottom-0 left-0 w-[3px]"
+                style:background-color={connection.color}
+                data-annotate="connection-color-{connection.name}"
+                aria-hidden="true"
+              ></span>
+            {/if}
             <span class="truncate text-sm text-zinc-200">{connection.name}</span>
             <span class="flex items-center gap-1 text-xs text-zinc-500">
               {engineLabel(connection.engine)}
