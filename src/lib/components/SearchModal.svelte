@@ -1,13 +1,22 @@
 <script lang="ts">
   import appStore from "$lib/stores/app.svelte";
   import * as api from "$lib/api";
-  import type { FileSearchHit } from "$lib/api";
+  import type { FileSearchHit, TableInfo } from "$lib/api";
+  import {
+    buildSearchItems,
+    matchConnections,
+    matchLoadedTables,
+    type SearchItem,
+  } from "$lib/searchItems";
 
   interface Props {
     onClose: () => void;
+    /// Show the TABLES pane (the left pane tab is held by +page.svelte). Called when a
+    /// table candidate is chosen, so the revealed table is visible
+    onOpenTable?: () => void;
   }
 
-  let { onClose }: Props = $props();
+  let { onClose, onOpenTable }: Props = $props();
 
   let query = $state("");
   let fileHits = $state<FileSearchHit[]>([]);
@@ -17,34 +26,26 @@
   /// Generation number of the async search. Used so an old response does not overwrite newer results
   let searchGeneration = 0;
 
-  /// Connection filtering. Partial match on name and description (case-insensitive). An empty query shows all
-  /// entries so it can be used to switch connections (jump).
-  const connMatches = $derived.by(() => {
-    const q = query.trim().toLowerCase();
-    const list = appStore.connections;
-    if (!q) {
-      return list;
-    }
-    return list.filter(
-      (c) =>
-        c.name.toLowerCase().includes(q) ||
-        (c.description ?? "").toLowerCase().includes(q),
-    );
-  });
+  /// Connection filtering (see $lib/searchItems.ts)
+  const connMatches = $derived(matchConnections(appStore.connections, query));
 
-  /// Flat candidate list for keyboard navigation (connections, then files).
+  /// Tables already loaded by the TABLES pane for the selected connection + database
+  /// (CYBERNEURA-DEV-1208). Nothing is fetched for the search: a connection whose TABLES pane
+  /// has not been opened simply has no table candidates
+  const tableMatches = $derived<TableInfo[]>(
+    matchLoadedTables(
+      appStore.loadedTables,
+      appStore.selectedConnection,
+      appStore.activeSchema,
+      query,
+    ),
+  );
+
+  /// Flat candidate list for keyboard navigation (connections, then files, then tables).
   /// The display grouping and indices correspond to this order.
-  type Item =
-    | { kind: "connection"; name: string; description: string | null }
-    | { kind: "file"; hit: FileSearchHit };
-  const items = $derived.by<Item[]>(() => [
-    ...connMatches.map((c) => ({
-      kind: "connection" as const,
-      name: c.name,
-      description: c.description,
-    })),
-    ...fileHits.map((hit) => ({ kind: "file" as const, hit })),
-  ]);
+  const items = $derived<SearchItem[]>(
+    buildSearchItems(connMatches, fileHits, tableMatches),
+  );
 
   /// Run the file search debounced on query change. Files are searched only for the selected
   /// connection (to reach files in other connections, switch connections).
@@ -82,11 +83,24 @@
     inputEl?.focus();
   });
 
-  const activate = async (item: Item) => {
+  const activate = async (item: SearchItem) => {
     if (item.kind === "connection") {
       await appStore.selectConnection(item.name);
-    } else {
+    } else if (item.kind === "file") {
       await appStore.selectFile(item.hit.file_name);
+    } else {
+      // Insert the name into the editor of the selected connection and show the table in the
+      // TABLES pane (expanded). Same connection as the loaded list by construction of tableMatches
+      const connection = appStore.selectedConnection;
+      appStore.insertSqlSnippet(item.table.qualified_name);
+      if (connection) {
+        appStore.revealTable(
+          connection,
+          appStore.activeSchema || null,
+          item.table.qualified_name,
+        );
+        onOpenTable?.();
+      }
     }
     onClose();
   };
@@ -136,7 +150,7 @@
         bind:value={query}
         onkeydown={onKeydown}
         type="text"
-        placeholder="Search connections and query files…"
+        placeholder="Search connections, query files and loaded tables…"
         class="w-full bg-transparent text-sm text-zinc-100 placeholder:text-zinc-500 focus:outline-none"
         data-annotate="search-input"
         autocomplete="off"
@@ -207,6 +221,39 @@
             </button>
           {/each}
         {/if}
+
+        {#if tableMatches.length > 0}
+          <p
+            class="px-3 pt-1.5 pb-0.5 text-[10px] font-semibold tracking-wide text-zinc-500 uppercase"
+          >
+            Tables{appStore.selectedConnection
+              ? ` · ${appStore.selectedConnection}`
+              : ""}{appStore.activeSchema ? ` · ${appStore.activeSchema}` : ""}
+          </p>
+          {#each tableMatches as table, k (table.qualified_name)}
+            {@const idx = connMatches.length + fileHits.length + k}
+            <button
+              class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs {activeIndex ===
+              idx
+                ? 'bg-zinc-700/60'
+                : 'hover:bg-zinc-800'}"
+              title="Insert the name into the editor and show it in TABLES"
+              data-annotate="search-result-table-{table.qualified_name}"
+              onmouseenter={() => (activeIndex = idx)}
+              onclick={() => activate({ kind: "table", table })}
+            >
+              <i class="bi bi-table text-zinc-400" aria-hidden="true"></i>
+              <span class="text-zinc-100">{table.qualified_name}</span>
+              {#if table.kind !== "table"}
+                <span
+                  class="shrink-0 rounded bg-purple-500/15 px-1 text-[9px] uppercase tracking-wide text-purple-400"
+                >
+                  {table.kind}
+                </span>
+              {/if}
+            </button>
+          {/each}
+        {/if}
       {/if}
     </div>
 
@@ -214,7 +261,7 @@
       class="flex items-center gap-3 border-t border-zinc-800 px-3 py-1 text-[10px] text-zinc-600"
     >
       <span><kbd>↑</kbd> <kbd>↓</kbd> navigate</span>
-      <span><kbd>↵</kbd> open</span>
+      <span><kbd>↵</kbd> open / insert</span>
       <span><kbd>esc</kbd> close</span>
     </div>
   </div>

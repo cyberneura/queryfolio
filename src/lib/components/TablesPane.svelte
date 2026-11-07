@@ -1,8 +1,11 @@
 <script lang="ts">
+  import { tick } from "svelte";
   import * as api from "$lib/api";
   import type { ColumnInfo, DumpTable, TableInfo } from "$lib/api";
   import appStore from "$lib/stores/app.svelte";
+  import { filterTerms, matchesFilter } from "$lib/paneFilter";
   import DumpModal from "./DumpModal.svelte";
+  import PaneFilterInput from "./PaneFilterInput.svelte";
 
   interface Props {
     /// Switch to the FILES / HISTORY tab (tab state is held by +page.svelte)
@@ -49,6 +52,45 @@
   let expanded = $state<Record<string, ExpandedEntry>>({});
 
   let clickTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /// The filter input under the header (opened by the magnifier button), same as the
+  /// CONNECTIONS / FILES panes (CYBERNEURA-DEV-1208). It only hides rows: the expanded
+  /// column lists are keyed by qualified_name and survive the filtering
+  let filterOpen = $state(false);
+  let filterQuery = $state("");
+  const filterTermsOf = $derived(filterTerms(filterQuery));
+
+  const closeFilter = () => {
+    filterOpen = false;
+    filterQuery = "";
+  };
+
+  /// Tables matching the filter (TABLES mode): qualified name, bare name and schema
+  const visibleTables = $derived(
+    tables.filter((t) =>
+      matchesFilter(filterTermsOf, [t.qualified_name, t.name, t.schema]),
+    ),
+  );
+  /// Databases matching the filter (SCHEMAS mode)
+  const visibleSchemaNames = $derived(
+    currentSchemaNames.filter((s) => matchesFilter(filterTermsOf, [s])),
+  );
+
+  /// Enter in the filter = the click action on the first match: insert the table name
+  /// (TABLES) or choose the database (SCHEMAS)
+  const submitFilter = () => {
+    if (appStore.tablesPaneListsSchemas) {
+      const schema = visibleSchemaNames[0];
+      if (schema !== undefined) {
+        void chooseSchema(schema);
+      }
+      return;
+    }
+    const table = visibleTables[0];
+    if (table) {
+      appStore.insertSqlSnippet(table.qualified_name);
+    }
+  };
 
   /// Right-click menu of a table / database row (only for engines that can dump)
   interface ContextMenu {
@@ -160,6 +202,13 @@
         tablesConnection = connection;
         tablesDatabase = databaseAtLoad;
         schemaNames = [];
+        // Let the Cmd+K search offer these tables (only this connection + database; the
+        // search itself never calls list_tables)
+        appStore.setLoadedTables({
+          connection,
+          database: databaseAtLoad,
+          tables: result,
+        });
       }
       loadError = null;
       // Opening the schema browser = a moment to use the connection. The tunnel is already
@@ -173,6 +222,7 @@
       loadError = toErrorMessage(e);
       tables = [];
       schemaNames = [];
+      appStore.setLoadedTables(null);
     } finally {
       if (generation === loadGeneration) {
         loading = false;
@@ -247,6 +297,45 @@
       }
     }
   };
+
+  /// A table chosen in the Cmd+K search: expand it and scroll it into view. The request is
+  /// consumed in the store once handled, so re-mounting the pane does not repeat it. The list
+  /// may still be loading when the request arrives (the pane is mounted by the search), so
+  /// this re-runs as `tables` / `loading` change until the list of the same connection and
+  /// database is on screen
+  $effect(() => {
+    const request = appStore.tableRevealRequest;
+    if (!request) {
+      return;
+    }
+    if (
+      loading ||
+      tablesConnection !== request.connection ||
+      tablesDatabase !== request.database ||
+      appStore.selectedConnection !== request.connection
+    ) {
+      return;
+    }
+    const table = tables.find((t) => t.qualified_name === request.qualifiedName);
+    if (!table) {
+      // Not in the list (the list is unfiltered, so the filter cannot hide it). Drop the request
+      appStore.consumeTableReveal(request.seq);
+      return;
+    }
+    appStore.consumeTableReveal(request.seq);
+    // The filter would hide the revealed row, so clear it
+    closeFilter();
+    if (!expanded[table.qualified_name]) {
+      void toggleExpand(table);
+    }
+    void tick().then(() => {
+      document
+        .querySelector<HTMLElement>(
+          `[data-annotate="button-table-${CSS.escape(table.qualified_name)}"]`,
+        )
+        ?.scrollIntoView({ block: "center" });
+    });
+  });
 
   /// Single click: insert the table name into the editor.
   /// Wait a little before committing to distinguish it from a double click.
@@ -325,9 +414,24 @@
     <span class="text-xs font-semibold tracking-wide text-zinc-400">
       {appStore.tablesPaneListsSchemas ? "SCHEMAS" : "TABLES"}
     </span>
+    <button
+      class="ml-auto rounded px-1.5 py-0.5 text-xs hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40 {filterOpen
+        ? 'bg-zinc-700 text-zinc-200'
+        : 'text-zinc-400'}"
+      title={appStore.tablesPaneListsSchemas ? "Filter schemas" : "Filter tables"}
+      aria-label={appStore.tablesPaneListsSchemas
+        ? "Filter schemas"
+        : "Filter tables"}
+      aria-pressed={filterOpen}
+      data-annotate="button-filter-tables"
+      disabled={!appStore.selectedConnection}
+      onclick={() => (filterOpen ? closeFilter() : (filterOpen = true))}
+    >
+      <i class="bi bi-search" aria-hidden="true"></i>
+    </button>
     {#if canDump && !appStore.tablesPaneListsSchemas}
       <button
-        class="ml-auto rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
+        class="rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
         title="Dump this database (right-click a table to dump only that table)"
         aria-label="Dump database"
         data-annotate="button-dump-database"
@@ -339,7 +443,6 @@
     {/if}
     <button
       class="rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
-      class:ml-auto={!canDump || appStore.tablesPaneListsSchemas}
       title={appStore.tablesPaneListsSchemas ? "Reload schemas" : "Reload tables"}
       aria-label={appStore.tablesPaneListsSchemas
         ? "Reload schemas"
@@ -351,6 +454,17 @@
       <i class="bi bi-arrow-clockwise" aria-hidden="true"></i>
     </button>
   </div>
+  {#if filterOpen}
+    <PaneFilterInput
+      bind:value={filterQuery}
+      placeholder={appStore.tablesPaneListsSchemas
+        ? "Filter schemas"
+        : "Filter tables"}
+      annotate="input-filter-tables"
+      onClose={closeFilter}
+      onSubmit={submitFilter}
+    />
+  {/if}
   <div class="min-h-0 flex-1 overflow-y-auto">
     {#if !appStore.selectedConnection}
       <p class="px-3 py-2 text-xs text-zinc-500">Select a connection</p>
@@ -365,7 +479,10 @@
         <p class="px-3 pb-1 pt-2 text-[10px] text-zinc-500">
           No database is set for this connection. Choose one to show its tables.
         </p>
-        {#each currentSchemaNames as schema (schema)}
+        {#if visibleSchemaNames.length === 0}
+          <p class="px-3 py-2 text-xs text-zinc-500">No matching schemas</p>
+        {/if}
+        {#each visibleSchemaNames as schema (schema)}
           <button
             class="flex w-full min-w-0 items-center gap-1.5 px-3 py-1 text-left text-sm text-zinc-200 hover:bg-zinc-800 disabled:opacity-40"
             title="Use this schema and show its tables"
@@ -385,7 +502,10 @@
         {loading ? "Loading..." : "No tables found"}
       </p>
     {:else}
-      {#each tables as table (table.qualified_name)}
+      {#if visibleTables.length === 0}
+        <p class="px-3 py-2 text-xs text-zinc-500">No matching tables</p>
+      {/if}
+      {#each visibleTables as table (table.qualified_name)}
         <div
           class="group flex items-center hover:bg-zinc-800"
           role="presentation"
