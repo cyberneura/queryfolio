@@ -183,6 +183,10 @@ jobs:
       - name: Type-check frontend
         run: pnpm check
 
+      # Pure TypeScript logic of the frontend (tests/*.test.mts, node:test; no vitest in this project)
+      - name: Run frontend tests
+        run: pnpm test
+
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 

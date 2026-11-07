@@ -22,6 +22,12 @@
     type NormalizedEngine,
     type CellEdit,
   } from "$lib/editableResult";
+  import {
+    nextSort,
+    reorderRows,
+    sortedRowOrder,
+    type SortState,
+  } from "$lib/resultSort";
   import CellInspector from "./CellInspector.svelte";
   import AiAnalysisModal from "./AiAnalysisModal.svelte";
 
@@ -70,6 +76,49 @@
   let exportMenuOpen = $state(false);
 
   const activeTab = $derived(appStore.activeResultTab);
+
+  // ---- Client-side sort of the fetched rows (CYBERNEURA-DEV-1206) ----
+  // The sort belongs to one result (tab + executedAt): switching tabs or re-running
+  // leaves it behind, so a stale state never applies to another result. `result.rows` is
+  // never reordered; `rowOrder` maps display positions to original row indexes, and
+  // everything that identifies a row's data (cell edits, pending edits, the inspector) keeps
+  // using the original index. The rectangular selection is a visual range, so it stays in
+  // display positions (see $lib/resultSort.ts).
+  let sort = $state<(SortState & { tabId: number; executedAt: number }) | null>(
+    null,
+  );
+  const activeSort = $derived.by<SortState | null>(() => {
+    const tab = activeTab;
+    if (!sort || !tab || sort.tabId !== tab.id || sort.executedAt !== tab.executedAt) {
+      return null;
+    }
+    return { colIndex: sort.colIndex, direction: sort.direction };
+  });
+  // Display position -> original row index
+  const rowOrder = $derived(
+    sortedRowOrder(activeTab?.result?.rows ?? [], activeSort),
+  );
+  // Original row index -> display position (the inverse of rowOrder)
+  const rowToDisplay = $derived.by(() => {
+    const map = new Map<number, number>();
+    rowOrder.forEach((rowIndex, displayIndex) => map.set(rowIndex, displayIndex));
+    return map;
+  });
+  // The result in display order, for the operations that follow what is on screen
+  // (Cmd+C of a selection). Same object as the result when not sorted
+  const displayedResult = $derived(
+    activeTab?.result ? reorderRows(activeTab.result, activeSort) : null,
+  );
+  const toggleSort = (colIndex: number) => {
+    const tab = activeTab;
+    if (!tab?.result) {
+      return;
+    }
+    const next = nextSort(activeSort, colIndex);
+    sort = next ? { ...next, tabId: tab.id, executedAt: tab.executedAt } : null;
+  };
+  const sortDirectionOf = (colIndex: number): "asc" | "desc" | null =>
+    activeSort?.colIndex === colIndex ? activeSort.direction : null;
 
   /// Build the execution result of a statement without a result set (INSERT / UPDATE / DELETE / DDL etc.)
   /// as a raw execution message in the style of a DB console. The last line carries the
@@ -319,11 +368,14 @@
   // Temporary feedback display when copying the selection
   let selectionCopied = $state(false);
 
-  // Close the inspector and the selection on tab switch (including switches caused by closing)
+  // Close the inspector, the selection and the sort on tab switch (including switches caused by closing).
+  // The sort is also keyed by tab + executedAt (activeSort), but without clearing it here
+  // it would come back when switching to the same tab again
   $effect(() => {
     void appStore.activeTabId;
     selectedCell = null;
     selection = null;
+    sort = null;
   });
 
   // When showing a different result, return to the top (computing the row window with the previous result's
@@ -471,7 +523,8 @@
 
   const copySelection = async () => {
     const range = selectedRange;
-    const result = activeTab?.result;
+    // The selection is a range of display positions, so copy from the rows in display order
+    const result = displayedResult;
     if (!range || !result) {
       return;
     }
@@ -571,7 +624,8 @@
     return {
       value: row[selectedCell.colIndex],
       column: result.columns[selectedCell.colIndex],
-      rowIndex: selectedCell.rowIndex,
+      // The inspector shows the row number as seen on screen (the display position when sorted)
+      rowIndex: rowToDisplay.get(selectedCell.rowIndex) ?? selectedCell.rowIndex,
     };
   });
 
@@ -593,6 +647,7 @@
   };
 
   // Cell click. If the previous action was a drag selection, suppress opening/closing the inspector
+  // rowIndex is the original row index: the inspector follows the data, not the position on screen
   const onCellClick = (rowIndex: number, colIndex: number) => {
     if (dragMoved) {
       dragMoved = false;
@@ -631,12 +686,17 @@
   };
 
   // Cell background color: the cell open in the inspector is emphasized first,
-  // then the rectangular selection range is lightly emphasized
-  const cellBgClass = (rowIndex: number, colIndex: number): string => {
+  // then the rectangular selection range is lightly emphasized.
+  // rowIndex = original row index (inspector), displayIndex = position on screen (selection)
+  const cellBgClass = (
+    rowIndex: number,
+    displayIndex: number,
+    colIndex: number,
+  ): string => {
     if (isSelectedCell(rowIndex, colIndex)) {
       return "bg-sky-800/60";
     }
-    if (isCellSelected(rowIndex, colIndex)) {
+    if (isCellSelected(displayIndex, colIndex)) {
       return "bg-sky-900/40";
     }
     return "";
@@ -669,6 +729,9 @@
     if (!tab?.result) {
       return null;
     }
+    // Take the sort of the result being output now: the refetch below awaits, and the tab or
+    // the sort can change meanwhile (the output must follow what was on screen when it started)
+    const sortAtStart = activeSort;
     let full: api.QueryResult | null = null;
     preparingOutput = true;
     try {
@@ -687,7 +750,9 @@
         `The output was truncated at ${result.row_count.toLocaleString()} rows.`,
       );
     }
-    return result;
+    // Copy / Export follow the order on screen. A refetched full result is sorted by the same
+    // column (still "within the fetched rows": whatever was fetched is what gets sorted)
+    return reorderRows(result, sortAtStart);
   };
 
   // Copy button: copy the whole result table to the clipboard in the selected format.
@@ -1043,10 +1108,12 @@
     }
     // If switched to another tab, the input also disappears from the DOM, so commit likewise
     // (commitCellEdit pushes to the tab of editingCell.tabId, so it is correct even after the switch)
+    // editingCell.rowIndex is the original index; the render window is in display positions
+    const displayIndex = rowToDisplay.get(ec.rowIndex) ?? -1;
     if (
       ec.tabId !== activeTab?.id ||
-      ec.rowIndex < rowWindow.start ||
-      ec.rowIndex >= rowWindow.end
+      displayIndex < rowWindow.start ||
+      displayIndex >= rowWindow.end
     ) {
       commitCellEdit();
     }
@@ -1588,27 +1655,64 @@
                 #
               </th>
               {#each result.columns as column, colIndex (colIndex)}
-                <!-- Clicking a header selects that column. Dragging extends it to multiple columns -->
+                {@const sortDirection = sortDirectionOf(colIndex)}
+                <!-- Clicking a header selects that column. Dragging extends it to multiple columns.
+                     The arrow at the right edge (or Alt+click) sorts the fetched rows by the column:
+                     ascending -> descending -> off. Sorting never touches the selection behavior -->
                 <th
-                  class="sticky top-0 z-10 border-b border-r border-zinc-700 bg-zinc-800 p-0 text-left font-semibold {isColHeaderSelected(
+                  class="group sticky top-0 z-10 border-b border-r border-zinc-700 bg-zinc-800 p-0 text-left font-semibold {isColHeaderSelected(
                     colIndex,
                   )
                     ? 'text-zinc-100'
                     : 'text-zinc-300'}"
                 >
-                  <button
-                    class="block w-full cursor-pointer truncate px-2 py-1 text-left {isColHeaderSelected(
-                      colIndex,
-                    )
+                  <div
+                    class="flex items-stretch {isColHeaderSelected(colIndex)
                       ? 'bg-sky-800/50'
                       : ''}"
-                    title="{column} — Click to select this column (drag to select more)"
-                    data-annotate="button-result-col-header-{colIndex}"
-                    onpointerdown={(e) => beginSelect("col", 0, colIndex, e)}
-                    onpointerenter={(e) => extendSelect("col", 0, colIndex, e)}
                   >
-                    {column}
-                  </button>
+                    <button
+                      class="min-w-0 flex-1 cursor-pointer truncate px-2 py-1 text-left"
+                      title="{column} — Click to select this column (drag to select more). Alt+click to sort"
+                      data-annotate="button-result-col-header-{colIndex}"
+                      onpointerdown={(e) => {
+                        if (e.altKey) {
+                          // Alt+click sorts instead of selecting. Stop here so no drag selection starts
+                          e.preventDefault();
+                          toggleSort(colIndex);
+                          return;
+                        }
+                        beginSelect("col", 0, colIndex, e);
+                      }}
+                      onpointerenter={(e) => extendSelect("col", 0, colIndex, e)}
+                    >
+                      {column}
+                    </button>
+                    <button
+                      class="shrink-0 cursor-pointer px-1 py-1 text-[0.65rem] {sortDirection
+                        ? 'text-sky-300'
+                        : 'text-zinc-500 opacity-0 group-hover:opacity-100'}"
+                      title="Sort by {column} ({sortDirection === 'asc'
+                        ? 'ascending; click for descending'
+                        : sortDirection === 'desc'
+                          ? 'descending; click to turn off'
+                          : 'ascending'}) — sorted within the fetched rows{result.truncated ||
+                      result.applied_limit !== null
+                        ? ', not the whole table'
+                        : ''}"
+                      aria-label="Sort by {column}"
+                      data-annotate="button-result-col-sort-{colIndex}"
+                      onclick={() => toggleSort(colIndex)}
+                    >
+                      <i
+                        class="bi {sortDirection === 'asc'
+                          ? 'bi-sort-up-alt'
+                          : sortDirection === 'desc'
+                            ? 'bi-sort-down'
+                            : 'bi-arrow-down-up'}"
+                      ></i>
+                    </button>
+                  </div>
                 </th>
               {/each}
               <!-- Spacer column (corresponds to the last col of the colgroup) -->
@@ -1627,13 +1731,16 @@
                 ></td>
               </tr>
             {/if}
-            {#each result.rows.slice(rowWindow.start, rowWindow.end) as row, windowIndex (rowWindow.start + windowIndex)}
-              {@const rowIndex = rowWindow.start + windowIndex}
-              <tr class="hover:bg-zinc-800/60" data-row-index={rowIndex}>
+            <!-- displayIndex = position on screen (selection, row number, data-annotate);
+                 rowIndex = original index into result.rows (the data: edits, inspector, pending) -->
+            {#each rowOrder.slice(rowWindow.start, rowWindow.end) as rowIndex, windowIndex (rowIndex)}
+              {@const displayIndex = rowWindow.start + windowIndex}
+              {@const row = result.rows[rowIndex]}
+              <tr class="hover:bg-zinc-800/60" data-row-index={displayIndex}>
                 <!-- Clicking a row number selects that row. Dragging extends it to multiple rows -->
                 <td
                   class="border-b border-r border-zinc-800 p-0 text-right {isRowHeaderSelected(
-                    rowIndex,
+                    displayIndex,
                   )
                     ? 'bg-sky-800/50 text-zinc-300'
                     : 'text-zinc-600'}"
@@ -1641,11 +1748,11 @@
                   <button
                     class="block w-full cursor-pointer px-2 py-0.5 text-right"
                     title="Click to select this row (drag to select more)"
-                    data-annotate="button-result-row-header-{rowIndex}"
-                    onpointerdown={(e) => beginSelect("row", rowIndex, 0, e)}
-                    onpointerenter={(e) => extendSelect("row", rowIndex, 0, e)}
+                    data-annotate="button-result-row-header-{displayIndex}"
+                    onpointerdown={(e) => beginSelect("row", displayIndex, 0, e)}
+                    onpointerenter={(e) => extendSelect("row", displayIndex, 0, e)}
                   >
-                    {rowIndex + 1}
+                    {displayIndex + 1}
                   </button>
                 </td>
                 {#each row as value, colIndex (colIndex)}
@@ -1658,7 +1765,7 @@
                     class="relative border-b border-r border-zinc-800 p-0 {pending !==
                     null
                       ? 'bg-amber-900/40'
-                      : cellBgClass(rowIndex, colIndex)}"
+                      : cellBgClass(rowIndex, displayIndex, colIndex)}"
                   >
                     {#if isEditingCell(rowIndex, colIndex)}
                       {#if editingCell?.readonly}
@@ -1667,7 +1774,7 @@
                         <!-- svelte-ignore a11y_autofocus -->
                         <textarea
                           class="block w-full resize-none bg-zinc-950 px-2 py-0.5 font-mono text-xs text-zinc-200 ring-1 ring-sky-500 outline-none"
-                          data-annotate="input-result-cell-view-{rowIndex}-{colIndex}"
+                          data-annotate="input-result-cell-view-{displayIndex}-{colIndex}"
                           value={editingValue}
                           rows="1"
                           readonly
@@ -1680,7 +1787,7 @@
                         <!-- svelte-ignore a11y_autofocus -->
                         <input
                           class="block w-full bg-zinc-950 px-2 py-0.5 font-mono text-xs text-amber-100 ring-1 ring-amber-500 outline-none"
-                          data-annotate="input-result-cell-{rowIndex}-{colIndex}"
+                          data-annotate="input-result-cell-{displayIndex}-{colIndex}"
                           bind:value={editingValue}
                           autofocus
                           onkeydown={onEditKeydown}
@@ -1699,11 +1806,11 @@
                         title={editable
                           ? "Double-click to edit"
                           : cellText(value)}
-                        data-annotate="button-result-cell-{rowIndex}-{colIndex}"
+                        data-annotate="button-result-cell-{displayIndex}-{colIndex}"
                         onpointerdown={(e) =>
-                          beginSelect("cell", rowIndex, colIndex, e)}
+                          beginSelect("cell", displayIndex, colIndex, e)}
                         onpointerenter={(e) =>
-                          extendSelect("cell", rowIndex, colIndex, e)}
+                          extendSelect("cell", displayIndex, colIndex, e)}
                         onclick={() => onCellClick(rowIndex, colIndex)}
                         ondblclick={() => beginCellEdit(rowIndex, colIndex)}
                       >
@@ -1720,7 +1827,7 @@
                             : 'text-zinc-400 hover:text-zinc-100'}"
                           title="Copy this cell value"
                           aria-label="Copy this cell value"
-                          data-annotate="button-copy-cell-{rowIndex}-{colIndex}"
+                          data-annotate="button-copy-cell-{displayIndex}-{colIndex}"
                           onclick={() => copyCellValue(rowIndex, colIndex)}
                         >
                           <i
