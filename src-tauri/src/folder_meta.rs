@@ -133,6 +133,7 @@ mod tests {
             readonly: true,
             allow_dangerous_statements: false,
             group_name: Some("Production".to_string()),
+            color: None,
         }
     }
 

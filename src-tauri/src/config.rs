@@ -2960,6 +2960,7 @@ servers:
             readonly: false,
             allow_dangerous_statements: false,
             group_name: None,
+            color: None,
         };
         let info = ConnectionInfo::from(&server);
         let json = serde_json::to_string(&info).unwrap();
@@ -3198,6 +3199,7 @@ servers:
             readonly: false,
             allow_dangerous_statements: false,
             group_name: None,
+            color: None,
         }
     }
 
@@ -3357,6 +3359,7 @@ servers:
             readonly: false,
             allow_dangerous_statements: false,
             group_name: None,
+            color: None,
             tls: false,
             ssl_mode: None,
             ssl_root_cert: None,

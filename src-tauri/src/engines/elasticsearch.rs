@@ -1082,6 +1082,7 @@ mod tests {
             readonly: false,
             allow_dangerous_statements: false,
             group_name: None,
+            color: None,
             tls: true,
             ssl_mode: None,
             ssl_root_cert: None,
