@@ -34,18 +34,32 @@ const isNullish = (v: unknown): v is null | undefined =>
   v === null || v === undefined;
 
 // Integer / decimal / exponent, optionally signed. Matched against trimmed strings only
-// (" 12" is a text column value, not a number).
-const NUMERIC_STRING = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+// (" 12" is a text column value, not a number). The grammar is unambiguous (the fraction
+// digits always follow a literal dot) so the regex cannot backtrack quadratically on a long
+// digit run followed by a non-digit; `\d+\.?\d*` would (Codex found 5.6 s for one 40,000-digit cell).
+const NUMERIC_STRING = /^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
 // Plain decimal notation (no exponent): compared digit by digit so that DECIMAL / BIGINT
 // values beyond the precision of Number keep their order
-const DECIMAL_STRING = /^[+-]?\d+(\.\d*)?$|^[+-]?\.\d+$/;
+const DECIMAL_STRING = /^[+-]?(\d+(\.\d*)?|\.\d+)$/;
+// Cells longer than this are never treated as numbers (no real numeric column produces them;
+// a huge digit-only TEXT is still bounded work) and are compared as text by their prefix only.
+// Comparison cost must not grow with the total characters of a result (AGENTS.md), since
+// sortedRowOrder runs synchronously on the main thread
+const MAX_NUMERIC_CHARS = 64;
+const MAX_COMPARE_CHARS = 10_000;
 
 /// A value that the sort treats as a number: numbers, booleans (false < true) and numeric strings
 /// (BIGINT / DECIMAL arrive as strings from the backend when they exceed 2^53, see db.rs json_i64).
 function numericValue(v: unknown): number | null {
   if (typeof v === "number") return v;
   if (typeof v === "boolean") return v ? 1 : 0;
-  if (typeof v === "string" && NUMERIC_STRING.test(v)) return Number(v);
+  if (
+    typeof v === "string" &&
+    v.length <= MAX_NUMERIC_CHARS &&
+    NUMERIC_STRING.test(v)
+  ) {
+    return Number(v);
+  }
   return null;
 }
 
@@ -82,12 +96,23 @@ function compareDecimalStrings(a: string, b: string): number {
   return pa.neg ? -magnitude : magnitude;
 }
 
-const textOf = (v: unknown): string =>
-  typeof v === "string" ? v : typeof v === "object" ? JSON.stringify(v) : String(v);
+// Text key of a cell for comparison, cut to MAX_COMPARE_CHARS (cells beyond that compare
+// equal on their prefix and keep the fetched order, which is acceptable for a visual sort)
+const textOf = (v: unknown): string => {
+  const text =
+    typeof v === "string"
+      ? v
+      : typeof v === "object"
+        ? JSON.stringify(v)
+        : String(v);
+  return text.length > MAX_COMPARE_CHARS ? text.slice(0, MAX_COMPARE_CHARS) : text;
+};
 
 /// Ascending comparison of two non-null cell values. Both numeric (number / boolean /
 /// numeric string) -> numeric comparison, everything else -> locale-aware string comparison.
 /// null / undefined are not handled here: `sortedRowOrder` always puts them last.
+/// Bounded: numeric detection stops at MAX_NUMERIC_CHARS and text is compared on at most
+/// MAX_COMPARE_CHARS, so a 100KB TEXT cell cannot make one comparison expensive.
 export function compareCells(a: unknown, b: unknown): number {
   const na = numericValue(a);
   const nb = numericValue(b);

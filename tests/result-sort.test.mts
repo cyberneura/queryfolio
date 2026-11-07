@@ -61,6 +61,20 @@ test("big decimal strings keep their order and integers mix with them exactly", 
   assert.equal(compareCells(1000, "1e3"), 0);
 });
 
+test("a long digit run followed by a non-digit is text and does not backtrack", () => {
+  const pathological = "1".repeat(40_000) + "x";
+  const started = performance.now();
+  // Text (not numeric): sorts after numbers
+  assert.equal(compareCells(pathological, 5), 1);
+  assert.equal(compareCells(pathological, "text"), -1);
+  // Over MAX_NUMERIC_CHARS, even a pure digit run is compared as text
+  assert.equal(compareCells("9".repeat(100), 5), 1);
+  // The 100KB TEXT case: linear and cut to the compare prefix
+  const huge = "a".repeat(100_000);
+  assert.equal(compareCells(huge, huge + "b"), 0);
+  assert.ok(performance.now() - started < 200, "comparison must stay cheap");
+});
+
 test("booleans sort as 0 / 1 and objects by their JSON text", () => {
   assert.equal(compareCells(false, true), -1);
   assert.equal(compareCells(true, 1), 0);
