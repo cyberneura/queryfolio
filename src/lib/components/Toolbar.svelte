@@ -43,7 +43,15 @@
 >
   <span class="text-sm font-semibold text-zinc-200">Queryfolio</span>
   {#if appStore.selectedConnection}
-    <span class="text-xs text-zinc-500">
+    {@const color = appStore.connectionColorOf(appStore.selectedConnection)}
+    <!-- A colored connection tints the name (25% of its color) and, while Writable is ON, frames it
+         in the same color: "Writable on production" is meant to be hard to miss (CYBERNEURA-DEV-1207) -->
+    <span
+      class="rounded px-1.5 py-0.5 text-xs {color ? 'text-zinc-100' : 'text-zinc-500'}"
+      style:background-color={color ? `color-mix(in srgb, ${color} 25%, transparent)` : undefined}
+      style:box-shadow={color && appStore.writable ? `inset 0 0 0 1px ${color}` : undefined}
+      data-annotate="toolbar-connection-name"
+    >
       {appStore.selectedConnection}
       {#if appStore.selectedFile}
         / {appStore.selectedFile}

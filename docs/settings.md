@@ -127,6 +127,7 @@ servers:
 | `readonly` | no | See [Safety guards](#safety-guards). Default `false`. |
 | `allow_dangerous_statements` | no | See [Safety guards](#safety-guards). Default `false`. |
 | `folder_name` | no | Override the query-file folder name. See [Query file storage](#query-file-storage-sqlfiles_dir-folder_name). |
+| `color` | no | Marks the connection in the UI (queryfolio extension): a 3px bar at the left edge of its row in CONNECTIONS, a tint behind the connection name in the toolbar (framed in the same color while Writable is ON), and a dot on its editor / result tabs. A CSS color name (`red`, `orange`, …) or `#rrggbb` / `#rgb`. Anything else (including a list or number) is ignored with a warning on stderr (the connection stays uncolored; the config still loads). A [group](#connection-groups) can set a `color` for all its servers; a server's own `color` wins, and an invalid own `color` leaves that server uncolored rather than falling back to the group's. |
 | `ssh_tunnel` | no | Connect through an SSH tunnel. See [SSH tunnels](#ssh-tunnels-ssh_tunnel). |
 | `template` | no | Inherit keys from a named template. See [Connection templates](#connection-templates). |
 
@@ -483,11 +484,16 @@ Wrap servers in a `group_name` + nested `servers` entry to show them under a
 group heading in the connections list (queryfolio extension). Grouped and plain
 (ungrouped) servers can be mixed; the display order follows the config order.
 Groups cannot be nested (a group inside a group is an error), and a group entry
-may only contain `group_name` and `servers`.
+may only contain `group_name`, `servers` and `color`.
+
+A group `color` (same values as the per-server [`color`](#common-keys)) applies to
+every server in the group that does not set its own, so one line marks all of
+production in red:
 
 ```yaml
 servers:
   - group_name: production
+    color: "#b91c1c"         # applies to prod-main and prod-replica
     servers:
       - name: prod-main
         engine: mysql

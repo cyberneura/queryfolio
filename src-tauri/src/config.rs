@@ -319,6 +319,40 @@ pub struct ServerConfig {
     /// would bypass the group entry validation (empty check / unknown key rejection).
     #[serde(default, skip_deserializing)]
     pub group_name: Option<String>,
+    /// queryfolio extension: a color that marks the connection in the UI (left edge of the
+    /// connections row, toolbar background, dots on the editor / result tabs), so that a
+    /// production connection is told apart at a glance (CYBERNEURA-DEV-1207). A CSS named color
+    /// or `#rrggbb` / `#rgb`; parse_server_entries validates it with color::normalize_color and
+    /// drops anything else with a warning (the value goes into CSS). A server's own color wins
+    /// over the color of its group; an invalid own color leaves the server uncolored (it does
+    /// not fall back to the group). Read leniently (`color_value_to_raw`): a non-string value
+    /// (list / mapping / number) becomes an invalid color that is warned about and dropped,
+    /// instead of a deserialization error that would take every connection away.
+    #[serde(default, deserialize_with = "deserialize_lenient_color")]
+    pub color: Option<String>,
+}
+
+/// The raw text of a `color` value for validation. Strings as is; numbers and booleans as
+/// their text (they will fail validation with a readable warning); lists and mappings as a
+/// placeholder that also fails validation; null / missing as None.
+fn color_value_to_raw(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::Null => None,
+        serde_yaml::Value::String(s) => Some(s.clone()),
+        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        serde_yaml::Value::Sequence(_) => Some("<list>".to_string()),
+        serde_yaml::Value::Mapping(_) => Some("<mapping>".to_string()),
+        serde_yaml::Value::Tagged(t) => color_value_to_raw(&t.value),
+    }
+}
+
+fn deserialize_lenient_color<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_yaml::Value::deserialize(deserializer)?;
+    Ok(color_value_to_raw(&value))
 }
 
 /// A stable short hash of a string (the first 8 hex digits of FNV-1a 64-bit).
@@ -601,6 +635,9 @@ pub struct ConnectionInfo {
     pub allow_dangerous_statements: bool,
     /// Display group name in the connection list (null if not in a group)
     pub group_name: Option<String>,
+    /// Validated color of the connection (its own, else the group's; null if neither). Already
+    /// normalized by color::normalize_color, so the frontend can put it into CSS as is
+    pub color: Option<String>,
     /// Whether the password is fetched with password_command. Neither the command nor its
     /// output is passed on, only this fact
     pub password_from_command: bool,
@@ -632,6 +669,7 @@ impl From<&ServerConfig> for ConnectionInfo {
             readonly: server.readonly,
             allow_dangerous_statements: server.allow_dangerous_statements,
             group_name: server.group_name.clone(),
+            color: server.color.clone(),
             password_from_command: server.password_command.is_some(),
             // Go through parse_engine so engine name aliases (mariadb / postgresql) are also picked
             // up.
@@ -1363,17 +1401,19 @@ fn parse_server_entries(
         })?;
         reject_renamed_server_key(entry_value, source)?;
         if !entry.contains_key("servers") {
-            result.push(parse_server_entry(entry_value, templates, source)?);
+            let mut server = parse_server_entry(entry_value, templates, source)?;
+            server.color = validated_color(server.color.as_deref(), &server.name, source);
+            result.push(server);
             continue;
         }
 
         // Group entry. Reject unknown keys so typos are not silently swallowed
         for (key, _) in entry {
             let key = key.as_str().unwrap_or_default();
-            if key != "group_name" && key != "servers" {
+            if key != "group_name" && key != "servers" && key != "color" {
                 return Err(AppError::Config(format!(
                     "Unknown key '{key}' in a servers group entry in {source} \
-                     (only group_name / servers are allowed)"
+                     (only group_name / servers / color are allowed)"
                 )));
             }
         }
@@ -1387,6 +1427,12 @@ fn parse_server_entries(
                     "A servers group entry in {source} requires a non-empty group_name"
                 ))
             })?;
+        // The group's color applies to its servers that have none of their own. Read leniently
+        // like the server key, so a list / number is warned about instead of silently dropped
+        let group_color = entry
+            .get("color")
+            .and_then(color_value_to_raw)
+            .and_then(|raw| validated_color(Some(&raw), &format!("group '{group_name}'"), source));
         let grouped = entry
             .get("servers")
             .and_then(|v| v.as_sequence())
@@ -1410,10 +1456,31 @@ fn parse_server_entries(
             }
             let mut server = parse_server_entry(server_value, templates, source)?;
             server.group_name = Some(group_name.to_string());
+            // Only a server without a color of its own takes the group's; an invalid own
+            // color leaves it uncolored (it was set, just wrongly: do not paint it by surprise)
+            server.color = match server.color.as_deref() {
+                Some(raw) => validated_color(Some(raw), &server.name, source),
+                None => group_color.clone(),
+            };
             result.push(server);
         }
     }
     Ok(result)
+}
+
+/// The color of a server / group after validation. An invalid value is dropped (the connection
+/// stays uncolored) with a warning on stderr rather than failing the whole config: a typo in a
+/// cosmetic key must not take every connection away.
+fn validated_color(raw: Option<&str>, owner: &str, source: &str) -> Option<String> {
+    let raw = raw?;
+    let normalized = crate::color::normalize_color(raw);
+    if normalized.is_none() {
+        eprintln!(
+            "queryfolio: ignoring invalid color {raw:?} of {owner} in {source} \
+             (use a CSS color name or #rrggbb)"
+        );
+    }
+    normalized
 }
 
 fn parse_server_entry(
@@ -1683,6 +1750,92 @@ servers:
         // It also propagates to ConnectionInfo
         let info = ConnectionInfo::from(&servers[0]);
         assert_eq!(info.group_name.as_deref(), Some("production"));
+    }
+
+    #[tokio::test]
+    async fn test_connection_color_is_validated_and_inherited_from_the_group() {
+        // A server's own color wins over the group's; a group color fills in the rest; an
+        // invalid value is dropped (uncolored) instead of failing the config; the value is
+        // normalized (lowercase) so the frontend can use it as is
+        let config = config_from_yaml(
+            r#"
+servers:
+  - group_name: production
+    color: "#B91C1C"
+    servers:
+      - name: prod-main
+        engine: mysql
+        host: prod.example.com
+      - name: prod-replica
+        engine: mysql
+        host: replica.example.com
+        color: Orange
+      - name: prod-bad
+        engine: mysql
+        host: bad.example.com
+        color: "rgb(1,2,3)"
+      - name: prod-list
+        engine: mysql
+        host: list.example.com
+        color: [red]
+  - name: standalone
+    engine: sqlite
+    schema: /tmp/x.db
+    color: teal
+  - name: standalone-bad
+    engine: sqlite
+    schema: /tmp/y.db
+    color: "red; background: url(x)"
+  - name: standalone-number
+    engine: sqlite
+    schema: /tmp/z.db
+    color: 123
+  - group_name: development
+    color: [not, a, color]
+    servers:
+      - name: dev-db
+        engine: postgres
+        host: localhost
+"#,
+        );
+        let servers = config.resolve_servers().unwrap();
+        let summary: Vec<(&str, Option<&str>)> = servers
+            .iter()
+            .map(|s| (s.name.as_str(), s.color.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("prod-main", Some("#b91c1c")),
+                ("prod-replica", Some("orange")),
+                // An invalid own color does not fall back to the group's
+                ("prod-bad", None),
+                // A non-string value is invalid (warned about), not a config error
+                ("prod-list", None),
+                ("standalone", Some("teal")),
+                ("standalone-bad", None),
+                ("standalone-number", None),
+                ("dev-db", None),
+            ]
+        );
+        let info = ConnectionInfo::from(&servers[0]);
+        assert_eq!(info.color.as_deref(), Some("#b91c1c"));
+    }
+
+    #[tokio::test]
+    async fn test_group_entry_rejects_keys_other_than_name_servers_color() {
+        let config = config_from_yaml(
+            r#"
+servers:
+  - group_name: production
+    colour: red
+    servers:
+      - name: prod-main
+        engine: mysql
+"#,
+        );
+        let err = config.resolve_servers().unwrap_err().to_string();
+        assert!(err.contains("colour"), "unexpected error: {err}");
     }
 
     #[tokio::test]

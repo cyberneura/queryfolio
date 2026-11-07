@@ -3058,6 +3058,11 @@ export default {
   get writable() {
     return writable;
   },
+  /// The validated color of a connection (see ConnectionInfo.color), null if none / unknown
+  connectionColorOf(name: string | null): string | null {
+    if (!name) return null;
+    return connections.find((c) => c.name === name)?.color ?? null;
+  },
   /// Whether the selected connection is readonly: true in config (cannot be lifted by the switch).
   /// false if no connection is selected. Used for the toggle's lock display
   get selectedConnectionReadonly() {

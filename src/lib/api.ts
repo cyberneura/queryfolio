@@ -55,6 +55,9 @@ export interface ConnectionInfo {
   allow_dangerous_statements: boolean;
   /// Display group name in the connection list (null if not in a group)
   group_name: string | null;
+  /// Color marking the connection (its own or its group's; validated and normalized by the
+  /// backend: a CSS color name or #rrggbb / #rgb). null when neither is set
+  color: string | null;
   /// Whether the password is fetched with password_command (neither the command nor its
   /// output is passed to the frontend)
   password_from_command: boolean;
