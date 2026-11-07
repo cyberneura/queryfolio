@@ -903,6 +903,9 @@
     onClose={() => {
       showSearch = false;
     }}
+    onOpenTable={() => {
+      leftPaneTab = "tables";
+    }}
   />
 {/if}
 

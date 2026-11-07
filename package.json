@@ -1,6 +1,6 @@
 {
   "name": "queryfolio",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "",
   "type": "module",
   "scripts": {
@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
-    "test": "node --experimental-strip-types tests/result-sort.test.mts",
+    "test": "node --experimental-strip-types tests/result-sort.test.mts && node --experimental-strip-types tests/search-items.test.mts",
     "tauri": "APPLE_SIGNING_IDENTITY='Developer ID Application: Cyberneura K.K. (2YN5TLNQ9J)' tauri",
     "release": "bash scripts/release.sh",
     "notices": "bash scripts/generate-third-party-notices.sh",

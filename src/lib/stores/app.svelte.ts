@@ -1,6 +1,7 @@
 import { toast } from "svelte-sonner";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import * as api from "$lib/api";
+import type { LoadedTables } from "$lib/searchItems";
 import type {
   AiInfo,
   ChatToolCall,
@@ -125,6 +126,20 @@ let errorMessage = $state<string | null>(null);
 let loadingConnections = $state(false);
 let schemas = $state<string[]>([]);
 let activeSchema = $state<string | null>(null);
+/// The table list the TABLES pane fetched last (connection + database it belongs to), for the
+/// Cmd+K search (CYBERNEURA-DEV-1208). null until TablesPane loads one; the search never
+/// fetches tables itself, so it does not open a connection just to search
+let loadedTables = $state<LoadedTables | null>(null);
+/// A request from the search modal to expand (and scroll to) a table in the TABLES pane.
+/// seq makes each request distinct so the pane can tell a new one from the last handled
+let tableRevealRequest = $state<{
+  connection: string;
+  /// The active database when the table was chosen (null when the connection has none)
+  database: string | null;
+  qualifiedName: string;
+  seq: number;
+} | null>(null);
+let tableRevealSeq = 0;
 /// AI settings info (null if not yet fetched or the fetch failed)
 let aiInfo = $state<AiInfo | null>(null);
 /// AI settings resolution error (unknown provider etc.; shown via the button's title)
@@ -357,6 +372,9 @@ const reloadConnectionsUnguarded = async (): Promise<boolean> => {
   endChatTransition();
   const previousConnection = selectedConnection;
   selectedConnection = null;
+  // The connection set changes, so a table list loaded before the reload must not feed the search
+  loadedTables = null;
+  tableRevealRequest = null;
   // The connections are replaced by the settings reload, so also return Writable to the safe side (OFF)
   writable = false;
   setFileEntries([]);
@@ -647,6 +665,14 @@ const maybeDisconnectIfIdle = (connection: string) => {
     return;
   }
   resourcesLoaded.delete(connection);
+  // The table list of a closed connection is no longer "loaded" for the Cmd+K search
+  // (the TABLES pane reloads it when opened again)
+  if (loadedTables?.connection === connection) {
+    loadedTables = null;
+  }
+  if (tableRevealRequest?.connection === connection) {
+    tableRevealRequest = null;
+  }
   // Record the disconnect event. If this connection's schema import is in flight, detect on completion that
   // "it was disconnected while waiting" and prevent registration as established (avoids defeating the lazy lifecycle).
   bumpConnectionLifecycle(connection);
@@ -3128,6 +3154,35 @@ export default {
   },
   get schemas() {
     return schemas;
+  },
+  /// The table list the TABLES pane fetched last (see loadedTables)
+  get loadedTables() {
+    return loadedTables;
+  },
+  /// Published by TablesPane after list_tables (null when it shows SCHEMAS, failed or has no
+  /// connection). Cleared on config reload because the connection set changes
+  setLoadedTables(value: LoadedTables | null) {
+    loadedTables = value;
+  },
+  get tableRevealRequest() {
+    return tableRevealRequest;
+  },
+  /// Ask the TABLES pane to expand the table and scroll to it (the search modal's table item).
+  /// The pane handles it only for the same connection + database, and consumes it when done
+  revealTable(connection: string, database: string | null, qualifiedName: string) {
+    tableRevealRequest = {
+      connection,
+      database,
+      qualifiedName,
+      seq: ++tableRevealSeq,
+    };
+  },
+  /// Drop the request once handled (or found impossible), so re-mounting the pane does not
+  /// expand / scroll again
+  consumeTableReveal(seq: number) {
+    if (tableRevealRequest?.seq === seq) {
+      tableRevealRequest = null;
+    }
   },
   get activeSchema() {
     return activeSchema;
