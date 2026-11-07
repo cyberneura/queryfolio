@@ -1758,7 +1758,7 @@ servers:
         // invalid value is dropped (uncolored) instead of failing the config; the value is
         // normalized (lowercase) so the frontend can use it as is
         let config = config_from_yaml(
-            r#"
+            r##"
 servers:
   - group_name: production
     color: "#B91C1C"
@@ -1796,7 +1796,7 @@ servers:
       - name: dev-db
         engine: postgres
         host: localhost
-"#,
+"##,
         );
         let servers = config.resolve_servers().unwrap();
         let summary: Vec<(&str, Option<&str>)> = servers
