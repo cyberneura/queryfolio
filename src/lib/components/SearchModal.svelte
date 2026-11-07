@@ -47,6 +47,14 @@
     buildSearchItems(connMatches, fileHits, tableMatches),
   );
 
+  /// Identity of a candidate across rebuilds of `items` (kind + name)
+  const itemKey = (item: SearchItem): string =>
+    item.kind === "connection"
+      ? `connection:${item.name}`
+      : item.kind === "file"
+        ? `file:${item.hit.file_name}`
+        : `table:${item.table.qualified_name}`;
+
   /// Run the file search debounced on query change. Files are searched only for the selected
   /// connection (to reach files in other connections, switch connections).
   $effect(() => {
@@ -66,7 +74,15 @@
       try {
         const hits = await api.searchQueryFiles(connection, q);
         if (gen === searchGeneration) {
+          // Files are inserted before the (synchronous) table candidates, so keep the
+          // highlighted candidate by identity rather than by index: a table chosen with the
+          // arrow keys must not turn into a file when the file search settles
+          const current = items[activeIndex];
           fileHits = hits;
+          if (current) {
+            const index = items.findIndex((item) => itemKey(item) === itemKey(current));
+            if (index >= 0) activeIndex = index;
+          }
         }
       } catch {
         // On search failure, empty the results (the modal stays open)

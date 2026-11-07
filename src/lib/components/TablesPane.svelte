@@ -65,6 +65,15 @@
     filterQuery = "";
   };
 
+  // The filter belongs to one list: when the pane switches between SCHEMAS and TABLES (a database
+  // was chosen, or the connection changed), a query typed for the other list would hide
+  // everything ("shop" typed to find the database would then filter the tables), so drop it
+  $effect(() => {
+    void appStore.tablesPaneListsSchemas;
+    void appStore.selectedConnection;
+    closeFilter();
+  });
+
   /// Tables matching the filter (TABLES mode): qualified name, bare name and schema
   const visibleTables = $derived(
     tables.filter((t) =>
