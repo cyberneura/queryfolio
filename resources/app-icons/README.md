@@ -30,3 +30,9 @@ Queryfolio keeps the size-specific stroke widths and reduced band counts from
 `generate.py`. The final small-image pass uses AppKit's rounded-plate alpha
 mask, because the Python circular corner approximation triggers a native frame.
 The colors and cylinder strokes still come from the Python renderer.
+
+Artwork is decoded with ImageIO, preserving embedded profiles, and drawn into
+explicit sRGB buffers. PNG export must retain an sRGB chunk; avoid a PNG
+encode/decode round trip through NSBitmapImageRep, which can re-export
+`gAMA=2.2` and make dark colors pale in other decoders. The shared helper rejects
+missing sRGB or conflicting gamma/ICC metadata before native verification.
