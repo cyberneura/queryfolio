@@ -260,41 +260,17 @@ fab -l                  # fab タスク一覧 (dev / check / unittest / build_lo
 
 `config.example.yaml` 参照。mssql (エイリアス sqlserver、queryfolio 独自拡張) は `schema` を database 名として扱い (省略時 master)、user / password の SQL Server 認証で繋ぐ。SQL エンジンなのでメタコマンド / `\c` / EXPLAIN (SHOWPLAN 疑似文) / auto LIMIT (TOP) / Format / AI / TABLES / SSH トンネルが使え、セル編集のみ非対応。`ssl_mode` / `tls` / `ssl_root_cert` は mysql / postgres と同じ (verify-ca は verify-full 相当)。sqlite は `schema` を DB ファイルパスとして扱う独自拡張。duckdb (queryfolio 独自拡張) も同様に `schema` (無ければ `host`) を DB ファイルパスとして扱うが、ファイルが存在しなければエラー (新規作成しない)。SQL エンジンなのでメタコマンド / EXPLAIN / auto LIMIT / Format / AI / TABLES は他の SQL エンジンと同様に使え、セル編集と `\c` (schema がファイルパスのため) のみ非対応。redis (エイリアス valkey、queryfolio 独自拡張) は `schema` を database 番号として扱い、エディタは 1 行 = 1 コマンド。**エディタ上部の Database: 欄で DB 番号を切り替えられる** (CYBERNEURA-DEV-408。選択肢は `CONFIG GET databases` から作り、取れなければ既定の 16。切替は SQL 系と同じく schema override + プール張り直しで効く)。Writable OFF 中は読み取りコマンドのホワイトリストのみ許可、FLUSHALL / FLUSHDB / SHUTDOWN / DEBUG は `allow_dangerous_statements` が必要。クエリファイルは `.redis` 拡張子で、TABLES / Explain / Format / セル編集 / AI は非対応 (capabilities で UI ごと隠れる)。elasticsearch (エイリアス es / opensearch、queryfolio 独自拡張) は host/port (デフォルト 9200) + user/password (Basic 認証) + `tls: true` (https、queryfolio 独自拡張) で接続し、エディタは Kibana Console 風のリクエストブロック。Writable OFF 中は GET/HEAD + 検索系 POST のホワイトリストのみ許可、インデックス削除 (`DELETE /<index>`) と `_delete_by_query` は `allow_dangerous_statements` が必要。クエリファイルは `.es` 拡張子で、TABLES (インデックス + mapping フィールド) は対応、スキーマ切替 / Explain / Format / セル編集 / AI は非対応。dynamodb (queryfolio 独自拡張) は PartiQL を ExecuteStatement API で実行する SQL エディタのエンジンで、`schema` = AWS リージョン (必須)、`host`/`port` = dynamodb-local 等のエンドポイント上書き (`tls: true` で https、port 省略時 8000)、認証は user/password (静的アクセスキー) → `aws_profile` (queryfolio 独自拡張、~/.aws のプロファイル名) → 既定の credentials chain の順。PartiQL に LIMIT 句が無いため auto LIMIT は付与されず API の limit + max_rows で行数を抑える。クエリファイルは `.sql` 拡張子で、TABLES (テーブル + キースキーマ / 属性定義) と Format は対応、メタコマンド / スキーマ切替 / Explain / セル編集 / AI / SSH トンネルは非対応。**`tables` (末尾のセミコロン可) はテーブル一覧を返す queryfolio 独自の文**で、PartiQL に SHOW TABLES が無いため ExecuteStatement を経由せず ListTables に流す。純粋な読み取りなので readonly / dangerous ガードより前で処理し、Writable OFF でも実行できる (CYBERNEURA-DEV-406)。Writable OFF 中は SELECT のみ、WHERE 無しの UPDATE / DELETE は `allow_dangerous_statements` が必要。
 
-## アプリアイコン
+## macOS app icon
 
-アイコンは `resources/app-icons/generate.py` が**サイズごとに描き分ける** (標準ライブラリのみ)。
-出力済みのマスターは `resources/app-icons/rendered/` にあり、`.icns` はそれを束ねたもの。
+Run `bash scripts/generate-macos-icons.sh` with Xcode on macOS. Fixed artwork,
+layout measurements, size-specific sources and the verification command are in
+`resources/app-icons/README.md`. Small @1x backgrounds reach the canvas edges;
+the glyph fits inside the central 80%. Larger backgrounds have 10% outer margins.
+Do not replace the generated ICNS with `tauri icon` / `iconutil`: preserve the
+ARGB small entries and the matching Assets.car / CFBundleIconName registration.
+Native rendering is verified by `.github/workflows/macos-icons.yml`.
 
-```shell
-python3 resources/app-icons/generate.py resources/app-icons/rendered
-python3 ../astragal/resources/app-icons/build_icns.py \
-  resources/app-icons/rendered src-tauri/icons/icon.icns
-```
-
-`src-tauri/icons/` の PNG は `rendered/` からコピーする
-(`32x32.png` ← `icon-32.png` / `64x64.png` ← `icon-64.png` /
-`128x128.png` ← `icon-128.png` / `128x128@2x.png` ← `icon-256.png` /
-`icon.png` ← `icon-512.png`)。
-
-**1 枚のマスターを縮小して作らないこと。** 円柱の線は 1024px キャンバスで 32px (3.1%) なので、
-32px へ縮小すると 1px になって潰れる。Finder のリスト表示やメニューのように小さいサイズを
-引く場所では、そのサイズのエントリの中身がそのまま見える。
-
-`generate.py` は小さいサイズで 2 つの手当てをする:
-
-- `MIN_STROKE` … 16 / 32 / 64px だけ線幅の下限を上げる (128 以上は比例のまま = 従来と同じ絵)
-- `BAND_COUNT` … 16px は帯 2 本、32px は 3 本に減らす。4 本のままだと隙間が 1px 未満になって
-  白い塊に潰れる
-
-形の数値 (角丸半径・楕円・帯の位置) は既存の 1024px アイコンを採寸して決めた。変えるとアプリの
-見た目が変わるので、触る時は `rendered/icon-1024.png` を元画像と見比べること。
-
-**`.icns` は `build_icns.py` で作り、エントリを大きい順 (先頭が 1024px) に並べる。**
-1Password の SSH キー許可ダイアログは icns の先頭のエントリを拡大して表示するため、
-`pnpm tauri icon` / `iconutil` が書く小さい順 (先頭が 16px) の icns ではぼやける。
-
-`.icns` の中身は `../astragal/resources/app-icons/inspect_icns.py` で一覧できる。
-icns を扱う道具は astragal に集約してあり、このリポジトリには置かない。
+The small-size generator retains size-specific stroke widths and fewer cylinder bands.
 
 ## 開発上の注意
 
