@@ -57,7 +57,7 @@ def _inside_round_rect(x, y, left, top, side, radius):
     return math.hypot(x - cx, y - cy) <= radius
 
 
-def render(size: int, supersample: int = 4) -> list[bytearray]:
+def render(size: int, supersample: int = 4, small: bool = False) -> list[bytearray]:
     s = size / REF
     left = top = SQ_INSET * s
     side = SQ_SIDE * s
@@ -66,6 +66,17 @@ def render(size: int, supersample: int = 4) -> list[bytearray]:
     cx = CYL_CX * s
     rx, ry = CYL_RX * s, CYL_RY * s
     centers = [c * s for c in band_centers(size)]
+    if small:
+        # Background and glyph have independent bounds. Keep the per-size strokes
+        # and band counts while fitting the complete mark into the central 80%.
+        left = top = 0.0
+        side = float(size)
+        radius = size * SQ_RADIUS / SQ_SIDE
+        factor = (size * 0.8 - 2 * half) / max(2 * CYL_RX, BAND_CY[-1] - BAND_CY[0] + 2 * CYL_RY)
+        cx = size / 2
+        rx, ry = CYL_RX * factor, CYL_RY * factor
+        mid_y = (BAND_CY[0] + BAND_CY[-1]) / 2
+        centers = [size / 2 + (c - mid_y) * factor for c in band_centers(size)]
     body_top, body_bottom = centers[0], centers[-1]
     side_x = (cx - rx, cx + rx)
 
@@ -136,6 +147,17 @@ def write_png(path: Path, size: int, rows: list[bytearray]) -> None:
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) == 3 and argv[1] == "--mac-small":
+        out_dir = Path(argv[2])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for size in (16, 32):
+            rows = render(size, small=True)
+            for y, row in enumerate(rows):
+                for x in range(size):
+                    if x == 0 or y == 0 or x == size - 1 or y == size - 1:
+                        row[x * 4 + 3] = min(239, row[x * 4 + 3])
+            write_png(out_dir / f"icon_{size}x{size}.png", size, rows)
+        return 0
     out_dir = Path(argv[1]) if len(argv) > 1 else Path(__file__).parent / "rendered"
     out_dir.mkdir(parents=True, exist_ok=True)
     for size in SIZES:
