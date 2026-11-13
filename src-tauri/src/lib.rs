@@ -1,5 +1,6 @@
 mod ai;
 mod cli;
+mod cli_install;
 mod color;
 mod config;
 mod db;
@@ -2294,6 +2295,8 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
     let app_menu = {
         use tauri::menu::PredefinedMenuItem;
 
+        let install_cli_item =
+            MenuItemBuilder::with_id("install_cli", "Install Command Line Tools…").build(app)?;
         let package_info = app.package_info();
         SubmenuBuilder::new(app, package_info.name.clone())
             .item(&PredefinedMenuItem::about(
@@ -2303,6 +2306,7 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
             )?)
             .item(&licenses_item)
             .item(&update_item)
+            .item(&install_cli_item)
             .separator()
             .services()
             .separator()
@@ -2630,6 +2634,32 @@ fn run_stats(weeks: u32) -> Result<String, AppError> {
     Ok(history_stats::format_stats(&weeks, &total))
 }
 
+/// The menu's Install Command Line Tools…. It may wait for the administrator password, so it
+/// does not block the thread that handles menu events
+#[cfg(target_os = "macos")]
+fn install_cli(app: tauri::AppHandle) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+    std::thread::spawn(move || {
+        let (kind, title, message) = match cli_install::install() {
+            Ok(installed) => (
+                MessageDialogKind::Info,
+                "Installed the queryfolio command",
+                installed,
+            ),
+            Err(e) => (
+                MessageDialogKind::Error,
+                "Failed to install the queryfolio command",
+                e,
+            ),
+        };
+        app.dialog()
+            .message(message)
+            .title(title)
+            .kind(kind)
+            .show(|_| {});
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     use tauri::Emitter;
@@ -2649,18 +2679,36 @@ pub fn run() {
         if let Some(command) = cli::info_command_from_args(&argv) {
             std::process::exit(run_info_command(command));
         }
-        match router::route_from_cli_args(&argv) {
-            Some(route) => match apply_cli_write_route(&route) {
-                Ok(config) => config,
-                Err(e) => {
-                    // Do not go to open something that could not be written. Make it possible for the
-                    // caller of the CLI to tell the failure from the exit status.
-                    eprintln!("[cli] failed to write the query file: {e}");
-                    std::process::exit(1);
+        let route = router::route_from_cli_args(&argv);
+        let config = match &route {
+            Some(route) if !cli_install::write_already_done(&argv) => {
+                match apply_cli_write_route(route) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        // Do not go to open something that could not be written. Make it possible for the
+                        // caller of the CLI to tell the failure from the exit status.
+                        eprintln!("[cli] failed to write the query file: {e}");
+                        std::process::exit(1);
+                    }
                 }
-            },
-            None => None,
+            }
+            _ => None,
+        };
+        // Started from the terminal through the installed command: hand the launch to
+        // LaunchServices after the write (see cli_install.rs)
+        #[cfg(target_os = "macos")]
+        if cli_install::invoked_via_symlink() {
+            let cwd = std::env::current_dir().ok();
+            let args = cli_install::relaunch_args(route.as_ref(), cwd.as_deref());
+            std::process::exit(match cli_install::launch_app(&args) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("queryfolio: {e}");
+                    1
+                }
+            });
         }
+        config
     };
 
     tauri::Builder::default()
@@ -2720,6 +2768,8 @@ pub fn run() {
                 }
             }
             "check_for_updates" => update_check::check_for_updates(app),
+            #[cfg(target_os = "macos")]
+            "install_cli" => install_cli(app.clone()),
             "view_override_config" => {
                 if let Err(e) = app.emit("menu-view-override-config", ()) {
                     eprintln!("[menu] failed to emit view override config event: {e}");
