@@ -135,6 +135,19 @@ queryfolio open /Users/me/.config/queryfolio/sqlfiles/reporting/monthly.sql
 
 Only files directly under a connection folder inside the query files directory (`sqlfiles_dir`) can be opened. Paths outside that directory, unknown folders, non-`.sql` files, and `..` traversal are rejected. The connection that owns the folder is selected automatically and the file is opened in a new editor tab.
 
+### Installing the `queryfolio` command (macOS)
+
+Choose **Queryfolio › Install Command Line Tools…** in the menu bar. It links
+`/usr/local/bin/queryfolio` to the executable inside the app (asking for an administrator
+password when `/usr/local/bin` is not writable), so `queryfolio` works from any terminal.
+Run it again after moving the app; an existing file at that path that is not a symlink is
+left alone and reported.
+
+Launched through that link, `queryfolio` does what was asked (printing, or writing the file)
+in the terminal and then hands the window part to macOS, so the app does not stay tied to
+the terminal. Without the link, call the executable inside the bundle:
+`/Applications/Queryfolio.app/Contents/MacOS/queryfolio`.
+
 ### Writing a query file from the CLI
 
 `write` takes a connection name and a file name instead of a path, so the query files directory and the connection's folder name do not have to be known by the caller. The content can be given as the third argument or piped in on stdin. This is mainly meant for AI agents that prepare a query for a human to review and run.
@@ -195,7 +208,7 @@ On Windows the release build is linked as a GUI application and has no console o
 
 Two consequences of that remain, and they are deliberate rather than oversights: because the shell does not wait for a GUI-subsystem program, in an interactive `cmd.exe` or PowerShell session the output can arrive after the prompt has already been redrawn, and `%ERRORLEVEL%` / `$LASTEXITCODE` will not carry the exit code of the option you ran. Removing them would mean shipping a second, console-subsystem executable in the installer, which puts a console window on every GUI launch. Use `Start-Process -Wait queryfolio -ArgumentList '--list-servers'` when you need the shell to wait.
 
-On macOS, call the binary inside the bundle — `open -a Queryfolio --args --list-servers` does not give you the output back:
+On macOS, use the installed `queryfolio` command (see above) or call the binary inside the bundle — `open -a Queryfolio --args --list-servers` does not give you the output back:
 
 ```shell
 /Applications/Queryfolio.app/Contents/MacOS/queryfolio --list-servers

@@ -130,7 +130,8 @@ STATS
     (no SQL, no connection names, no hosts), and nothing is sent anywhere.
     --weeks defaults to 8.
 
-On macOS the app bundle takes the same arguments after --args:
+On macOS, Queryfolio > Install Command Line Tools... puts this command at
+/usr/local/bin/queryfolio. The app bundle also takes the same arguments after --args:
 
     open -a Queryfolio --args open /path/to/query.sql
 "
