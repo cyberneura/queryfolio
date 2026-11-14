@@ -101,7 +101,8 @@
     }
   };
 
-  /// Right-click menu of a table / database row (only for engines that can dump)
+  /// Right-click menu of a table / database row (only for engines that can dump or show a
+  /// table definition)
   interface ContextMenu {
     x: number;
     y: number;
@@ -109,6 +110,9 @@
     /// null = the active schema
     database: string | null;
     table: DumpTable | null;
+    /// The table's name for `\d+`: always `schema.table` when the engine reports a schema;
+    /// null for a database row
+    definitionName: string | null;
   }
   let contextMenu = $state<ContextMenu | null>(null);
   /// Open dump dialog (the connection is fixed when it opens)
@@ -119,6 +123,9 @@
   } | null>(null);
 
   const canDump = $derived(appStore.selectedCapabilities?.supports_dump === true);
+  const canShowDefinition = $derived(
+    appStore.selectedCapabilities?.supports_table_definition === true,
+  );
 
   /// Right-click on a database row (SCHEMAS mode; only the current connection's list is shown)
   const openSchemaMenu = (event: MouseEvent, schema: string) => {
@@ -127,14 +134,21 @@
       return;
     }
     event.preventDefault();
-    contextMenu = { x: event.clientX, y: event.clientY, connection, database: schema, table: null };
+    contextMenu = {
+      x: event.clientX,
+      y: event.clientY,
+      connection,
+      database: schema,
+      table: null,
+      definitionName: null,
+    };
   };
 
   /// Right-click on a table row. The row may still belong to the previous connection / database
   /// while the next list loads, so the dump targets where the list came from, and is not offered
   /// at all when that is no longer the selection
   const openTableMenu = (event: MouseEvent, table: TableInfo) => {
-    if (!canDump) {
+    if (!canDump && !canShowDefinition) {
       return;
     }
     event.preventDefault();
@@ -151,7 +165,40 @@
       connection: tablesConnection,
       database: tablesDatabase,
       table: { schema: table.schema, name: table.name },
+      definitionName: definitionNameOf(table),
     };
+  };
+
+  /// The name "Show definition" asks for. Not `qualified_name`: that one is made for inserting
+  /// into SQL and leaves the default schema out (`public` on PostgreSQL), so on a connection
+  /// whose search_path puts another schema first, `users` would resolve to a different table
+  /// than the `public.users` row that was clicked. The schema the row actually has is kept
+  const definitionNameOf = (table: TableInfo): string =>
+    table.schema ? `${table.schema}.${table.name}` : table.name;
+
+  /// Whether a table name can be given to a meta command. Same shape as the backend's
+  /// validate_relation_name (simple identifiers, at most `schema.table`): names with spaces,
+  /// hyphens or quotes are rejected there, so "Show definition" is disabled for them
+  /// (`\w` without the u flag is exactly the ASCII letters, digits and `_`; `[^\W\d]` is
+  /// therefore an ASCII letter or `_`)
+  const isMetaCommandName = (name: string): boolean =>
+    /^[^\W\d][\w$]*(\.[^\W\d][\w$]*)?$/.test(name);
+
+  /// "Show definition": run the meta command `\d+ <table>` like a statement typed in the editor
+  /// (same guards, a normal result tab, an entry in the history). The editor is not touched.
+  /// The menu was opened for the selected connection and database; if either changed while it
+  /// was open, do nothing rather than show a table of the same name in another database
+  const showDefinition = (menu: ContextMenu) => {
+    contextMenu = null;
+    if (
+      !menu.definitionName ||
+      !isMetaCommandName(menu.definitionName) ||
+      menu.connection !== appStore.selectedConnection ||
+      menu.database !== (appStore.activeSchema || null)
+    ) {
+      return;
+    }
+    void appStore.runQuery(`\\d+ ${menu.definitionName}`);
   };
 
   const openDump = (
@@ -602,10 +649,29 @@
   >
     <div
       class="fixed min-w-44 rounded border border-zinc-700 bg-zinc-800 py-1 text-xs text-zinc-200 shadow-xl"
-      style="left: {Math.min(menu.x, window.innerWidth - 240)}px; top: {Math.min(menu.y, window.innerHeight - 72)}px"
+      style="left: {Math.min(menu.x, window.innerWidth - 300)}px; top: {Math.min(menu.y, window.innerHeight - 96)}px"
       role="menu"
     >
-      {#if menu.table}
+      {#if menu.table && canShowDefinition}
+        {@const supportedName = isMetaCommandName(menu.definitionName ?? "")}
+        <button
+          class="flex w-full items-center gap-2 px-3 py-1 text-left hover:bg-zinc-700 disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
+          role="menuitem"
+          title={supportedName
+            ? `Indexes, foreign keys and the CREATE statement (runs \\d+ ${menu.definitionName})`
+            : "Not available for this table: \\d+ only takes simple names (letters, digits, _ and $)"}
+          disabled={!supportedName}
+          data-annotate="menu-show-definition"
+          onclick={(e) => {
+            e.stopPropagation();
+            showDefinition(menu);
+          }}
+        >
+          <i class="bi bi-diagram-3" aria-hidden="true"></i>
+          Show definition of "{menu.table.name}"
+        </button>
+      {/if}
+      {#if menu.table && canDump}
         <button
           class="flex w-full items-center gap-2 px-3 py-1 text-left hover:bg-zinc-700"
           role="menuitem"
@@ -619,22 +685,24 @@
           Dump table "{menu.table.name}"...
         </button>
       {/if}
-      <button
-        class="flex w-full items-center gap-2 px-3 py-1 text-left hover:bg-zinc-700"
-        role="menuitem"
-        data-annotate="menu-dump-database"
-        onclick={(e) => {
-          e.stopPropagation();
-          openDump(menu.connection, menu.database, null);
-        }}
-      >
-        <i class="bi bi-database-down" aria-hidden="true"></i>
-        Dump database{menu.database
-          ? ` "${menu.database}"`
-          : appStore.activeSchema
-            ? ` "${appStore.activeSchema}"`
-            : ""}...
-      </button>
+      {#if canDump}
+        <button
+          class="flex w-full items-center gap-2 px-3 py-1 text-left hover:bg-zinc-700"
+          role="menuitem"
+          data-annotate="menu-dump-database"
+          onclick={(e) => {
+            e.stopPropagation();
+            openDump(menu.connection, menu.database, null);
+          }}
+        >
+          <i class="bi bi-database-down" aria-hidden="true"></i>
+          Dump database{menu.database
+            ? ` "${menu.database}"`
+            : appStore.activeSchema
+              ? ` "${appStore.activeSchema}"`
+              : ""}...
+        </button>
+      {/if}
     </div>
   </div>
 {/if}

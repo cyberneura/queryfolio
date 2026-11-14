@@ -33,6 +33,8 @@ export interface EngineCapabilities {
   supports_dump: boolean;
   /// Whether the PROCESS LIST pane is supported (mysql / postgres)
   supports_process_list: boolean;
+  /// Whether `\d+ <table>` (indexes, foreign keys, CREATE statement) is supported
+  supports_table_definition: boolean;
 }
 
 export interface ConnectionInfo {
