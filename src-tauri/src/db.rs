@@ -3786,6 +3786,19 @@ mod tests {
             .collect();
         assert_eq!(column_names, vec!["id", "name", "score"]);
 
+        // \d+ <table>: the CREATE statement (plus indexes / foreign keys) as kind / name / definition
+        let result = run_query(&pool, "\\d+ t", 10, None, false, false).await.unwrap();
+        assert_eq!(result.columns, vec!["kind", "name", "definition"]);
+        assert_eq!(result.rows[0][0], serde_json::json!("table"));
+        assert_eq!(result.rows[0][1], serde_json::json!("t"));
+        assert!(result.rows[0][2]
+            .as_str()
+            .is_some_and(|sql| sql.to_ascii_uppercase().starts_with("CREATE TABLE")));
+        // A table that does not exist is an empty result, an unsafe name an error
+        let result = run_query(&pool, "\\d+ nope", 10, None, false, false).await.unwrap();
+        assert_eq!(result.row_count, 0);
+        assert!(run_query(&pool, "\\d+ t'x", 10, None, false, false).await.is_err());
+
         // An unsupported meta command is an error
         assert!(run_query(&pool, "\\du", 10, None, false, false).await.is_err());
 
@@ -4204,6 +4217,8 @@ mod tests {
         // Meta commands are only read-only catalog queries, so they are allowed
         let result = run_query(&pool, "\\dt", 10, None, true, false).await.unwrap();
         assert_eq!(result.rows[0][0], serde_json::json!("t"));
+        let result = run_query(&pool, "\\d+ t", 10, None, true, false).await.unwrap();
+        assert_eq!(result.rows[0][0], serde_json::json!("table"));
 
         // Write statements are rejected (the error message states readonly explicitly)
         for sql in [

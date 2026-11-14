@@ -51,6 +51,9 @@ pub struct EngineCapabilities {
     /// process_list.rs). Needs a pool with more than one connection so that it works while a
     /// query is running, which rules out the single-connection engines (SQL Server, DuckDB)
     pub supports_process_list: bool,
+    /// Whether `\d+ <table>` (indexes, foreign keys, CREATE statement; meta_commands.rs) is
+    /// supported. The TABLES pane offers "Show definition" only when this is true
+    pub supports_table_definition: bool,
 }
 
 /// Common capabilities of the SQL engines (mysql / postgres / sqlite).
@@ -66,6 +69,7 @@ const SQL_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_ai: true,
     supports_dump: false,
     supports_process_list: false,
+    supports_table_definition: true,
 };
 
 /// MySQL / PostgreSQL additionally have a dump tool (mysqldump / pg_dump) and a process list
@@ -89,6 +93,7 @@ const REDIS_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_ai: false,
     supports_dump: false,
     supports_process_list: false,
+    supports_table_definition: false,
 };
 
 /// Elasticsearch works with Kibana Console-style request blocks in the editor, and the
@@ -105,6 +110,7 @@ const ELASTICSEARCH_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_ai: false,
     supports_dump: false,
     supports_process_list: false,
+    supports_table_definition: false,
 };
 
 /// DuckDB is a SQL engine, but the path that applies cell edits (run_statements) assumes
@@ -126,6 +132,8 @@ const DYNAMODB_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_explain: false,
     supports_editable_cells: false,
     supports_ai: false,
+    // No meta commands at all (PartiQL has no catalog queries)
+    supports_table_definition: false,
     ..SQL_CAPABILITIES
 };
 
@@ -143,6 +151,8 @@ const SQLITE_CAPABILITIES: EngineCapabilities = EngineCapabilities {
 /// (bracket identifiers, `#temp`); SqlEditor passes the dialect based on the engine.
 const MSSQL_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_editable_cells: false,
+    // `\d+` is not implemented for T-SQL (meta_commands.rs mssql_meta)
+    supports_table_definition: false,
     ..SQL_CAPABILITIES
 };
 
@@ -188,6 +198,19 @@ mod tests {
         // Only mysql / postgres have a dump tool (dump.rs)
         assert!(sql.supports_dump);
         assert!(capabilities_for_name("postgres").supports_dump);
+        // `\d+ <table>` exists for exactly the engines meta_commands.rs implements it for
+        for engine in ["mysql", "postgres", "sqlite", "duckdb"] {
+            assert!(
+                capabilities_for_name(engine).supports_table_definition,
+                "{engine}"
+            );
+        }
+        for engine in ["mssql", "redis", "elasticsearch", "dynamodb"] {
+            assert!(
+                !capabilities_for_name(engine).supports_table_definition,
+                "{engine}"
+            );
+        }
         let others = [
             "sqlite",
             "duckdb",
