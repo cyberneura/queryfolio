@@ -1,4 +1,6 @@
 import type { QueryResult } from "$lib/api";
+// The .ts extension is needed by the node test runner (see searchItems.ts)
+import { stringifyBounded } from "./resultSort.ts";
 
 const cellToString = (value: unknown): string => {
   if (value === null || value === undefined) {
@@ -255,3 +257,186 @@ export const toJsonRange = (
   }
   return JSON.stringify(records, null, 2);
 };
+
+// ---- Markdown table (CYBERNEURA-DEV-1267) ----
+//
+// A GitHub Flavored Markdown table (`| a | b |` + `| --- | --- |`) for pasting a result into
+// GitHub, Taskshoot, Slack or an AI chat. Differences from CSV / TSV:
+// - NULL is written as `NULL` (an empty cell would be indistinguishable from an empty string
+//   for a human reader, and nothing parses this output back).
+// - The formula-injection guard is not applied: it protects spreadsheets, and a leading `'`
+//   would only corrupt the value shown in a rendered table.
+// - A table always has a header row, so there is no "without headers" variant.
+// - A cell is cut at MARKDOWN_MAX_CELL_CHARS (see below); CSV / TSV / JSON stay full-fidelity.
+
+// Integer / decimal / exponent, optionally signed. The grammar is unambiguous (see
+// NUMERIC_STRING in resultSort.ts for why `\d+\.?\d*` must not be used)
+const MARKDOWN_NUMERIC_STRING = /^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
+// Longer strings are never numbers (bounds the regex work per cell)
+const MARKDOWN_MAX_NUMERIC_CHARS = 64;
+
+/// A cell contributes at most this many characters (before escaping) to a Markdown table;
+/// a longer one is cut and ends with `…`. db.rs does not cut long TEXT / JSON cells, and the
+/// escaping below runs a callback per special character on the WebView's main thread:
+/// 500 rows x 3 columns of 100 KB cells took seconds and produced a table nobody can read
+/// or paste. A Markdown table is for showing a result to a person or an AI, so unlike
+/// CSV / TSV / JSON it does not need to carry every byte; the caller tells the user when
+/// cells were cut (`truncatedCells`).
+export const MARKDOWN_MAX_CELL_CHARS = 10_000;
+
+/// The text of one cell before escaping, cut at MARKDOWN_MAX_CELL_CHARS.
+const markdownCellText = (value: unknown): { text: string; cut: boolean } => {
+  let text: string;
+  if (value === null || value === undefined) {
+    text = "NULL";
+  } else if (typeof value === "object") {
+    // Compact JSON is always a single line. Serialize one character past the limit so
+    // that "longer than the limit" can be told without walking a huge value in full
+    text = stringifyBounded(value, MARKDOWN_MAX_CELL_CHARS + 1);
+  } else {
+    text = String(value);
+  }
+  return text.length > MARKDOWN_MAX_CELL_CHARS
+    ? { text: text.slice(0, MARKDOWN_MAX_CELL_CHARS), cut: true }
+    : { text, cut: false };
+};
+
+const MARKDOWN_ENTITIES: Record<string, string> = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+};
+
+// `\w` without the u flag is exactly the ASCII letters, digits and `_`
+const isAsciiAlphanumeric = (ch: string | undefined): boolean =>
+  ch !== undefined && /^[^\W_]$/.test(ch);
+
+/// Escape one cell (or header) so that it is shown as the text it is where it is pasted:
+/// - `|` and a line break cannot break the table (`\|`, `<br>`),
+/// - `&` `<` `>` become entities, so nothing is read as HTML and the only tag this output
+///   ever contains is the `<br>` made here,
+/// - the inline Markdown delimiters (backslash, backtick, `*`, `~`) are backslash-escaped,
+///   so a value like `**x**` is not rendered as formatting and a backtick cannot turn the
+///   entities and `<br>` into literal code-span text,
+/// - `]` is escaped where it would complete a link or an image (`](` and `][`), so
+///   `[label](url)` / `![img](url)` stay text and no remote image is loaded. Other brackets
+///   are left alone: a JSON array cell would otherwise be full of backslashes,
+/// - `_` is escaped unless it sits between two ASCII letters / digits: an intraword
+///   underscore never starts emphasis in GFM, and leaving it alone keeps snake_case
+///   column names and identifiers readable when the table is read as plain text.
+/// A single pass, so the backslashes and the `<br>` added here are not escaped again.
+export const escapeMarkdownCell = (text: string): string =>
+  text.replace(/\r\n|[\r\n\\|&<>`*_\]~]/g, (m, offset: number) => {
+    if (m === "\r\n" || m === "\r" || m === "\n") {
+      return "<br>";
+    }
+    if (m in MARKDOWN_ENTITIES) {
+      return MARKDOWN_ENTITIES[m];
+    }
+    if (
+      m === "_" &&
+      isAsciiAlphanumeric(text[offset - 1]) &&
+      isAsciiAlphanumeric(text[offset + 1])
+    ) {
+      return m;
+    }
+    if (m === "]" && text[offset + 1] !== "(" && text[offset + 1] !== "[") {
+      return m;
+    }
+    return `\\${m}`;
+  });
+
+const isMarkdownNumeric = (value: unknown): boolean => {
+  if (typeof value === "number" || typeof value === "bigint") {
+    return true;
+  }
+  // BIGINT beyond 2^53 and DECIMAL arrive as strings (db.rs json_i64)
+  return (
+    typeof value === "string" &&
+    value.length <= MARKDOWN_MAX_NUMERIC_CHARS &&
+    MARKDOWN_NUMERIC_STRING.test(value)
+  );
+};
+
+/// Markdown table of the rows [rowStart, rowEnd] and columns [colStart, colEnd] (closed
+/// intervals). A column is right-aligned (`---:`) when it has at least one non-NULL value in
+/// the output rows and all of them are numbers. `truncatedCells` counts the cells that were
+/// cut at MARKDOWN_MAX_CELL_CHARS.
+const markdownTable = (
+  result: QueryResult,
+  range: CellRange,
+): MarkdownTable => {
+  const { rowStart, rowEnd, colStart, colEnd } = range;
+  const width = Math.max(0, colEnd - colStart + 1);
+  const numeric: boolean[] = new Array(width).fill(true);
+  const hasValue: boolean[] = new Array(width).fill(false);
+  const body: string[] = [];
+  let truncatedCells = 0;
+  for (let r = rowStart; r <= rowEnd; r++) {
+    const row = result.rows[r];
+    if (!row) {
+      continue;
+    }
+    const fields: string[] = [];
+    for (let i = 0; i < width; i++) {
+      const v = row[colStart + i];
+      if (v !== null && v !== undefined) {
+        hasValue[i] = true;
+        if (numeric[i] && !isMarkdownNumeric(v)) {
+          numeric[i] = false;
+        }
+      }
+      const { text, cut } = markdownCellText(v);
+      if (cut) {
+        truncatedCells++;
+      }
+      fields.push(cut ? `${escapeMarkdownCell(text)}…` : escapeMarkdownCell(text));
+    }
+    body.push(`| ${fields.join(" | ")} |`);
+  }
+  const header: string[] = [];
+  const separator: string[] = [];
+  for (let i = 0; i < width; i++) {
+    header.push(escapeMarkdownCell(result.columns[colStart + i] ?? ""));
+    separator.push(numeric[i] && hasValue[i] ? "---:" : "---");
+  }
+  const text = [
+    `| ${header.join(" | ")} |`,
+    `| ${separator.join(" | ")} |`,
+    ...body,
+  ].join("\n");
+  return { text, truncatedCells };
+};
+
+/// A Markdown table and how many of its cells were cut at MARKDOWN_MAX_CELL_CHARS.
+export interface MarkdownTable {
+  text: string;
+  truncatedCells: number;
+}
+
+const wholeRange = (result: QueryResult): CellRange => ({
+  rowStart: 0,
+  rowEnd: result.rows.length - 1,
+  colStart: 0,
+  colEnd: result.columns.length - 1,
+});
+
+/// The whole result as a Markdown table, with the number of cut cells (for Copy / Export,
+/// which warn about them).
+export const toMarkdownTable = (
+  result: QueryResult,
+  range: CellRange = wholeRange(result),
+): MarkdownTable => markdownTable(result, range);
+
+export const toMarkdown = (result: QueryResult): string =>
+  markdownTable(result, wholeRange(result)).text;
+
+// Convert only the selected range to a Markdown table (for Cmd+C copy).
+// withHeaders is ignored because a Markdown table cannot exist without its header row
+// (an argument kept to simplify the caller's branching, like toJsonRange).
+// The range is assumed to be already clamped to the result size by the caller.
+export const toMarkdownRange = (
+  result: QueryResult,
+  range: CellRange,
+  _withHeaders: boolean,
+): string => markdownTable(result, range).text;

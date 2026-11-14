@@ -10,6 +10,8 @@
     toCsvRange,
     toJson,
     toJsonRange,
+    MARKDOWN_MAX_CELL_CHARS,
+    toMarkdownTable,
     toTsv,
     toTsvRange,
     type CellRange,
@@ -41,10 +43,18 @@
   let { onOpenProcessList }: Props = $props();
 
   // Output format shared by Copy / Export / Cmd+C copy.
-  type CopyFormat = "csv" | "tsv" | "json";
+  const COPY_FORMATS = ["tsv", "csv", "json", "markdown"] as const;
+  type CopyFormat = (typeof COPY_FORMATS)[number];
+  // File extension (and save dialog filter name) of each format
+  const EXPORT_FILE_TYPES: Record<CopyFormat, { ext: string; name: string }> = {
+    tsv: { ext: "tsv", name: "TSV" },
+    csv: { ext: "csv", name: "CSV" },
+    json: { ext: "json", name: "JSON" },
+    markdown: { ext: "md", name: "Markdown" },
+  };
   const COPY_FORMAT_KEY = "queryfolio.results.copyFormat";
   const isCopyFormat = (v: string): v is CopyFormat =>
-    v === "csv" || v === "tsv" || v === "json";
+    (COPY_FORMATS as readonly string[]).includes(v);
   function loadCopyFormat(): CopyFormat {
     try {
       const v = localStorage.getItem(COPY_FORMAT_KEY);
@@ -670,11 +680,13 @@
       return;
     }
     const text =
-      copyFormat === "csv"
-        ? toCsvRange(result, range, copyWithHeaders)
-        : copyFormat === "tsv"
-          ? toTsvRange(result, range, copyWithHeaders)
-          : toJsonRange(result, range, copyWithHeaders);
+      copyFormat === "markdown"
+        ? markdownText(result, range)
+        : { csv: toCsvRange, tsv: toTsvRange, json: toJsonRange }[copyFormat](
+            result,
+            range,
+            copyWithHeaders,
+          );
     await writeText(text);
     selectionCopied = true;
     setTimeout(() => {
@@ -866,6 +878,18 @@
     return "";
   };
 
+  // The Markdown table of a result (or of a range of it). Unlike the other formats it cuts
+  // long cells (see MARKDOWN_MAX_CELL_CHARS in $lib/export.ts), so say so when that happened
+  const markdownText = (result: api.QueryResult, range?: CellRange): string => {
+    const { text, truncatedCells } = toMarkdownTable(result, range);
+    if (truncatedCells > 0) {
+      toast.warning(
+        `${truncatedCells.toLocaleString()} cell(s) longer than ${MARKDOWN_MAX_CELL_CHARS.toLocaleString()} characters were cut in the Markdown table. Use CSV / TSV / JSON for the full values.`,
+      );
+    }
+    return text;
+  };
+
   // Stringify the whole result table in the selected format (shared by Copy / Export).
   const serializeResult = (
     format: CopyFormat,
@@ -874,11 +898,9 @@
     if (!result) {
       return null;
     }
-    return format === "csv"
-      ? toCsv(result)
-      : format === "tsv"
-        ? toTsv(result)
-        : toJson(result);
+    return format === "markdown"
+      ? markdownText(result)
+      : { csv: toCsv, tsv: toTsv, json: toJson }[format](result);
   };
 
   // Prepare the result to output for Copy / Export.
@@ -946,12 +968,12 @@
     if (!activeTab?.result || preparingOutput) {
       return;
     }
-    const ext = copyFormat;
+    const { ext, name } = EXPORT_FILE_TYPES[copyFormat];
     let path: string | null;
     try {
       path = await save({
         defaultPath: `result.${ext}`,
-        filters: [{ name: ext.toUpperCase(), extensions: [ext] }],
+        filters: [{ name, extensions: [ext] }],
       });
     } catch (e) {
       toast.error(`Export failed: ${e}`);
@@ -1640,7 +1662,7 @@
           {/if}
           <label
             class="flex cursor-pointer items-center gap-1 select-none hover:text-zinc-200"
-            title="Include column headers when copying a cell selection with Cmd+C (Ctrl+C)"
+            title="Include column headers when copying a cell selection with Cmd+C (Ctrl+C). CSV / TSV only: JSON always has keys and a Markdown table always has its header row"
           >
             <input
               type="checkbox"
@@ -1657,7 +1679,7 @@
             data-annotate="select-copy-format"
             bind:value={copyFormat}
           >
-            {#each ["tsv", "csv", "json"] as const as format (format)}
+            {#each COPY_FORMATS as format (format)}
               <option value={format}>{format.toUpperCase()}</option>
             {/each}
           </select>
