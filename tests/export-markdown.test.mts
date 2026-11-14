@@ -1,6 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { escapeMarkdownCell, toMarkdown, toMarkdownRange } from "../src/lib/export.ts";
+import {
+  escapeMarkdownCell,
+  MARKDOWN_MAX_CELL_CHARS,
+  toMarkdown,
+  toMarkdownRange,
+  toMarkdownTable,
+} from "../src/lib/export.ts";
 import { reorderRows } from "../src/lib/resultSort.ts";
 
 // Only the fields the converters read
@@ -114,6 +120,42 @@ test("the table follows the sorted order of the rows on screen", () => {
     "| 2 | Bob |",
     "| 1 | Alice |",
   ]);
+});
+
+test("long cells are cut, marked with an ellipsis and counted", () => {
+  const long = "a|".repeat(MARKDOWN_MAX_CELL_CHARS);
+  const exact = "b".repeat(MARKDOWN_MAX_CELL_CHARS);
+  const json = { text: "c".repeat(MARKDOWN_MAX_CELL_CHARS * 3) };
+  const table = toMarkdownTable(result(["v", "w"], [[long, exact], [json, "short"]]));
+  assert.equal(table.truncatedCells, 2);
+  const lines = table.text.split("\n");
+  const [first, second] = lines[2].slice(2, -2).split(" | ");
+  // Cut before escaping: half the kept characters are pipes, each escaped to 2 characters
+  assert.equal(first.length, MARKDOWN_MAX_CELL_CHARS * 1.5 + 1);
+  assert.ok(first.endsWith("…"));
+  // A cell of exactly the limit is not cut
+  assert.equal(second, exact);
+  assert.ok(lines[3].startsWith('| {"text":"ccc'));
+  assert.ok(lines[3].includes("… | short |"));
+  assert.equal(toMarkdownTable(result(["v"], [["x"]])).truncatedCells, 0);
+  // A range reports only its own cells
+  const range = { rowStart: 1, rowEnd: 1, colStart: 1, colEnd: 1 };
+  assert.equal(
+    toMarkdownTable(result(["v", "w"], [[long, exact], [json, "short"]]), range).truncatedCells,
+    0,
+  );
+});
+
+test("huge cells are bounded work", () => {
+  // About 100 KB per cell, with the mix of special characters of ordinary text / HTML
+  const huge = "Lorem ipsum <b>dolor</b> sit amet | consectetur *adipiscing* elit\n".repeat(1_600);
+  const big = { k: huge };
+  const rows = Array.from({ length: 500 }, () => [huge, big, huge]);
+  const started = performance.now();
+  const table = toMarkdownTable(result(["a", "b", "c"], rows));
+  const elapsed = performance.now() - started;
+  assert.equal(table.truncatedCells, 1500);
+  assert.ok(elapsed < 2000, `took ${elapsed} ms`);
 });
 
 test("a huge digit-only cell does not make alignment detection slow", () => {
