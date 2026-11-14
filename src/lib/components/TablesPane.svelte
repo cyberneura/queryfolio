@@ -110,9 +110,9 @@
     /// null = the active schema
     database: string | null;
     table: DumpTable | null;
-    /// The table's name as it is written in SQL (TableInfo.qualified_name); null for a
-    /// database row
-    qualifiedName: string | null;
+    /// The table's name for `\d+`: always `schema.table` when the engine reports a schema;
+    /// null for a database row
+    definitionName: string | null;
   }
   let contextMenu = $state<ContextMenu | null>(null);
   /// Open dump dialog (the connection is fixed when it opens)
@@ -140,7 +140,7 @@
       connection,
       database: schema,
       table: null,
-      qualifiedName: null,
+      definitionName: null,
     };
   };
 
@@ -165,15 +165,24 @@
       connection: tablesConnection,
       database: tablesDatabase,
       table: { schema: table.schema, name: table.name },
-      qualifiedName: table.qualified_name,
+      definitionName: definitionNameOf(table),
     };
   };
+
+  /// The name "Show definition" asks for. Not `qualified_name`: that one is made for inserting
+  /// into SQL and leaves the default schema out (`public` on PostgreSQL), so on a connection
+  /// whose search_path puts another schema first, `users` would resolve to a different table
+  /// than the `public.users` row that was clicked. The schema the row actually has is kept
+  const definitionNameOf = (table: TableInfo): string =>
+    table.schema ? `${table.schema}.${table.name}` : table.name;
 
   /// Whether a table name can be given to a meta command. Same shape as the backend's
   /// validate_relation_name (simple identifiers, at most `schema.table`): names with spaces,
   /// hyphens or quotes are rejected there, so "Show definition" is disabled for them
+  /// (`\w` without the u flag is exactly the ASCII letters, digits and `_`; `[^\W\d]` is
+  /// therefore an ASCII letter or `_`)
   const isMetaCommandName = (name: string): boolean =>
-    /^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)?$/.test(name);
+    /^[^\W\d][\w$]*(\.[^\W\d][\w$]*)?$/.test(name);
 
   /// "Show definition": run the meta command `\d+ <table>` like a statement typed in the editor
   /// (same guards, a normal result tab, an entry in the history). The editor is not touched.
@@ -182,14 +191,14 @@
   const showDefinition = (menu: ContextMenu) => {
     contextMenu = null;
     if (
-      !menu.qualifiedName ||
-      !isMetaCommandName(menu.qualifiedName) ||
+      !menu.definitionName ||
+      !isMetaCommandName(menu.definitionName) ||
       menu.connection !== appStore.selectedConnection ||
       menu.database !== (appStore.activeSchema || null)
     ) {
       return;
     }
-    void appStore.runQuery(`\\d+ ${menu.qualifiedName}`);
+    void appStore.runQuery(`\\d+ ${menu.definitionName}`);
   };
 
   const openDump = (
@@ -644,12 +653,12 @@
       role="menu"
     >
       {#if menu.table && canShowDefinition}
-        {@const supportedName = isMetaCommandName(menu.qualifiedName ?? "")}
+        {@const supportedName = isMetaCommandName(menu.definitionName ?? "")}
         <button
           class="flex w-full items-center gap-2 px-3 py-1 text-left hover:bg-zinc-700 disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
           role="menuitem"
           title={supportedName
-            ? `Indexes, foreign keys and the CREATE statement (runs \\d+ ${menu.qualifiedName})`
+            ? `Indexes, foreign keys and the CREATE statement (runs \\d+ ${menu.definitionName})`
             : "Not available for this table: \\d+ only takes simple names (letters, digits, _ and $)"}
           disabled={!supportedName}
           data-annotate="menu-show-definition"
