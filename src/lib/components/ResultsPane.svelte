@@ -22,12 +22,14 @@
     type NormalizedEngine,
     type CellEdit,
   } from "$lib/editableResult";
+  import { nextSort, sortedRowOrder, type SortState } from "$lib/resultSort";
   import {
-    nextSort,
-    reorderRows,
-    sortedRowOrder,
-    type SortState,
-  } from "$lib/resultSort";
+    buildSearchIndex,
+    filterRowOrder,
+    MAX_CELL_SEARCH_CHARS,
+    visibleRows,
+  } from "$lib/resultFilter";
+  import { filterTerms } from "$lib/paneFilter";
   import CellInspector from "./CellInspector.svelte";
   import AiAnalysisModal from "./AiAnalysisModal.svelte";
 
@@ -94,9 +96,127 @@
     }
     return { colIndex: sort.colIndex, direction: sort.direction };
   });
-  // Display position -> original row index
-  const rowOrder = $derived(
+
+  // ---- Client-side filter of the fetched rows (CYBERNEURA-DEV-1266) ----
+  // One filter per result tab, kept while the tab shows the same result: like the sort it is
+  // keyed by executedAt, so a re-run drops it. Unlike the sort it survives switching tabs
+  // (coming back to a tab shows the rows that were being looked at).
+  // `input` is what is in the text box, `query` the debounced value the rows are filtered by.
+  interface TabFilter {
+    executedAt: number;
+    input: string;
+    query: string;
+  }
+  const FILTER_DEBOUNCE_MS = 150;
+  let filters = $state<Record<number, TabFilter>>({});
+  const filterTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  let filterInputEl = $state<HTMLInputElement | null>(null);
+  const activeFilter = $derived.by<TabFilter | null>(() => {
+    const tab = activeTab;
+    const filter = tab ? filters[tab.id] : undefined;
+    return tab && filter && filter.executedAt === tab.executedAt ? filter : null;
+  });
+  const filterOpen = $derived(activeFilter !== null);
+  const filterQuery = $derived(activeFilter?.query ?? "");
+  const activeFilterTerms = $derived(filterTerms(filterQuery));
+  const filterActive = $derived(activeFilterTerms.length > 0);
+  // The search text of every row, built once per result while the filter is open and reused
+  // for every keystroke (it does not depend on the query)
+  const searchIndex = $derived.by(() =>
+    filterOpen ? buildSearchIndex(activeTab?.result?.rows ?? []) : undefined,
+  );
+  const dropFilter = (tabId: number) => {
+    const timer = filterTimers.get(tabId);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      filterTimers.delete(tabId);
+    }
+    delete filters[tabId];
+  };
+  // Open the filter of the active tab (or focus it when it is already open)
+  const openFilter = () => {
+    const tab = activeTab;
+    if (!tab?.result || tab.result.columns.length === 0) {
+      return;
+    }
+    if (activeFilter) {
+      filterInputEl?.focus();
+      filterInputEl?.select();
+      return;
+    }
+    filters[tab.id] = { executedAt: tab.executedAt, input: "", query: "" };
+  };
+  // Close the filter of the active tab and show all rows again
+  const closeFilter = () => {
+    const tab = activeTab;
+    if (!tab) {
+      return;
+    }
+    const hadFocus = document.activeElement === filterInputEl;
+    dropFilter(tab.id);
+    if (hadFocus) {
+      // Keep the keyboard on the result pane (Cmd+F / Cmd+C / Cmd+A are handled only there)
+      gridEl?.focus({ preventScroll: true });
+    }
+  };
+  const onFilterInput = (value: string) => {
+    const tab = activeTab;
+    const filter = activeFilter;
+    if (!tab || !filter) {
+      return;
+    }
+    filter.input = value;
+    const tabId = tab.id;
+    const executedAt = tab.executedAt;
+    clearTimeout(filterTimers.get(tabId));
+    // Debounced: filtering walks every fetched row, which is too much to do per keystroke
+    // on a result fetched without default_limit
+    filterTimers.set(
+      tabId,
+      setTimeout(() => {
+        filterTimers.delete(tabId);
+        const current = filters[tabId];
+        if (current && current.executedAt === executedAt) {
+          current.query = current.input;
+        }
+      }, FILTER_DEBOUNCE_MS),
+    );
+  };
+  // Forget the filters of closed tabs and of replaced results (re-run), so that they neither
+  // pile up nor come back
+  $effect(() => {
+    const live = new Map(appStore.resultTabs.map((tab) => [tab.id, tab.executedAt]));
+    for (const [key, filter] of Object.entries(filters)) {
+      const tabId = Number(key);
+      if (live.get(tabId) !== filter.executedAt) {
+        dropFilter(tabId);
+      }
+    }
+  });
+  // Focus the input when the filter is opened by the button or Cmd+F. Coming back to a tab
+  // whose filter is open must not steal the focus, so this is requested explicitly
+  let filterFocusPending = false;
+  $effect(() => {
+    if (filterInputEl && filterFocusPending) {
+      filterFocusPending = false;
+      filterInputEl.focus();
+    }
+  });
+  const openFilterAndFocus = () => {
+    filterFocusPending = !activeFilter;
+    openFilter();
+  };
+
+  // All fetched rows in sorted order. Kept apart from the filter so that typing in the filter
+  // does not sort again
+  const sortedOrder = $derived(
     sortedRowOrder(activeTab?.result?.rows ?? [], activeSort),
+  );
+  // Display position -> original row index: the rows that pass the filter, in sorted order
+  const rowOrder = $derived(
+    filterActive && searchIndex
+      ? filterRowOrder(sortedOrder, searchIndex, activeFilterTerms)
+      : sortedOrder,
   );
   // Original row index -> display position (the inverse of rowOrder)
   const rowToDisplay = $derived.by(() => {
@@ -105,10 +225,17 @@
     return map;
   });
   // The result in display order, for the operations that follow what is on screen
-  // (Cmd+C of a selection). Same object as the result when not sorted
-  const displayedResult = $derived(
-    activeTab?.result ? reorderRows(activeTab.result, activeSort) : null,
-  );
+  // (Cmd+C of a selection). Same object as the result when neither sorted nor filtered
+  const displayedResult = $derived.by(() => {
+    const result = activeTab?.result;
+    if (!result) {
+      return null;
+    }
+    if (!activeSort && !filterActive) {
+      return result;
+    }
+    return { ...result, rows: rowOrder.map((i) => result.rows[i]) };
+  });
   const toggleSort = (colIndex: number) => {
     const tab = activeTab;
     if (!tab?.result) {
@@ -230,7 +357,8 @@
   // The sticky header height is offset by "distance from the content top" and "amount hidden by the header",
   // so it does not enter the computation of start
   const rowWindow = $derived.by(() => {
-    const total = activeTab?.result?.rows.length ?? 0;
+    // The rows on screen (fewer than result.rows while a filter is active)
+    const total = rowOrder.length;
     const h = rowHeight > 0 ? rowHeight : DEFAULT_ROW_HEIGHT;
     if (total === 0) {
       return { start: 0, end: 0, padTop: 0, padBottom: 0 };
@@ -385,6 +513,9 @@
   $effect(() => {
     void appStore.activeTabId;
     void activeTab?.executedAt;
+    // Also when the filter changes the rows on screen (the scroll amount of the previous row set
+    // means nothing for the new one)
+    void filterQuery;
     if (gridEl) {
       gridEl.scrollTop = 0;
       // Also reset the horizontal position. Otherwise, when switching to another result after scrolling a horizontally wide result to the right,
@@ -392,6 +523,15 @@
       gridEl.scrollLeft = 0;
     }
     gridScrollTop = 0;
+  });
+
+  // The rectangular selection is a range of display positions and the inspector shows one row:
+  // when the filter changes which rows are on screen, both would point at other rows
+  // (or at a hidden one), so drop them
+  $effect(() => {
+    void filterQuery;
+    selectedCell = null;
+    selection = null;
   });
 
   // Clamp the selection to the result size and normalize it (fix min/max).
@@ -405,7 +545,8 @@
     if (!result) {
       return null;
     }
-    const maxRow = result.rows.length - 1;
+    // Display positions: the last row on screen, not the last fetched row
+    const maxRow = rowOrder.length - 1;
     const maxCol = result.columns.length - 1;
     if (maxRow < 0 || maxCol < 0) {
       return null;
@@ -458,7 +599,7 @@
   };
   const isColHeaderSelected = (colIndex: number): boolean => {
     const r = selectedRange;
-    const rows = activeTab?.result?.rows.length ?? 0;
+    const rows = rowOrder.length;
     return (
       r !== null &&
       r.rowStart === 0 &&
@@ -564,7 +705,7 @@
     if (
       !tab ||
       !result ||
-      result.rows.length === 0 ||
+      rowOrder.length === 0 ||
       result.columns.length === 0
     ) {
       return false;
@@ -574,7 +715,7 @@
       mode: "cell",
       anchorRow: 0,
       anchorCol: 0,
-      focusRow: result.rows.length - 1,
+      focusRow: rowOrder.length - 1,
       focusCol: result.columns.length - 1,
     };
     return true;
@@ -583,10 +724,33 @@
   // Cmd+C (Ctrl+C) copies the selection as CSV, Cmd+A (Ctrl+A) selects the whole table.
   // Both are handled only while the result grid has focus
   const handleWindowKeydown = (e: KeyboardEvent) => {
+    if (e.key === "Escape") {
+      // Esc on the grid closes the filter (Esc in the filter input is handled by the input).
+      // Something else that already handled the key (a modal, the cell editor) wins
+      if (filterOpen && !e.defaultPrevented && isGridKeyTarget()) {
+        e.preventDefault();
+        closeFilter();
+      }
+      return;
+    }
     if (!(e.metaKey || e.ctrlKey)) {
       return;
     }
     const key = e.key.toLowerCase();
+    if (key === "f") {
+      // Cmd+F (Ctrl+F) opens the row filter only while the result pane has the focus (the grid
+      // or the filter input itself). In the SQL editor the same key is CodeMirror's search,
+      // which handles it there; this handler must not react to it
+      if (
+        !e.altKey &&
+        !e.shiftKey &&
+        (isGridKeyTarget() || document.activeElement === filterInputEl)
+      ) {
+        e.preventDefault();
+        openFilterAndFocus();
+      }
+      return;
+    }
     if (key !== "c" && key !== "a") {
       return;
     }
@@ -732,6 +896,7 @@
     // Take the sort of the result being output now: the refetch below awaits, and the tab or
     // the sort can change meanwhile (the output must follow what was on screen when it started)
     const sortAtStart = activeSort;
+    const filterAtStart = filterQuery;
     let full: api.QueryResult | null = null;
     preparingOutput = true;
     try {
@@ -750,9 +915,10 @@
         `The output was truncated at ${result.row_count.toLocaleString()} rows.`,
       );
     }
-    // Copy / Export follow the order on screen. A refetched full result is sorted by the same
-    // column (still "within the fetched rows": whatever was fetched is what gets sorted)
-    return reorderRows(result, sortAtStart);
+    // Copy / Export follow what is on screen: the rows that pass the filter, in the sorted order.
+    // A refetched full result is filtered by the same terms and sorted by the same column
+    // (still "within the fetched rows": whatever was fetched is what gets filtered and sorted)
+    return visibleRows(result, sortAtStart, filterAtStart);
   };
 
   // Copy button: copy the whole result table to the clipboard in the selected format.
@@ -1332,7 +1498,16 @@
             {result.affected_rows} rows affected
           </span>
         {:else}
-          <span data-annotate="text-row-count">{result.row_count} rows</span>
+          {#if filterActive}
+            <span
+              data-annotate="text-row-count"
+              title="Rows matching the filter / fetched rows"
+            >
+              {rowOrder.length} of {result.rows.length} rows
+            </span>
+          {:else}
+            <span data-annotate="text-row-count">{result.row_count} rows</span>
+          {/if}
           {#if result.applied_limit !== null}
             <span
               class="text-zinc-500"
@@ -1406,6 +1581,58 @@
           </button>
         {/if}
         {#if activeTab.result && activeTab.result.columns.length > 0}
+          <!-- Filter the fetched rows (nothing is sent to the database) -->
+          {#if activeFilter}
+            <span class="relative inline-flex items-center">
+              <i
+                class="bi bi-search pointer-events-none absolute left-1.5 text-[10px] text-zinc-500"
+                aria-hidden="true"
+              ></i>
+              <input
+                bind:this={filterInputEl}
+                class="w-44 rounded border border-zinc-600 bg-zinc-800 py-0.5 pl-5 pr-5 text-xs text-zinc-200 outline-none placeholder:text-zinc-500 focus:border-blue-400"
+                type="text"
+                spellcheck="false"
+                autocomplete="off"
+                placeholder="Filter rows"
+                aria-label="Filter the fetched rows"
+                title="Show only the fetched rows that contain every word (case-insensitive, in any cell). The query is not re-run. Cells are matched on their first {MAX_CELL_SEARCH_CHARS.toLocaleString()} characters"
+                data-annotate="input-filter-result"
+                value={activeFilter.input}
+                oninput={(e) => onFilterInput(e.currentTarget.value)}
+                onkeydown={(e) => {
+                  // WebKit can deliver the key that commits an IME composition after
+                  // compositionend, with isComposing already false; keyCode 229 still marks it
+                  if (e.isComposing || e.keyCode === 229) {
+                    return;
+                  }
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    closeFilter();
+                  }
+                }}
+              />
+              <button
+                class="absolute right-1 text-zinc-500 hover:text-zinc-200"
+                title="Close the filter and show all rows (Esc)"
+                aria-label="Close the filter"
+                data-annotate="button-close-filter-result"
+                onclick={closeFilter}
+              >
+                <i class="bi bi-x" aria-hidden="true"></i>
+              </button>
+            </span>
+          {:else}
+            <button
+              class="rounded border border-zinc-700 px-1.5 py-0.5 hover:bg-zinc-700 hover:text-zinc-200"
+              title="Filter the fetched rows (Cmd+F / Ctrl+F while the result has the focus)"
+              aria-label="Filter the fetched rows"
+              data-annotate="button-filter-result"
+              onclick={openFilterAndFocus}
+            >
+              <i class="bi bi-search" aria-hidden="true"></i>
+            </button>
+          {/if}
           {#if selectionCopied}
             <span class="text-emerald-400" data-annotate="text-selection-copied">
               Copied
@@ -1436,7 +1663,9 @@
           </select>
           <button
             class="rounded border border-zinc-700 px-1.5 py-0.5 hover:bg-zinc-700 hover:text-zinc-200"
-            title="Copy the whole result to the clipboard in the selected format"
+            title={filterActive
+              ? "Copy the rows matching the filter to the clipboard in the selected format"
+              : "Copy the whole result to the clipboard in the selected format"}
             data-annotate="button-copy-result"
             onclick={copyResult}
           >
@@ -1446,7 +1675,9 @@
           <span class="relative inline-flex">
             <button
               class="rounded-l border border-zinc-700 px-1.5 py-0.5 hover:bg-zinc-700 hover:text-zinc-200"
-              title="Export the whole result to a file in the selected format (UTF-8)"
+              title={filterActive
+                ? "Export the rows matching the filter to a file in the selected format (UTF-8)"
+                : "Export the whole result to a file in the selected format (UTF-8)"}
               data-annotate="button-export-result"
               onclick={() => void exportResult("utf-8")}
             >
@@ -1865,6 +2096,14 @@
             {/if}
           </tbody>
         </table>
+        {#if filterActive && rowOrder.length === 0}
+          <p
+            class="px-3 py-2 text-xs text-zinc-500"
+            data-annotate="text-filter-no-match"
+          >
+            No fetched rows match the filter.
+          </p>
+        {/if}
       {:else if activeTab?.result}
         {@const result = activeTab.result}
         <pre
