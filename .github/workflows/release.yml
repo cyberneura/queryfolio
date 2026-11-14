@@ -239,7 +239,12 @@ jobs:
           fi
           if [ "$draft_count" -eq 1 ]; then
             id="$drafts"
+            # Always send tag_name too. PATCHing only target_commitish on a draft makes GitHub
+            # replace its tag_name with `untagged-<hash>` (observed 2026-11-14). The next run's
+            # lookup (tag_name == TAG) then misses the draft, and publishing would create the
+            # wrong tag (CYBERNEURA-DEV-1274).
             gh api -X PATCH "repos/${GH_REPO}/releases/${id}" \
+              -f tag_name="${TAG}" \
               -f target_commitish="${GITHUB_SHA}" --silent
             echo "Reusing draft ${id} for ${TAG} (target set to ${GITHUB_SHA})."
           else
@@ -514,7 +519,9 @@ jobs:
             echo "::error::v${VERSION} should no longer be published (see the message above); leaving the draft as it is."
             exit 1
           fi
+          # tag_name is sent again for the same reason as in the draft job.
           gh api -X PATCH "repos/${GH_REPO}/releases/${RELEASE_ID}" \
             -F draft=false -f make_latest=true \
+            -f tag_name="v${VERSION}" \
             -f target_commitish="${GITHUB_SHA}" --silent
 
