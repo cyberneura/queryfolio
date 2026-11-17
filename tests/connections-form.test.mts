@@ -107,3 +107,8 @@ test("an entry whose engine did not change keeps every key, even ones the form d
   dyn.value.aws_profile = "staging";
   assert.deepEqual(valueForSave(dyn, { aws: "dynamodb" }), { name: "dyn", template: "aws", aws_profile: "staging" });
 });
+
+test("ssh_tunnel: null (cancelling a template's tunnel) passes validation", () => {
+  const items = itemsFromView({ servers: [{ name: "a", template: "t", ssh_tunnel: null }], secrets: {}, revision: "r" }, { t: "postgres" });
+  assert.equal(validateItems(items), null);
+});

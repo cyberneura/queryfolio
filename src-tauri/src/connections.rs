@@ -192,7 +192,7 @@ fn entry_at<'a>(servers: &'a [Value], path: &str) -> Option<&'a Value> {
     }
 }
 
-/// JSON → YAML for an entry, dropping empty strings and empty mappings (the form removes a key
+/// JSON → YAML for an entry, dropping empty strings and empty mappings (strings are not trimmed) (the form removes a key
 /// when a field is cleared, so an emptied field = key absent). **Nulls are kept**: the form never
 /// sends one of its own, so a null came from the file, where it cancels a value a template would
 /// supply (`password: null`, `password_command: null`, ...).
@@ -211,7 +211,8 @@ fn clean(value: serde_json::Value) -> serde_json::Value {
         serde_json::Value::Array(items) => {
             serde_json::Value::Array(items.into_iter().map(clean).collect())
         }
-        serde_json::Value::String(s) => serde_json::Value::String(s.trim().to_string()),
+        // Strings are written as they are: whitespace can be significant in a database name, a
+        // user or a file path, and an untouched entry must be written back unchanged
         other => other,
     }
 }
@@ -379,8 +380,8 @@ pub fn build_servers(patch: &ConnectionsPatch, original: &[Value]) -> Result<Vec
                     return Err(AppError::Config("A group needs a name".into()));
                 }
                 let mut group = Mapping::new();
-                group.insert("group_name".into(), Value::String(group_name.trim().into()));
-                if let Some(color) = color.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+                group.insert("group_name".into(), Value::String(group_name.clone()));
+                if let Some(color) = color.as_deref().filter(|c| !c.trim().is_empty()) {
                     group.insert("color".into(), Value::String(color.into()));
                 }
                 let children = servers
@@ -708,14 +709,14 @@ mod tests {
         let built = build_server(
             &edit(
                 None,
-                serde_json::json!({"name": " x ", "engine": "postgres", "host": "", "custom": 1, "ssh_tunnel": {"host": ""}}),
+                serde_json::json!({"name": "x", "engine": "postgres", "host": "", "schema": " reports ", "custom": 1, "ssh_tunnel": {"host": ""}}),
             ),
             &[],
         )
         .unwrap();
         assert_eq!(
             serde_yaml::to_string(&built).unwrap(),
-            "name: x\nengine: postgres\ncustom: 1\n"
+            "name: x\nengine: postgres\nschema: ' reports '\ncustom: 1\n"
         );
     }
 }

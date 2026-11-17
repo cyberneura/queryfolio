@@ -315,8 +315,10 @@ export function validateItems(items: Item[]): string | null {
     }
     const command = server.value.password_command;
     if (typeof command === "string" && command.trim() === "") return `${name}: enter the password command`;
-    const tunnel = obj(server.value.ssh_tunnel);
-    if ("ssh_tunnel" in server.value && fieldsFor(String(server.value.engine ?? "")).includes("ssh_tunnel")) {
+    // `ssh_tunnel: null` (cancelling a template's tunnel) has nothing to check
+    const rawTunnel = server.value.ssh_tunnel;
+    const tunnel = obj(rawTunnel);
+    if (rawTunnel && typeof rawTunnel === "object" && fieldsFor(String(server.value.engine ?? "")).includes("ssh_tunnel")) {
       const alias = typeof tunnel.ssh_config === "string" ? tunnel.ssh_config.trim() : null;
       if (alias === "") return `${name}: enter the Host alias from ~/.ssh/config`;
       if (alias === null && String(tunnel.host ?? "").trim() === "") return `${name}: enter the SSH host`;
