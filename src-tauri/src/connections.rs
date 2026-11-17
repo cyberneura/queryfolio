@@ -311,26 +311,19 @@ pub fn build_server(edit: &ServerEdit, original: &[Value]) -> Result<Value, AppE
                         "{key} must be a single line (use Remove to clear it)"
                     )));
                 }
-                Some(Value::String(v.clone()))
+                Value::String(v.clone())
             }
-            Some(Change::Unset) => None,
-            None => source
-                .and_then(|s| get_path(s, key))
-                .filter(|v| is_set(v))
-                .cloned(),
-        };
-        // An explicit `null` in the source entry cancels a value the template would supply
-        // (e.g. `password: null` next to password_command); `clean` dropped it, so put it back
-        let secret = match secret {
-            Some(secret) => secret,
-            None if !matches!(edit.secrets.get(key), Some(Change::Set(_)))
-                && source
-                    .and_then(|s| get_path(s, key))
-                    .is_some_and(|v| v.is_null()) =>
-            {
-                Value::Null
-            }
-            None => continue,
+            // Removing the password of a templated entry must cancel the template's password
+            // (`password: null`), or template expansion would bring it back. Tunnel secrets live
+            // inside `ssh_tunnel`, which the entry replaces as a whole, so they need nothing
+            Some(Change::Unset) if key == "password" && map.contains_key("template") => Value::Null,
+            Some(Change::Unset) => continue,
+            // Untouched: the source entry's value exactly as it was, an empty string or an
+            // explicit null (which cancels a template's value) included
+            None => match source.and_then(|s| get_path(s, key)) {
+                Some(value) => value.clone(),
+                None => continue,
+            },
         };
         match key.split_once('.') {
             Some((parent, leaf)) => {
@@ -692,6 +685,33 @@ mod tests {
         )
         .unwrap();
         validate_servers(&[fresh], &templates).unwrap();
+    }
+
+    #[test]
+    fn remove_on_a_templated_entry_cancels_and_untouched_empty_passwords_stay() {
+        let templates =
+            vec![
+                serde_yaml::from_str::<Value>("{name: t, engine: postgres, password: tpw}")
+                    .unwrap(),
+            ];
+        let doc = yaml(
+            "servers:\n- name: a\n  template: t\n  password: pw\n- name: b\n  template: t\n  password: ''\n",
+        );
+        let local = view(&doc);
+        let original = local_servers_seq(&doc).unwrap();
+        let mut a = edit(Some("0"), local.servers[0].clone());
+        a.secrets.insert("password".into(), Change::Unset);
+        let built = build_server(&a, &original).unwrap();
+        assert!(built
+            .as_mapping()
+            .unwrap()
+            .get("password")
+            .unwrap()
+            .is_null());
+        let b = build_server(&edit(Some("1"), local.servers[1].clone()), &original).unwrap();
+        assert_eq!(b.as_mapping().unwrap().get("password").unwrap(), "");
+        let parsed = crate::config::parse_server_entries(&[b], &templates, "t").unwrap();
+        assert_eq!(parsed[0].password.as_deref(), Some(""));
     }
 
     #[test]
