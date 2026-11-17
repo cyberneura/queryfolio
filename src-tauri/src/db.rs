@@ -1061,6 +1061,53 @@ fn db_error_code(error: &AppError) -> DbErrorCode<'_> {
     DbErrorCode::Other
 }
 
+/// "Test connection" in the connection editor (CYBERNEURA-DEV-1299): connects once with
+/// `server` and closes again. Nothing is cached (no pool, no tunnel in `DbManager`) and nothing
+/// is saved. password_command runs like a real connect; the tunnel lives only for the attempt.
+pub async fn test_connection(server: &ServerConfig) -> Result<(), AppError> {
+    let mut server = server.clone();
+    if let Some(command) = server.password_command()? {
+        let command = command.to_string();
+        server.password = Some(crate::config::run_password_command(&server.name, &command).await?);
+    }
+    let engine = parse_engine(&server.engine)?;
+    let mut tunnel = None;
+    let (host, port) = match (&server.ssh_tunnel, engine) {
+        (Some(_), Engine::Sqlite | Engine::DuckDb | Engine::DynamoDb) => {
+            return Err(AppError::Config(format!(
+                "ssh_tunnel cannot be used with {}",
+                server.engine
+            )));
+        }
+        (Some(tunnel_config), _) => {
+            let target_host = server.host.clone().unwrap_or_else(|| "localhost".into());
+            let target_port = server.port.unwrap_or(default_port(engine));
+            let tunnel_config = tunnel_config.clone();
+            let started = tokio::task::spawn_blocking(move || {
+                SshTunnel::start(&tunnel_config, &target_host, target_port)
+            })
+            .await
+            .map_err(|e| AppError::SshTunnel(format!("SSH tunnel task failed: {e}")))??;
+            let local_port = started.local_port;
+            tunnel = Some(started);
+            ("127.0.0.1".to_string(), local_port)
+        }
+        (None, _) => (
+            server.host.clone().unwrap_or_else(|| "localhost".into()),
+            server.port.unwrap_or(default_port(engine)),
+        ),
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        connect(&server, engine, &host, port),
+    )
+    .await
+    .map_err(|_| AppError::Config("The connection did not answer within 30 seconds".into()))?;
+    drop(result?);
+    drop(tunnel);
+    Ok(())
+}
+
 pub(crate) fn default_port(engine: Engine) -> u16 {
     match engine {
         Engine::MySql => 3306,

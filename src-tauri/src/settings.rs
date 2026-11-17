@@ -695,19 +695,33 @@ pub fn save_patch(
     override_keys: &[String],
     allow_drop_comments: bool,
 ) -> Result<SaveOutcome, AppError> {
+    save_doc_change(path, allow_drop_comments, |doc| {
+        apply_patch(doc, patch, override_keys).map_err(|errors| {
+            AppError::Config(
+                errors
+                    .iter()
+                    .map(|e| format!("{}: {}", e.field, e.message))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        })
+    })
+}
+
+/// The write path shared by every structural save (the general settings and the connection
+/// editor): under the lock, re-read the file, let `change` edit the parsed mapping, and write the
+/// result with the same rules (unchanged = untouched, comments confirmed once, round-trip check,
+/// `.bak` before the first overwrite, atomic write through symlinks).
+pub fn save_doc_change(
+    path: &Path,
+    allow_drop_comments: bool,
+    change: impl FnOnce(&mut Mapping) -> Result<(), AppError>,
+) -> Result<SaveOutcome, AppError> {
     let _guard = lock_config_writes();
     let original = std::fs::read_to_string(path)?;
     let mut doc = parse_local(&original)?;
     let before = doc.clone();
-    apply_patch(&mut doc, patch, override_keys).map_err(|errors| {
-        AppError::Config(
-            errors
-                .iter()
-                .map(|e| format!("{}: {}", e.field, e.message))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-    })?;
+    change(&mut doc)?;
     if doc == before {
         return Ok(SaveOutcome::Saved {
             path: path.display().to_string(),

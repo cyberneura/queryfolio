@@ -78,6 +78,27 @@ file), and invalid values are shown next to the field and are not saved.
 - While `QUERYFOLIO_CONFIG_YAML` is set, or the file cannot be parsed, the
   window is read-only.
 
+### Connection editor
+
+The pencil button in the CONNECTIONS header (or right-click a connection, or
+**Add a connection…** when there are none) opens a list of your connections
+with a form: add, edit, duplicate, delete, reorder, and put connections into
+groups. The form shows only the fields the chosen engine uses.
+
+- Passwords are never shown. Choose **Get it with a command — password_command
+  (1Password recommended)**, e.g. `op read "op://<vault>/<item>/password"`, or
+  **Enter it here** (stored as plain text in config.yml). The same warning as
+  [below](#fetching-a-password-at-connect-time-password_command) applies: the
+  command runs on your Mac.
+- **Test connection** connects once with the settings in the form, without
+  saving them.
+- If `config_override_command` provides `servers`, that list replaces the local
+  one, so the editor is read-only and points you to **View override YAML**.
+- Saving rewrites config.yml like the Settings window does (comments are
+  removed after you confirm; `config.yml.bak` is kept before the first
+  overwrite). If config.yml changed while the editor was open, the save is
+  refused; reopen the editor.
+
 ### Text editor
 
 - Menu bar **Config → Edit config.yml** opens a built-in editor (with YAML
