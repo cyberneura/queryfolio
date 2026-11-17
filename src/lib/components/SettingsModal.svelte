@@ -350,7 +350,7 @@
 
           {#if view.folders.length > 0}
             <details class="text-zinc-400">
-              <summary class="cursor-pointer text-zinc-500">
+              <summary class="cursor-pointer text-zinc-500" data-annotate="toggle-folder-list">
                 Folder of each connection ({view.folders.length})
               </summary>
               <p class="mt-1 text-zinc-500">
