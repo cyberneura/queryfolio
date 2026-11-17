@@ -353,6 +353,13 @@ pub fn build_server(edit: &ServerEdit, original: &[Value]) -> Result<Value, AppE
     {
         map.insert("password".into(), Value::Null);
     }
+    // ... and the other way round: a literal password cancels a command the template may supply
+    if map.contains_key("template")
+        && map.get("password").is_some_and(|v| !v.is_null())
+        && !map.contains_key("password_command")
+    {
+        map.insert("password_command".into(), Value::Null);
+    }
     if let Some(Value::Mapping(tunnel)) = map.get("ssh_tunnel").cloned() {
         let source_tunnel = source
             .and_then(|s| s.get("ssh_tunnel"))
@@ -685,6 +692,25 @@ mod tests {
         )
         .unwrap();
         validate_servers(&[fresh], &templates).unwrap();
+    }
+
+    #[test]
+    fn a_literal_password_cancels_the_template_command() {
+        let templates = vec![serde_yaml::from_str::<Value>(
+            "{name: t, engine: postgres, password_command: op read x}",
+        )
+        .unwrap()];
+        let mut e = edit(None, serde_json::json!({"name": "a", "template": "t"}));
+        e.secrets
+            .insert("password".into(), Change::Set("pw".into()));
+        let built = build_server(&e, &[]).unwrap();
+        assert!(built
+            .as_mapping()
+            .unwrap()
+            .get("password_command")
+            .unwrap()
+            .is_null());
+        validate_servers(&[built], &templates).unwrap();
     }
 
     #[test]

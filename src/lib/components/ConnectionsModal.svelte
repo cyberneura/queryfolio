@@ -190,6 +190,11 @@
     if (!selectedServer) return;
     if (text === "") delete selectedServer.secretEdits[key];
     else selectedServer.secretEdits[key] = { op: "set", value: text };
+    // A literal password on a templated entry cancels a command the template may supply
+    // (the backend does the same; doing it here keeps the form's mode in step)
+    if (key === "password" && text !== "" && selectedServer.value.template && !("password_command" in selectedServer.value)) {
+      selectedServer.value.password_command = null;
+    }
     testResult = null;
   }
 
@@ -549,6 +554,8 @@
                       checked={tunnel !== null}
                       onchange={(e) => {
                         if (e.currentTarget.checked) server.value.ssh_tunnel = {};
+                        // With a template (which could supply a tunnel), cancel it explicitly
+                        else if (server.value.template) server.value.ssh_tunnel = null;
                         else delete server.value.ssh_tunnel;
                         testResult = null;
                       }}
