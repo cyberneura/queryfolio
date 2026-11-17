@@ -2,6 +2,7 @@ mod ai;
 mod cli;
 mod color;
 mod config;
+mod connections;
 mod db;
 mod dump;
 mod engines;
@@ -2015,6 +2016,149 @@ async fn save_general_settings(
     config::save_general_settings(&patch, &override_keys, allow_drop_comments)
 }
 
+/// The connection editor's view (CYBERNEURA-DEV-1299, connections.rs). No secrets.
+#[derive(serde::Serialize)]
+struct ConnectionsEditorView {
+    config_path: String,
+    editable: bool,
+    readonly_reason: Option<String>,
+    /// config_override_command provides `servers` (the list is replaced wholesale), so the local
+    /// list has no effect
+    servers_overridden: bool,
+    override_error: Option<String>,
+    has_comments: bool,
+    backup_path: String,
+    backup_exists: bool,
+    local: Option<connections::LocalServers>,
+    /// Connection templates (local + override): name and engine, so the form can show the
+    /// fields of an engine inherited from a template
+    templates: Vec<TemplateRef>,
+    /// Engine names the form offers
+    engines: Vec<&'static str>,
+}
+
+#[derive(serde::Serialize)]
+struct TemplateRef {
+    name: String,
+    engine: Option<String>,
+}
+
+/// Connection templates for validation: from the merged config when it could be built
+/// (templates can live in the override), else from the local file.
+fn editor_templates(
+    merged: Result<&AppConfig, &AppError>,
+    local: &serde_yaml::Mapping,
+) -> Vec<serde_yaml::Value> {
+    let from = |doc: Option<&serde_yaml::Value>| {
+        doc.and_then(|v| v.as_sequence())
+            .cloned()
+            .unwrap_or_default()
+    };
+    match merged {
+        Ok(config) => from(config.raw("server_templates")),
+        Err(_) => from(local.get("server_templates")),
+    }
+}
+
+#[tauri::command]
+async fn get_connections_editor(
+    state: tauri::State<'_, AppState>,
+) -> Result<ConnectionsEditorView, AppError> {
+    let merged = state.resolve_config().await;
+    let override_keys = config::settings_override_keys(merged.as_deref());
+    let (path, text) = config::local_config_text()?;
+    let target = settings::resolve_write_target(&path).unwrap_or_else(|_| path.clone());
+    let backup = settings::backup_path_for(&target);
+    let mut view = ConnectionsEditorView {
+        config_path: path.display().to_string(),
+        editable: false,
+        readonly_reason: None,
+        servers_overridden: settings::is_overridden(&override_keys, "servers"),
+        override_error: merged.as_ref().err().map(|e| e.to_string()),
+        has_comments: settings::has_comments(&text),
+        backup_exists: backup.exists(),
+        backup_path: backup.display().to_string(),
+        local: None,
+        templates: Vec::new(),
+        engines: vec![
+            "postgres",
+            "mysql",
+            "mssql",
+            "sqlite",
+            "duckdb",
+            "redis",
+            "elasticsearch",
+            "dynamodb",
+        ],
+    };
+    match settings::parse_local(&text).and_then(|doc| {
+        let local = connections::read_local_servers(&doc)?;
+        Ok((doc, local))
+    }) {
+        Ok((doc, local)) => {
+            view.templates = editor_templates(merged.as_deref(), &doc)
+                .iter()
+                .filter_map(|t| {
+                    Some(TemplateRef {
+                        name: t.get("name")?.as_str()?.to_string(),
+                        engine: t.get("engine").and_then(|e| e.as_str()).map(str::to_string),
+                    })
+                })
+                .collect();
+            view.local = Some(local);
+            view.editable = !view.servers_overridden;
+            if view.servers_overridden {
+                view.readonly_reason = Some(
+                    "config_override_command provides servers, which replaces the whole list, so connections saved here would have no effect".into(),
+                );
+            }
+        }
+        Err(e) => view.readonly_reason = Some(e.to_string()),
+    }
+    Ok(view)
+}
+
+/// Saves the connection editor's list (replaces `servers`). The frontend reloads afterwards.
+#[tauri::command]
+async fn save_connections(
+    state: tauri::State<'_, AppState>,
+    patch: connections::ConnectionsPatch,
+    allow_drop_comments: bool,
+) -> Result<settings::SaveOutcome, AppError> {
+    static SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _save = SAVE_LOCK.lock().await;
+    let merged = state.resolve_config().await;
+    let override_keys = config::settings_override_keys(merged.as_deref());
+    if settings::is_overridden(&override_keys, "servers") {
+        return Err(AppError::Config(
+            "config_override_command provides servers, so connections cannot be saved here".into(),
+        ));
+    }
+    let (path, _) = config::local_config_text()?;
+    let merged_ref = merged.as_deref();
+    settings::save_doc_change(&path, allow_drop_comments, |doc| {
+        let templates = editor_templates(merged_ref, doc);
+        connections::apply_connections(doc, &patch, &templates)
+    })
+}
+
+/// "Test connection": connects with the edited (unsaved) entry and returns only whether it
+/// worked. Secrets of the entry it was read from are filled in on this side.
+#[tauri::command]
+async fn test_connection(
+    state: tauri::State<'_, AppState>,
+    server: connections::ServerEdit,
+    revision: String,
+) -> Result<String, AppError> {
+    let merged = state.resolve_config().await;
+    let (_, text) = config::local_config_text()?;
+    let doc = settings::parse_local(&text)?;
+    let templates = editor_templates(merged.as_deref(), &doc);
+    let server = connections::server_for_test(&server, &revision, &doc, &templates)?;
+    db::test_connection(&server).await?;
+    Ok(format!("Connected to {}", server.name))
+}
+
 /// "Show config file" in the Settings window: the same as Config > Reveal config folder.
 #[tauri::command]
 fn reveal_config_file() -> Result<(), AppError> {
@@ -2874,6 +3018,9 @@ pub fn run() {
             save_general_settings,
             test_config_override_command,
             reveal_config_file,
+            get_connections_editor,
+            save_connections,
+            test_connection,
             write_export_file,
             get_dump_info,
             preview_dump_command,

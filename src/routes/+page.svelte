@@ -25,6 +25,7 @@
   import ReplaceMultilinePane from "$lib/components/ReplaceMultilinePane.svelte";
   import ResultsPane from "$lib/components/ResultsPane.svelte";
   import SettingsModal from "$lib/components/SettingsModal.svelte";
+  import ConnectionsModal from "$lib/components/ConnectionsModal.svelte";
   import ConfigEditorModal from "$lib/components/ConfigEditorModal.svelte";
   import LicensesModal from "$lib/components/LicensesModal.svelte";
   import AiAnalysisModal from "$lib/components/AiAnalysisModal.svelte";
@@ -38,6 +39,8 @@
   import PaneDivider from "$lib/components/PaneDivider.svelte";
 
   let showSettings = $state(false);
+  /// Connection editor (CYBERNEURA-DEV-1299). undefined = closed; a name = open on that connection
+  let connectionsEditor = $state<{ name: string | null } | null>(null);
   let showSearch = $state(false);
   /// License list opened from the Third-Party Licenses menu item
   let showLicenses = $state(false);
@@ -67,6 +70,7 @@
   const isModalOpen = () =>
     showSearch ||
     showSettings ||
+    connectionsEditor !== null ||
     showLicenses ||
     configEditorMode !== null ||
     appStore.aiAnalysis !== null ||
@@ -671,7 +675,16 @@
        only one axis makes the other compute to auto, so hidden is set explicitly) -->
   <div class="flex min-h-0 flex-1 overflow-x-auto overflow-y-hidden">
     <div class="shrink-0" style="width: {connectionsWidth}px">
-      <ConnectionsPane onEditConfig={() => openConfigEditor("config")} />
+      <ConnectionsPane
+        onEditConfig={() => openConfigEditor("config")}
+        onManageConnections={(name) => {
+          if (configEditorMode !== null) {
+            toast.warning("Close the config editor first");
+            return;
+          }
+          connectionsEditor = { name: name ?? null };
+        }}
+      />
     </div>
     <PaneDivider
       direction="vertical"
@@ -915,6 +928,23 @@
     }}
     onOpenTable={() => {
       leftPaneTab = "tables";
+    }}
+  />
+{/if}
+
+{#if connectionsEditor !== null}
+  <ConnectionsModal
+    initialName={connectionsEditor.name}
+    onClose={() => {
+      connectionsEditor = null;
+    }}
+    onViewOverride={() => {
+      connectionsEditor = null;
+      openConfigEditor("source");
+    }}
+    onEditAsText={() => {
+      connectionsEditor = null;
+      openConfigEditor("config");
     }}
   />
 {/if}

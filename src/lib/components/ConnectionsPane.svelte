@@ -11,9 +11,11 @@
   type Props = {
     /// Open the config editor (ConfigEditorModal). Same as the Edit config.yml menu item
     onEditConfig: () => void;
+    /// Opens the connection editor (optionally on one connection)
+    onManageConnections: (name?: string) => void;
   };
 
-  let { onEditConfig }: Props = $props();
+  let { onEditConfig, onManageConnections }: Props = $props();
 
   const SETTINGS_DOC_URL =
     "https://github.com/cyberneura/queryfolio/blob/main/docs/settings.md";
@@ -323,6 +325,15 @@
     </button>
     <button
       class="rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200"
+      title="Add or edit connections"
+      aria-label="Add or edit connections"
+      data-annotate="button-manage-connections"
+      onclick={() => onManageConnections()}
+    >
+      <i class="bi bi-pencil-square" aria-hidden="true"></i>
+    </button>
+    <button
+      class="rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200"
       title="Reload connections"
       aria-label="Reload connections"
       data-annotate="button-reload-connections"
@@ -358,6 +369,14 @@
         >
           <i class="bi bi-folder2-open" aria-hidden="true"></i>
           Open SQLite / DuckDB file…
+        </button>
+        <button
+          class="flex items-center gap-1.5 rounded bg-zinc-700 px-2 py-1.5 text-left text-xs text-zinc-200 hover:bg-zinc-600"
+          data-annotate="button-empty-add-connection"
+          onclick={() => onManageConnections()}
+        >
+          <i class="bi bi-plus-circle" aria-hidden="true"></i>
+          Add a connection…
         </button>
         <button
           class="flex items-center gap-1.5 rounded bg-zinc-700 px-2 py-1.5 text-left text-xs text-zinc-200 hover:bg-zinc-600"
@@ -408,6 +427,10 @@
             style:--connection-color={connection.color ?? undefined}
             data-annotate="button-connection-{connection.name}"
             onclick={() => appStore.selectConnection(connection.name)}
+            oncontextmenu={(e) => {
+              e.preventDefault();
+              onManageConnections(connection.name);
+            }}
             onmouseenter={(e) => showTip(connection, e)}
             onmousemove={(e) => hovered && setAnchor(e)}
             onmouseleave={hideTip}

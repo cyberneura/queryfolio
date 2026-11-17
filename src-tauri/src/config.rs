@@ -1429,6 +1429,27 @@ pub fn settings_override_keys(merged: Result<&AppConfig, &AppError>) -> Vec<Stri
     }
 }
 
+/// The local config file and its text, for the editors that rewrite it (the template is created
+/// first if there is no file). Errors while the config comes from QUERYFOLIO_CONFIG_YAML.
+pub fn local_config_text() -> Result<(PathBuf, String), AppError> {
+    if config_env_override() {
+        return Err(AppError::Config(
+            "The config is overridden by QUERYFOLIO_CONFIG_YAML, so there is no file to edit"
+                .into(),
+        ));
+    }
+    let dir = app_config_dir()?;
+    let text = read_config_file_in(&dir)?;
+    Ok((config_path_in(&dir), text))
+}
+
+impl AppConfig {
+    /// A top-level value of the (merged) config, as written.
+    pub fn raw(&self, key: &str) -> Option<&serde_yaml::Value> {
+        self.doc.get(key)
+    }
+}
+
 /// Builds the Settings window's view from the local file and the (cached) merged config.
 pub fn general_settings_view(
     merged: Result<&AppConfig, &AppError>,
@@ -1608,7 +1629,7 @@ fn reject_renamed_server_key(entry: &serde_yaml::Value, source: &str) -> Result<
 /// - A group entry (group_name + a nested servers list).
 ///   Flattened into the nested servers, recording group_name on each server.
 ///   Recursion (a group inside a group) is forbidden (depth 1 only).
-fn parse_server_entries(
+pub(crate) fn parse_server_entries(
     servers: &[serde_yaml::Value],
     templates: &[serde_yaml::Value],
     source: &str,

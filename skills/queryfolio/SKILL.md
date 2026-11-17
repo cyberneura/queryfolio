@@ -384,8 +384,8 @@ ship the contents somewhere else casually.
   [ -f "$CONF" ] || CONF=~/.config/queryfolio/config.yaml
   ```
 
-- The app's **Settings window** (Config → Settings…) rewrites `config.yml` from its structure
-  when the user saves it, which removes comments (after asking the user once, and keeping the
+- The app's **Settings window** (Config → Settings…) and **connection editor** (CONNECTIONS → pencil) rewrite `config.yml` from its structure
+  when the user saves, which removes comments (after asking the user once, and keeping the
   pre-first-save file as `config.yml.bak`). Do not rely on comments you add to `config.yml`
   surviving. It never writes values that come from `config_override_command`.
 - When `QUERYFOLIO_CONFIG_YAML` holds a non-empty value for the running app (a development /
