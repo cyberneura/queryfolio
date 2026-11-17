@@ -737,6 +737,9 @@ pub struct AppConfig {
     /// The config_override_command actually applied in load_merged.
     /// The key is dropped from the merged doc, so it is saved here for display.
     applied_override: Option<String>,
+    /// Dotted paths of the values the override YAML provided (settings::override_key_paths).
+    /// The Settings window shows these fields read-only and never writes them locally.
+    override_keys: Vec<String>,
 }
 
 impl AppConfig {
@@ -751,6 +754,7 @@ impl AppConfig {
                     doc,
                     source_path: None,
                     applied_override: None,
+                    override_keys: Vec::new(),
                 });
             }
         }
@@ -774,6 +778,7 @@ impl AppConfig {
             doc,
             source_path: Some(path),
             applied_override: None,
+            override_keys: Vec::new(),
         })
     }
 
@@ -792,6 +797,10 @@ impl AppConfig {
         let yaml = run_source_command(&command).await?;
         let overrides = parse_mapping(&yaml, &format!("{CONFIG_OVERRIDE_COMMAND_KEY}: {command}"))?;
         merge_mapping(&mut config.doc, &overrides);
+        config.override_keys = crate::settings::override_key_paths(&overrides)
+            .into_iter()
+            .filter(|key| key != CONFIG_OVERRIDE_COMMAND_KEY)
+            .collect();
         // Do not fetch recursively even if the fetched YAML has config_override_command.
         // Drop the key itself to indicate it has already been applied (the info display uses the
         // local value, so removing it here does not affect the display).
@@ -812,7 +821,7 @@ impl AppConfig {
         self.doc
             .get("default_limit")
             .and_then(|v| v.as_u64())
-            .unwrap_or(500)
+            .unwrap_or(crate::settings::DEFAULT_LIMIT)
     }
 
     /// Resolves the directory for saved query files.
@@ -977,6 +986,13 @@ pub fn write_config_file(content: &str) -> Result<String, AppError> {
 }
 
 fn write_config_file_in(dir: &std::path::Path, content: &str) -> Result<String, AppError> {
+    let _guard = crate::settings::lock_config_writes();
+    write_config_file_unlocked(dir, content)
+}
+
+/// `write_config_file_in` for callers that already hold `settings::CONFIG_WRITE_LOCK`
+/// (a read-modify-write such as `add_file_connection_in`).
+fn write_config_file_unlocked(dir: &std::path::Path, content: &str) -> Result<String, AppError> {
     // Saving broken YAML as-is would lose the connection list on the next launch, so
     // verify before saving that it parses as a mapping
     parse_mapping(content, "the edited config")?;
@@ -985,36 +1001,12 @@ fn write_config_file_in(dir: &std::path::Path, content: &str) -> Result<String, 
     let path = config_path_in(dir);
 
     // The config may contain connection passwords and SSH key passphrases in plain text, so
-    // always write with owner-only (600). Even if the existing file is 644/640 etc., narrow it to
-    // 600, matching the fix policy of ensure_config_file_in / AppConfig::load (inheriting the
-    // existing permissions could leak to other users via the shared staff group on macOS)
-    #[cfg(unix)]
-    let mode = 0o600;
-
-    let temp = path.with_extension("yml.tmp");
-    // Specify the permissions at creation time. Calling set_permissions after writing would
-    // leave the contents, which include passwords, with umask-dependent permissions (usually
-    // 644) for that interval, letting other users on the same machine read them
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(mode)
-            .open(&temp)?;
-        // mode only takes effect on creation, so also set it explicitly in case a temp
-        // file was left behind by a previous interruption
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode))?;
-        file.write_all(content.as_bytes())?;
-        file.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    std::fs::write(&temp, content)?;
-    std::fs::rename(&temp, &path)?;
+    // it is always written owner-only (600), even if the existing file is 644/640 (inheriting
+    // them could leak to other users via the shared staff group on macOS). The write goes
+    // through a temp file + rename so a failure midway never leaves a half-written config, and
+    // a symlinked config.yml (dotfiles) stays a symlink: the target is replaced, not the link
+    // (settings::write_atomically)
+    crate::settings::write_atomically(&path, content)?;
     Ok(path.display().to_string())
 }
 
@@ -1067,6 +1059,9 @@ fn add_file_connection_in(dir: &std::path::Path, path: &str) -> Result<FileConne
         return Err(AppError::Config(format!("{path} is not an existing file")));
     }
 
+    // Held from the read to the write so that a save from the Settings window or the text
+    // editor in between is not overwritten by this append
+    let _guard = crate::settings::lock_config_writes();
     let text = read_config_file_in(dir)?;
     let doc = parse_mapping(&text, "the config")?;
     // Duplicate detection is done on the effective config, with templates expanded and groups
@@ -1122,7 +1117,7 @@ fn add_file_connection_in(dir: &std::path::Path, path: &str) -> Result<FileConne
     let name = unique_connection_name(&base_name, &names);
 
     let updated = append_server_entry(&text, &name, engine, path)?;
-    write_config_file_in(dir, &updated)?;
+    write_config_file_unlocked(dir, &updated)?;
     Ok(FileConnection { name, added: true })
 }
 
@@ -1307,6 +1302,230 @@ pub async fn fetch_override_config_yaml() -> Result<String, AppError> {
             "The config has no {CONFIG_OVERRIDE_COMMAND_KEY}"
         ))),
     }
+}
+
+/// Runs a `config_override_command` typed into the Settings window (it does not have to be
+/// saved yet) and returns how many values its YAML would override. **The values themselves are
+/// never returned** (they are usually secrets); errors carry the command and stderr only,
+/// as for every setting command (`run_setting_command`).
+pub async fn test_override_command(command: &str) -> Result<usize, AppError> {
+    crate::settings::validate_command(command).map_err(AppError::Config)?;
+    let yaml = run_source_command(command.trim()).await?;
+    let overrides = parse_mapping(&yaml, &format!("{CONFIG_OVERRIDE_COMMAND_KEY}: {command}"))?;
+    Ok(crate::settings::override_key_paths(&overrides)
+        .iter()
+        .filter(|key| key.as_str() != CONFIG_OVERRIDE_COMMAND_KEY)
+        .count())
+}
+
+/// A connection template as the Settings window lists it (read-only).
+#[derive(Debug, Serialize, PartialEq)]
+pub struct TemplateSummary {
+    pub name: String,
+    pub engine: Option<String>,
+}
+
+/// The query file folder of one connection, for the Settings window (read-only; `folder_name`
+/// is a per-connection key and is edited with the connection).
+#[derive(Debug, Serialize, PartialEq)]
+pub struct FolderSummary {
+    pub connection: String,
+    pub folder: String,
+    /// Whether the connection sets `folder_name` itself (otherwise the folder is derived)
+    pub explicit: bool,
+}
+
+/// Everything the Settings window shows. Contains no secrets: the API key is only reported as
+/// set / not set, and override values are only named (`overridden`), never included.
+#[derive(Debug, Serialize)]
+pub struct GeneralSettingsView {
+    pub config_path: String,
+    /// false while the config comes from QUERYFOLIO_CONFIG_YAML or the file cannot be parsed
+    pub editable: bool,
+    pub readonly_reason: Option<String>,
+    /// Whether the file has comments that a save would drop
+    pub has_comments: bool,
+    pub backup_path: String,
+    pub backup_exists: bool,
+    pub local: crate::settings::LocalSettings,
+    /// Dotted paths the override provides (read-only in the form)
+    pub overridden: Vec<String>,
+    /// Why the merged config could not be built (override command failure, etc.). The form still
+    /// works on the local file, but cannot tell which keys the override provides
+    pub override_error: Option<String>,
+    /// Values in use right now (merged config), for the "currently" hints
+    pub effective_default_limit: Option<u64>,
+    pub effective_sqlfiles_dir: Option<String>,
+    pub templates: Vec<TemplateSummary>,
+    pub folders: Vec<FolderSummary>,
+}
+
+impl AppConfig {
+    /// See `override_keys`.
+    pub fn override_keys(&self) -> &[String] {
+        &self.override_keys
+    }
+
+    fn template_summaries(&self) -> Vec<TemplateSummary> {
+        self.doc
+            .get("server_templates")
+            .and_then(|v| v.as_sequence())
+            .map(|templates| {
+                templates
+                    .iter()
+                    .filter_map(|t| t.as_mapping())
+                    .filter_map(|t| {
+                        let name = t.get("name")?.as_str()?.to_string();
+                        let engine = t.get("engine").and_then(|v| v.as_str()).map(str::to_string);
+                        Some(TemplateSummary { name, engine })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn folder_summaries(&self) -> Vec<FolderSummary> {
+        // A broken servers list is reported by the connections pane; here it just lists nothing
+        self.resolve_servers()
+            .map(|servers| {
+                servers
+                    .iter()
+                    .map(|s| FolderSummary {
+                        connection: s.name.clone(),
+                        folder: s.sqlfiles_folder_name(),
+                        explicit: s
+                            .folder_name
+                            .as_deref()
+                            .is_some_and(|f| !f.trim().is_empty()),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Keys the Settings window must treat as coming from `config_override_command`.
+///
+/// From the merged config when it could be built. When it could not, and the local file has
+/// `config_override_command` (so the failure is most likely the command), which keys it would
+/// provide is unknown: everything but the command is locked (`OVERRIDE_UNKNOWN_KEYS`). Without
+/// the key the failure is something else (broken YAML, ...) and nothing is overridden.
+pub fn settings_override_keys(merged: Result<&AppConfig, &AppError>) -> Vec<String> {
+    match merged {
+        Ok(config) => config.override_keys().to_vec(),
+        Err(_) => {
+            let has_command = AppConfig::load()
+                .map(|local| local.doc.contains_key(CONFIG_OVERRIDE_COMMAND_KEY))
+                .unwrap_or(false);
+            if has_command {
+                crate::settings::OVERRIDE_UNKNOWN_KEYS
+                    .iter()
+                    .map(|k| k.to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Builds the Settings window's view from the local file and the (cached) merged config.
+pub fn general_settings_view(
+    merged: Result<&AppConfig, &AppError>,
+) -> Result<GeneralSettingsView, AppError> {
+    let (
+        overridden,
+        override_error,
+        effective_default_limit,
+        effective_sqlfiles_dir,
+        templates,
+        folders,
+    ) = match merged {
+        Ok(config) => (
+            config.override_keys().to_vec(),
+            None,
+            Some(config.default_limit()),
+            config
+                .resolve_sqlfiles_dir()
+                .ok()
+                .map(|p| p.display().to_string()),
+            config.template_summaries(),
+            config.folder_summaries(),
+        ),
+        Err(e) => (
+            settings_override_keys(Err(e)),
+            Some(e.to_string()),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        ),
+    };
+    let mut view = GeneralSettingsView {
+        config_path: String::new(),
+        editable: false,
+        readonly_reason: None,
+        has_comments: false,
+        backup_path: String::new(),
+        backup_exists: false,
+        local: crate::settings::LocalSettings::default(),
+        overridden,
+        override_error,
+        effective_default_limit,
+        effective_sqlfiles_dir,
+        templates,
+        folders,
+    };
+    if config_env_override() {
+        view.config_path = "(env QUERYFOLIO_CONFIG_YAML)".into();
+        view.readonly_reason = Some(
+            "The config comes from QUERYFOLIO_CONFIG_YAML, so there is no file to save to".into(),
+        );
+        if let Ok(yaml) = std::env::var("QUERYFOLIO_CONFIG_YAML") {
+            if let Ok(doc) = crate::settings::parse_local(&yaml) {
+                view.local = crate::settings::read_local_settings(&doc);
+            }
+        }
+        return Ok(view);
+    }
+    let dir = app_config_dir()?;
+    let text = read_config_file_in(&dir)?;
+    let path = config_path_in(&dir);
+    view.config_path = path.display().to_string();
+    let target = crate::settings::resolve_write_target(&path).unwrap_or_else(|_| path.clone());
+    let backup = crate::settings::backup_path_for(&target);
+    view.backup_exists = backup.exists();
+    view.backup_path = backup.display().to_string();
+    view.has_comments = crate::settings::has_comments(&text);
+    match crate::settings::parse_local(&text) {
+        Ok(doc) => {
+            view.local = crate::settings::read_local_settings(&doc);
+            view.editable = true;
+        }
+        Err(e) => view.readonly_reason = Some(e.to_string()),
+    }
+    Ok(view)
+}
+
+/// Saves the Settings window's changes into the local config file.
+pub fn save_general_settings(
+    patch: &crate::settings::SettingsPatch,
+    override_keys: &[String],
+    allow_drop_comments: bool,
+) -> Result<crate::settings::SaveOutcome, AppError> {
+    if config_env_override() {
+        return Err(AppError::Config(
+            "The config is overridden by QUERYFOLIO_CONFIG_YAML, so it cannot be saved".into(),
+        ));
+    }
+    let dir = app_config_dir()?;
+    ensure_config_file_in(&dir)?;
+    crate::settings::save_patch(
+        &config_path_in(&dir),
+        patch,
+        override_keys,
+        allow_drop_comments,
+    )
 }
 
 /// Recursively merges the fetched YAML (over) into the local config (base). over takes precedence.
@@ -1682,6 +1901,7 @@ mod tests {
             doc: parse_mapping(yaml, "test").unwrap(),
             source_path: None,
             applied_override: None,
+            override_keys: Vec::new(),
         }
     }
 
@@ -2029,6 +2249,10 @@ server_templates:
         let mut config = config_from_yaml(local_yaml);
         let overrides = parse_mapping(fetched_yaml, "test override").unwrap();
         merge_mapping(&mut config.doc, &overrides);
+        config.override_keys = crate::settings::override_key_paths(&overrides)
+            .into_iter()
+            .filter(|key| key != CONFIG_OVERRIDE_COMMAND_KEY)
+            .collect();
         config.doc.remove(CONFIG_OVERRIDE_COMMAND_KEY);
         config.applied_override = Some("test-command".to_string());
         config

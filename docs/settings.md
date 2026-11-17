@@ -45,7 +45,40 @@ save. (On Windows, the platform's default file permissions apply.)
 
 ## Editing the config
 
-You can edit the file with any text editor, or from inside the app:
+You can edit the file with any text editor, or from inside the app.
+
+### Settings window
+
+Menu bar **Config → Settings…** (Cmd/Ctrl+,) — also the gear button in the
+toolbar — opens a form for the settings that are not connections:
+`default_limit`, `sqlfiles_dir`, `config_override_command` and the `ai:`
+section. It also lists your connection templates and the query file folder of
+each connection (read-only; edit those in the YAML). Each field has a one-line
+explanation and a **Reset to default** button (which removes the key from the
+file), and invalid values are shown next to the field and are not saved.
+
+- **It only writes your local config file.** Values that
+  `config_override_command` provides (for example an API key kept in
+  1Password) are shown as *Overridden by 1Password (config_override_command)*,
+  cannot be edited here, and are never copied into config.yml.
+- **API keys are never displayed.** For the AI API key you choose between
+  *Get it from 1Password (recommended)* — the window shows the YAML to store in
+  1Password and an `op read "op://<vault>/<item>/<field>"` command to put in
+  `config_override_command`, both with a Copy button — and *Enter it here*,
+  which stores it in config.yml as plain text.
+- **Test** next to `config_override_command` runs the command and tells you
+  how many values it would override. The values themselves are not shown.
+- Saving rewrites the whole file from its structure, so **comments are
+  removed**. If the file has comments, you are asked once before the first
+  such save. Before the first overwrite, the previous file is kept next to it
+  as `config.yml.bak`. Use **Edit as text** (or Config → Edit config.yml) if
+  you want to keep your comments.
+- If config.yml is a symlink (dotfiles), the file it points to is updated and
+  the link is kept.
+- While `QUERYFOLIO_CONFIG_YAML` is set, or the file cannot be parsed, the
+  window is read-only.
+
+### Text editor
 
 - Menu bar **Config → Edit config.yml** opens a built-in editor (with YAML
   syntax highlighting and lint errors shown inline). While there are no
