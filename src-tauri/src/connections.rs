@@ -341,7 +341,7 @@ pub fn build_server(edit: &ServerEdit, original: &[Value]) -> Result<Value, AppE
     // A template may supply `password`; with password_command on this entry, cancel it the way
     // docs/settings.md describes (`password: null`), or the two would be combined and rejected
     if map.contains_key("template")
-        && map.contains_key("password_command")
+        && map.get("password_command").is_some_and(|v| !v.is_null())
         && !map.contains_key("password")
     {
         map.insert("password".into(), Value::Null);
@@ -712,6 +712,21 @@ mod tests {
         assert_eq!(b.as_mapping().unwrap().get("password").unwrap(), "");
         let parsed = crate::config::parse_server_entries(&[b], &templates, "t").unwrap();
         assert_eq!(parsed[0].password.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_null_command_keeps_the_inherited_password() {
+        let templates = vec![serde_yaml::from_str::<Value>(
+            "{name: t, engine: postgres, password: tpw, password_command: op read x}",
+        )
+        .unwrap()];
+        let doc = yaml("servers:\n- name: a\n  template: t\n  password_command: null\n");
+        let local = view(&doc);
+        let original = local_servers_seq(&doc).unwrap();
+        let built = build_server(&edit(Some("0"), local.servers[0].clone()), &original).unwrap();
+        assert!(built.as_mapping().unwrap().get("password").is_none());
+        let parsed = crate::config::parse_server_entries(&[built], &templates, "t").unwrap();
+        assert_eq!(parsed[0].password.as_deref(), Some("tpw"));
     }
 
     #[test]
