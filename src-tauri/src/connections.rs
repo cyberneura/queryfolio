@@ -316,8 +316,18 @@ pub fn build_server(edit: &ServerEdit, original: &[Value]) -> Result<Value, AppE
                 .filter(|v| is_set(v))
                 .cloned(),
         };
-        let Some(secret) = secret else {
-            continue;
+        // An explicit `null` in the source entry cancels a value the template would supply
+        // (e.g. `password: null` next to password_command); `clean` dropped it, so put it back
+        let secret = match secret {
+            Some(secret) => secret,
+            None if !matches!(edit.secrets.get(key), Some(Change::Set(_)))
+                && source
+                    .and_then(|s| get_path(s, key))
+                    .is_some_and(|v| v.is_null()) =>
+            {
+                Value::Null
+            }
+            None => continue,
         };
         match key.split_once('.') {
             Some((parent, leaf)) => {
@@ -331,6 +341,14 @@ pub fn build_server(edit: &ServerEdit, original: &[Value]) -> Result<Value, AppE
                 map.insert(Value::String(key.into()), secret);
             }
         }
+    }
+    // A template may supply `password`; with password_command on this entry, cancel it the way
+    // docs/settings.md describes (`password: null`), or the two would be combined and rejected
+    if map.contains_key("template")
+        && map.contains_key("password_command")
+        && !map.contains_key("password")
+    {
+        map.insert("password".into(), Value::Null);
     }
     if let Some(Value::Mapping(tunnel)) = map.get("ssh_tunnel").cloned() {
         let source_tunnel = source
@@ -628,6 +646,42 @@ mod tests {
             &[]
         )
         .is_err());
+    }
+
+    #[test]
+    fn an_explicit_null_password_cancels_the_template_password() {
+        let templates =
+            vec![
+                serde_yaml::from_str::<Value>("{name: t, engine: postgres, password: tpw}")
+                    .unwrap(),
+            ];
+        let doc = yaml(
+            "servers:\n- name: a\n  template: t\n  password: null\n  password_command: op read x\n",
+        );
+        let local = view(&doc);
+        assert!(
+            local.secrets.is_empty(),
+            "a null password is not a stored secret"
+        );
+        let original = local_servers_seq(&doc).unwrap();
+        let built = build_server(&edit(Some("0"), local.servers[0].clone()), &original).unwrap();
+        assert!(built
+            .as_mapping()
+            .unwrap()
+            .get("password")
+            .unwrap()
+            .is_null());
+        validate_servers(&[built], &templates).unwrap();
+        // A new entry that uses a template and a password command gets the null too
+        let fresh = build_server(
+            &edit(
+                None,
+                serde_json::json!({"name": "b", "template": "t", "password_command": "op read y"}),
+            ),
+            &[],
+        )
+        .unwrap();
+        validate_servers(&[fresh], &templates).unwrap();
     }
 
     #[test]

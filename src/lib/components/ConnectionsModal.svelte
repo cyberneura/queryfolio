@@ -416,7 +416,7 @@
                 </label>
                 <label class={`${label} col-span-2`}>
                   <span>Description <span class={muted}>(optional)</span></span>
-                  <input class={input} value={str(server.value.description)} oninput={(e) => setField("description", e.currentTarget.value)} />
+                  <input class={input} data-annotate="input-connection-description" value={str(server.value.description)} oninput={(e) => setField("description", e.currentTarget.value)} />
                 </label>
                 <label class={label}>
                   <span>Template <span class={muted}>(server_templates)</span></span>
@@ -466,7 +466,7 @@
                 {#if fields.includes("aws_profile")}
                   <label class={label}>
                     <span>AWS profile <span class={muted}>(~/.aws)</span></span>
-                    <input class={input} value={str(server.value.aws_profile)} oninput={(e) => setField("aws_profile", e.currentTarget.value)} />
+                    <input class={input} data-annotate="input-connection-aws-profile" value={str(server.value.aws_profile)} oninput={(e) => setField("aws_profile", e.currentTarget.value)} />
                   </label>
                 {/if}
                 {#if fields.includes("ssl_mode")}
@@ -482,12 +482,12 @@
                 {#if fields.includes("ssl_root_cert")}
                   <label class={label}>
                     <span>Root CA file <span class={muted}>(verify-ca / verify-full)</span></span>
-                    <input class={input} value={str(server.value.ssl_root_cert)} oninput={(e) => setField("ssl_root_cert", e.currentTarget.value)} />
+                    <input class={input} data-annotate="input-connection-ssl-root-cert" value={str(server.value.ssl_root_cert)} oninput={(e) => setField("ssl_root_cert", e.currentTarget.value)} />
                   </label>
                 {/if}
                 {#if fields.includes("tls")}
                   <label class="flex items-center gap-2 pt-4">
-                    <input type="checkbox" checked={server.value.tls === true} onchange={(e) => setFlag("tls", e.currentTarget.checked)} />
+                    <input type="checkbox" data-annotate="checkbox-connection-tls" checked={server.value.tls === true} onchange={(e) => setFlag("tls", e.currentTarget.checked)} />
                     Use https (tls)
                   </label>
                 {/if}
@@ -554,11 +554,11 @@
                   {#if tunnel}
                     <div class="ml-5 flex flex-col gap-1.5">
                       <label class="flex items-center gap-2">
-                        <input type="radio" name="tunnel-mode" checked={typeof tunnel.ssh_config === "string"} onchange={() => setTunnel("ssh_config", str(tunnel.ssh_config) || " ")} />
+                        <input type="radio" name="tunnel-mode" data-annotate="radio-tunnel-ssh-config" checked={typeof tunnel.ssh_config === "string"} onchange={() => setTunnel("ssh_config", str(tunnel.ssh_config) || " ")} />
                         Use a Host from ~/.ssh/config (ProxyJump etc. work; OpenSSH handles authentication)
                       </label>
                       <label class="flex items-center gap-2">
-                        <input type="radio" name="tunnel-mode" checked={typeof tunnel.ssh_config !== "string"} onchange={() => setTunnel("ssh_config", undefined)} />
+                        <input type="radio" name="tunnel-mode" data-annotate="radio-tunnel-host" checked={typeof tunnel.ssh_config !== "string"} onchange={() => setTunnel("ssh_config", undefined)} />
                         Enter the host and user
                       </label>
                       {#if typeof tunnel.ssh_config === "string"}
@@ -566,16 +566,17 @@
                       {:else}
                         <div class="grid grid-cols-2 gap-1.5">
                           <input class={input} placeholder="host" data-annotate="input-tunnel-host" value={str(tunnel.host)} oninput={(e) => setTunnel("host", e.currentTarget.value)} />
-                          <input class={input} placeholder="port (22)" inputmode="numeric" value={str(tunnel.port)} oninput={(e) => setTunnel("port", e.currentTarget.value.trim() === "" ? undefined : Number(e.currentTarget.value))} />
+                          <input class={input} data-annotate="input-tunnel-port" placeholder="port (22)" inputmode="numeric" value={str(tunnel.port)} oninput={(e) => setTunnel("port", e.currentTarget.value.trim() === "" ? undefined : Number(e.currentTarget.value))} />
                           <input class={input} placeholder="user" data-annotate="input-tunnel-user" value={str(tunnel.user)} oninput={(e) => setTunnel("user", e.currentTarget.value)} />
-                          <input class={input} placeholder="private key path (optional)" value={str(tunnel.private_key_path)} oninput={(e) => setTunnel("private_key_path", e.currentTarget.value)} />
-                          <input class={`${input} col-span-2`} placeholder="ssh-agent socket (optional; e.g. the 1Password agent)" value={str(tunnel.identity_agent)} oninput={(e) => setTunnel("identity_agent", e.currentTarget.value)} />
+                          <input class={input} data-annotate="input-tunnel-private-key-path" placeholder="private key path (optional)" value={str(tunnel.private_key_path)} oninput={(e) => setTunnel("private_key_path", e.currentTarget.value)} />
+                          <input class={`${input} col-span-2`} data-annotate="input-tunnel-identity-agent" placeholder="ssh-agent socket (optional; e.g. the 1Password agent)" value={str(tunnel.identity_agent)} oninput={(e) => setTunnel("identity_agent", e.currentTarget.value)} />
                           {#each [["ssh_tunnel.password", "SSH password"], ["ssh_tunnel.private_key_passphrase", "Key passphrase"]] as [key, text] (key)}
                             <div class="col-span-2 flex items-center gap-2">
                               <input
                                 class={input}
                                 type="password"
                                 autocomplete="off"
+                                data-annotate={`input-${key}`}
                                 placeholder={stored(key as SecretKey) ? `${text}: stored (type to replace)` : `${text} (optional)`}
                                 disabled={removing(key as SecretKey)}
                                 value={typed(key as SecretKey)}
@@ -583,7 +584,7 @@
                               />
                               {#if stored(key as SecretKey)}
                                 <label class="flex shrink-0 items-center gap-1 text-zinc-400">
-                                  <input type="checkbox" checked={removing(key as SecretKey)} onchange={(e) => removeSecret(key as SecretKey, e.currentTarget.checked)} />
+                                  <input type="checkbox" data-annotate={`checkbox-remove-${key}`} checked={removing(key as SecretKey)} onchange={(e) => removeSecret(key as SecretKey, e.currentTarget.checked)} />
                                   Remove
                                 </label>
                               {/if}
@@ -611,7 +612,7 @@
                 </label>
                 <label class={label}>
                   <span>Query file folder <span class={muted}>(folder_name; empty = derived)</span></span>
-                  <input class={input} value={str(server.value.folder_name)} oninput={(e) => setField("folder_name", e.currentTarget.value)} />
+                  <input class={input} data-annotate="input-connection-folder-name" value={str(server.value.folder_name)} oninput={(e) => setField("folder_name", e.currentTarget.value)} />
                 </label>
               </div>
               {#if server.origin !== null && server.value.folder_name === undefined}

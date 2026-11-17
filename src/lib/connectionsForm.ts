@@ -74,7 +74,8 @@ export const ENGINE_FIELDS: Record<string, string[]> = {
   mssql: ["host", "port", "schema", "user", "password", "ssl_mode", "ssl_root_cert", "ssh_tunnel"],
   sqlite: ["schema"],
   duckdb: ["schema"],
-  redis: ["host", "port", "schema", "user", "password", "ssl_mode", "ssh_tunnel"],
+  // Redis picks plaintext / TLS with `tls` only (engines/redis.rs connection_addr); ssl_mode has no effect
+  redis: ["host", "port", "schema", "user", "password", "tls", "ssh_tunnel"],
   elasticsearch: ["host", "port", "user", "password", "tls", "ssh_tunnel"],
   dynamodb: ["schema", "host", "port", "tls", "user", "password", "aws_profile"],
 };
