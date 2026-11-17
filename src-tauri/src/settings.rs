@@ -556,11 +556,25 @@ pub(crate) fn resolve_write_target(path: &Path) -> Result<PathBuf, AppError> {
     if let Ok(real) = std::fs::canonicalize(path) {
         return Ok(real);
     }
-    let target = match std::fs::read_link(path) {
-        Ok(link) if link.is_absolute() => link,
-        Ok(link) => path.parent().map(|p| p.join(&link)).unwrap_or(link),
-        Err(_) => path.to_path_buf(),
-    };
+    // A dangling link: follow it to the last link target (following one level only would make
+    // the rename replace an intermediate link of a chain with a plain file). A loop stops at
+    // the hop limit
+    let mut target = path.to_path_buf();
+    let mut hops = 0;
+    while let Ok(link) = std::fs::read_link(&target) {
+        hops += 1;
+        if hops > 40 {
+            return Err(AppError::Config(format!(
+                "Too many levels of symbolic links: {}",
+                path.display()
+            )));
+        }
+        target = if link.is_absolute() {
+            link
+        } else {
+            target.parent().map(|p| p.join(&link)).unwrap_or(link)
+        };
+    }
     if let Some(dir) = target.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -1091,5 +1105,20 @@ mod tests {
         let backup = backup_path_for(&real);
         let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "the backup can hold passwords too");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_chain_is_followed_to_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.yml");
+        let alias = dir.path().join("alias.yml");
+        let real = dir.path().join("sub").join("real.yml");
+        std::os::unix::fs::symlink(&alias, &first).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        assert_eq!(resolve_write_target(&first).unwrap(), real);
+        let looped = dir.path().join("loop.yml");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        assert!(resolve_write_target(&looped).is_err());
     }
 }
