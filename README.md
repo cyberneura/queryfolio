@@ -45,6 +45,7 @@ What this means in practice:
 - Connection config in YAML, compatible with the sql-agent-mcp-server format
   - Secrets can stay in 1Password: the config YAML is fetched lazily via a getter command like `op read "op://..."`
   - Per-connection `password_command`: fetch a password when that connection is opened (e.g. AWS RDS IAM auth tokens), refreshed automatically when an expired token is rejected (PostgreSQL / MySQL)
+- Settings window (Config → Settings…, Cmd/Ctrl+,): edit `default_limit`, `sqlfiles_dir`, `config_override_command` and the AI settings in a form. Values that `config_override_command` provides (for example an API key kept in 1Password) are read-only there and are never written into config.yml, and API keys are never displayed. Saving rewrites the file (comments are removed after you confirm; the previous file is kept as `config.yml.bak`), so **Edit config.yml** stays available for hand-written YAML
 - Query files per connection, auto-saved (`~/.config/queryfolio/sqlfiles/<folder>/*.sql`, where `<folder>` is `folder_name` or `<host>_<engine>_<schema>_<user>`)
 - CodeMirror 6 SQL editor with per-engine dialect, statement highlighting, Cmd+Enter to run the statement under the cursor (or each selected statement in turn), and schema-based autocompletion (table / column names; Tab or Enter accepts a suggestion)
 - SQL formatting for SELECT statements (conservative: unsupported or unparsable statements are left untouched)

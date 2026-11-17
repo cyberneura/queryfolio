@@ -24,7 +24,7 @@
   import EditorTabs from "$lib/components/EditorTabs.svelte";
   import ReplaceMultilinePane from "$lib/components/ReplaceMultilinePane.svelte";
   import ResultsPane from "$lib/components/ResultsPane.svelte";
-  import ConfigInfoModal from "$lib/components/ConfigInfoModal.svelte";
+  import SettingsModal from "$lib/components/SettingsModal.svelte";
   import ConfigEditorModal from "$lib/components/ConfigEditorModal.svelte";
   import LicensesModal from "$lib/components/LicensesModal.svelte";
   import AiAnalysisModal from "$lib/components/AiAnalysisModal.svelte";
@@ -516,6 +516,15 @@
       openConfigEditor("source");
     });
     // Third-Party Licenses menu item (app menu on macOS, directly under About in Help elsewhere)
+    // Config > Settings… (Cmd+, / Ctrl+,): the form for the general settings
+    const unlistenSettingsPromise = listen("menu-open-settings", () => {
+      // The text editor would be covered by the form; let it finish first
+      if (configEditorMode !== null) {
+        toast.warning("Close the config editor first");
+        return;
+      }
+      showSettings = true;
+    });
     const unlistenLicensesPromise = listen("menu-show-licenses", () => {
       showLicenses = true;
     });
@@ -617,6 +626,7 @@
       void unlistenEditPromise.then((unlisten) => unlisten());
       void unlistenEditSourcePromise.then((unlisten) => unlisten());
       void unlistenLicensesPromise.then((unlisten) => unlisten());
+      void unlistenSettingsPromise.then((unlisten) => unlisten());
       void unlistenCloseTabPromise.then((unlisten) => unlisten());
       void unlistenOpenFilePromise.then((unlisten) => unlisten());
       void unlistenOpenFileErrPromise.then((unlisten) => unlisten());
@@ -910,9 +920,13 @@
 {/if}
 
 {#if showSettings}
-  <ConfigInfoModal
+  <SettingsModal
     onClose={() => {
       showSettings = false;
+    }}
+    onEditAsText={() => {
+      showSettings = false;
+      openConfigEditor("config");
     }}
   />
 {/if}

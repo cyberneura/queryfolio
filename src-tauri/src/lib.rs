@@ -15,6 +15,7 @@ mod query_files;
 mod router;
 mod run_log_output;
 mod schema_info;
+mod settings;
 mod third_party_notices;
 mod tunnel;
 mod update_check;
@@ -1982,6 +1983,46 @@ fn add_file_connection(path: String) -> Result<config::FileConnection, AppError>
     config::add_file_connection(&path)
 }
 
+/// The Settings window's view of the general settings (CYBERNEURA-DEV-1298, settings.rs).
+/// Which keys the override provides comes from the cached merged config, so opening the window
+/// does not run config_override_command again.
+#[tauri::command]
+async fn get_general_settings(
+    state: tauri::State<'_, AppState>,
+) -> Result<config::GeneralSettingsView, AppError> {
+    let merged = state.resolve_config().await;
+    config::general_settings_view(merged.as_deref())
+}
+
+/// Saves the Settings window's changes to the local config file. Keys the override provides
+/// are rejected (they are never written locally). The frontend reloads the config afterwards.
+#[tauri::command]
+async fn save_general_settings(
+    state: tauri::State<'_, AppState>,
+    patch: settings::SettingsPatch,
+    allow_drop_comments: bool,
+) -> Result<settings::SaveOutcome, AppError> {
+    // If the merged config cannot be built while the file has config_override_command, which
+    // keys it provides is unknown, and everything but the command is treated as overridden
+    // (config::settings_override_keys)
+    let merged = state.resolve_config().await;
+    let override_keys = config::settings_override_keys(merged.as_deref());
+    config::save_general_settings(&patch, &override_keys, allow_drop_comments)
+}
+
+/// "Show config file" in the Settings window: the same as Config > Reveal config folder.
+#[tauri::command]
+fn reveal_config_file() -> Result<(), AppError> {
+    reveal_config_folder()
+}
+
+/// Runs a config_override_command from the Settings window and returns only how many values it
+/// would override (never the values).
+#[tauri::command]
+async fn test_config_override_command(command: String) -> Result<usize, AppError> {
+    config::test_override_command(&command).await
+}
+
 /// Returns the raw YAML fetched by running config_override_command
 /// (for the copy view. It can be edited at the display destination but is not saved).
 #[tauri::command]
@@ -2275,6 +2316,11 @@ fn about_metadata(app: &tauri::AppHandle) -> tauri::menu::AboutMetadata<'_> {
 fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 
+    // The form for the general settings (CYBERNEURA-DEV-1298). Cmd+, is the platform's
+    // usual Settings shortcut; nothing else in the app uses it
+    let settings_item = MenuItemBuilder::with_id("open_settings", "Settings…")
+        .accelerator("CmdOrCtrl+,")
+        .build(app)?;
     let edit_config_item =
         MenuItemBuilder::with_id("edit_config_file", "Edit config.yml").build(app)?;
     let edit_source_item = MenuItemBuilder::with_id(
@@ -2368,7 +2414,9 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
     let reveal_item =
         MenuItemBuilder::with_id("reveal_config_folder", "Reveal config folder").build(app)?;
     let config_menu = {
-        let mut builder = SubmenuBuilder::new(app, "Config").item(&edit_config_item);
+        let mut builder = SubmenuBuilder::new(app, "Config")
+            .item(&settings_item)
+            .item(&edit_config_item);
         if show_source_item {
             builder = builder.item(&edit_source_item);
         }
@@ -2704,6 +2752,11 @@ pub fn run() {
                     eprintln!("[menu] {e}");
                 }
             }
+            "open_settings" => {
+                if let Err(e) = app.emit("menu-open-settings", ()) {
+                    eprintln!("[menu] failed to emit open settings event: {e}");
+                }
+            }
             "edit_config_file" => {
                 if let Err(e) = app.emit("menu-edit-config", ()) {
                     eprintln!("[menu] failed to emit edit config event: {e}");
@@ -2812,6 +2865,10 @@ pub fn run() {
             write_config_file,
             add_file_connection,
             read_override_config_yaml,
+            get_general_settings,
+            save_general_settings,
+            test_config_override_command,
+            reveal_config_file,
             write_export_file,
             get_dump_info,
             preview_dump_command,

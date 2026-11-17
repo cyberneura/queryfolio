@@ -582,3 +582,81 @@ export const runDump = (
 
 export const cancelDump = (dumpId: string) =>
   invoke<boolean>("cancel_dump", { dumpId });
+
+/// One message about a settings field (dotted key path such as `ai.model`).
+export interface FieldMessage {
+  field: string;
+  message: string;
+}
+
+/// The local `ai:` section as the Settings window shows it. The API key itself never comes back.
+export interface AiSettings {
+  present: boolean;
+  provider: string | null;
+  model: string | null;
+  base_url: string | null;
+  tool_reasoning_effort: string | null;
+  api_key_set: boolean;
+}
+
+/// Values of the general settings in the local config file (not the merged config).
+export interface LocalSettings {
+  default_limit: number | null;
+  sqlfiles_dir: string | null;
+  config_override_command: string | null;
+  ai: AiSettings;
+  invalid: FieldMessage[];
+}
+
+/// Everything the Settings window shows (CYBERNEURA-DEV-1298, settings.rs). No secrets.
+export interface GeneralSettingsView {
+  config_path: string;
+  editable: boolean;
+  readonly_reason: string | null;
+  has_comments: boolean;
+  backup_path: string;
+  backup_exists: boolean;
+  local: LocalSettings;
+  /// Dotted paths that config_override_command provides (read-only in the form)
+  overridden: string[];
+  override_error: string | null;
+  effective_default_limit: number | null;
+  effective_sqlfiles_dir: string | null;
+  templates: { name: string; engine: string | null }[];
+  folders: { connection: string; folder: string; explicit: boolean }[];
+}
+
+/// One field of a save: write the value, or remove the key (= back to the default).
+/// A field that is absent from the patch is left as it is.
+export type Change<T> = { op: "set"; value: T } | { op: "unset" };
+
+export interface SettingsPatch {
+  default_limit?: Change<number>;
+  sqlfiles_dir?: Change<string>;
+  config_override_command?: Change<string>;
+  ai_provider?: Change<string>;
+  ai_model?: Change<string>;
+  ai_base_url?: Change<string>;
+  ai_tool_reasoning_effort?: Change<string>;
+  ai_api_key?: Change<string>;
+}
+
+export type SaveOutcome =
+  | { status: "saved"; path: string; changed: boolean; backup_created: string | null }
+  | { status: "needs_comment_confirmation" };
+
+export const getGeneralSettings = () =>
+  invoke<GeneralSettingsView>("get_general_settings");
+
+/// Save the Settings window's changes. With allowDropComments false, a file that has comments is
+/// not written and `needs_comment_confirmation` comes back (ask the user, then save again).
+export const saveGeneralSettings = (patch: SettingsPatch, allowDropComments: boolean) =>
+  invoke<SaveOutcome>("save_general_settings", { patch, allowDropComments });
+
+/// Run a config_override_command (saved or not) and return how many values it would override.
+/// The values themselves are never returned.
+export const testConfigOverrideCommand = (command: string) =>
+  invoke<number>("test_config_override_command", { command });
+
+/// Show config.yml in Finder / Explorer (same as Config > Reveal config folder).
+export const revealConfigFile = () => invoke<void>("reveal_config_file");
