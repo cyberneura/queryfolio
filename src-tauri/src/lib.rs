@@ -2002,6 +2002,11 @@ async fn save_general_settings(
     patch: settings::SettingsPatch,
     allow_drop_comments: bool,
 ) -> Result<settings::SaveOutcome, AppError> {
+    // One save at a time from deciding the override keys to writing: otherwise a save that
+    // changes config_override_command could land between another save's decision and its
+    // write, which would then write a key with the stale decision
+    static SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _save = SAVE_LOCK.lock().await;
     // If the merged config cannot be built while the file has config_override_command, which
     // keys it provides is unknown, and everything but the command is treated as overridden
     // (config::settings_override_keys)

@@ -571,34 +571,61 @@ pub(crate) fn resolve_write_target(path: &Path) -> Result<PathBuf, AppError> {
 /// owner-only permissions (the config may hold passwords). Callers hold `CONFIG_WRITE_LOCK`.
 pub(crate) fn write_atomically(path: &Path, content: &str) -> Result<PathBuf, AppError> {
     let target = resolve_write_target(path)?;
-    let temp = target.with_extension("yml.tmp");
+    write_file_atomically(&target, content)?;
+    Ok(target)
+}
+
+/// A temp file name next to `target` that does not exist yet. A fixed name would let a symlink
+/// planted at that name redirect the write (and truncate whatever it points to, the config
+/// itself included), so the name is unique (pid + time + counter) and the file is opened with
+/// `create_new`.
+fn unique_temp_path(target: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.yml".into());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    target.with_file_name(format!(
+        ".{name}.{}-{nanos}-{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Writes the whole content to a fresh temp file (`create_new` = O_EXCL, so it never opens an
+/// existing file or symlink), then renames it over `target`. Owner-only permissions.
+fn write_file_atomically(target: &Path, content: &str) -> std::io::Result<()> {
+    let temp = unique_temp_path(target);
     let result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::io::Write;
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&temp)?;
-            // mode only applies on creation; a temp file left by an interrupted save keeps its
-            // old mode otherwise
-            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
-            file.write_all(content.as_bytes())?;
-            file.sync_all()?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        #[cfg(not(unix))]
-        std::fs::write(&temp, content)?;
-        std::fs::rename(&temp, &target)
+        let mut file = options.open(&temp)?;
+        // mode() is only narrowed further by umask; guard against an umask that drops the
+        // owner bits too
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temp, target)
     })();
-    if let Err(e) = result {
+    if result.is_err() {
         let _ = std::fs::remove_file(&temp);
-        return Err(e.into());
     }
-    Ok(target)
+    result
 }
 
 /// Path of the backup kept before the Settings window first rewrites the file.
@@ -613,7 +640,7 @@ pub fn backup_path_for(target: &Path) -> PathBuf {
 /// Writes the backup if there is none yet. Never overwrites an existing one (it holds the
 /// state from before the first save, which is the one worth keeping).
 ///
-/// The copy is written to a temp file and renamed into place only once it is complete, so a
+/// The copy is written to a fresh temp file and renamed into place only once it is complete, so a
 /// failed write (disk full, ...) never leaves a truncated `.bak` that a later save would take
 /// for the finished backup. Callers hold `CONFIG_WRITE_LOCK`, so the existence check and the
 /// rename do not race with another save from this process.
@@ -622,33 +649,7 @@ fn write_backup_once(target: &Path, original: &str) -> Result<Option<PathBuf>, A
     if std::fs::symlink_metadata(&backup).is_ok() {
         return Ok(None);
     }
-    let temp = backup.with_extension("bak.tmp");
-    let result = (|| -> std::io::Result<()> {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            options.mode(0o600);
-            let mut file = options.open(&temp)?;
-            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
-            use std::io::Write;
-            file.write_all(original.as_bytes())?;
-            file.sync_all()?;
-        }
-        #[cfg(not(unix))]
-        {
-            use std::io::Write;
-            let mut file = options.open(&temp)?;
-            file.write_all(original.as_bytes())?;
-            file.sync_all()?;
-        }
-        std::fs::rename(&temp, &backup)
-    })();
-    if let Err(e) = result {
-        let _ = std::fs::remove_file(&temp);
-        return Err(e.into());
-    }
+    write_file_atomically(&backup, original)?;
     Ok(Some(backup))
 }
 
@@ -920,7 +921,12 @@ mod tests {
             }
         ));
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
-        assert!(!path.with_extension("yml.tmp").exists());
+        let leftovers = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0, "temp files are renamed away");
     }
 
     #[test]
@@ -1030,6 +1036,28 @@ mod tests {
             ..Default::default()
         };
         apply_patch(&mut doc, &patch, &keys).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_symlink_is_never_written_through() {
+        // A symlink at a predictable temp name must not redirect the write
+        let (dir, path) = temp_config("default_limit: 1\n");
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "keep me\n").unwrap();
+        for name in ["config.yml.tmp", ".config.yml.tmp", "config.yml.bak.tmp"] {
+            std::os::unix::fs::symlink(&victim, dir.path().join(name)).unwrap();
+        }
+        let patch = SettingsPatch {
+            default_limit: set(2),
+            ..Default::default()
+        };
+        save_patch(&path, &patch, &[], false).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "default_limit: 2\n"
+        );
     }
 
     #[cfg(unix)]
