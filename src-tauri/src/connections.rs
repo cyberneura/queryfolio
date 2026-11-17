@@ -192,14 +192,16 @@ fn entry_at<'a>(servers: &'a [Value], path: &str) -> Option<&'a Value> {
     }
 }
 
-/// JSON → YAML for an entry, dropping nulls and empty strings (an emptied field = key absent).
+/// JSON → YAML for an entry, dropping empty strings and empty mappings (the form removes a key
+/// when a field is cleared, so an emptied field = key absent). **Nulls are kept**: the form never
+/// sends one of its own, so a null came from the file, where it cancels a value a template would
+/// supply (`password: null`, `password_command: null`, ...).
 fn clean(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => serde_json::Value::Object(
             map.into_iter()
                 .map(|(k, v)| (k, clean(v)))
                 .filter(|(_, v)| match v {
-                    serde_json::Value::Null => false,
                     serde_json::Value::String(s) => !s.is_empty(),
                     serde_json::Value::Object(m) => !m.is_empty(),
                     _ => true,
@@ -685,11 +687,28 @@ mod tests {
     }
 
     #[test]
+    fn a_null_override_of_a_template_field_is_kept() {
+        let templates = vec![serde_yaml::from_str::<Value>(
+            "{name: t, engine: postgres, password_command: op read x}",
+        )
+        .unwrap()];
+        let doc =
+            yaml("servers:\n- name: a\n  template: t\n  password_command: null\n  password: pw\n");
+        let local = view(&doc);
+        let original = local_servers_seq(&doc).unwrap();
+        let built = build_server(&edit(Some("0"), local.servers[0].clone()), &original).unwrap();
+        let map = built.as_mapping().unwrap();
+        assert!(map.get("password_command").unwrap().is_null());
+        assert_eq!(map.get("password").unwrap(), "pw");
+        validate_servers(&[built], &templates).unwrap();
+    }
+
+    #[test]
     fn empty_fields_are_dropped_and_unknown_keys_kept() {
         let built = build_server(
             &edit(
                 None,
-                serde_json::json!({"name": " x ", "engine": "postgres", "host": "", "port": null, "custom": 1, "ssh_tunnel": {"host": ""}}),
+                serde_json::json!({"name": " x ", "engine": "postgres", "host": "", "custom": 1, "ssh_tunnel": {"host": ""}}),
             ),
             &[],
         )

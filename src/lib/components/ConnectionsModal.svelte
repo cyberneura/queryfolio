@@ -510,7 +510,11 @@
                     </div>
                   {/if}
                   <label class="flex items-center gap-2">
-                    <input type="radio" name="password-mode" data-annotate="radio-password-direct" checked={!usesCommand} onchange={() => setField("password_command", undefined)} />
+                    <input type="radio" name="password-mode" data-annotate="radio-password-direct" checked={!usesCommand} onchange={() => {
+                      // With a template (which could supply a command), cancel it explicitly
+                      if (server.value.template) server.value.password_command = null;
+                      else setField("password_command", undefined);
+                    }} />
                     Enter it here (stored as plain text in config.yml)
                   </label>
                   {#if !usesCommand}
