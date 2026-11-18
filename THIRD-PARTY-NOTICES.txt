@@ -432,7 +432,7 @@ THE SOFTWARE.
 License: MIT
 
 Used by:
-  @sveltejs/kit 2.70.3 (git+https://github.com/sveltejs/kit.git)
+  @sveltejs/kit 2.70.4 (git+https://github.com/sveltejs/kit.git)
 
 Copyright (c) 2020 [these people](https://github.com/sveltejs/kit/graphs/contributors)
 
@@ -3071,7 +3071,7 @@ DEALINGS IN THE SOFTWARE.
 License: MIT License
 
 Used by:
-  libz-sys 1.1.31 (https://github.com/rust-lang/libz-sys)
+  libz-sys 1.1.33 (https://github.com/rust-lang/libz-sys)
 
 Copyright (c) 2014 Alex Crichton
 Copyright (c) 2020 Josh Triplett
@@ -7485,6 +7485,7 @@ Used by:
   windows-strings 0.4.2 (https://github.com/microsoft/windows-rs)
   windows-strings 0.5.1 (https://github.com/microsoft/windows-rs)
   windows-sys 0.48.0 (https://github.com/microsoft/windows-rs)
+  windows-sys 0.52.0 (https://github.com/microsoft/windows-rs)
   windows-sys 0.59.0 (https://github.com/microsoft/windows-rs)
   windows-sys 0.60.2 (https://github.com/microsoft/windows-rs)
   windows-sys 0.61.2 (https://github.com/microsoft/windows-rs)
@@ -10161,7 +10162,7 @@ Used by:
 License: Zlib
 
 Used by:
-  zlib (bundled by libz-sys 1.1.31)
+  zlib (bundled by libz-sys 1.1.33)
 
 Copyright notice:
 
