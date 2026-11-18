@@ -54,12 +54,27 @@ ignore = [
   # The fixed version (zip >= 9) cannot be selected by `cargo update -p zip` because libduckdb-sys
   # pins the 6.x range.
   #
-  # Condition for removal: when libduckdb-sys requires zip >= 9. Delete these four lines then and
+  # Condition for removal: when libduckdb-sys requires zip >= 9. Delete these lines then and
   # verify the upgrade actually happened.
   "RUSTSEC-2026-0367",
   "RUSTSEC-2026-0368",
   "RUSTSEC-2026-0369",
   "RUSTSEC-2026-0429",
+  # Same zip 6.0.0, same build-dependency-only path (CYBERNEURA-DEV-1306). These concern reading
+  # untrusted archives: AES entries whose authentication code is not checked when the data ends
+  # early (RUSTSEC-2026-0545), the legacy Shrink / Reduce / Implode decoders preallocating the
+  # declared size (RUSTSEC-2026-0547), and `ZipStreamReader` using local-header names
+  # (RUSTSEC-2026-0548). None of them is reachable here:
+  #   - libduckdb-sys 1.10504.0 enables zip with `default-features = false, features = ["deflate"]`,
+  #     so the AES (`aes-crypto`) and legacy (`legacy-zip`) decoders are not compiled at all.
+  #   - Its build.rs only calls zip (`ZipArchive::extract`, never `ZipStreamReader`) in the
+  #     non-bundled path when `DUCKDB_DOWNLOAD_LIB=1` downloads a prebuilt libduckdb. We use the
+  #     `bundled` feature, which unpacks `duckdb.tar.gz` with flate2 + tar and never touches zip.
+  # Verify: `cargo tree -e features -i zip@6.0.0 --target all` must not show aes-crypto / legacy-zip,
+  # and `duckdb` in Cargo.toml must keep the `bundled` feature.
+  "RUSTSEC-2026-0545",
+  "RUSTSEC-2026-0547",
+  "RUSTSEC-2026-0548",
 
   # webpki-roots 0.26.11 — bundled root certificates trust distrusted emSign intermediates (RUSTSEC-2026-0381)
   #
