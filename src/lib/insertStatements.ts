@@ -66,15 +66,22 @@ export function insertLiteral(engine: NormalizedEngine, value: unknown): string 
   return literalFromValue(engine, value);
 }
 
+export type InsertStatements = { ok: true; text: string } | { ok: false; reason: string };
+
 /// INSERT statements for the rows (one statement per row, `;`-terminated, one per line).
 /// With a range, only the selected rows and columns are written (Cmd+C of a cell selection).
+///
+/// On PostgreSQL an array cell is refused: the backend returns both array columns (`text[]`,
+/// enum arrays) and JSON arrays as JS arrays, and a JSON literal is not a valid array literal
+/// (nor the other way round), so neither choice can be right for every column. MySQL and
+/// SQLite have no array type, so an array there is JSON.
 export function toInsertStatements(
   engine: NormalizedEngine,
   table: string,
   columns: readonly string[],
   rows: readonly (readonly unknown[])[],
   range?: CellRange,
-): string {
+): InsertStatements {
   const colStart = range?.colStart ?? 0;
   const colEnd = range?.colEnd ?? columns.length - 1;
   const rowStart = range?.rowStart ?? 0;
@@ -88,7 +95,16 @@ export function toInsertStatements(
   for (let r = rowStart; r <= rowEnd; r++) {
     const row = rows[r];
     if (!row) continue;
+    if (engine === "postgres") {
+      const arrayCol = colIndexes.find((c) => Array.isArray(row[c]));
+      if (arrayCol !== undefined) {
+        return {
+          ok: false,
+          reason: `SQL INSERT cannot write the column "${columns[arrayCol]}": on PostgreSQL an array value may be an ARRAY or a JSON array, which need different literals. Leave the column out of the SELECT (or the selection)`,
+        };
+      }
+    }
     lines.push(`${head}${colIndexes.map((c) => insertLiteral(engine, row[c])).join(", ")});`);
   }
-  return lines.join("\n");
+  return { ok: true, text: lines.join("\n") };
 }

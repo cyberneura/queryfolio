@@ -3,8 +3,14 @@ import assert from "node:assert/strict";
 import {
   insertLiteral,
   insertTarget,
-  toInsertStatements,
+  toInsertStatements as build,
 } from "../src/lib/insertStatements.ts";
+
+const toInsertStatements = (...args: Parameters<typeof build>): string => {
+  const built = build(...args);
+  assert.ok(built.ok, built.ok ? "" : built.reason);
+  return built.text;
+};
 
 test("only a single-table SELECT can be written as INSERT statements", () => {
   assert.deepEqual(insertTarget("mysql", "SELECT * FROM users WHERE id = 1", ["id"]), {
@@ -87,5 +93,31 @@ test("a range writes only the selected rows and columns", () => {
     }),
     'INSERT INTO "t" ("name", "age") VALUES (\'b\', 20);\n' +
       'INSERT INTO "t" ("name", "age") VALUES (\'c\', 30);',
+  );
+});
+
+test("PostgreSQL array cells are refused; other dialects write arrays as JSON", () => {
+  const rows = [[1, ["happy", null, "sad"]]];
+  const pg = build("postgres", "items", ["id", "moods"], rows);
+  assert.equal(pg.ok, false);
+  assert.match(pg.ok ? "" : pg.reason, /"moods"/);
+  // Leaving the array column out of the selection works
+  assert.equal(
+    toInsertStatements("postgres", "items", ["id", "moods"], rows, {
+      rowStart: 0,
+      rowEnd: 0,
+      colStart: 0,
+      colEnd: 0,
+    }),
+    'INSERT INTO "items" ("id") VALUES (1);',
+  );
+  // Objects (JSON) are still fine on PostgreSQL
+  assert.equal(
+    toInsertStatements("postgres", "items", ["meta"], [[{ a: 1 }]]),
+    `INSERT INTO "items" ("meta") VALUES ('{"a":1}');`,
+  );
+  assert.equal(
+    toInsertStatements("mysql", "items", ["tags"], [[["a", "b"]]]),
+    "INSERT INTO `items` (`tags`) VALUES ('[\"a\",\"b\"]');",
   );
 });
