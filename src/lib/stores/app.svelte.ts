@@ -1758,9 +1758,10 @@ const prepareTargetTab = (newTab = false): ResultTab | null => {
     return current;
   }
   if (resultTabs.length >= MAX_RESULT_TABS) {
-    // A running tab is not discarded either (its result would be thrown away on completion)
+    // A running tab is not discarded either (its result would be thrown away on completion).
+    // With newTab the active tab is the result being navigated from, so it stays too
     const oldest = resultTabs
-      .filter((t) => !t.pinned && !t.running)
+      .filter((t) => !t.pinned && !t.running && !(newTab && t.id === activeTabId))
       .reduce<ResultTab | null>(
         (acc, t) => (acc === null || t.executedAt < acc.executedAt ? t : acc),
         null,
