@@ -121,3 +121,9 @@ test("PostgreSQL array cells are refused; other dialects write arrays as JSON", 
     "INSERT INTO `items` (`tags`) VALUES ('[\"a\",\"b\"]');",
   );
 });
+
+test("a value with a NUL character is refused", () => {
+  const built = build("sqlite", "t", ["id", "body"], [[1, "a\u0000b"]]);
+  assert.equal(built.ok, false);
+  assert.match(built.ok ? "" : built.reason, /"body".*NUL/);
+});
