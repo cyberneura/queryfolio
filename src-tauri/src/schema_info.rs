@@ -475,15 +475,26 @@ async fn fetch_sqlite_foreign_keys(
         let ref_column = match to {
             Some(to) if !to.is_empty() => to,
             _ => {
-                // The implicit target is the parent's primary key; only a single-column one fits
-                let parent = match schema {
-                    Some(schema) => format!("{schema}.{ref_table}"),
-                    None => ref_table.clone(),
-                };
-                let Ok(parent) = validate_relation_name(&parent) else {
+                // The implicit target is the parent's primary key; only a single-column one
+                // fits. pragma_table_info takes the schema as its own argument (a "schema.table"
+                // name would be read as one literal table name and find nothing). Both names
+                // are embedded, so they go through the identifier validation first
+                if validate_relation_name(&ref_table).is_err()
+                    || schema.is_some_and(|s| validate_relation_name(s).is_err())
+                {
                     continue;
+                }
+                let info = match schema {
+                    Some(schema) => format!("pragma_table_info('{ref_table}', '{schema}')"),
+                    None => format!("pragma_table_info('{ref_table}')"),
                 };
-                let pk = fetch_primary_keys(&DbPool::Sqlite(p.clone()), parent).await?;
+                let pk: Vec<String> =
+                    sqlx::query(&format!("SELECT name FROM {info} WHERE pk > 0 ORDER BY pk"))
+                        .fetch_all(p)
+                        .await?
+                        .iter()
+                        .map(|row| row.try_get::<String, _>(0).unwrap_or_default())
+                        .collect();
                 match pk.as_slice() {
                     [only] => only.clone(),
                     _ => continue,
@@ -804,6 +815,26 @@ mod tests {
             ]
         );
         assert!(keys.iter().all(|k| k.ref_schema.is_none()));
+        // Schema-qualified: the implicit parent key is still resolved, in that schema
+        let qualified = fetch_foreign_keys(&pool, "main.orders").await.unwrap();
+        let mut got: Vec<(&str, &str, Option<&str>)> = qualified
+            .iter()
+            .map(|k| {
+                (
+                    k.column.as_str(),
+                    k.ref_column.as_str(),
+                    k.ref_schema.as_deref(),
+                )
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("customer_id", "id", Some("main")),
+                ("product_sku", "sku", Some("main")),
+            ]
+        );
         assert!(fetch_foreign_keys(&pool, "lonely")
             .await
             .unwrap()
