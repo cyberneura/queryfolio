@@ -95,6 +95,18 @@ export function toInsertStatements(
   for (let r = rowStart; r <= rowEnd; r++) {
     const row = rows[r];
     if (!row) continue;
+    // A NUL character cannot appear in an SQL string literal (SQLite stops parsing there,
+    // PostgreSQL text cannot hold it), so refuse instead of writing a broken statement
+    const nulCol = colIndexes.find((c) => {
+      const v = row[c];
+      return typeof v === "string" && v.includes("\u0000");
+    });
+    if (nulCol !== undefined) {
+      return {
+        ok: false,
+        reason: `SQL INSERT cannot write the column "${columns[nulCol]}": a value contains a NUL character, which an SQL string literal cannot hold`,
+      };
+    }
     if (engine === "postgres") {
       const arrayCol = colIndexes.find((c) => Array.isArray(row[c]));
       if (arrayCol !== undefined) {
