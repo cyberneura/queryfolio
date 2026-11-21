@@ -88,11 +88,10 @@ export function rowDetailDisplay(value: unknown): RowDetailDisplay {
     return { ...cut(bounded), isNull: false, isJson: false };
   }
   if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (
-      value.length <= ROW_DETAIL_PRETTY_MAX_CHARS &&
-      (trimmed.startsWith("{") || trimmed.startsWith("["))
-    ) {
+    // Check the size before trim(): trim walks the whole string, and this runs for every
+    // column of the row each time the panel moves
+    const trimmed = value.length <= ROW_DETAIL_PRETTY_MAX_CHARS ? value.trim() : "";
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
       try {
         const parsed: unknown = JSON.parse(trimmed);
         return { ...cut(JSON.stringify(parsed, null, 2)), isNull: false, isJson: true };
