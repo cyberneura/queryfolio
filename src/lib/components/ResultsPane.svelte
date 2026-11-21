@@ -32,7 +32,9 @@
     visibleRows,
   } from "$lib/resultFilter";
   import { filterTerms } from "$lib/paneFilter";
+  import { stepRow } from "$lib/rowDetail";
   import CellInspector from "./CellInspector.svelte";
+  import RowDetailPanel from "./RowDetailPanel.svelte";
   import AiAnalysisModal from "./AiAnalysisModal.svelte";
 
   interface Props {
@@ -514,6 +516,8 @@
     selectedCell = null;
     selection = null;
     sort = null;
+    rowDetail = null;
+    contextMenu = null;
   });
 
   // When showing a different result, return to the top (computing the row window with the previous result's
@@ -736,6 +740,9 @@
   // Cmd+C (Ctrl+C) copies the selection as CSV, Cmd+A (Ctrl+A) selects the whole table.
   // Both are handled only while the result grid has focus
   const handleWindowKeydown = (e: KeyboardEvent) => {
+    if (handleRowDetailKeydown(e)) {
+      return;
+    }
     if (e.key === "Escape") {
       // Esc on the grid closes the filter (Esc in the filter input is handled by the input).
       // Something else that already handled the key (a modal, the cell editor) wins
@@ -780,6 +787,216 @@
     }
     e.preventDefault();
     void copySelection();
+  };
+
+  // ---- Row detail panel (CYBERNEURA-DEV-1317) ----
+  // One row shown as a vertical "column : value" list. Keyed by tab + executedAt like the
+  // sort, so a re-run closes it; rowIndex is the original index into result.rows (the data),
+  // and ↑ / ↓ walk rowOrder (the display order after the sort and the filter).
+  let rowDetail = $state<{
+    tabId: number;
+    executedAt: number;
+    rowIndex: number;
+  } | null>(null);
+  let rowDetailEl = $state<HTMLDivElement | null>(null);
+  const rowDetailView = $derived.by(() => {
+    const tab = activeTab;
+    const result = tab?.result;
+    if (
+      !rowDetail ||
+      !tab ||
+      !result ||
+      tab.batch !== null ||
+      rowDetail.tabId !== tab.id ||
+      rowDetail.executedAt !== tab.executedAt
+    ) {
+      return null;
+    }
+    const displayIndex = rowToDisplay.get(rowDetail.rowIndex);
+    const row = result.rows[rowDetail.rowIndex];
+    if (displayIndex === undefined || !row) {
+      return null;
+    }
+    return { columns: result.columns, row, displayIndex, total: rowOrder.length };
+  });
+  // Drop a row detail that no longer shows anything (re-run, the row filtered out), so that
+  // it does not come back by itself later
+  $effect(() => {
+    if (rowDetail && !rowDetailView) {
+      rowDetail = null;
+    }
+  });
+
+  const openRowDetail = (rowIndex: number) => {
+    const tab = activeTab;
+    if (!tab?.result || tab.batch !== null || tab.result.columns.length === 0) {
+      return;
+    }
+    rowDetail = { tabId: tab.id, executedAt: tab.executedAt, rowIndex };
+  };
+  const closeRowDetail = () => {
+    const hadFocus = rowDetailEl?.contains(document.activeElement) ?? false;
+    rowDetail = null;
+    if (hadFocus) {
+      gridEl?.focus({ preventScroll: true });
+    }
+  };
+
+  // The row Space opens: the cell open in the inspector, else the first row of the selection
+  const rowForSpace = (): number | null => {
+    const tab = activeTab;
+    if (!tab) {
+      return null;
+    }
+    if (selectedCell && selectedCell.tabId === tab.id) {
+      return selectedCell.rowIndex;
+    }
+    const range = selectedRange;
+    return range ? (rowOrder[range.rowStart] ?? null) : null;
+  };
+
+  // Scroll the grid so that the row at a display position is visible below the sticky header
+  const revealDisplayRow = (displayIndex: number) => {
+    const el = gridEl;
+    if (!el) {
+      return;
+    }
+    const h = rowHeight > 0 ? rowHeight : DEFAULT_ROW_HEIGHT;
+    const headerHeight = el.querySelector("thead")?.getBoundingClientRect().height ?? 0;
+    const top = displayIndex * h;
+    if (top < el.scrollTop) {
+      el.scrollTop = top;
+    } else if (headerHeight + top + h > el.scrollTop + el.clientHeight) {
+      el.scrollTop = headerHeight + top + h - el.clientHeight;
+    }
+  };
+
+  // Move the panel to the previous / next row on screen. The grid selection and the
+  // inspector follow, so that the highlighted row is the one shown in the panel
+  const stepRowDetail = (delta: number) => {
+    const tab = activeTab;
+    if (!rowDetail || !tab) {
+      return;
+    }
+    const next = stepRow(rowOrder, rowDetail.rowIndex, delta);
+    if (next === null || next === rowDetail.rowIndex) {
+      return;
+    }
+    rowDetail = { ...rowDetail, rowIndex: next };
+    const displayIndex = rowToDisplay.get(next) ?? 0;
+    const colCount = tab.result?.columns.length ?? 1;
+    selection = {
+      tabId: tab.id,
+      mode: "row",
+      anchorRow: displayIndex,
+      anchorCol: 0,
+      focusRow: displayIndex,
+      focusCol: colCount - 1,
+    };
+    if (selectedCell && selectedCell.tabId === tab.id) {
+      selectedCell = { ...selectedCell, rowIndex: next };
+    }
+    revealDisplayRow(displayIndex);
+  };
+
+  const focusInRowDetail = (): boolean =>
+    rowDetailEl !== null && rowDetailEl.contains(document.activeElement);
+  const focusInTextInput = (): boolean =>
+    document.activeElement instanceof HTMLInputElement ||
+    document.activeElement instanceof HTMLTextAreaElement;
+
+  // Space presses that opened / closed the panel: their keyup must not click the focused
+  // cell button as well (buttons activate on the keyup of Space)
+  let spaceHandled = false;
+  const handleWindowKeyup = (e: KeyboardEvent) => {
+    if (e.key === " " && spaceHandled) {
+      spaceHandled = false;
+      e.preventDefault();
+    }
+  };
+
+  /// Keys of the row detail panel. Returns true when the key was handled here.
+  /// Space toggles the panel while the grid has the focus; with the panel open, ↑ / ↓ move
+  /// between rows and Esc closes it (from the grid or from inside the panel)
+  const handleRowDetailKeydown = (e: KeyboardEvent): boolean => {
+    if (e.defaultPrevented || e.isComposing) {
+      return false;
+    }
+    const plain = !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey;
+    if (e.key === " " && plain && isGridKeyTarget()) {
+      if (rowDetailView) {
+        e.preventDefault();
+        spaceHandled = true;
+        closeRowDetail();
+        return true;
+      }
+      const rowIndex = rowForSpace();
+      if (rowIndex === null) {
+        return false;
+      }
+      e.preventDefault();
+      spaceHandled = true;
+      openRowDetail(rowIndex);
+      return true;
+    }
+    if (!rowDetailView) {
+      return false;
+    }
+    const inScope = isGridKeyTarget() || (focusInRowDetail() && !focusInTextInput());
+    if ((e.key === "ArrowUp" || e.key === "ArrowDown") && plain && inScope) {
+      e.preventDefault();
+      stepRowDetail(e.key === "ArrowUp" ? -1 : 1);
+      return true;
+    }
+    if (e.key === "Escape" && (isGridKeyTarget() || focusInRowDetail())) {
+      // With the cell inspector open, Esc closes the inspector first (it listens itself)
+      if (inspectedCell) {
+        return false;
+      }
+      e.preventDefault();
+      closeRowDetail();
+      return true;
+    }
+    return false;
+  };
+
+  // Right-click menu of a row (cell or row number): Show row
+  let contextMenu = $state<{ x: number; y: number; rowIndex: number } | null>(
+    null,
+  );
+  const openContextMenu = (e: MouseEvent, rowIndex: number) => {
+    const tab = activeTab;
+    if (!tab?.result || tab.batch !== null) {
+      return;
+    }
+    e.preventDefault();
+    // Keep the menu inside the window (a row at the bottom / right edge)
+    const MENU_WIDTH = 180;
+    const MENU_HEIGHT = 40;
+    contextMenu = {
+      x: Math.max(0, Math.min(e.clientX, window.innerWidth - MENU_WIDTH)),
+      y: Math.max(0, Math.min(e.clientY, window.innerHeight - MENU_HEIGHT)),
+      rowIndex,
+    };
+  };
+
+  // Show row from the right-click menu: also select the row, and give the keyboard back to
+  // the grid (the menu button had the focus), so that ↑ / ↓ / Esc / Space work right away
+  const showRowFromMenu = (rowIndex: number) => {
+    const tab = activeTab;
+    const displayIndex = rowToDisplay.get(rowIndex);
+    if (tab?.result && displayIndex !== undefined) {
+      selection = {
+        tabId: tab.id,
+        mode: "row",
+        anchorRow: displayIndex,
+        anchorCol: 0,
+        focusRow: displayIndex,
+        focusCol: tab.result.columns.length - 1,
+      };
+    }
+    openRowDetail(rowIndex);
+    gridEl?.focus({ preventScroll: true });
   };
 
   // Value passed to the inspector. null (= hidden) when the result is replaced, e.g. by re-execution,
@@ -1405,6 +1622,7 @@
   onpointerup={endDrag}
   onpointercancel={endDrag}
   onkeydown={handleWindowKeydown}
+  onkeyup={handleWindowKeyup}
 />
 
 <div class="flex h-full min-h-0 flex-col bg-zinc-900">
@@ -2015,6 +2233,7 @@
                     data-annotate="button-result-row-header-{displayIndex}"
                     onpointerdown={(e) => beginSelect("row", displayIndex, 0, e)}
                     onpointerenter={(e) => extendSelect("row", displayIndex, 0, e)}
+                    oncontextmenu={(e) => openContextMenu(e, rowIndex)}
                   >
                     {displayIndex + 1}
                   </button>
@@ -2077,6 +2296,7 @@
                           extendSelect("cell", displayIndex, colIndex, e)}
                         onclick={() => onCellClick(rowIndex, colIndex)}
                         ondblclick={() => beginCellEdit(rowIndex, colIndex)}
+                        oncontextmenu={(e) => openContextMenu(e, rowIndex)}
                       >
                         {pending !== null ? pending : cellText(value)}
                       </button>
@@ -2138,6 +2358,29 @@
       {/if}
     </div>
 
+    <!-- Row detail panel (Space / right-click > Show row) -->
+    {#if rowDetailView}
+      <RowDetailPanel
+        columns={rowDetailView.columns}
+        row={rowDetailView.row}
+        displayIndex={rowDetailView.displayIndex}
+        total={rowDetailView.total}
+        onprev={() => stepRowDetail(-1)}
+        onnext={() => stepRowDetail(1)}
+        onclose={closeRowDetail}
+        oninspect={(colIndex) => {
+          if (activeTab && rowDetail) {
+            selectedCell = {
+              tabId: activeTab.id,
+              rowIndex: rowDetail.rowIndex,
+              colIndex,
+            };
+          }
+        }}
+        bind:panelEl={rowDetailEl}
+      />
+    {/if}
+
     <!-- Cell inspector (shown only while a cell is selected) -->
     {#if inspectedCell}
       <CellInspector
@@ -2149,6 +2392,40 @@
     {/if}
   </div>
 </div>
+
+<!-- Right-click menu of a result row -->
+{#if contextMenu}
+  <button
+    class="fixed inset-0 z-40 cursor-default"
+    aria-label="Close menu"
+    data-annotate="result-row-menu-backdrop"
+    onclick={() => (contextMenu = null)}
+    oncontextmenu={(e) => {
+      e.preventDefault();
+      contextMenu = null;
+    }}
+  ></button>
+  <div
+    class="fixed z-50 min-w-40 rounded border border-zinc-700 bg-zinc-800 py-1 text-xs text-zinc-300 shadow-lg"
+    style="left:{contextMenu.x}px; top:{contextMenu.y}px"
+    role="menu"
+  >
+    <button
+      class="block w-full px-3 py-1 text-left hover:bg-zinc-700 hover:text-zinc-100"
+      role="menuitem"
+      data-annotate="menu-result-show-row"
+      onclick={() => {
+        const rowIndex = contextMenu?.rowIndex;
+        contextMenu = null;
+        if (rowIndex !== undefined) {
+          showRowFromMenu(rowIndex);
+        }
+      }}
+    >
+      Show row <span class="ml-2 text-zinc-500">Space</span>
+    </button>
+  </div>
+{/if}
 
 <!-- Modal for the AI explanation of the execution plan -->
 {#if appStore.aiAnalysis !== null}
