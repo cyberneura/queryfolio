@@ -33,6 +33,7 @@
   } from "$lib/resultFilter";
   import { filterTerms } from "$lib/paneFilter";
   import { stepRow } from "$lib/rowDetail";
+  import { insertTarget, toInsertStatements } from "$lib/insertStatements";
   import CellInspector from "./CellInspector.svelte";
   import RowDetailPanel from "./RowDetailPanel.svelte";
   import AiAnalysisModal from "./AiAnalysisModal.svelte";
@@ -45,7 +46,9 @@
   let { onOpenProcessList }: Props = $props();
 
   // Output format shared by Copy / Export / Cmd+C copy.
-  const COPY_FORMATS = ["tsv", "csv", "json", "markdown"] as const;
+  // "insert" (SQL INSERT statements, CYBERNEURA-DEV-1318) is offered only for the engines
+  // whose SQL dialect cell editing already speaks, and works only for a single-table SELECT
+  const COPY_FORMATS = ["tsv", "csv", "json", "markdown", "insert"] as const;
   type CopyFormat = (typeof COPY_FORMATS)[number];
   // File extension (and save dialog filter name) of each format
   const EXPORT_FILE_TYPES: Record<CopyFormat, { ext: string; name: string }> = {
@@ -53,6 +56,15 @@
     csv: { ext: "csv", name: "CSV" },
     json: { ext: "json", name: "JSON" },
     markdown: { ext: "md", name: "Markdown" },
+    insert: { ext: "sql", name: "SQL" },
+  };
+  // Label of each format in the format selector
+  const COPY_FORMAT_LABELS: Record<CopyFormat, string> = {
+    tsv: "TSV",
+    csv: "CSV",
+    json: "JSON",
+    markdown: "MARKDOWN",
+    insert: "SQL INSERT",
   };
   const COPY_FORMAT_KEY = "queryfolio.results.copyFormat";
   const isCopyFormat = (v: string): v is CopyFormat =>
@@ -683,14 +695,23 @@
     if (!range || !result) {
       return;
     }
-    const text =
-      copyFormat === "markdown"
-        ? markdownText(result, range)
-        : { csv: toCsvRange, tsv: toTsvRange, json: toJsonRange }[copyFormat](
-            result,
-            range,
-            copyWithHeaders,
-          );
+    let text: string;
+    if (copyFormat === "insert") {
+      const sql = insertText(activeInsertTarget, result, range);
+      if (sql === null) {
+        return;
+      }
+      text = sql;
+    } else {
+      text =
+        copyFormat === "markdown"
+          ? markdownText(result, range)
+          : { csv: toCsvRange, tsv: toTsvRange, json: toJsonRange }[copyFormat](
+              result,
+              range,
+              copyWithHeaders,
+            );
+    }
     await writeText(text);
     selectionCopied = true;
     setTimeout(() => {
@@ -1107,13 +1128,86 @@
     return text;
   };
 
+  // ---- SQL INSERT format (CYBERNEURA-DEV-1318) ----
+  // Offered only where cell editing works (MySQL / PostgreSQL / SQLite): the statements are
+  // built with the same identifier / literal quoting. Redis / Elasticsearch / DynamoDB /
+  // DuckDB / SQL Server do not get the option at all (capability-based, like the other UI)
+  const activeTabCapabilities = $derived(
+    activeTab
+      ? (appStore.connections.find((c) => c.name === activeTab.connection)
+          ?.capabilities ?? null)
+      : null,
+  );
+  const insertFormatOffered = $derived(
+    activeTabCapabilities?.supports_editable_cells ?? false,
+  );
+  // Whether the active result can be written as INSERT statements (the table it came from),
+  // or why not. A batch tab holds a per-statement summary, not rows of a table
+  const activeInsertTarget = $derived.by(() => {
+    const tab = activeTab;
+    const engine = activeEngine;
+    if (!tab?.result || !engine || !insertFormatOffered) {
+      return null;
+    }
+    if (tab.batch !== null) {
+      return {
+        ok: false as const,
+        reason: "SQL INSERT is not available for the summary of a multi-statement run",
+      };
+    }
+    return insertTarget(engine, tab.sql, tab.result.columns);
+  });
+  // The selector only lists the formats the active result can use. A stored "insert" stays
+  // selected but is disabled with the reason in its title (and Copy / Export say why)
+  // (also kept, disabled, when it is the stored choice on a connection that does not offer it,
+  // so that the selector never shows an empty value)
+  const selectableFormats = $derived(
+    COPY_FORMATS.filter(
+      (f) => f !== "insert" || insertFormatOffered || copyFormat === "insert",
+    ),
+  );
+  type InsertTargetSnapshot = typeof activeInsertTarget;
+  // INSERT statements for a result (whole, or a range of it). null after telling the user why
+  // the format cannot be used for this result. `target` is the active result's target taken
+  // by the caller **before any await** (Copy / Export re-fetch the rows first; by then another
+  // tab, table or dialect can be active)
+  const insertText = (
+    target: InsertTargetSnapshot,
+    result: api.QueryResult,
+    range?: CellRange,
+  ): string | null => {
+    if (!target || !target.ok) {
+      toast.warning(
+        target?.reason ?? "SQL INSERT is not available for this connection",
+      );
+      return null;
+    }
+    const built = toInsertStatements(
+      target.engine,
+      target.table,
+      result.columns,
+      result.rows,
+      range,
+    );
+    if (!built.ok) {
+      toast.warning(built.reason);
+      return null;
+    }
+    return built.text;
+  };
+
   // Stringify the whole result table in the selected format (shared by Copy / Export).
+  // insertTarget: the snapshot of activeInsertTarget taken before the re-fetch
   const serializeResult = (
     format: CopyFormat,
     result: api.QueryResult | null | undefined,
+    insertTarget: InsertTargetSnapshot,
   ): string | null => {
     if (!result) {
       return null;
+    }
+    if (format === "insert") {
+      return insertText(insertTarget, result);
     }
     return format === "markdown"
       ? markdownText(result)
@@ -1165,7 +1259,10 @@
     if (preparingOutput) {
       return;
     }
-    const text = serializeResult(copyFormat, await resultForOutput());
+    // Take the format and the INSERT target before the re-fetch awaits (see insertText)
+    const format = copyFormat;
+    const target = activeInsertTarget;
+    const text = serializeResult(format, await resultForOutput(), target);
     if (text === null) {
       return;
     }
@@ -1185,7 +1282,17 @@
     if (!activeTab?.result || preparingOutput) {
       return;
     }
-    const { ext, name } = EXPORT_FILE_TYPES[copyFormat];
+    // Take the format and the INSERT target before the dialog and the re-fetch await
+    const format = copyFormat;
+    const target = activeInsertTarget;
+    // Say why before the save dialog rather than after the user picked a path
+    if (format === "insert" && !target?.ok) {
+      toast.warning(
+        target?.reason ?? "SQL INSERT is not available for this connection",
+      );
+      return;
+    }
+    const { ext, name } = EXPORT_FILE_TYPES[format];
     let path: string | null;
     try {
       path = await save({
@@ -1201,7 +1308,7 @@
       return;
     }
     // Do the refetch and serialization after the path is confirmed (avoids wasted work on cancel)
-    const text = serializeResult(copyFormat, await resultForOutput());
+    const text = serializeResult(format, await resultForOutput(), target);
     if (text === null) {
       return;
     }
@@ -1897,8 +2004,19 @@
             data-annotate="select-copy-format"
             bind:value={copyFormat}
           >
-            {#each COPY_FORMATS as format (format)}
-              <option value={format}>{format.toUpperCase()}</option>
+            {#each selectableFormats as format (format)}
+              {#if format === "insert"}
+                <option
+                  value={format}
+                  disabled={!activeInsertTarget?.ok}
+                  title={activeInsertTarget?.ok
+                    ? `INSERT INTO ${activeInsertTarget.table} statements, one per row (not executed)`
+                    : (activeInsertTarget?.reason ?? "")}
+                  >{COPY_FORMAT_LABELS[format]}</option
+                >
+              {:else}
+                <option value={format}>{COPY_FORMAT_LABELS[format]}</option>
+              {/if}
             {/each}
           </select>
           <button
