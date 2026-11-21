@@ -1748,18 +1748,20 @@ const isBatchRunning = (connection: string): boolean =>
 /// If there is an active non-pinned tab that is not running, reuse it; otherwise create a new tab.
 /// On reaching the limit, discard the oldest non-pinned tab that is not running.
 /// Returns null when no room can be made (already notified by toast).
-const prepareTargetTab = (): ResultTab | null => {
+const prepareTargetTab = (newTab = false): ResultTab | null => {
   const current = resultTabs.find((t) => t.id === activeTabId);
   // A running tab is not reused: queries on different connections run in parallel, so
   // the active tab may still be running another connection's query. Reusing it would
-  // overwrite that query's result, so the new query gets its own tab
-  if (current && !current.pinned && !current.running) {
+  // overwrite that query's result, so the new query gets its own tab.
+  // newTab: always open a new tab (following a foreign key keeps the result it came from)
+  if (!newTab && current && !current.pinned && !current.running) {
     return current;
   }
   if (resultTabs.length >= MAX_RESULT_TABS) {
-    // A running tab is not discarded either (its result would be thrown away on completion)
+    // A running tab is not discarded either (its result would be thrown away on completion).
+    // With newTab the active tab is the result being navigated from, so it stays too
     const oldest = resultTabs
-      .filter((t) => !t.pinned && !t.running)
+      .filter((t) => !t.pinned && !t.running && !(newTab && t.id === activeTabId))
       .reduce<ResultTab | null>(
         (acc, t) => (acc === null || t.executedAt < acc.executedAt ? t : acc),
         null,
@@ -2004,6 +2006,11 @@ const fetchResultWithoutDefaultLimit = async (
 const runQuery = (sql: string): Promise<QueryResult | null> =>
   runQueryInTab(sql);
 
+/// Run SQL in a new result tab, keeping the active one (CYBERNEURA-DEV-1319: following a
+/// foreign key from a result cell). Same guards and history as runQuery
+const runQueryInNewTab = (sql: string): Promise<QueryResult | null> =>
+  runQueryInTab(sql, undefined, true);
+
 /// What the Run and Log re-fetch produced (see runQueryForLog).
 /// shown = the displayed result is the whole result, or the statement is not safe to run again
 /// (log the displayed one) / full = the result fetched without default_limit /
@@ -2082,6 +2089,7 @@ const runQueryInTab = async (
     connection: string,
     schema: string | null,
   ) => Promise<void>,
+  newTab = false,
 ): Promise<QueryResult | null> => {
   // Fix the target connection before the await. Even if the connection switches during later awaits (save,
   // dangerous-statement confirmation modal), the confirmed connection and the executing connection must not diverge
@@ -2123,7 +2131,7 @@ const runQueryInTab = async (
     return null;
   }
   errorMessage = null;
-  const tab = prepareTargetTab();
+  const tab = prepareTargetTab(newTab);
   if (!tab) {
     return null;
   }
@@ -3290,6 +3298,7 @@ export default {
   dismissFixSuggestion,
   isConnectionRunning,
   runQuery,
+  runQueryInNewTab,
   runBatch,
   fetchResultWithoutDefaultLimit,
   explainQuery,

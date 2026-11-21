@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { writeText } from "@tauri-apps/plugin-clipboard-manager";
   import { save } from "@tauri-apps/plugin-dialog";
   import { toast } from "svelte-sonner";
@@ -19,6 +20,7 @@
   import {
     singleTableSelectTable,
     buildUpdateStatements,
+    literalFromValue,
     normalizeEngine,
     normalizeTableName,
     type NormalizedEngine,
@@ -34,6 +36,7 @@
   import { filterTerms } from "$lib/paneFilter";
   import { stepRow } from "$lib/rowDetail";
   import { insertTarget, toInsertStatements } from "$lib/insertStatements";
+  import { foreignKeyLookupTable, referencedRowSql } from "$lib/foreignKeys";
   import CellInspector from "./CellInspector.svelte";
   import RowDetailPanel from "./RowDetailPanel.svelte";
   import AiAnalysisModal from "./AiAnalysisModal.svelte";
@@ -1721,6 +1724,159 @@
     clearPending();
     previewStatements = null;
   };
+
+  // ------- Following a foreign key from a cell (CYBERNEURA-DEV-1319) -------
+  // For a single-table SELECT on MySQL / PostgreSQL / SQLite (the engines cell editing
+  // supports), the single-column foreign keys of the table put an arrow on their cells, which
+  // runs `SELECT * FROM <referenced table> WHERE <referenced column> = <value>` in a new result
+  // tab (also pasted into the editor and kept in the history). Only offered while the tab's
+  // connection and database are the selected ones: the SELECT runs there.
+
+  // Foreign keys per result tab, keyed by fkColumnKey of the column name
+  let foreignKeys = $state(
+    new Map<number, { executedAt: number; byColumn: Map<string, api.ForeignKeyInfo> }>(),
+  );
+  // Catalog lookups, once per connection + database + table (shared across tabs and re-runs).
+  // A failed lookup is not cached, so the next result tries again
+  const foreignKeyCache = new Map<string, Promise<api.ForeignKeyInfo[]>>();
+  // Bumped on every reload of the connections, so that a lookup started before it is dropped
+  let foreignKeyGeneration = 0;
+  $effect(() => {
+    // Forget everything when the connections are reloaded: another database may be behind
+    // the same connection name, and a tab's result would otherwise keep the old keys
+    void appStore.connections;
+    foreignKeyGeneration++;
+    foreignKeyCache.clear();
+    // untrack: this effect must depend on the connections only, not on the map it clears
+    // (otherwise every lookup that fills the map would clear it again)
+    untrack(() => {
+      if (foreignKeys.size > 0) {
+        foreignKeys = new Map();
+      }
+    });
+  });
+  // How a result column is matched with the catalog's column name. PostgreSQL returns the
+  // exact (case-sensitive) name in both, and `"Customer_ID"` and `customer_id` can be two
+  // columns there; MySQL / SQLite compare column names case-insensitively, and the result
+  // label is spelled as written in the SELECT list
+  const fkColumnKey = (engine: NormalizedEngine, column: string): string =>
+    engine === "postgres" ? column : column.toLowerCase();
+
+  const canFollowForeignKeys = $derived(
+    activeTab !== null &&
+      activeTab.batch === null &&
+      activeTab.connection === appStore.selectedConnection &&
+      activeTab.schema === appStore.activeSchema &&
+      (appStore.selectedCapabilities?.supports_editable_cells ?? false),
+  );
+  const activeForeignKeys = $derived.by(() => {
+    const tab = activeTab;
+    if (!tab || !canFollowForeignKeys) {
+      return null;
+    }
+    const entry = foreignKeys.get(tab.id);
+    return entry && entry.executedAt === tab.executedAt ? entry.byColumn : null;
+  });
+
+  $effect(() => {
+    const tab = activeTab;
+    const engine = activeEngine;
+    if (!tab?.result || !engine || !canFollowForeignKeys) {
+      return;
+    }
+    const existing = foreignKeys.get(tab.id);
+    if (existing && existing.executedAt === tab.executedAt) {
+      return;
+    }
+    const table = foreignKeyLookupTable(engine, tab.sql, tab.result.columns);
+    if (!table) {
+      return;
+    }
+    void loadForeignKeys(tab, table, engine);
+  });
+
+  async function loadForeignKeys(
+    tab: ResultTab,
+    table: string,
+    engine: NormalizedEngine,
+  ) {
+    const generation = foreignKeyGeneration;
+    // Snapshot before the await: a re-run reuses the same (unpinned) ResultTab object, so
+    // tab.executedAt would read the new run's timestamp afterwards
+    const executedAt = tab.executedAt;
+    const key = `${tab.connection}\u0001${tab.schema ?? ""}\u0001${table}`;
+    let pending = foreignKeyCache.get(key);
+    if (!pending) {
+      pending = api.getForeignKeys(tab.connection, table);
+      foreignKeyCache.set(key, pending);
+    }
+    let keys: api.ForeignKeyInfo[];
+    try {
+      keys = await pending;
+    } catch {
+      // No arrows when the catalog cannot be read (the result itself is unaffected)
+      if (generation === foreignKeyGeneration) {
+        foreignKeyCache.delete(key);
+      }
+      keys = [];
+    }
+    // Drop a stale answer (the result was replaced, the tab closed, or the connections were
+    // reloaded meanwhile)
+    const current = appStore.resultTabs.find((t) => t.id === tab.id);
+    if (
+      generation !== foreignKeyGeneration ||
+      !current ||
+      current.executedAt !== executedAt
+    ) {
+      return;
+    }
+    const byColumn = new Map<string, api.ForeignKeyInfo>();
+    for (const k of keys) {
+      const columnKey = fkColumnKey(engine, k.column);
+      // The backend keeps one key per column; keep the first if two names fold together
+      if (!byColumn.has(columnKey)) {
+        byColumn.set(columnKey, k);
+      }
+    }
+    foreignKeys.set(tab.id, { executedAt, byColumn });
+    foreignKeys = new Map(foreignKeys);
+  }
+
+  // The foreign key a cell can follow: its column has one and the value is a scalar
+  // (NULL references nothing; a JSON cell is not a key)
+  const foreignKeyOf = (
+    colIndex: number,
+    value: unknown,
+  ): api.ForeignKeyInfo | null => {
+    const keys = activeForeignKeys;
+    const engine = activeEngine;
+    const column = activeTab?.result?.columns[colIndex];
+    if (
+      !keys ||
+      !engine ||
+      column === undefined ||
+      value === null ||
+      value === undefined
+    ) {
+      return null;
+    }
+    if (typeof value === "object") {
+      return null;
+    }
+    return keys.get(fkColumnKey(engine, column)) ?? null;
+  };
+
+  const followForeignKey = (fk: api.ForeignKeyInfo, value: unknown) => {
+    const engine = activeEngine;
+    if (!engine) {
+      return;
+    }
+    const sql = referencedRowSql(engine, fk, literalFromValue(engine, value));
+    // Keep what ran visible: paste it into the editor (when a query file is open) and run it
+    // in a new tab, so the result it came from stays where it was
+    appStore.insertSqlSnippet(`${sql};`);
+    void appStore.runQueryInNewTab(sql);
+  };
 </script>
 
 <!-- Drag selection is tracked via the cell's pointerenter, so
@@ -2359,6 +2515,7 @@
                 {#each row as value, colIndex (colIndex)}
                   {@const pending = pendingInput(rowIndex, colIndex)}
                   {@const editable = isCellEditable(rowIndex, colIndex)}
+                  {@const fk = foreignKeyOf(colIndex, value)}
                   <!-- Click opens the cell inspector, drag does rectangular selection,
                        double-click edits (non-editable cells get a read-only view).
                        For truncate, the button/input is laid over the whole cell -->
@@ -2397,7 +2554,9 @@
                       {/if}
                     {:else}
                       <button
-                        class="block w-full truncate px-2 py-0.5 text-left {editable
+                        class="block w-full truncate px-2 py-0.5 text-left {fk
+                          ? 'pr-5'
+                          : ''} {editable
                           ? 'cursor-cell'
                           : 'cursor-pointer'} {pending !== null
                           ? 'text-amber-200'
@@ -2412,12 +2571,39 @@
                           beginSelect("cell", displayIndex, colIndex, e)}
                         onpointerenter={(e) =>
                           extendSelect("cell", displayIndex, colIndex, e)}
-                        onclick={() => onCellClick(rowIndex, colIndex)}
+                        onclick={(e) => {
+                          // Cmd+click (Ctrl+click) on a foreign key cell follows it
+                          if (fk && (e.metaKey || e.ctrlKey)) {
+                            followForeignKey(fk, value);
+                            return;
+                          }
+                          onCellClick(rowIndex, colIndex);
+                        }}
                         ondblclick={() => beginCellEdit(rowIndex, colIndex)}
                         oncontextmenu={(e) => openContextMenu(e, rowIndex)}
                       >
                         {pending !== null ? pending : cellText(value)}
                       </button>
+                      {#if fk}
+                        <!-- Follow the foreign key: the referenced row in a new result tab.
+                             Left of the copy icon of the active cell -->
+                        <button
+                          class="absolute top-1/2 -translate-y-1/2 rounded px-0.5 text-zinc-500 hover:bg-zinc-700 hover:text-sky-300 {isSelectedCell(
+                            rowIndex,
+                            colIndex,
+                          )
+                            ? 'right-6'
+                            : 'right-0.5'}"
+                          title="Open the referenced row: {fk.ref_schema
+                            ? `${fk.ref_schema}.`
+                            : ''}{fk.ref_table}.{fk.ref_column} = {cellText(value)} (new result tab; Cmd+click the cell does the same)"
+                          aria-label="Open the referenced row in {fk.ref_table}"
+                          data-annotate="button-follow-fk-{displayIndex}-{colIndex}"
+                          onclick={() => followForeignKey(fk, value)}
+                        >
+                          <i class="bi bi-box-arrow-up-right text-[0.65rem]" aria-hidden="true"></i>
+                        </button>
+                      {/if}
                       {#if isSelectedCell(rowIndex, colIndex)}
                         {@const copied =
                           copiedCellKey === `${rowIndex}:${colIndex}`}
