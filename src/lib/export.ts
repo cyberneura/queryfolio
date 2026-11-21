@@ -16,7 +16,7 @@ const cellToString = (value: unknown): string => {
 // Only string values from the DB are escaped, so numeric values (e.g. -1) are not broken.
 const FORMULA_TRIGGER = /^[=+\-@\t\r]/;
 
-const escapeFormulaInjection = (value: unknown, text: string): string => {
+export const escapeFormulaInjection = (value: unknown, text: string): string => {
   if (typeof value === "string" && FORMULA_TRIGGER.test(text)) {
     return `'${text}`;
   }
@@ -24,7 +24,7 @@ const escapeFormulaInjection = (value: unknown, text: string): string => {
 };
 
 // Headers (column names / aliases) are always strings, so check them unconditionally
-const escapeHeaderFormula = (header: string): string =>
+export const escapeHeaderFormula = (header: string): string =>
   FORMULA_TRIGGER.test(header) ? `'${header}` : header;
 
 const escapeCsvField = (field: string): string => {
