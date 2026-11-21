@@ -335,6 +335,171 @@ pub async fn fetch_primary_keys(pool: &DbPool, table: &str) -> Result<Vec<String
     Ok(keys)
 }
 
+/// A single-column foreign key of a table (for following a reference from a result cell,
+/// CYBERNEURA-DEV-1319). Composite foreign keys are left out: one cell value cannot identify
+/// the referenced row.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ForeignKeyInfo {
+    /// Column of the table that holds the reference
+    pub column: String,
+    /// Schema (PostgreSQL) / database (MySQL) / attached database (SQLite) of the referenced
+    /// table. Always given for PostgreSQL and MySQL so that the generated SELECT does not
+    /// depend on the search_path / current database; None for the main SQLite database
+    pub ref_schema: Option<String>,
+    /// Referenced table (as stored in the catalog, not quoted)
+    pub ref_table: String,
+    /// Referenced column
+    pub ref_column: String,
+}
+
+/// Returns the single-column foreign keys of a table (MySQL / PostgreSQL / SQLite; empty for
+/// the other engines). A column that is the source of several single-column foreign keys keeps
+/// the first one (by constraint name), so each column has at most one target.
+/// The table name goes through the same identifier validation as fetch_columns, because the
+/// PostgreSQL / SQLite queries embed it.
+pub async fn fetch_foreign_keys(
+    pool: &DbPool,
+    table: &str,
+) -> Result<Vec<ForeignKeyInfo>, AppError> {
+    if !matches!(
+        pool,
+        DbPool::Postgres(_) | DbPool::MySql(_) | DbPool::Sqlite(_)
+    ) {
+        return Ok(vec![]);
+    }
+    let table = validate_relation_name(table)?;
+    let mut keys: Vec<ForeignKeyInfo> = match pool {
+        DbPool::Postgres(p) => {
+            // conkey / confkey of a single-column foreign key have exactly one element
+            let sql = format!(
+                "SELECT a.attname, rn.nspname, rc.relname, ra.attname \
+                 FROM pg_catalog.pg_constraint con \
+                 JOIN pg_catalog.pg_attribute a \
+                   ON a.attrelid = con.conrelid AND a.attnum = con.conkey[1] \
+                 JOIN pg_catalog.pg_class rc ON rc.oid = con.confrelid \
+                 JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace \
+                 JOIN pg_catalog.pg_attribute ra \
+                   ON ra.attrelid = con.confrelid AND ra.attnum = con.confkey[1] \
+                 WHERE con.conrelid = '{table}'::regclass AND con.contype = 'f' \
+                   AND cardinality(con.conkey) = 1 \
+                 ORDER BY a.attnum, con.conname"
+            );
+            sqlx::query(&sql)
+                .fetch_all(p)
+                .await?
+                .iter()
+                .map(|row| ForeignKeyInfo {
+                    column: row.try_get(0).unwrap_or_default(),
+                    ref_schema: row.try_get(1).ok(),
+                    ref_table: row.try_get(2).unwrap_or_default(),
+                    ref_column: row.try_get(3).unwrap_or_default(),
+                })
+                .collect()
+        }
+        DbPool::MySql(p) => {
+            let (schema_part, table_part) = match table.split_once('.') {
+                Some((s, t)) => (Some(s.to_string()), t),
+                None => (None, table),
+            };
+            // A constraint with more than one KEY_COLUMN_USAGE row is a composite key
+            sqlx::query(
+                "SELECT k.COLUMN_NAME, k.REFERENCED_TABLE_SCHEMA, k.REFERENCED_TABLE_NAME, \
+                   k.REFERENCED_COLUMN_NAME \
+                 FROM information_schema.KEY_COLUMN_USAGE k \
+                 WHERE k.TABLE_SCHEMA = COALESCE(?, DATABASE()) AND k.TABLE_NAME = ? \
+                   AND k.REFERENCED_TABLE_NAME IS NOT NULL \
+                   AND (SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE k2 \
+                        WHERE k2.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA \
+                          AND k2.TABLE_NAME = k.TABLE_NAME \
+                          AND k2.CONSTRAINT_NAME = k.CONSTRAINT_NAME) = 1 \
+                 ORDER BY k.CONSTRAINT_NAME",
+            )
+            .bind(schema_part)
+            .bind(table_part)
+            .fetch_all(p)
+            .await?
+            .iter()
+            .map(|row| ForeignKeyInfo {
+                column: row.try_get(0).unwrap_or_default(),
+                ref_schema: row.try_get(1).ok(),
+                ref_table: row.try_get(2).unwrap_or_default(),
+                ref_column: row.try_get(3).unwrap_or_default(),
+            })
+            .collect()
+        }
+        DbPool::Sqlite(p) => fetch_sqlite_foreign_keys(p, table).await?,
+        _ => unreachable!(),
+    };
+    // One target per column (the first by the ORDER BY above)
+    let mut seen = std::collections::HashSet::new();
+    keys.retain(|k| {
+        !k.column.is_empty() && !k.ref_table.is_empty() && seen.insert(k.column.clone())
+    });
+    Ok(keys)
+}
+
+/// SQLite: `pragma_foreign_key_list` returns one row per column of each foreign key (`id`
+/// groups them). `to` is NULL when the key references the parent's primary key implicitly
+/// (`REFERENCES parent`), so resolve it from the parent's single-column primary key.
+async fn fetch_sqlite_foreign_keys(
+    p: &sqlx::SqlitePool,
+    table: &str,
+) -> Result<Vec<ForeignKeyInfo>, AppError> {
+    let (schema, name) = match table.split_once('.') {
+        Some((s, t)) => (Some(s), t),
+        None => (None, table),
+    };
+    let list = match schema {
+        Some(schema) => format!("pragma_foreign_key_list('{name}', '{schema}')"),
+        None => format!("pragma_foreign_key_list('{name}')"),
+    };
+    let sql = format!(
+        "SELECT f.\"from\", f.\"table\", f.\"to\" FROM {list} f \
+         WHERE f.id IN (SELECT id FROM {list} GROUP BY id HAVING COUNT(*) = 1) \
+         ORDER BY f.id"
+    );
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query(&sql)
+        .fetch_all(p)
+        .await?
+        .iter()
+        .map(|row| {
+            (
+                row.try_get(0).unwrap_or_default(),
+                row.try_get(1).unwrap_or_default(),
+                row.try_get::<Option<String>, _>(2).ok().flatten(),
+            )
+        })
+        .collect();
+    let mut keys = Vec::new();
+    for (column, ref_table, to) in rows {
+        let ref_column = match to {
+            Some(to) if !to.is_empty() => to,
+            _ => {
+                // The implicit target is the parent's primary key; only a single-column one fits
+                let parent = match schema {
+                    Some(schema) => format!("{schema}.{ref_table}"),
+                    None => ref_table.clone(),
+                };
+                let Ok(parent) = validate_relation_name(&parent) else {
+                    continue;
+                };
+                let pk = fetch_primary_keys(&DbPool::Sqlite(p.clone()), parent).await?;
+                match pk.as_slice() {
+                    [only] => only.clone(),
+                    _ => continue,
+                }
+            }
+        };
+        keys.push(ForeignKeyInfo {
+            column,
+            ref_schema: schema.map(str::to_string),
+            ref_table,
+            ref_column,
+        });
+    }
+    Ok(keys)
+}
+
 /// Fetches all columns of all tables at once and returns a map of qualified table name ->
 /// column list. Used to fill the cache for get_schema_map (SQL completion).
 pub async fn fetch_all_columns(
@@ -586,6 +751,67 @@ mod tests {
                 .unwrap();
         }
         pool
+    }
+
+    #[tokio::test]
+    async fn test_fetch_foreign_keys_sqlite() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .in_memory(true),
+            )
+            .await
+            .unwrap();
+        let pool = DbPool::Sqlite(pool);
+        for sql in [
+            "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)",
+            "CREATE TABLE regions (code TEXT, country TEXT, PRIMARY KEY (code, country))",
+            "CREATE TABLE products (sku TEXT PRIMARY KEY)",
+            "CREATE TABLE orders (\
+               id INTEGER PRIMARY KEY, \
+               customer_id INTEGER REFERENCES customers(id), \
+               product_sku TEXT REFERENCES products, \
+               region_code TEXT, region_country TEXT, \
+               note TEXT, \
+               FOREIGN KEY (region_code, region_country) REFERENCES regions(code, country))",
+            "CREATE TABLE lonely (id INTEGER PRIMARY KEY)",
+        ] {
+            crate::db::run_query(&pool, sql, 10, None, false, false)
+                .await
+                .unwrap();
+        }
+        let keys = fetch_foreign_keys(&pool, "orders").await.unwrap();
+        let mut got: Vec<(&str, &str, &str)> = keys
+            .iter()
+            .map(|k| {
+                (
+                    k.column.as_str(),
+                    k.ref_table.as_str(),
+                    k.ref_column.as_str(),
+                )
+            })
+            .collect();
+        got.sort();
+        // The composite key to regions is left out; the implicit target (REFERENCES products)
+        // resolves to the parent's primary key
+        assert_eq!(
+            got,
+            vec![
+                ("customer_id", "customers", "id"),
+                ("product_sku", "products", "sku"),
+            ]
+        );
+        assert!(keys.iter().all(|k| k.ref_schema.is_none()));
+        assert!(fetch_foreign_keys(&pool, "lonely")
+            .await
+            .unwrap()
+            .is_empty());
+        // The table name is validated like fetch_columns (it is embedded in the pragma call)
+        assert!(fetch_foreign_keys(&pool, "orders'); DROP TABLE x; --")
+            .await
+            .is_err());
     }
 
     #[tokio::test]

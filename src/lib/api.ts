@@ -366,6 +366,20 @@ export const listProcesses = (connection: string) =>
 export const getPrimaryKeys = (connection: string, table: string) =>
   invoke<string[]>("get_primary_keys", { connection, table });
 
+/// A single-column foreign key (corresponds to schema_info::ForeignKeyInfo)
+export interface ForeignKeyInfo {
+  column: string;
+  /// Schema / database of the referenced table (null for the main SQLite database)
+  ref_schema: string | null;
+  ref_table: string;
+  ref_column: string;
+}
+
+/// Returns the single-column foreign keys of a table (MySQL / PostgreSQL / SQLite; empty for
+/// the other engines). For following a reference from a result cell (CYBERNEURA-DEV-1319).
+export const getForeignKeys = (connection: string, table: string) =>
+  invoke<ForeignKeyInfo[]>("get_foreign_keys", { connection, table });
+
 /// Apply the result-grid cell edits as a group of UPDATEs in a single transaction.
 /// writable means the same as in runQuery (unspecified / false is read-only).
 /// Returns the total number of affected rows.

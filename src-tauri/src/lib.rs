@@ -1421,6 +1421,24 @@ async fn get_primary_keys(
         .await
 }
 
+/// Returns the single-column foreign keys of a table (for following a reference from a result
+/// cell to the referenced row, CYBERNEURA-DEV-1319). Empty for engines without them.
+#[tauri::command]
+async fn get_foreign_keys(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    table: String,
+) -> Result<Vec<schema_info::ForeignKeyInfo>, AppError> {
+    let server = state.find_server(&connection).await?;
+    let table = &table;
+    state
+        .db
+        .with_pool(&server, db::PasswordRetry::Idempotent, |pool| async move {
+            schema_info::fetch_foreign_keys(&pool, table).await
+        })
+        .await
+}
+
 /// Applies cell edits in the result grid as a group of UPDATEs in one transaction.
 /// The resolution of writable is the same as run_query (config readonly takes precedence, then the switch).
 /// Returns the total number of affected rows.
@@ -2993,6 +3011,7 @@ pub fn run() {
             list_columns,
             get_schema_map,
             get_primary_keys,
+            get_foreign_keys,
             list_processes,
             run_statements,
             get_ai_info,
