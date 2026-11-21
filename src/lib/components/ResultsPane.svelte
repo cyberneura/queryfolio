@@ -700,7 +700,7 @@
     }
     let text: string;
     if (copyFormat === "insert") {
-      const sql = insertText(result, range);
+      const sql = insertText(activeInsertTarget, result, range);
       if (sql === null) {
         return;
       }
@@ -1169,38 +1169,48 @@
       (f) => f !== "insert" || insertFormatOffered || copyFormat === "insert",
     ),
   );
+  type InsertTargetSnapshot = typeof activeInsertTarget;
   // INSERT statements for a result (whole, or a range of it). null after telling the user why
-  // the format cannot be used for this result
+  // the format cannot be used for this result. `target` is the active result's target taken
+  // by the caller **before any await** (Copy / Export re-fetch the rows first; by then another
+  // tab, table or dialect can be active)
   const insertText = (
+    target: InsertTargetSnapshot,
     result: api.QueryResult,
     range?: CellRange,
   ): string | null => {
-    const target = activeInsertTarget;
     if (!target || !target.ok) {
       toast.warning(
         target?.reason ?? "SQL INSERT is not available for this connection",
       );
       return null;
     }
-    return toInsertStatements(
+    const built = toInsertStatements(
       target.engine,
       target.table,
       result.columns,
       result.rows,
       range,
     );
+    if (!built.ok) {
+      toast.warning(built.reason);
+      return null;
+    }
+    return built.text;
   };
 
   // Stringify the whole result table in the selected format (shared by Copy / Export).
+  // insertTarget: the snapshot of activeInsertTarget taken before the re-fetch
   const serializeResult = (
     format: CopyFormat,
     result: api.QueryResult | null | undefined,
+    insertTarget: InsertTargetSnapshot,
   ): string | null => {
     if (!result) {
       return null;
     }
     if (format === "insert") {
-      return insertText(result);
+      return insertText(insertTarget, result);
     }
     return format === "markdown"
       ? markdownText(result)
@@ -1252,7 +1262,10 @@
     if (preparingOutput) {
       return;
     }
-    const text = serializeResult(copyFormat, await resultForOutput());
+    // Take the format and the INSERT target before the re-fetch awaits (see insertText)
+    const format = copyFormat;
+    const target = activeInsertTarget;
+    const text = serializeResult(format, await resultForOutput(), target);
     if (text === null) {
       return;
     }
@@ -1272,15 +1285,17 @@
     if (!activeTab?.result || preparingOutput) {
       return;
     }
+    // Take the format and the INSERT target before the dialog and the re-fetch await
+    const format = copyFormat;
+    const target = activeInsertTarget;
     // Say why before the save dialog rather than after the user picked a path
-    if (copyFormat === "insert" && !activeInsertTarget?.ok) {
+    if (format === "insert" && !target?.ok) {
       toast.warning(
-        activeInsertTarget?.reason ??
-          "SQL INSERT is not available for this connection",
+        target?.reason ?? "SQL INSERT is not available for this connection",
       );
       return;
     }
-    const { ext, name } = EXPORT_FILE_TYPES[copyFormat];
+    const { ext, name } = EXPORT_FILE_TYPES[format];
     let path: string | null;
     try {
       path = await save({
@@ -1296,7 +1311,7 @@
       return;
     }
     // Do the refetch and serialization after the path is confirmed (avoids wasted work on cancel)
-    const text = serializeResult(copyFormat, await resultForOutput());
+    const text = serializeResult(format, await resultForOutput(), target);
     if (text === null) {
       return;
     }
@@ -1786,6 +1801,9 @@
     engine: NormalizedEngine,
   ) {
     const generation = foreignKeyGeneration;
+    // Snapshot before the await: a re-run reuses the same (unpinned) ResultTab object, so
+    // tab.executedAt would read the new run's timestamp afterwards
+    const executedAt = tab.executedAt;
     const key = `${tab.connection}\u0001${tab.schema ?? ""}\u0001${table}`;
     let pending = foreignKeyCache.get(key);
     if (!pending) {
@@ -1808,7 +1826,7 @@
     if (
       generation !== foreignKeyGeneration ||
       !current ||
-      current.executedAt !== tab.executedAt
+      current.executedAt !== executedAt
     ) {
       return;
     }
@@ -1820,7 +1838,7 @@
         byColumn.set(columnKey, k);
       }
     }
-    foreignKeys.set(tab.id, { executedAt: tab.executedAt, byColumn });
+    foreignKeys.set(tab.id, { executedAt, byColumn });
     foreignKeys = new Map(foreignKeys);
   }
 
