@@ -20,6 +20,7 @@
     OP_COMMAND_EXAMPLE,
     OVERRIDE_YAML_TEMPLATE,
     REASONING_EFFORT_CHOICES,
+    AGENT_PROVIDER_CHOICES,
     buildPatch,
     initialValues,
     isEmptyPatch,
@@ -162,6 +163,16 @@
       return REASONING_EFFORT_CHOICES;
     }
     return [...REASONING_EFFORT_CHOICES, { value: current, label: current }];
+  });
+
+  /// The agent provider choices, plus the value in the file when it is not one of them (a
+  /// typo, a future provider): shown as it is so that it is not silently rewritten
+  const agentProviderChoices = $derived.by(() => {
+    const current = values?.agentProvider;
+    if (current === undefined || AGENT_PROVIDER_CHOICES.some((c) => c.value === current)) {
+      return AGENT_PROVIDER_CHOICES;
+    }
+    return [...AGENT_PROVIDER_CHOICES, { value: current, label: `${current} (not supported)` }];
   });
 
   const inputClass =
@@ -646,6 +657,99 @@
             </select>
           </div>
           {@render fieldNotes("ai.tool_reasoning_effort")}
+        </section>
+
+        <!-- Coding agent (CYBERNEURA-DEV-1354) -->
+        <section class="flex flex-col gap-1.5">
+          <h3 class="font-semibold text-zinc-300">Agent (Claude Code / Codex)</h3>
+          <p class="text-zinc-500">
+            Use a coding agent for the Chat pane and the AI field above the editor instead of
+            the built-in assistant. Queryfolio starts the
+            <span class="font-mono">claude</span> / <span class="font-mono">codex</span>
+            command you have installed, with the login you already have (your subscription);
+            no API key is stored here. The agent is told which query file is open and edits
+            it directly.
+          </p>
+          <span class="text-zinc-400">Agent (agent.provider)</span>
+          <div class="flex items-center gap-2">
+            <select
+              class={`${inputClass} max-w-72`}
+              data-annotate="select-agent-provider-setting"
+              disabled={locked("agent.provider")}
+              value={values.agentProvider}
+              onchange={(e) => {
+                if (values) values.agentProvider = e.currentTarget.value;
+              }}
+            >
+              {#each agentProviderChoices as choice (choice.value)}
+                <option value={choice.value}>{choice.label}</option>
+              {/each}
+            </select>
+          </div>
+          {@render fieldNotes("agent.provider")}
+
+          <span class="text-zinc-400">Working directory (agent.directory)</span>
+          <p class="text-zinc-500">
+            Where the agent runs. Empty: the query file folder of the connection. Set it to a
+            clone of your application's repository to let the agent read the code while it
+            writes queries; it can still edit the query files.
+          </p>
+          <div class="flex items-center gap-2">
+            <input
+              class={inputClass}
+              placeholder="(the connection's query file folder)"
+              data-annotate="input-agent-directory-setting"
+              disabled={locked("agent.directory")}
+              value={values.agentDirectory}
+              oninput={(e) => {
+                if (values) values.agentDirectory = e.currentTarget.value;
+              }}
+            />
+            {@render resetButton(
+              "agent.directory",
+              () => {
+                if (values) values.agentDirectory = "";
+              },
+              values.agentDirectory === "",
+            )}
+          </div>
+          {#if view.local.agent.directories > 0}
+            <p class="text-zinc-500" data-annotate="text-agent-directories">
+              {view.local.agent.directories} connection{view.local.agent.directories === 1
+                ? " has its"
+                : "s have their"} own directory in
+              <span class="font-mono">agent.directories</span> (edit them in config.yml).
+            </p>
+          {:else}
+            <p class="text-zinc-500">
+              A directory per connection can be set in config.yml:
+              <span class="font-mono">agent.directories.&lt;connection name&gt;</span>.
+            </p>
+          {/if}
+          {@render fieldNotes("agent.directory")}
+
+          <label class="flex items-start gap-2 text-zinc-300">
+            <input
+              type="checkbox"
+              class="mt-0.5"
+              data-annotate="checkbox-agent-auto-accept-edits"
+              disabled={locked("agent.auto_accept_edits")}
+              checked={values.agentAutoAcceptEdits}
+              onchange={(e) => {
+                if (values) values.agentAutoAcceptEdits = e.currentTarget.checked;
+              }}
+            />
+            <span>
+              Let the agent edit files without asking each time (agent.auto_accept_edits)
+              <span class="block text-zinc-500">
+                Claude Code is started in its acceptEdits mode: file edits inside the working
+                directory and the query file folder are applied directly. Commands the agent
+                wants to run always ask for approval in the Chat pane. Codex follows its own
+                sandbox and approval settings (~/.codex/config.toml).
+              </span>
+            </span>
+          </label>
+          {@render fieldNotes("agent.auto_accept_edits")}
         </section>
       {/if}
 

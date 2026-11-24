@@ -1,3 +1,5 @@
+mod agent;
+mod agent_process;
 mod ai;
 mod cli;
 mod color;
@@ -411,6 +413,41 @@ impl AppState {
         Ok(map)
     }
 
+    /// Resolves the coding agent settings (None: no `agent:` provider, the built-in assistant
+    /// is used). Parsed from the merged config every time: it is cheap, and a separate cache
+    /// would be one more thing reset_connections has to clear.
+    async fn resolve_agent_config(&self) -> Result<Option<agent::AgentConfig>, AppError> {
+        agent::AgentConfig::from_value(self.resolve_config().await?.agent().as_ref())
+    }
+
+    /// Resolves what is needed to start the agent of a connection: the settings and the
+    /// directories. The connection's query file folder is created if it does not exist (the
+    /// agent runs there by default) and gets its `_queryfolio.md`, which tells the agent which
+    /// database the folder is for.
+    async fn resolve_agent_launch(
+        &self,
+        connection: &str,
+        chosen_directory: Option<&str>,
+    ) -> Result<(agent::AgentConfig, agent::AgentDirectories), AppError> {
+        let config = self.resolve_agent_config().await?.ok_or_else(|| {
+            AppError::Agent(
+                "No agent is configured. Add an 'agent:' section (provider: claude or codex) \
+                 to config.yml"
+                    .into(),
+            )
+        })?;
+        let server = self.find_server(connection).await?;
+        let query_dir = query_files::ensure_connection_dir(
+            &self.resolve_sqlfiles_dir().await?,
+            &server.sqlfiles_folder_name(),
+        )?;
+        let query_dir = std::path::absolute(&query_dir).unwrap_or(query_dir);
+        // Best effort: a failure to write the meta file does not stop the agent
+        let _ = self.refresh_folder_meta(&server).await;
+        let dirs = agent::resolve_directories(&config, connection, &query_dir, chosen_directory)?;
+        Ok((config, dirs))
+    }
+
     /// Resolves the context common to AI commands (SQL generation / error fixing):
     /// AI config, connection config, active schema name for the prompt, and the schema map.
     /// Returns an error with a guidance message when AI is not configured.
@@ -476,6 +513,9 @@ async fn reset_connections(
     *state.ai.lock().await = None;
     state.db.reset().await;
     state.schema_cache.clear().await;
+    // The agent provider, its directories and the connections may all have changed: end the
+    // running chat agents (the frontend drops its conversations on reload too)
+    agent_process::stop_all_chats(&app);
     // Editing the config can change whether config_override_command exists, so
     // re-determine whether the menu item for the copy view (not saveable) is needed
     rebuild_menu(&app);
@@ -1464,6 +1504,15 @@ async fn run_statements(
             db::run_statements(&pool, statements, readonly_guard, allow_dangerous).await
         })
         .await
+}
+
+/// Returns the coding agent settings the frontend needs (which provider, if any).
+/// If the `agent:` section is invalid (unknown provider etc.), an error is returned.
+#[tauri::command]
+async fn get_agent_info(state: tauri::State<'_, AppState>) -> Result<agent::AgentInfo, AppError> {
+    Ok(agent::AgentInfo::from_config(
+        state.resolve_agent_config().await?.as_ref(),
+    ))
 }
 
 /// Returns information on the AI config (configured / model). Does not include the api_key.
@@ -2948,6 +2997,7 @@ pub fn run() {
             _ => {}
         })
         .manage(AppState::with_config(preflight_config))
+        .manage(agent_process::AgentState::default())
         .setup(|app| {
             use tauri::Manager;
             use tauri_plugin_deep_link::DeepLinkExt;
@@ -3026,6 +3076,13 @@ pub fn run() {
             ai_fix_sql,
             ai_chat,
             cancel_ai_chat,
+            get_agent_info,
+            agent_process::agent_reset,
+            agent_process::agent_start,
+            agent_process::agent_write,
+            agent_process::agent_stop,
+            agent_process::agent_run_once,
+            agent_process::agent_cancel_once,
             get_config_info,
             third_party_notices,
             ensure_config_file,
@@ -3047,8 +3104,15 @@ pub fn run() {
             cancel_dump,
             frontend_ready,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            // End the chat agents with the app. Waits (bounded) for them to exit, so that the
+            // SIGKILL fallback has run and no agent process outlives Queryfolio
+            if let tauri::RunEvent::Exit = event {
+                agent_process::stop_all_and_wait(app);
+            }
+        });
 }
 
 #[cfg(test)]

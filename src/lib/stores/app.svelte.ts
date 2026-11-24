@@ -11,6 +11,9 @@ import type {
 } from "$lib/api";
 import { merge3 } from "$lib/mergeText";
 import { sessionStatementReason } from "$lib/batchSession";
+import { resetConversations } from "$lib/agentChat/conversations.svelte";
+import { oncePrompt, schemaSummary } from "$lib/agentChat/context";
+import type { AgentEditorContext } from "$lib/agentChat/context";
 import {
   RUN_LOG_FETCH_MAX_ROWS,
   planRunLogWrite,
@@ -146,6 +149,13 @@ let aiInfo = $state<AiInfo | null>(null);
 let aiError = $state<string | null>(null);
 /// Generating SQL with AI (button spinner, prevents double submit)
 let aiGenerating = $state(false);
+/// Coding agent settings (null until loaded or when the `agent:` section is invalid)
+let agentInfo = $state<api.AgentInfo | null>(null);
+/// Why the agent settings could not be resolved (shown where the agent would be used)
+let agentError = $state<string | null>(null);
+/// ID of the one-shot agent run started from the inline AI field (null when none is running)
+let agentRunId = $state<string | null>(null);
+let nextAgentRunSeq = 0;
 /// Explaining the execution plan with AI (button spinner, prevents double submit)
 let aiAnalyzing = $state(false);
 /// Markdown of the AI execution plan explanation (non-null only while the modal is shown)
@@ -310,6 +320,126 @@ const loadAiInfo = async () => {
     aiInfo = null;
     aiError = toErrorMessage(e);
   }
+  try {
+    agentInfo = await api.getAgentInfo();
+    agentError = null;
+  } catch (e) {
+    agentInfo = null;
+    agentError = toErrorMessage(e);
+  }
+};
+
+/// What a coding agent is told about the editor: the connection, the open query file (as an
+/// absolute path) and `statement` (the statement at the cursor, supplied by the page). null
+/// when `connection` is not the selected one any more.
+///
+/// **The open file is saved first**, so that the agent reads what the editor shows; the agent
+/// then edits the file on disk and the external-change watcher brings the edit back.
+const agentEditorContext = async (
+  connection: string,
+  statement: string,
+): Promise<AgentEditorContext | null> => {
+  if (connection !== selectedConnection) {
+    return null;
+  }
+  await flushPendingSave();
+  if (connection !== selectedConnection) {
+    return null;
+  }
+  const tab = getActiveEditorTab();
+  const openTab = tab && tab.connection === connection ? tab : null;
+  let filePath: string | null = null;
+  if (openTab) {
+    try {
+      filePath = await api.queryFilePath(connection, openTab.file);
+    } catch {
+      // The path is context only; the message is still worth sending without it
+    }
+  }
+  const info = connections.find((c) => c.name === connection);
+  return {
+    connection,
+    engine: info?.engine ?? "sql",
+    database: activeSchema,
+    filePath,
+    statement: openTab ? statement : "",
+  };
+};
+
+/// Table / column names for the agent's first message (empty when the map is not loaded)
+const agentSchemaSummary = (): string => schemaSummary(schemaMap);
+
+/// Run the configured agent once from the inline AI field: it edits the open query file as
+/// instructed and its final message is shown in a toast. Returns true on success (used to
+/// decide whether to close the input field).
+const runAgentOnce = async (instruction: string, statement: string): Promise<boolean> => {
+  const connection = selectedConnection;
+  if (!connection) {
+    toast.warning("Select a connection first");
+    return false;
+  }
+  if (!getActiveEditorTab()) {
+    toast.warning("Select or create a query file first");
+    return false;
+  }
+  if (!instruction.trim()) {
+    toast.warning("Enter an instruction for the agent");
+    return false;
+  }
+  if (aiGenerating) {
+    return false;
+  }
+  aiGenerating = true;
+  const runId = `once-${Date.now()}-${++nextAgentRunSeq}`;
+  agentRunId = runId;
+  const agentName = agentInfo?.provider_name ?? "The agent";
+  try {
+    const context = await agentEditorContext(connection, statement);
+    if (!context || !context.filePath) {
+      toast.warning("Select or create a query file first");
+      return false;
+    }
+    if (agentRunId !== runId) {
+      // Cancelled while the file was being saved
+      return false;
+    }
+    const result = await api.agentRunOnce(
+      runId,
+      connection,
+      oncePrompt(instruction, context, agentSchemaSummary()),
+    );
+    // Bring the agent's edit into the editor now instead of at the next watcher tick
+    await fileWatchTick();
+    toast.success(`${agentName} finished`, {
+      description: result.output || "(no message)",
+      duration: 15_000,
+    });
+    return true;
+  } catch (e) {
+    const message = toErrorMessage(e);
+    // The agent may have edited the file before it was stopped or failed
+    await fileWatchTick();
+    if (message === api.CANCELLED_ERROR_MESSAGE) {
+      toast.info(`${agentName} was stopped`);
+    } else {
+      toast.error(`${agentName} failed`, { description: message, duration: 15_000 });
+    }
+    return false;
+  } finally {
+    if (agentRunId === runId) {
+      agentRunId = null;
+    }
+    aiGenerating = false;
+  }
+};
+
+/// Stop the one-shot agent run started from the inline AI field
+const cancelAgentOnce = () => {
+  const runId = agentRunId;
+  if (runId) {
+    agentRunId = null;
+    void api.agentCancelOnce(runId).catch(() => {});
+  }
 };
 
 /// Reload the connection settings (pools and SSH tunnels are discarded too).
@@ -360,6 +490,10 @@ const reloadConnectionsUnguarded = async (): Promise<boolean> => {
     }
   }
   stopBatchErrorPrompts(() => true);
+  // The backend ends the chat agents in reset_connections (their provider, directories and
+  // connections may all have changed); drop their conversations with them
+  resetConversations();
+  cancelAgentOnce();
   try {
     await api.resetConnections();
   } catch (e) {
@@ -410,6 +544,8 @@ const reloadConnectionsUnguarded = async (): Promise<boolean> => {
   activeSchema = null;
   aiInfo = null;
   aiError = null;
+  agentInfo = null;
+  agentError = null;
   aiAnalysis = null;
   aiExplanation = null;
   // Chat abort and discard were done before resetConnections (clearChat)
@@ -3209,6 +3345,16 @@ export default {
   get aiGenerating() {
     return aiGenerating;
   },
+  get agentInfo() {
+    return agentInfo;
+  },
+  get agentError() {
+    return agentError;
+  },
+  /// Whether a one-shot agent run (inline AI field) is in progress and can be stopped
+  get agentRunning() {
+    return agentRunId !== null;
+  },
   get aiAnalyzing() {
     return aiAnalyzing;
   },
@@ -3269,6 +3415,13 @@ export default {
   loadConnections,
   loadAiInfo,
   generateSql,
+  runAgentOnce,
+  cancelAgentOnce,
+  agentEditorContext,
+  agentSchemaSummary,
+  /// Check the open query files for changes made outside the editor right now (an agent
+  /// finished a turn) instead of waiting for the next watcher tick
+  checkOpenFilesForExternalChanges: () => fileWatchTick(),
   loadSchemaMap,
   ensureConnectionResources,
   reloadConnections,
