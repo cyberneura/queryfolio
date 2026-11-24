@@ -606,6 +606,9 @@ pub async fn fetch_all_columns(
 #[derive(Default)]
 pub struct SchemaCache {
     inner: tokio::sync::Mutex<HashMap<(String, String), CachedSchema>>,
+    /// Advanced by every invalidation. A catalog read that started before an invalidation must
+    /// not store its (possibly older) result afterwards: see put_all_columns_if_current.
+    epoch: std::sync::atomic::AtomicU64,
 }
 
 /// Cache contents for one (connection, schema).
@@ -671,7 +674,9 @@ impl SchemaCache {
             .insert(table.to_string(), columns.to_vec());
     }
 
-    /// Registers the columns of all tables at once (fills the cache for get_schema_map).
+    /// Registers the columns of all tables at once (tests; the app goes through
+    /// put_all_columns_if_current).
+    #[cfg(test)]
     pub async fn put_all_columns(
         &self,
         connection: &str,
@@ -679,6 +684,30 @@ impl SchemaCache {
         columns: BTreeMap<String, Vec<ColumnInfo>>,
     ) {
         let mut inner = self.inner.lock().await;
+        let entry = inner.entry(Self::key(connection, schema)).or_default();
+        entry.columns = columns.into_iter().collect();
+        entry.columns_complete = true;
+    }
+
+    /// The invalidation epoch to remember before a catalog read (see put_all_columns_if_current)
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// put_all_columns, unless the cache was invalidated since `epoch` was read: the catalog
+    /// read may predate the change that caused the invalidation (a DDL followed by a refresh),
+    /// and storing it would bring the stale tables back.
+    pub async fn put_all_columns_if_current(
+        &self,
+        connection: &str,
+        schema: &str,
+        columns: BTreeMap<String, Vec<ColumnInfo>>,
+        epoch: u64,
+    ) {
+        let mut inner = self.inner.lock().await;
+        if self.epoch() != epoch {
+            return;
+        }
         let entry = inner.entry(Self::key(connection, schema)).or_default();
         entry.columns = columns.into_iter().collect();
         entry.columns_complete = true;
@@ -711,25 +740,29 @@ impl SchemaCache {
         )
     }
 
+    fn bump_epoch(&self) {
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Discards the cache per (connection, schema) (for the reload button).
     pub async fn invalidate_schema(&self, connection: &str, schema: &str) {
-        self.inner
-            .lock()
-            .await
-            .remove(&Self::key(connection, schema));
+        let mut inner = self.inner.lock().await;
+        self.bump_epoch();
+        inner.remove(&Self::key(connection, schema));
     }
 
     /// Discards the cache per connection (when switching the active schema).
     pub async fn invalidate_connection(&self, connection: &str) {
-        self.inner
-            .lock()
-            .await
-            .retain(|(conn, _), _| conn != connection);
+        let mut inner = self.inner.lock().await;
+        self.bump_epoch();
+        inner.retain(|(conn, _), _| conn != connection);
     }
 
     /// Discards the whole cache (when reloading settings).
     pub async fn clear(&self) {
-        self.inner.lock().await.clear();
+        let mut inner = self.inner.lock().await;
+        self.bump_epoch();
+        inner.clear();
     }
 }
 
@@ -924,6 +957,34 @@ mod tests {
         let users: Vec<&str> = map["users"].iter().map(|c| c.name.as_str()).collect();
         assert_eq!(users, vec!["id", "name", "score"]);
         assert_eq!(map["orders"].len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_stale_catalog_read_is_not_cached_after_invalidation() {
+        let cache = SchemaCache::default();
+        let columns = || {
+            BTreeMap::from([(
+                "users".to_string(),
+                vec![ColumnInfo {
+                    name: "id".into(),
+                    data_type: "int".into(),
+                    nullable: false,
+                }],
+            )])
+        };
+        // A read that started before an invalidation is dropped
+        let epoch = cache.epoch();
+        cache.invalidate_schema("conn1", "db1").await;
+        cache
+            .put_all_columns_if_current("conn1", "db1", columns(), epoch)
+            .await;
+        assert!(cache.get_schema_map("conn1", "db1").await.is_none());
+        // A read that started after it is stored
+        let epoch = cache.epoch();
+        cache
+            .put_all_columns_if_current("conn1", "db1", columns(), epoch)
+            .await;
+        assert!(cache.get_schema_map("conn1", "db1").await.is_some());
     }
 
     #[tokio::test]

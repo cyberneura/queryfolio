@@ -390,6 +390,7 @@ impl AppState {
         if mysql_without_database(server, schema_key) {
             return Ok(Default::default());
         }
+        let epoch = self.schema_cache.epoch();
         let all = self
             .db
             .with_pool(server, db::PasswordRetry::Idempotent, |pool| async move {
@@ -406,7 +407,7 @@ impl AppState {
             })
             .collect();
         self.schema_cache
-            .put_all_columns(&server.name, schema_key, all)
+            .put_all_columns_if_current(&server.name, schema_key, all, epoch)
             .await;
         Ok(map)
     }
@@ -1376,13 +1377,22 @@ async fn list_columns(
 
 /// Returns a map of table name -> column name list (to enhance SQL completion).
 /// If the cache lacks columns for all tables, fetches them in bulk and caches them.
+/// With refresh = true, discards the cache of the active schema and fetches again.
 #[tauri::command]
 async fn get_schema_map(
     state: tauri::State<'_, AppState>,
     connection: String,
+    refresh: Option<bool>,
 ) -> Result<std::collections::BTreeMap<String, Vec<String>>, AppError> {
     let server = state.find_server(&connection).await?;
     let schema_key = state.active_schema_key(&server).await;
+    if refresh.unwrap_or(false) {
+        // A statement that changed the schema just ran: the cached tables / columns are stale
+        state
+            .schema_cache
+            .invalidate_schema(&connection, &schema_key)
+            .await;
+    }
     state.resolve_schema_map(&server, &schema_key).await
 }
 

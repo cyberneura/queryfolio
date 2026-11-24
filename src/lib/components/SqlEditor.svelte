@@ -23,8 +23,15 @@
   import { toast } from "svelte-sonner";
   import { tags as t } from "@lezer/highlight";
   import { acceptCompletion, autocompletion, completionKeymap } from "@codemirror/autocomplete";
+  import type { CompletionContext, CompletionResult } from "@codemirror/autocomplete";
   import { sql, MSSQL, MySQL, PostgreSQL, SQLite } from "@codemirror/lang-sql";
-  import type { SQLNamespace } from "@codemirror/lang-sql";
+  import {
+    buildCompletionModel,
+    completeSql,
+    completionWindow,
+    dialectForEngine,
+    SQL_COMPLETION_VALID_FOR,
+  } from "$lib/editor/sqlCompletion";
   import { oneDark } from "@codemirror/theme-one-dark";
   import { formatSql } from "$lib/sqlFormat";
   import { vscodeMultiSelection } from "$lib/editor/vscodeEditing";
@@ -79,10 +86,6 @@
   let view: EditorView | null = null;
   const languageCompartment = new Compartment();
 
-  /// Upper limit on the number of tables used for schema completion. Beyond it, columns are not
-  /// passed and only table names are used (limits the build cost and memory of completion candidates)
-  const MAX_SCHEMA_TABLES_WITH_COLUMNS = 2000;
-
   /// How long a multi-statement run may block to finish parsing the document before splitting it
   const PARSE_BEFORE_RUN_TIMEOUT_MS = 1000;
 
@@ -105,21 +108,37 @@
     }
   };
 
-  // Convert the schema map into the schema option of lang-sql.
-  // Record<string, string[]> can be passed as is as a SQLNamespace
-  // (dotted keys such as PostgreSQL's "schema.table" are split into a hierarchy
-  // on the lang-sql side). For a huge schema, omit the columns and keep only table names.
-  const schemaNamespace = (
+  // Schema completion (tables / columns / aliases) is our own source ($lib/editor/sqlCompletion)
+  // instead of the `schema` option of lang-sql: that one offers columns only after `table.`,
+  // resolves names case-sensitively and cannot read SQL Server's bracketed keys
+  // (CYBERNEURA-DEV-1355). The model is built once per schema map; columns are looked up per
+  // completion, so a huge schema costs nothing until its tables are referenced.
+  const schemaCompletionSource = (
+    engineName: string | null,
     map: Record<string, string[]> | null,
-  ): SQLNamespace | undefined => {
-    if (!map) {
-      return undefined;
-    }
-    const tables = Object.keys(map);
-    if (tables.length <= MAX_SCHEMA_TABLES_WITH_COLUMNS) {
-      return map;
-    }
-    return Object.fromEntries(tables.map((table) => [table, []]));
+  ) => {
+    const model = buildCompletionModel(map, dialectForEngine(engineName));
+    return (context: CompletionContext): CompletionResult | null => {
+      if (!model) {
+        return null;
+      }
+      // Only the text around the cursor is read: the source runs while typing, and a query file
+      // can carry megabytes of Run and Log comments
+      const window = completionWindow(context.state.doc.length, context.pos);
+      const result = completeSql(
+        model,
+        context.state.sliceDoc(window.from, window.to),
+        context.pos - window.from,
+        context.explicit,
+      );
+      return (
+        result && {
+          from: result.from + window.from,
+          options: result.options,
+          validFor: SQL_COMPLETION_VALID_FOR,
+        }
+      );
+    };
   };
 
   // The language extension put into languageCompartment. Switched by the engine's editor_language
@@ -136,11 +155,13 @@
     if (language === "es") {
       return esLanguage;
     }
-    return sql({
-      dialect: dialectFor(engineName),
-      schema: schemaNamespace(map),
-      upperCaseKeywords: true,
-    });
+    const dialect = dialectFor(engineName);
+    return [
+      sql({ dialect, upperCaseKeywords: true }),
+      dialect.language.data.of({
+        autocomplete: schemaCompletionSource(engineName, map),
+      }),
+    ];
   };
 
   // Return the range of the Statement node that contains the cursor.
