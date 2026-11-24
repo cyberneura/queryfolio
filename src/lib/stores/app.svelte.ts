@@ -11,6 +11,7 @@ import type {
 } from "$lib/api";
 import { merge3 } from "$lib/mergeText";
 import { sessionStatementReason } from "$lib/batchSession";
+import { changesSchema, sameSchemaMap } from "$lib/editor/sqlCompletion";
 import {
   RUN_LOG_FETCH_MAX_ROWS,
   planRunLogWrite,
@@ -258,6 +259,38 @@ const getActiveEditorTab = (): EditorTab | null =>
 /// switches, only the result of the latest request is applied even if an old response resolves later.
 let schemaMapGeneration = 0;
 
+/// Schema maps fetched so far, by connection + active schema (CYBERNEURA-DEV-1355). Selecting a
+/// connection clears the editor's map and re-fetches it; with this cache the completion of a
+/// connection seen before works at once (stale-while-revalidate) instead of being empty until the
+/// catalog query returns. Showing it opens no connection. Cleared by a settings reload.
+const schemaMapCache = new Map<string, Record<string, string[]>>();
+const schemaMapCacheKey = (connection: string, schema: string | null) =>
+  `${connection}\u0001${schema ?? ""}`;
+
+/// Guards on writing a fetched map into schemaMapCache: the latest request per key wins (an
+/// older fetch resolving late must not overwrite the result of a refresh after a DDL), and
+/// nothing fetched before a settings reload is kept (the same connection name may now point at
+/// another server).
+const schemaMapRequestSeq = new Map<string, number>();
+let schemaMapCacheEpoch = 0;
+
+/// Connections whose backend schema cache is known to be stale (a DDL ran but the catalog was
+/// not re-read because the connection was about to be closed). The next fetch for them asks
+/// the backend to discard its cache first.
+const staleSchemaConnections = new Set<string>();
+
+const dropSchemaMapCache = (connection: string) => {
+  for (const key of [...schemaMapCache.keys()]) {
+    if (key.startsWith(`${connection}\u0001`)) {
+      schemaMapCache.delete(key);
+    }
+  }
+};
+
+/// Delays before retrying a failed schema map fetch. A failure used to leave the editor without
+/// completion until the next connection / schema switch
+const SCHEMA_MAP_RETRY_DELAYS_MS = [2_000, 10_000];
+
 /// Generation number of the running applyConnectionContext. On successive connection switches, checks
 /// before commit whether this is the latest generation, so that the response of a slow connection resolving later
 /// does not overwrite the new connection's files / schemas / activeSchema (same intent as schemaMapGeneration)
@@ -416,6 +449,10 @@ const reloadConnectionsUnguarded = async (): Promise<boolean> => {
   // Advance the generation and discard so that an in-flight fetch cannot later write an old map
   schemaMapGeneration++;
   schemaMap = null;
+  // The reloaded settings may point the same connection name at another server
+  schemaMapCache.clear();
+  schemaMapCacheEpoch++;
+  staleSchemaConnections.clear();
   await loadConnections();
   if (errorMessage) {
     return false;
@@ -430,24 +467,89 @@ const reloadConnectionsUnguarded = async (): Promise<boolean> => {
 };
 
 /// Re-fetch the schema map for SQL completion in the background.
-/// Completion is only an aid, so on failure continue without completion and do not notify.
-const loadSchemaMap = async () => {
+/// Completion is only an aid, so on failure continue without completion and do not notify
+/// (it is retried a couple of times, see SCHEMA_MAP_RETRY_DELAYS_MS).
+/// refresh: also discard the backend cache (after a statement that changed the schema).
+const loadSchemaMap = async (refresh = false, attempt = 0) => {
   const connection = selectedConnection;
   const generation = ++schemaMapGeneration;
   if (!connection) {
     schemaMap = null;
     return;
   }
-  // Clear first so that candidates from the old schema are not offered while fetching
-  schemaMap = null;
+  const cacheKey = schemaMapCacheKey(connection, activeSchema);
+  // Offer what was fetched for this connection + schema before while fetching; never the
+  // candidates of another schema
+  const cached = schemaMapCache.get(cacheKey) ?? null;
+  if (!sameSchemaMap(schemaMap, cached)) {
+    schemaMap = cached;
+  }
+  const wasStale = staleSchemaConnections.has(connection);
+  const requestSeq = (schemaMapRequestSeq.get(cacheKey) ?? 0) + 1;
+  schemaMapRequestSeq.set(cacheKey, requestSeq);
+  const epoch = schemaMapCacheEpoch;
   try {
-    const map = await api.getSchemaMap(connection);
-    // If a newer request has started, discard the old response
-    if (generation === schemaMapGeneration) {
+    const map = await api.getSchemaMap(connection, refresh || wasStale);
+    if (
+      epoch === schemaMapCacheEpoch &&
+      schemaMapRequestSeq.get(cacheKey) === requestSeq
+    ) {
+      schemaMapCache.set(cacheKey, map);
+      if (wasStale) {
+        staleSchemaConnections.delete(connection);
+      }
+    }
+    // If a newer request has started, discard the old response. An unchanged map is not
+    // reassigned: that would rebuild the editor's completion for nothing
+    if (generation === schemaMapGeneration && !sameSchemaMap(schemaMap, map)) {
       schemaMap = map;
     }
   } catch {
-    // Continue silently without completion (neither toast nor errorMessage)
+    // Continue silently without completion (neither toast nor errorMessage), and try again
+    // later unless something else has started a fetch or the connection has been closed
+    const delay = SCHEMA_MAP_RETRY_DELAYS_MS[attempt];
+    if (delay !== undefined) {
+      setTimeout(() => {
+        if (
+          generation === schemaMapGeneration &&
+          selectedConnection === connection &&
+          resourcesLoaded.has(connection)
+        ) {
+          void loadSchemaMap(refresh, attempt + 1);
+        }
+      }, delay);
+    }
+  }
+};
+
+/// Call after a statement ran successfully.
+///
+/// - A connection that is in use by an editor tab but not established (its first attempt
+///   failed and the query then reconnected by itself) gets its schema list / completion map now.
+/// - If the statement may have changed the tables / columns (CREATE / ALTER / DROP / RENAME),
+///   re-fetch the completion candidates so that the new table completes right away.
+///
+/// **Nothing is fetched for a connection without an editor tab**: it is about to be
+/// disconnected (maybeDisconnectIfIdle runs right after this), and a catalog query arriving
+/// after the disconnect would reopen its tunnel with nothing left to close it. Its caches are
+/// only marked stale, and the next fetch refreshes them.
+const refreshSchemaAfterStatement = (connection: string, sql: string) => {
+  const schemaChanged = changesSchema(sql);
+  const inUse = editorTabs.some((t) => t.connection === connection);
+  if (schemaChanged) {
+    dropSchemaMapCache(connection);
+    staleSchemaConnections.add(connection);
+  }
+  if (!inUse || connection !== selectedConnection) {
+    return;
+  }
+  if (!resourcesLoaded.has(connection)) {
+    // loadSchemaMap (run by the import) sees the stale mark and refreshes
+    void ensureConnectionResources(connection);
+    return;
+  }
+  if (schemaChanged) {
+    void loadSchemaMap(true);
   }
 };
 
@@ -553,9 +655,11 @@ const applyConnectionContext = async (name: string): Promise<boolean> => {
   // import the full list and completion map via ensureConnectionResources when a file is loaded into the
   // editor / the schema browser is opened.
   schemas = schema ? [schema] : [];
-  // Clear the completion candidates for the new connection (also advance the generation to prevent a late write from an old fetch)
+  // Swap the completion candidates for the new connection's (also advance the generation to prevent
+  // a late write from an old fetch). A map fetched for this connection + schema before is offered
+  // at once — that opens no connection; it is re-fetched when the connection is established
   schemaMapGeneration++;
-  schemaMap = null;
+  schemaMap = schemaMapCache.get(schemaMapCacheKey(name, schema)) ?? null;
   if (resourcesLoaded.has(name)) {
     // When an already established connection is re-selected, the tunnel is still open, so re-fetch the schema
     // list / completion map reset above and restore the UI (dropdown / completion). This does not newly open
@@ -642,6 +746,25 @@ const ensureConnectionResources = async (connection: string) => {
   if (connection !== selectedConnection || resourcesLoaded.has(connection)) {
     return;
   }
+  // One import per connection at a time: several triggers arrive together (opening a file
+  // activates its tab first), and each would issue its own catalog requests. A failed import
+  // leaves no entry, so the next trigger retries
+  const running = resourceImports.get(connection);
+  if (running) {
+    return running;
+  }
+  const run = importConnectionResources(connection).finally(() => {
+    if (resourceImports.get(connection) === run) {
+      resourceImports.delete(connection);
+    }
+  });
+  resourceImports.set(connection, run);
+  return run;
+};
+
+const resourceImports = new Map<string, Promise<void>>();
+
+const importConnectionResources = async (connection: string) => {
   // Registering before success would mistake a failed connection for "established" and miss retries, so
   // register after listSchemas (which opens the connection) succeeds. If a disconnect intervened during the import,
   // loadConnectionSchemaResources returns false (and closes the reopened tunnel again),
@@ -786,6 +909,14 @@ const activateEditorTab = async (id: number, viaCycle = false) => {
   lastActiveTabByConnection.set(tab.connection, id);
   if (!tabCycle) {
     touchTabMru(id);
+  }
+  // A connection whose first attempt failed (VPN down, tunnel timeout) is not established, and
+  // nothing fetched its schema list / completion map again until another file was opened. Coming
+  // back to one of its tabs is an opportunity to use the connection, like opening a file
+  // (no-op when already established). Not when the tab was closed while this was awaiting:
+  // closing the last tab disconnects, and this would open the connection again
+  if (editorTabs.some((t) => t.id === id)) {
+    void ensureConnectionResources(tab.connection);
   }
 };
 
@@ -1848,6 +1979,9 @@ const executeTab = async (
   tab.result = result;
   tab.error = error;
   tab.cancelled = cancelled;
+  if (result) {
+    refreshSchemaAfterStatement(tab.connection, tab.sql);
+  }
   // If `\c` switched the active schema, make the display follow
   // (the switch itself is already done in the backend)
   if (result?.switched_schema) {
@@ -2319,6 +2453,7 @@ const executeBatchInTab = async (tab: ResultTab, statements: string[]) => {
         tab.schema = result.switched_schema;
         applySwitchedSchema(connection, result.switched_schema);
       }
+      refreshSchemaAfterStatement(connection, statement);
       outcomes[i] = {
         status: "ok",
         rows: result ? (result.affected_rows ?? result.row_count) : null,

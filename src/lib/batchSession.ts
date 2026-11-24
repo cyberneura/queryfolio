@@ -40,12 +40,13 @@ const blankQuotedAndComments = (sql: string): string =>
     " ",
   );
 
-/// Strip leading whitespace, line comments and block comments
-const stripLeadingComments = (sql: string): string => {
+/// Strip leading whitespace, line comments (`--`, and MySQL's `#`: no statement of the other
+/// dialects starts with `#`) and block comments
+export const stripLeadingComments = (sql: string): string => {
   let rest = sql;
   for (;;) {
     rest = rest.trimStart();
-    if (rest.startsWith("--")) {
+    if (rest.startsWith("--") || rest.startsWith("#")) {
       const newline = rest.indexOf("\n");
       rest = newline < 0 ? "" : rest.slice(newline + 1);
     } else if (rest.startsWith("/*")) {
