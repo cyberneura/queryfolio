@@ -69,7 +69,9 @@
     if (!c) {
       return "";
     }
-    const state = c.starting
+    const state = !c.launched
+      ? "Starts with your first message"
+      : c.starting || (!c.ready && !c.stopped)
       ? "Starting…"
       : c.busy
         ? "Working…"
@@ -78,6 +80,11 @@
           : "Disconnected";
     return c.usage ? `${state} · ${c.usage}` : state;
   });
+
+  /// The directory shown in the header: where the agent runs, or (before it is started) the
+  /// one chosen for this chat
+  const shownDirectory = (c: Conversation | null | undefined): string =>
+    c ? c.cwd || (c.chosenDirectory ?? "") : "";
 
   let logEl: HTMLDivElement | undefined = $state();
   let directoryInput = $state("");
@@ -130,12 +137,12 @@
     const c = conversation;
     followBottom = true;
     editingDirectory = false;
-    directoryInput = c?.cwd ?? "";
+    directoryInput = shownDirectory(c);
   });
 
   $effect(() => {
     if (!editingDirectory) {
-      directoryInput = conversation?.cwd ?? "";
+      directoryInput = shownDirectory(conversation);
     }
   });
 
@@ -180,7 +187,7 @@
       return;
     }
     const value = directoryInput.trim();
-    if (value === c.cwd) {
+    if (value === (c.cwd || (c.chosenDirectory ?? ""))) {
       return;
     }
     // Empty: back to the configured directory (or the connection's query folder)
@@ -345,12 +352,13 @@
           "Edit and press Enter to use another directory for this chat (for example a " +
           "clone of the application's repository). Empty: back to the configured one."}
         spellcheck="false"
+        placeholder={conversation.chosenDirectory ?? "(the configured directory, or the query file folder)"}
         bind:value={directoryInput}
         disabled={conversation.starting}
         onfocus={() => (editingDirectory = true)}
         onblur={() => {
           editingDirectory = false;
-          directoryInput = conversation?.cwd ?? "";
+          directoryInput = shownDirectory(conversation);
         }}
         onkeydown={(e) => {
           if (e.key === "Enter") {
@@ -377,7 +385,7 @@
   >
     {#if appStore.selectedConnection === null}
       <p class="text-xs leading-relaxed text-zinc-500">Select a connection first.</p>
-    {:else if conversation && conversation.items.length === 0 && !conversation.starting}
+    {:else if conversation && conversation.items.length === 0 && !conversation.starting && conversation.queue.length === 0}
       <p class="text-xs leading-relaxed text-zinc-500" data-annotate="text-agent-chat-empty">
         Ask {agentLabel} to write or change your queries. It works in the directory above
         and is told which query file is open and the statement at the cursor, so it can
@@ -657,7 +665,7 @@
           type="submit"
           class="shrink-0 rounded border border-blue-500/50 bg-blue-500/15 px-2 py-1 text-xs text-blue-300 hover:bg-blue-500/25 disabled:cursor-not-allowed disabled:opacity-50"
           data-annotate="button-agent-chat-send"
-          disabled={!c.draft.trim() || (!c.ready && !c.queueing)}
+          disabled={!c.draft.trim() || (c.launched && !c.ready && !c.queueing)}
         >
           {c.queueing ? "Queue" : "Send"}
         </button>

@@ -402,8 +402,9 @@ export interface AgentInfo {
 export const getAgentInfo = () => invoke<AgentInfo>("get_agent_info");
 
 /// Run the configured agent once in the connection's agent directory with `prompt` and return
-/// its final message (the inline AI field above the editor). The agent may edit files there;
-/// it cannot run commands. Rejects with CANCELLED_ERROR_MESSAGE when cancelled by runId.
+/// its final message (the inline AI field above the editor). The agent may edit files there
+/// (Claude Code has only its file tools; Codex is confined by its workspace-write sandbox).
+/// Rejects with CANCELLED_ERROR_MESSAGE when cancelled by runId.
 export const agentRunOnce = (runId: string, connection: string, prompt: string) =>
   invoke<{ output: string; cwd: string }>("agent_run_once", { runId, connection, prompt });
 

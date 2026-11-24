@@ -68,8 +68,8 @@
   /// Title of the AI button (explains how to configure when unset or on error)
   const aiButtonTitle = $derived(
     agentName
-      ? `Ask ${agentName} to change this query file. It edits the file directly ` +
-          "(file edits only, no commands); its reply is shown as a notification."
+      ? `Ask ${agentName} to change this query file. It edits the file directly, ` +
+          "and its reply is shown as a notification."
       : appStore.agentError
         ? `The agent is unavailable: ${appStore.agentError}`
         : aiConfigured

@@ -12,7 +12,7 @@
 //! the reaping threads on exit) is adapted from Beckwell (Cyberneura, MIT) via Astragal. See
 //! docs/agent-chat.md.
 
-use crate::agent::{self, AgentConfig, AgentDirectories};
+use crate::agent::{self, AgentConfig, AgentDirectories, Provider};
 use crate::error::AppError;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -35,6 +35,17 @@ const ONCE_TIMEOUT: Duration = Duration::from_secs(600);
 /// How much of a failed one-shot run's stderr is returned in the error
 const ONCE_MAX_STDERR_CHARS: usize = 2_000;
 
+/// How much of each output stream of a one-shot run is kept (the end of it). The rest is read
+/// and discarded, so that a chatty agent can neither fill the pipe nor the memory
+const ONCE_MAX_OUTPUT_BYTES: usize = 256 * 1024;
+
+/// How long the output of a one-shot run is still read after the agent exited. A process the
+/// agent left behind can hold the pipe open forever
+const ONCE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Upper bound on remembered cancellations of runs that have not registered yet
+const MAX_PENDING_CANCELS: usize = 64;
+
 struct AgentProcess {
     child: Child,
     stdin: Arc<Mutex<ChildStdin>>,
@@ -54,11 +65,26 @@ struct Processes {
     reaping: Vec<JoinHandle<()>>,
 }
 
+/// A running one-shot run
+struct OnceRun {
+    token: CancellationToken,
+    /// Process (= process group) ID once spawned, for the shutdown at app exit
+    pid: Option<u32>,
+}
+
+#[derive(Default)]
+struct OnceRuns {
+    /// Running one-shot runs by the ID the frontend gave them
+    running: HashMap<String, OnceRun>,
+    /// IDs cancelled before their run registered (Stop pressed while the command was still on
+    /// its way): the run is refused when it arrives
+    cancelled: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct AgentState {
     processes: Mutex<Processes>,
-    /// Running one-shot runs by the ID the frontend gave them
-    once: Mutex<HashMap<String, CancellationToken>>,
+    once: Mutex<OnceRuns>,
 }
 
 #[derive(Clone, Serialize)]
@@ -77,6 +103,8 @@ struct AgentExit {
 pub struct AgentStarted {
     /// The directory the agent was started in
     cwd: String,
+    /// The agent that was started (the protocol the frontend has to speak)
+    provider: Provider,
 }
 
 #[derive(Clone, Serialize)]
@@ -86,21 +114,42 @@ pub struct AgentReset {
     generation: u64,
 }
 
-/// Asks a process to exit. SIGKILL would not let Claude Code stop the command of a running
-/// tool, which would then be left behind as an orphan; SIGTERM gives it the chance.
+/// Sends a signal to the process group of an agent.
+///
+/// Agents are started as the leader of their own process group (`own_process_group`), and the
+/// commands their tools run stay in that group unless they detach on purpose. Signalling the
+/// group, not just the agent, is what keeps Stop / New chat / quitting from leaving such
+/// commands behind when the agent itself does not clean up.
 /// `kill(1)` is used instead of libc to avoid a direct dependency for one call.
-fn send_sigterm(pid: u32) {
+fn signal_group(pid: u32, signal: &str) {
     #[cfg(unix)]
     {
         let _ = Command::new("/bin/kill")
-            .args(["-TERM", &pid.to_string()])
+            .args([&format!("-{signal}"), "--", &format!("-{pid}")])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
     }
     #[cfg(not(unix))]
-    let _ = pid;
+    let _ = (pid, signal);
+}
+
+/// Asks an agent (and what it started) to exit. SIGKILL right away would not let Claude Code
+/// stop the command of a running tool in an orderly way; SIGTERM gives it the chance.
+fn send_sigterm(pid: u32) {
+    signal_group(pid, "TERM");
+}
+
+/// Makes the command the leader of a new process group (see signal_group)
+fn own_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = command;
 }
 
 fn wait_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
@@ -119,9 +168,13 @@ fn wait_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
 /// Collects a process that was sent SIGTERM; kills it when it does not exit in time.
 /// Exiting the app waits for this, so every wait is bounded.
 fn reap(mut child: Child) {
+    let pid = child.id();
     if wait_exit(&mut child, EXIT_TIMEOUT).is_some() {
+        // The agent is gone; end what it may have left in its group
+        signal_group(pid, "KILL");
         return;
     }
+    signal_group(pid, "KILL");
     let _ = child.kill();
     if wait_exit(&mut child, EXIT_TIMEOUT).is_some() {
         return;
@@ -161,11 +214,32 @@ pub fn stop_all_and_wait(app_handle: &AppHandle) {
         stop_all(&mut processes);
         std::mem::take(&mut processes.reaping)
     };
-    for token in state.once.lock().unwrap().values() {
-        token.cancel();
+    // One-shot runs: cancel them (their tasks may never get to run again while the app is
+    // exiting) and signal their process groups directly
+    let once_pids: Vec<u32> = {
+        let once = state.once.lock().unwrap();
+        once.running
+            .values()
+            .map(|run| {
+                run.token.cancel();
+                run.pid
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect()
+    };
+    for pid in &once_pids {
+        send_sigterm(*pid);
     }
     for handle in handles {
         let _ = handle.join();
+    }
+    if !once_pids.is_empty() {
+        std::thread::sleep(Duration::from_millis(300));
+        for pid in once_pids {
+            signal_group(pid, "KILL");
+        }
     }
 }
 
@@ -201,20 +275,26 @@ fn for_each_line(reader: impl std::io::Read, mut on_line: impl FnMut(String)) {
 /// directories that only the shell profile adds)
 #[cfg(unix)]
 fn login_shell() -> Option<std::path::PathBuf> {
-    let shell = std::env::var_os("SHELL")
+    // Only shells that understand the POSIX syntax of the wrapper in agent_command. With
+    // another login shell (fish, nu) fall back to zsh / bash: their profiles usually carry the
+    // same PATH additions, and a plain spawn with the GUI's PATH would find nothing
+    let posix = |path: &std::path::PathBuf| {
+        path.is_absolute()
+            && path.is_file()
+            && matches!(
+                path.file_name().and_then(|s| s.to_str()),
+                Some("zsh" | "bash" | "ksh" | "sh")
+            )
+    };
+    std::env::var_os("SHELL")
         .map(std::path::PathBuf::from)
-        .filter(|path| path.is_absolute() && path.is_file())
+        .filter(posix)
         .or_else(|| {
             ["/bin/zsh", "/bin/bash"]
                 .into_iter()
                 .map(std::path::PathBuf::from)
-                .find(|path| path.is_file())
-        })?;
-    matches!(
-        shell.file_name().and_then(|s| s.to_str()),
-        Some("zsh" | "bash" | "ksh" | "sh")
-    )
-    .then_some(shell)
+                .find(posix)
+        })
 }
 
 /// Builds the command that runs `argv` in `cwd`.
@@ -244,10 +324,12 @@ fn agent_command(cwd: &Path, argv: &[String]) -> Command {
             .arg(cwd)
             .args(argv)
             .current_dir(cwd);
+        own_process_group(&mut command);
         return command;
     }
     let mut command = Command::new(resolve_program(&argv[0]));
     command.args(&argv[1..]).current_dir(cwd);
+    own_process_group(&mut command);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -288,13 +370,16 @@ pub async fn agent_reset(app_handle: AppHandle) -> Result<AgentReset, AppError> 
     })
 }
 
-/// Starts the chat agent of a connection. `directory` is a working directory chosen in the
-/// chat pane (None: the configured one, then the connection's query file folder).
+/// Starts the chat agent of a connection. `provider` and `directory` are what the user chose
+/// in the chat pane for this conversation (None: the configured provider; the configured
+/// directory, then the connection's query file folder). The frontend speaks the protocol of
+/// the provider it passes here, so the command line must be built from the same value.
 #[tauri::command]
 pub async fn agent_start(
     id: u32,
     generation: u64,
     connection: String,
+    provider: Option<Provider>,
     directory: Option<String>,
     app_handle: AppHandle,
     state: tauri::State<'_, super::AppState>,
@@ -302,6 +387,7 @@ pub async fn agent_start(
     let (config, dirs) = state
         .resolve_agent_launch(&connection, directory.as_deref())
         .await?;
+    let config = config.with_provider(provider);
     let argv = agent::chat_argv(&config, &dirs);
     let agents = app_handle.state::<AgentState>();
     // Hold the lock from the generation check to the registration: a stop_all (page
@@ -387,6 +473,7 @@ pub async fn agent_start(
 
     Ok(AgentStarted {
         cwd: dirs.cwd.to_string_lossy().into_owned(),
+        provider: config.provider,
     })
 }
 
@@ -443,8 +530,9 @@ pub struct OnceResult {
 }
 
 /// Runs the agent once with `prompt` in the connection's agent directory and returns its final
-/// message. The agent may edit files there (and in the query file folder); it cannot run
-/// commands (see agent::once_argv). `run_id` is chosen by the frontend for agent_cancel_once.
+/// message. The agent may edit files there (and in the query file folder); see
+/// agent::once_argv for what else it can and cannot do. `run_id` is chosen by the frontend for
+/// agent_cancel_once.
 #[tauri::command]
 pub async fn agent_run_once(
     run_id: String,
@@ -456,39 +544,102 @@ pub async fn agent_run_once(
     if prompt.trim().is_empty() {
         return Err(AppError::Agent("The instruction is empty".into()));
     }
-    let (config, dirs) = state.resolve_agent_launch(&connection, None).await?;
     let token = CancellationToken::new();
     {
         let agents = app_handle.state::<AgentState>();
         let mut once = agents.once.lock().unwrap();
-        if once.contains_key(&run_id) {
+        // Stop was pressed before this command arrived
+        if let Some(index) = once.cancelled.iter().position(|id| id == &run_id) {
+            once.cancelled.remove(index);
+            return Err(AppError::Cancelled);
+        }
+        if once.running.contains_key(&run_id) {
             return Err(AppError::Agent("This agent run already exists".into()));
         }
-        once.insert(run_id.clone(), token.clone());
+        once.running.insert(
+            run_id.clone(),
+            OnceRun {
+                token: token.clone(),
+                pid: None,
+            },
+        );
     }
-    let result = run_once(&config, &dirs, &prompt, &token).await;
+    let result = async {
+        let (config, dirs) = state.resolve_agent_launch(&connection, None).await?;
+        if token.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        run_once(&config, &dirs, &prompt, &token, |pid| {
+            let agents = app_handle.state::<AgentState>();
+            let mut once = agents.once.lock().unwrap();
+            if let Some(run) = once.running.get_mut(&run_id) {
+                run.pid = Some(pid);
+            }
+        })
+        .await
+    }
+    .await;
     app_handle
         .state::<AgentState>()
         .once
         .lock()
         .unwrap()
+        .running
         .remove(&run_id);
     result
 }
 
-/// Cancels a one-shot run (the run then fails with AppError::Cancelled)
+/// Cancels a one-shot run (the run then fails with AppError::Cancelled). A run that has not
+/// registered yet is remembered and refused when it arrives.
 #[tauri::command]
 pub async fn agent_cancel_once(run_id: String, app_handle: AppHandle) -> Result<(), AppError> {
-    if let Some(token) = app_handle
-        .state::<AgentState>()
-        .once
-        .lock()
-        .unwrap()
-        .get(&run_id)
-    {
-        token.cancel();
+    let agents = app_handle.state::<AgentState>();
+    let mut once = agents.once.lock().unwrap();
+    if let Some(run) = once.running.get(&run_id) {
+        run.token.cancel();
+    } else {
+        if once.cancelled.len() >= MAX_PENDING_CANCELS {
+            once.cancelled.remove(0);
+        }
+        once.cancelled.push(run_id);
     }
     Ok(())
+}
+
+/// Reads a stream to its end and keeps the last ONCE_MAX_OUTPUT_BYTES of it
+async fn read_tail(mut reader: impl tokio::io::AsyncRead + Unpin) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut kept: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                kept.extend_from_slice(&chunk[..n]);
+                if kept.len() > 2 * ONCE_MAX_OUTPUT_BYTES {
+                    let cut = kept.len() - ONCE_MAX_OUTPUT_BYTES;
+                    kept.drain(..cut);
+                }
+            }
+        }
+    }
+    if kept.len() > ONCE_MAX_OUTPUT_BYTES {
+        let cut = kept.len() - ONCE_MAX_OUTPUT_BYTES;
+        kept.drain(..cut);
+    }
+    kept
+}
+
+/// Waits (bounded) for an output reader after the agent exited, then gives up on it
+async fn finish_reader(reader: tokio::task::JoinHandle<Vec<u8>>) -> String {
+    let abort = reader.abort_handle();
+    match tokio::time::timeout(ONCE_DRAIN_TIMEOUT, reader).await {
+        Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
+        _ => {
+            abort.abort();
+            String::new()
+        }
+    }
 }
 
 async fn run_once(
@@ -496,40 +647,46 @@ async fn run_once(
     dirs: &AgentDirectories,
     prompt: &str,
     token: &CancellationToken,
+    on_spawn: impl FnOnce(u32),
 ) -> Result<OnceResult, AppError> {
     // Codex writes its final message here. A private directory: the message can quote the
     // query file
     let scratch = ScratchDir::create()?;
     let last_message_file = scratch.path.join("last-message.txt");
-    let argv = agent::once_argv(config, dirs, prompt, &last_message_file);
+    let argv = agent::once_argv(config, dirs, &last_message_file);
 
     let mut command = tokio::process::Command::from(agent_command(&dirs.cwd, &argv));
     command
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     let mut child = command.spawn().map_err(|e| start_error(config, &e))?;
     let pid = child.id();
-    let mut stdout = child.stdout.take().expect("stdout is piped");
-    let mut stderr = child.stderr.take().expect("stderr is piped");
+    if let Some(pid) = pid {
+        on_spawn(pid);
+    }
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
+    // The prompt goes in on stdin (see agent::once_argv), from its own task: the agent may not
+    // read it all before it starts writing output. Closing stdin tells it the prompt is complete
+    let prompt_bytes = prompt.as_bytes().to_vec();
+    let write_prompt = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let _ = stdin.write_all(&prompt_bytes).await;
+        let _ = stdin.shutdown().await;
+    });
     // Drain both pipes while waiting: a full pipe would block the agent forever
-    let read_stdout = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let _ = tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut buf).await;
-        buf
-    });
-    let read_stderr = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let _ = tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut buf).await;
-        buf
-    });
+    let read_stdout = tokio::spawn(read_tail(stdout));
+    let read_stderr = tokio::spawn(read_tail(stderr));
 
     let status = tokio::select! {
         status = child.wait() => Some(status?),
         _ = token.cancelled() => None,
         _ = tokio::time::sleep(ONCE_TIMEOUT) => None,
     };
+    write_prompt.abort();
     let Some(status) = status else {
         // Cancelled or timed out: SIGTERM first (the agent stops its own children), then kill
         if let Some(pid) = pid {
@@ -538,6 +695,11 @@ async fn run_once(
         if tokio::time::timeout(EXIT_TIMEOUT, child.wait()).await.is_err() {
             let _ = child.kill().await;
         }
+        if let Some(pid) = pid {
+            signal_group(pid, "KILL");
+        }
+        read_stdout.abort();
+        read_stderr.abort();
         return Err(if token.is_cancelled() {
             AppError::Cancelled
         } else {
@@ -548,8 +710,13 @@ async fn run_once(
             ))
         });
     };
-    let stdout = String::from_utf8_lossy(&read_stdout.await.unwrap_or_default()).into_owned();
-    let stderr = String::from_utf8_lossy(&read_stderr.await.unwrap_or_default()).into_owned();
+    // The agent exited. Whatever it left running in its group must not keep the pipes (and
+    // this run) open
+    if let Some(pid) = pid {
+        signal_group(pid, "KILL");
+    }
+    let stdout = finish_reader(read_stdout).await;
+    let stderr = finish_reader(read_stderr).await;
     if !status.success() {
         let detail = tail_chars(
             if stderr.trim().is_empty() { &stdout } else { &stderr },
@@ -669,6 +836,60 @@ mod tests {
         );
         assert!(!tmp.path().join("pwned").exists());
         assert!(!tmp.path().join("pwned2").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdin_reaches_the_program_through_the_login_shell() {
+        // The prompt of a one-shot run is written to stdin; the profile of the login shell
+        // must not consume it
+        let tmp = tempfile::tempdir().unwrap();
+        let mut child = agent_command(tmp.path(), &["cat".to_string()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let prompt = "line 1\nline 2 with $HOME and `x`\n";
+        child.stdin.take().unwrap().write_all(prompt.as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), prompt);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_an_agent_ends_what_it_started() {
+        // The "agent" starts a background command and waits; SIGTERM to its group ends both
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("pid");
+        let script = format!("sleep 300 & echo $! > '{}'; wait", marker.display());
+        let mut child = agent_command(tmp.path(), &["sh".into(), "-c".into(), script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() || std::fs::read_to_string(&marker).unwrap().trim().is_empty() {
+            assert!(Instant::now() < deadline, "the background command did not start");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let background: u32 = std::fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+        let alive = |pid: u32| {
+            Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(alive(background));
+        send_sigterm(child.id());
+        assert!(wait_exit(&mut child, Duration::from_secs(5)).is_some());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive(background) {
+            assert!(Instant::now() < deadline, "the background command survived");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[cfg(unix)]

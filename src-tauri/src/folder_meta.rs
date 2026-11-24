@@ -105,6 +105,12 @@ pub fn write_folder_meta(dir: &Path, server: &ServerConfig) -> Result<(), AppErr
             return Ok(());
         }
     }
+    // Never write through a link: the folder is also the working directory of a coding agent
+    // (CYBERNEURA-DEV-1354), and a link planted there would make this refresh overwrite
+    // whatever it points at with Queryfolio's own permissions. Replace the link itself
+    if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        fs::remove_file(&path)?;
+    }
     fs::write(&path, content)?;
     Ok(())
 }
@@ -265,5 +271,24 @@ mod tests {
         assert_eq!(mtime1, mtime2);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_folder_meta_does_not_write_through_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.txt");
+        fs::write(&outside, "precious").unwrap();
+        let folder = dir.path().join("folder");
+        fs::create_dir(&folder).unwrap();
+        let path = folder.join(META_FILE_NAME);
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+
+        let server = base_server();
+        write_folder_meta(&folder, &server).unwrap();
+        // The link was replaced by the metadata file; its target is untouched
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "precious");
+        assert!(!fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(&path).unwrap(), render_meta(&server));
     }
 }

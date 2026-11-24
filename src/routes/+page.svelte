@@ -509,13 +509,15 @@
     // first message). Built when the message is actually sent, which can be later than when it
     // was typed (queued messages)
     setPromptBuilder(async (connection, request, first) => {
-      const context = await appStore.agentEditorContext(
+      const snapshot = await appStore.agentEditorContext(
         connection,
         editor?.getCurrentStatement() ?? "",
       );
       // The connection is not the selected one any more: send the request without the editor
       // context of another connection
-      return chatPrompt(request, context, first && context ? appStore.agentSchemaSummary() : "");
+      return snapshot
+        ? chatPrompt(request, snapshot.context, first ? snapshot.schema : "")
+        : chatPrompt(request, null);
     });
 
     // Reload on notification from the Reload config file menu item

@@ -104,6 +104,15 @@ impl AgentConfig {
         }))
     }
 
+    /// The same settings with another provider (the chat pane lets the user pick the agent
+    /// for one conversation; the backend, not the webview, turns that into a command line)
+    pub fn with_provider(mut self, provider: Option<Provider>) -> Self {
+        if let Some(provider) = provider {
+            self.provider = provider;
+        }
+        self
+    }
+
     /// The directory setting that applies to a connection (per connection, then the common one)
     fn directory_setting(&self, connection: &str) -> Option<&str> {
         self.directories
@@ -220,37 +229,55 @@ pub fn chat_argv(config: &AgentConfig, dirs: &AgentDirectories) -> Vec<String> {
     argv
 }
 
-/// Tools the one-shot Claude Code run may use: reading and editing files, nothing that runs a
+/// Tools the one-shot Claude Code run has: reading and editing files, nothing that runs a
 /// command. There is nobody to answer an approval prompt in a one-shot run.
-const ONCE_CLAUDE_TOOLS: [&str; 5] = ["Read", "Edit", "Write", "Glob", "Grep"];
+const ONCE_CLAUDE_TOOLS: &str = "Read,Edit,Write,Glob,Grep";
 
 /// Command line of a one-shot run (the inline AI field above the editor): the agent gets one
-/// prompt, may edit files in its working directories, and its final message is the result.
+/// prompt **on stdin**, may edit files in its working directories, and its final message is the
+/// result.
 ///
-/// Claude Code prints the final message to stdout. Codex writes it to `last_message_file`
-/// (`--output-last-message`; its stdout also carries progress).
+/// The prompt is not an argument: it is multi-line user text (a `.cmd` shim on Windows cannot
+/// take a newline in an argument), it can exceed the length limit of one argument, and command
+/// lines are visible to other processes while the prompt quotes the user's SQL.
+///
+/// - Claude Code: `--tools` limits the built-in tools to the file tools (the others do not
+///   exist for the run, they are not merely unapproved), `--strict-mcp-config` without an MCP
+///   config leaves it no MCP tools, and `acceptEdits` applies the edits — the instruction is
+///   the request to edit, and nobody could answer a prompt. It prints the final message to
+///   stdout.
+/// - Codex: `--sandbox workspace-write` confines what it does (commands included) to writes
+///   inside the working directory and the query file folder, without network access. It writes
+///   the final message to `last_message_file` (its stdout also carries progress). `-` reads
+///   the prompt from stdin.
 pub fn once_argv(
     config: &AgentConfig,
     dirs: &AgentDirectories,
-    prompt: &str,
     last_message_file: &Path,
 ) -> Vec<String> {
     let mut argv: Vec<String> = Vec::new();
     match config.provider {
         Provider::Claude => {
             argv.extend(
-                ["claude", "-p", "--output-format", "text", "--permission-mode", "acceptEdits"]
-                    .into_iter()
-                    .map(String::from),
+                [
+                    "claude",
+                    "-p",
+                    "--output-format",
+                    "text",
+                    "--permission-mode",
+                    "acceptEdits",
+                    "--tools",
+                    ONCE_CLAUDE_TOOLS,
+                    "--allowedTools",
+                    ONCE_CLAUDE_TOOLS,
+                    "--strict-mcp-config",
+                ]
+                .into_iter()
+                .map(String::from),
             );
-            argv.push("--allowedTools".into());
-            argv.push(ONCE_CLAUDE_TOOLS.join(","));
             if let Some(query_dir) = &dirs.query_dir {
                 argv.extend(["--add-dir".into(), path_arg(query_dir)]);
             }
-            // `--` ends the options: the prompt is user text and may start with a dash
-            argv.push("--".into());
-            argv.push(prompt.to_string());
         }
         Provider::Codex => {
             argv.extend(
@@ -262,8 +289,7 @@ pub fn once_argv(
                 argv.extend(["--add-dir".into(), path_arg(query_dir)]);
             }
             argv.extend(["--output-last-message".into(), path_arg(last_message_file)]);
-            argv.push("--".into());
-            argv.push(prompt.to_string());
+            argv.push("-".into());
         }
     }
     argv
@@ -480,19 +506,22 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_runs_cannot_run_commands_and_take_the_prompt_last() {
+    fn one_shot_runs_take_the_prompt_on_stdin_and_are_confined() {
         let out = Path::new("/tmp/last.txt");
-        let claude = once_argv(&agent(Provider::Claude, true), &dirs(Some("/q")), "-x fix it", out);
-        assert!(claude.windows(2).any(|w| w == ["--allowedTools", "Read,Edit,Write,Glob,Grep"]));
+        let claude = once_argv(&agent(Provider::Claude, false), &dirs(Some("/q")), out);
+        // Only the file tools exist for the run, and no MCP server is loaded
+        assert!(claude.windows(2).any(|w| w == ["--tools", "Read,Edit,Write,Glob,Grep"]));
+        assert!(claude.contains(&"--strict-mcp-config".to_string()));
         assert!(!claude.iter().any(|a| a.contains("Bash")));
-        assert!(claude.windows(2).any(|w| w == ["--add-dir", "/q"]));
-        assert_eq!(&claude[claude.len() - 2..], ["--", "-x fix it"]);
-        let codex = once_argv(&agent(Provider::Codex, true), &dirs(None), "fix it", out);
+        assert_eq!(&claude[claude.len() - 2..], ["--add-dir", "/q"]);
+        let codex = once_argv(&agent(Provider::Codex, true), &dirs(None), out);
         assert!(codex.windows(2).any(|w| w == ["--sandbox", "workspace-write"]));
         assert!(codex.windows(2).any(|w| w == ["--output-last-message", "/tmp/last.txt"]));
-        assert_eq!(&codex[codex.len() - 2..], ["--", "fix it"]);
+        // `-`: the prompt comes from stdin, never from the command line
+        assert_eq!(codex.last().map(String::as_str), Some("-"));
         for argv in [&claude, &codex] {
             assert!(!argv.iter().any(|a| a.contains("dangerously")), "{argv:?}");
+            assert!(!argv.iter().any(|a| a == "bypassPermissions"), "{argv:?}");
         }
     }
 

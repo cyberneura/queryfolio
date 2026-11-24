@@ -362,25 +362,30 @@ const loadAiInfo = async () => {
   }
 };
 
-/// What a coding agent is told about the editor: the connection, the open query file (as an
-/// absolute path) and `statement` (the statement at the cursor, supplied by the page). null
-/// when `connection` is not the selected one any more.
+/// What a coding agent is told about the editor, as one consistent snapshot: the connection,
+/// the open query file (as an absolute path), `statement` (the statement at the cursor, which
+/// the caller reads from the editor in the same tick as this call) and the table list.
+/// null when `connection` is not the selected one.
 ///
 /// **The open file is saved first**, so that the agent reads what the editor shows; the agent
 /// then edits the file on disk and the external-change watcher brings the edit back.
+///
+/// Everything is captured before the first await and checked after the last one: the user can
+/// switch tabs or connections while the file is being saved, and the statement of one file must
+/// not be sent with the path of another, nor the tables of another connection.
 const agentEditorContext = async (
   connection: string,
   statement: string,
-): Promise<AgentEditorContext | null> => {
-  if (connection !== selectedConnection) {
-    return null;
-  }
-  await flushPendingSave();
+): Promise<{ context: AgentEditorContext; schema: string } | null> => {
   if (connection !== selectedConnection) {
     return null;
   }
   const tab = getActiveEditorTab();
   const openTab = tab && tab.connection === connection ? tab : null;
+  const database = activeSchema;
+  const schema = schemaSummary(schemaMap);
+  const info = connections.find((c) => c.name === connection);
+  const saved = await flushPendingSave();
   let filePath: string | null = null;
   if (openTab) {
     try {
@@ -389,18 +394,20 @@ const agentEditorContext = async (
       // The path is context only; the message is still worth sending without it
     }
   }
-  const info = connections.find((c) => c.name === connection);
+  // The tab was closed meanwhile: there is no open file to talk about any more
+  const stillOpen = openTab !== null && editorTabs.some((t) => t.id === openTab.id);
   return {
-    connection,
-    engine: info?.engine ?? "sql",
-    database: activeSchema,
-    filePath,
-    statement: openTab ? statement : "",
+    context: {
+      connection,
+      engine: info?.engine ?? "sql",
+      database,
+      filePath: stillOpen ? filePath : null,
+      statement: stillOpen ? statement : "",
+      unsaved: stillOpen && (!saved || openTab.dirty || openTab.conflicted === true),
+    },
+    schema,
   };
 };
-
-/// Table / column names for the agent's first message (empty when the map is not loaded)
-const agentSchemaSummary = (): string => schemaSummary(schemaMap);
 
 /// Run the configured agent once from the inline AI field: it edits the open query file as
 /// instructed and its final message is shown in a toast. Returns true on success (used to
@@ -427,9 +434,17 @@ const runAgentOnce = async (instruction: string, statement: string): Promise<boo
   agentRunId = runId;
   const agentName = agentInfo?.provider_name ?? "The agent";
   try {
-    const context = await agentEditorContext(connection, statement);
-    if (!context || !context.filePath) {
+    const snapshot = await agentEditorContext(connection, statement);
+    if (!snapshot || !snapshot.context.filePath) {
       toast.warning("Select or create a query file first");
+      return false;
+    }
+    if (snapshot.context.unsaved) {
+      // The agent edits the file on disk. Editing an older copy than the editor shows would
+      // end in a conflict, or in losing one side
+      toast.warning("Save the query file first", {
+        description: "The editor has changes that could not be saved (or a conflict to resolve).",
+      });
       return false;
     }
     if (agentRunId !== runId) {
@@ -439,7 +454,7 @@ const runAgentOnce = async (instruction: string, statement: string): Promise<boo
     const result = await api.agentRunOnce(
       runId,
       connection,
-      oncePrompt(instruction, context, agentSchemaSummary()),
+      oncePrompt(instruction, snapshot.context, snapshot.schema),
     );
     // Bring the agent's edit into the editor now instead of at the next watcher tick
     await fileWatchTick();
@@ -470,6 +485,9 @@ const runAgentOnce = async (instruction: string, statement: string): Promise<boo
 const cancelAgentOnce = () => {
   const runId = agentRunId;
   if (runId) {
+    // Clearing the ID also stops a run that has not been sent yet (runAgentOnce checks it
+    // after preparing the context); the backend remembers the cancellation for a run whose
+    // command is still on its way
     agentRunId = null;
     void api.agentCancelOnce(runId).catch(() => {});
   }
@@ -3561,7 +3579,6 @@ export default {
   runAgentOnce,
   cancelAgentOnce,
   agentEditorContext,
-  agentSchemaSummary,
   /// Check the open query files for changes made outside the editor right now (an agent
   /// finished a turn) instead of waiting for the next watcher tick
   checkOpenFilesForExternalChanges: () => fileWatchTick(),

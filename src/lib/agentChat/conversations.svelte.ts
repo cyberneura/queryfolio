@@ -43,6 +43,10 @@ export class Conversation {
   busy = $state(false);
   starting = $state(false);
   stopped = $state(false);
+  /// Whether the agent process has been started for this conversation. It is started by the
+  /// first message, not by opening the pane: an agent process per connection the user merely
+  /// looked at would be a waste (each is a full CLI)
+  launched = $state(false);
   usage = $state("");
   /// Model and settings line reported by the agent when the session starts
   sessionDetail = $state("");
@@ -86,6 +90,10 @@ let promptBuilder: PromptBuilder = async (_connection, request) => request;
 let generation = 0;
 let nextId = 0;
 let initializing: Promise<void> | null = null;
+
+/// Turns whose message has been handed to the protocol (from then on Stop has to interrupt
+/// the agent; before that it only has to drop the dispatch)
+const sentToAgent = new WeakSet<InFlight>();
 
 const byProcess = (id: number): Conversation | undefined =>
   [...conversations.values()].find((c) => c.process === id);
@@ -157,6 +165,9 @@ const start = async (c: Conversation, resume: string | null = null): Promise<voi
     await init();
   } catch (e) {
     c.starting = false;
+    c.stopped = true;
+    // Keep what is queued, but do not let it look like it is about to be sent
+    c.queueHeld = true;
     note(c, String(e), true);
     return;
   }
@@ -267,10 +278,14 @@ const start = async (c: Conversation, resume: string | null = null): Promise<voi
     },
   });
   try {
+    // The backend builds the command line for the provider passed here, the same one whose
+    // protocol was created above (the header lets the user pick another agent than the
+    // configured one for this conversation)
     const started = await invoke<{ cwd: string }>("agent_start", {
       id,
       generation,
       connection: c.connection,
+      provider: c.provider,
       directory: c.chosenDirectory,
     });
     if (c.process !== id || c.stopped || conversations.get(c.connection) !== c) {
@@ -283,7 +298,8 @@ const start = async (c: Conversation, resume: string | null = null): Promise<voi
     if (c.process === id) {
       c.process = null;
       c.stopped = true;
-      note(c, String(e), true);
+      c.queueHeld = true;
+      note(c, `${String(e)} Use New chat to try again.`, true);
     }
   } finally {
     c.starting = false;
@@ -294,6 +310,13 @@ const start = async (c: Conversation, resume: string | null = null): Promise<voi
 /// same session after the process had to be replaced (`resume`).
 export const restart = async (c: Conversation, resume: string | null = null): Promise<void> => {
   if (c.starting) {
+    return;
+  }
+  if (!c.launched) {
+    // Nothing is running yet (a provider / directory change before the first message): the
+    // new settings apply when the first message starts the agent
+    c.items = [];
+    c.cwd = "";
     return;
   }
   c.starting = true;
@@ -325,10 +348,12 @@ export const restart = async (c: Conversation, resume: string | null = null): Pr
     return;
   }
   c.stopped = false;
+  c.launched = true;
   await start(c, resume);
 };
 
-/// The conversation of a connection, started on first use
+/// The conversation of a connection, created on first use. Its agent is not started here
+/// (see Conversation.launched)
 export const conversationFor = (connection: string, provider: ChatAgent): Conversation => {
   const existing = conversations.get(connection);
   if (existing) {
@@ -336,7 +361,6 @@ export const conversationFor = (connection: string, provider: ChatAgent): Conver
   }
   const c = new Conversation(connection, provider);
   conversations.set(connection, c);
-  void start(c);
   return c;
 };
 
@@ -354,6 +378,11 @@ export const submit = async (c: Conversation, text: string): Promise<void> => {
   const request = text.trim();
   if (!request) {
     return;
+  }
+  if (!c.launched) {
+    // The first message starts the agent; it is queued below and sent once the agent is ready
+    c.launched = true;
+    void start(c);
   }
   if (c.queueing) {
     if (c.queue.length === 0) {
@@ -425,6 +454,7 @@ const dispatch = (
       return;
     }
     c.introduced = true;
+    sentToAgent.add(record);
     await protocol.send(prompt);
   })().then(
     () => {},
@@ -510,6 +540,17 @@ export const interrupt = async (c: Conversation): Promise<void> => {
     return;
   }
   c.queueHeld = true;
+  const pending = c.inFlight;
+  if (pending && !pending.started && c.busy && !sentToAgent.has(pending)) {
+    // Stop arrived while the message was still being prepared (the open file is saved and the
+    // editor context collected first). Nothing has reached the agent: drop the dispatch, so
+    // that it is not sent after the user stopped it. The dispatch sees that it is no longer
+    // the turn in flight and returns without sending
+    c.inFlight = null;
+    c.busy = false;
+    note(c, "Stopped before the message was sent.");
+    return;
+  }
   for (const item of c.items) {
     if (!live()) {
       return;

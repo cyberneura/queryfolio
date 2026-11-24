@@ -3,8 +3,10 @@
 /// that "fix this query" needs no explanation. Pure functions; tested with node.
 ///
 /// What is sent: the connection name, the engine, the active database, file paths, the SQL at
-/// the cursor, and (first message only) table and column names. Never sent: host names, users,
-/// passwords, or query results.
+/// the cursor, and (first message only) table and column names. Never sent: passwords or
+/// query results. Host and user names are not put into the prompt as such, but the default
+/// query folder name is built from them (it is part of the file path), and `_queryfolio.md`
+/// in that folder, which the agent can read, lists them.
 
 export interface AgentEditorContext {
   /// Connection name as shown in the app
@@ -17,6 +19,8 @@ export interface AgentEditorContext {
   filePath: string | null;
   /// The statement at the cursor, or the selection (empty when there is none)
   statement: string;
+  /// The editor holds changes that could not be saved, so the file on disk is behind it
+  unsaved?: boolean;
 }
 
 /// Longest statement quoted in the context. The file itself is on disk for the agent to read
@@ -77,6 +81,11 @@ const contextLines = (context: AgentEditorContext): string[] => {
       ? `Query file open in the editor: ${context.filePath}`
       : "No query file is open in the editor.",
   );
+  if (context.filePath && context.unsaved) {
+    lines.push(
+      "Warning: the editor has changes that could not be saved; the file on disk is older.",
+    );
+  }
   const statement = context.statement.trim();
   if (statement) {
     const clipped = clip(statement, MAX_STATEMENT_CHARS);

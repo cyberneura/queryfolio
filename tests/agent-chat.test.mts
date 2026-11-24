@@ -78,3 +78,14 @@ test("queued messages are sent in order, merged upward, and dropped when emptied
   assert.equal(canDispatch({ ...state, held: true }), false);
   assert.equal(canDispatch({ ...state, busy: true }), false);
 });
+
+test("unsaved editor changes are pointed out to the agent", () => {
+  assert.ok(
+    chatPrompt("x", { ...context, unsaved: true }).includes(
+      "Warning: the editor has changes that could not be saved; the file on disk is older.",
+    ),
+  );
+  assert.ok(!chatPrompt("x", { ...context, unsaved: false }).includes("Warning:"));
+  // Without an open file there is nothing to warn about
+  assert.ok(!chatPrompt("x", { ...context, filePath: null, unsaved: true }).includes("Warning:"));
+});
