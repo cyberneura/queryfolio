@@ -1048,13 +1048,18 @@ mod tests {
 
     #[test]
     fn agent_directory_must_be_absolute() {
+        // What counts as absolute is the platform's rule (a path starting with `/` has no
+        // drive on Windows and is not absolute there)
+        #[cfg(unix)]
         assert!(validate_agent_directory("/srv/app").is_ok());
+        #[cfg(windows)]
+        assert!(validate_agent_directory("C:\\repos\\app").is_ok());
         assert!(validate_agent_directory("~/repos/app").is_ok());
         assert!(validate_agent_directory("~").is_ok());
         assert!(validate_agent_directory("repos/app").is_err());
         assert!(validate_agent_directory("~user/app").is_err());
         assert!(validate_agent_directory(" ").is_err());
-        assert!(validate_agent_directory("/a\nb").is_err());
+        assert!(validate_agent_directory("~/a\nb").is_err());
     }
 
     #[test]
