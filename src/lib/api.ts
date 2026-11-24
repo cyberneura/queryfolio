@@ -328,8 +328,9 @@ export const listColumns = (connection: string, table: string) =>
   invoke<ColumnInfo[]>("list_columns", { connection, table });
 
 /// Returns a map of table name -> column name list (for SQL completion).
-export const getSchemaMap = (connection: string) =>
-  invoke<Record<string, string[]>>("get_schema_map", { connection });
+/// With refresh = true the backend discards its cache for the active schema first (after a DDL).
+export const getSchemaMap = (connection: string, refresh = false) =>
+  invoke<Record<string, string[]>>("get_schema_map", { connection, refresh });
 
 /// One column of a process row as returned by the server (for the detail view)
 export interface ProcessField {
