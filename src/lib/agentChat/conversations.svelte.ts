@@ -30,7 +30,9 @@ interface InFlight {
 
 export class Conversation {
   readonly connection: string;
-  provider: ChatAgent;
+  /// The agent of this conversation (the header lets the user pick another one than the
+  /// configured one). Reactive: the pane labels messages and approvals with it
+  provider = $state<ChatAgent>("claude");
   items = $state<Item[]>([]);
   /// Working directory the agent reported / was started in
   cwd = $state("");

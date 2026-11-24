@@ -244,20 +244,20 @@
   };
 
   /// Markdown of an agent message, with an "insert into the editor" button next to the copy
-  /// button of each code block (the HTML is sanitized by renderMarkdown; the button is added
-  /// after that, as fixed markup)
+  /// button of each code block. renderMarkdown sanitizes the HTML (and drops data attributes);
+  /// the insert button and the `data-annotate` identifiers of both buttons are added after
+  /// that, as fixed markup next to the copy button the renderer emits
+  const COPY_BUTTON_OPEN = '<button type="button" class="copy-code"';
+  const ANNOTATED_COPY_BUTTON_OPEN = `${COPY_BUTTON_OPEN} data-annotate="button-agent-chat-copy-code"`;
   const INSERT_BUTTON_HTML =
-    '<button type="button" class="insert-code" title="Insert into the editor" ' +
-    'aria-label="Insert into the editor"></button>';
-  const renderAgentText = (text: string, streaming: boolean): string => {
-    const html = renderMarkdown(text);
-    return streaming
-      ? html
-      : html.replaceAll(
-          '<button type="button" class="copy-code"',
-          `${INSERT_BUTTON_HTML}<button type="button" class="copy-code"`,
-        );
-  };
+    '<button type="button" class="insert-code" data-annotate="button-agent-chat-insert-code" ' +
+    'title="Insert into the editor" aria-label="Insert into the editor"></button>';
+  const renderAgentText = (text: string, streaming: boolean): string =>
+    renderMarkdown(text).replaceAll(
+      COPY_BUTTON_OPEN,
+      // No insert button while the block is still being written
+      streaming ? ANNOTATED_COPY_BUTTON_OPEN : `${INSERT_BUTTON_HTML}${ANNOTATED_COPY_BUTTON_OPEN}`,
+    );
 
   const toolTitle = (item: Extract<Item, { kind: "tool_use" }>): string => {
     const input = item.input ?? {};
