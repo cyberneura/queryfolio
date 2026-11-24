@@ -746,19 +746,27 @@ const ensureConnectionResources = async (connection: string) => {
   if (connection !== selectedConnection || resourcesLoaded.has(connection)) {
     return;
   }
-  // One import per connection at a time: several triggers arrive together (opening a file
-  // activates its tab first), and each would issue its own catalog requests. A failed import
-  // leaves no entry, so the next trigger retries
-  const running = resourceImports.get(connection);
+  // One import per connection lifecycle at a time: several triggers arrive together (opening a
+  // file activates its tab first), and each would issue its own catalog requests. The key
+  // carries the lifecycle / reset generations: an import that started before a disconnect is
+  // rejected when it completes (loadConnectionSchemaResources), so a tab reopened meanwhile must
+  // start its own instead of joining that one. A failed import leaves no entry, so the next
+  // trigger retries
+  const key = [
+    connection,
+    connectionLifecycleGen.get(connection) ?? 0,
+    connectionsResetGen,
+  ].join("\u0001");
+  const running = resourceImports.get(key);
   if (running) {
     return running;
   }
   const run = importConnectionResources(connection).finally(() => {
-    if (resourceImports.get(connection) === run) {
-      resourceImports.delete(connection);
+    if (resourceImports.get(key) === run) {
+      resourceImports.delete(key);
     }
   });
-  resourceImports.set(connection, run);
+  resourceImports.set(key, run);
   return run;
 };
 
