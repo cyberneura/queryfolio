@@ -45,7 +45,7 @@ pub const MAX_DEFAULT_LIMIT: u64 = 1_000_000;
 /// setting except the command itself. Which keys the override provides is unknown then, and
 /// letting the user "change" a value that the override replaces would only look like it
 /// worked. The command stays editable so the user can fix it.
-pub const OVERRIDE_UNKNOWN_KEYS: [&str; 3] = ["default_limit", "sqlfiles_dir", "ai"];
+pub const OVERRIDE_UNKNOWN_KEYS: [&str; 4] = ["default_limit", "sqlfiles_dir", "ai", "agent"];
 
 /// The only AI provider supported today (see ai.rs).
 pub const AI_PROVIDER_OPENAI: &str = "openai";
@@ -72,6 +72,18 @@ pub struct AiSettings {
     pub api_key_set: bool,
 }
 
+/// The local `agent:` section (coding agent for the chat pane and the inline AI field,
+/// CYBERNEURA-DEV-1354) as the form shows it. `directories` (per connection) is edited in the
+/// text editor; the form only reports how many entries there are.
+#[derive(Debug, Default, Serialize, PartialEq)]
+pub struct AgentSettings {
+    pub provider: Option<String>,
+    pub directory: Option<String>,
+    pub auto_accept_edits: Option<bool>,
+    /// Number of entries in `agent.directories`
+    pub directories: usize,
+}
+
 /// The local values of the general settings, read from the file (not the merged config).
 #[derive(Debug, Default, Serialize, PartialEq)]
 pub struct LocalSettings {
@@ -79,6 +91,7 @@ pub struct LocalSettings {
     pub sqlfiles_dir: Option<String>,
     pub config_override_command: Option<String>,
     pub ai: AiSettings,
+    pub agent: AgentSettings,
     /// Keys whose local value has an unexpected type, with a message. The form shows the
     /// message and leaves the value alone unless the user replaces it.
     pub invalid: Vec<FieldMessage>,
@@ -113,6 +126,9 @@ pub struct SettingsPatch {
     pub ai_base_url: Option<Change<String>>,
     pub ai_tool_reasoning_effort: Option<Change<String>>,
     pub ai_api_key: Option<Change<String>>,
+    pub agent_provider: Option<Change<String>>,
+    pub agent_directory: Option<Change<String>>,
+    pub agent_auto_accept_edits: Option<Change<bool>>,
 }
 
 /// Result of a save.
@@ -192,6 +208,41 @@ pub fn read_local_settings(doc: &Mapping) -> LocalSettings {
         Some(_) => out.invalid.push(FieldMessage {
             field: "ai".into(),
             message: "ai in the file is not a mapping; fix it in the text editor".into(),
+        }),
+    }
+    match doc.get("agent") {
+        None | Some(Value::Null) => {}
+        Some(Value::Mapping(agent)) => {
+            read_string(
+                agent,
+                "provider",
+                "agent.provider",
+                &mut out.agent.provider,
+                &mut out.invalid,
+            );
+            read_string(
+                agent,
+                "directory",
+                "agent.directory",
+                &mut out.agent.directory,
+                &mut out.invalid,
+            );
+            match agent.get("auto_accept_edits") {
+                None | Some(Value::Null) => {}
+                Some(Value::Bool(flag)) => out.agent.auto_accept_edits = Some(*flag),
+                Some(_) => out.invalid.push(FieldMessage {
+                    field: "agent.auto_accept_edits".into(),
+                    message: "agent.auto_accept_edits in the file is not true / false".into(),
+                }),
+            }
+            out.agent.directories = agent
+                .get("directories")
+                .and_then(Value::as_mapping)
+                .map_or(0, Mapping::len);
+        }
+        Some(_) => out.invalid.push(FieldMessage {
+            field: "agent".into(),
+            message: "agent in the file is not a mapping; fix it in the text editor".into(),
         }),
     }
     out
@@ -337,6 +388,36 @@ pub fn apply_patch(
         validate_set(&patch.ai_api_key, validate_api_key),
     );
 
+    check(
+        "agent.provider",
+        patch.agent_provider.is_some(),
+        validate_set(&patch.agent_provider, validate_agent_provider),
+    );
+    check(
+        "agent.directory",
+        patch.agent_directory.is_some(),
+        validate_set(&patch.agent_directory, validate_agent_directory),
+    );
+    check(
+        "agent.auto_accept_edits",
+        patch.agent_auto_accept_edits.is_some(),
+        Ok(()),
+    );
+    let touches_agent = patch.agent_provider.is_some()
+        || patch.agent_directory.is_some()
+        || patch.agent_auto_accept_edits.is_some();
+    if touches_agent {
+        if let Some(value) = doc.get("agent") {
+            if !matches!(value, Value::Mapping(_) | Value::Null) {
+                errors.push(FieldMessage {
+                    field: "agent".into(),
+                    message: "agent in the file is not a mapping; fix it in the text editor"
+                        .into(),
+                });
+            }
+        }
+    }
+
     let touches_ai = patch.ai_provider.is_some()
         || patch.ai_model.is_some()
         || patch.ai_base_url.is_some()
@@ -409,6 +490,37 @@ pub fn apply_patch(
             doc.remove("ai");
         } else {
             set_keeping_position(doc, "ai", Value::Mapping(ai));
+        }
+    }
+
+    if touches_agent {
+        // Keys the form does not edit (`directories`) stay as they are
+        let mut agent = match doc.get("agent") {
+            Some(Value::Mapping(map)) => map.clone(),
+            _ => Mapping::new(),
+        };
+        apply_top(
+            &mut agent,
+            "provider",
+            patch.agent_provider.as_ref().map(string_change),
+        );
+        apply_top(
+            &mut agent,
+            "directory",
+            patch.agent_directory.as_ref().map(string_change),
+        );
+        apply_top(
+            &mut agent,
+            "auto_accept_edits",
+            patch
+                .agent_auto_accept_edits
+                .as_ref()
+                .map(|c| map_change(c, |flag| Value::Bool(*flag))),
+        );
+        if agent.is_empty() {
+            doc.remove("agent");
+        } else {
+            set_keeping_position(doc, "agent", Value::Mapping(agent));
         }
     }
     Ok(())
@@ -494,6 +606,30 @@ pub fn validate_command(value: &str) -> Result<(), String> {
 pub fn validate_provider(value: &str) -> Result<(), String> {
     if value.trim() != AI_PROVIDER_OPENAI {
         return Err(format!("Only '{AI_PROVIDER_OPENAI}' is supported"));
+    }
+    Ok(())
+}
+
+/// `agent.provider`: which CLI the chat pane and the inline AI field use (agent.rs)
+pub fn validate_agent_provider(value: &str) -> Result<(), String> {
+    match value.trim() {
+        "claude" | "codex" => Ok(()),
+        _ => Err("Choose Claude Code or Codex".into()),
+    }
+}
+
+/// `agent.directory`: an absolute path (`~` allowed). Whether it exists is checked when the
+/// agent starts, not here — the directory may be created later, or live on a disk that is not
+/// mounted right now.
+pub fn validate_agent_directory(value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("Enter a directory, or clear the field to use the query file folder".into());
+    }
+    single_line("The agent directory", value)?;
+    let absolute = value == "~" || value.starts_with("~/") || Path::new(value).is_absolute();
+    if !absolute {
+        return Err("Enter an absolute path (it may start with ~/)".into());
     }
     Ok(())
 }
@@ -849,9 +985,81 @@ mod tests {
             ai_api_key: set("  ".into()),
             sqlfiles_dir: set("a\nb".into()),
             ai_model: set("gpt 5".into()),
+            agent_provider: set("gemini".into()),
+            agent_directory: set("relative/dir".into()),
+            agent_auto_accept_edits: None,
         };
         let errors = apply_patch(&mut doc, &patch, &[]).unwrap_err();
-        assert_eq!(errors.len(), 8, "{errors:?}");
+        assert_eq!(errors.len(), 10, "{errors:?}");
+    }
+
+    #[test]
+    fn agent_section_is_read_created_and_removed() {
+        let local = read_local_settings(&yaml(
+            "agent:\n  provider: codex\n  directory: ~/app\n  auto_accept_edits: false\n  directories:\n    a: /x\n    b: /y\n",
+        ));
+        assert_eq!(local.agent.provider.as_deref(), Some("codex"));
+        assert_eq!(local.agent.directory.as_deref(), Some("~/app"));
+        assert_eq!(local.agent.auto_accept_edits, Some(false));
+        assert_eq!(local.agent.directories, 2);
+        assert!(local.invalid.is_empty());
+
+        let mut doc = yaml("servers: []\n");
+        let patch = SettingsPatch {
+            agent_provider: set("claude".into()),
+            agent_directory: set(" ~/repos/app ".into()),
+            agent_auto_accept_edits: set(false),
+            ..Default::default()
+        };
+        apply_patch(&mut doc, &patch, &[]).unwrap();
+        assert_eq!(
+            serde_yaml::to_string(&doc).unwrap(),
+            "servers: []\nagent:\n  provider: claude\n  directory: ~/repos/app\n  auto_accept_edits: false\n"
+        );
+        let patch = SettingsPatch {
+            agent_provider: Some(Change::Unset),
+            agent_directory: Some(Change::Unset),
+            agent_auto_accept_edits: Some(Change::Unset),
+            ..Default::default()
+        };
+        apply_patch(&mut doc, &patch, &[]).unwrap();
+        assert_eq!(serde_yaml::to_string(&doc).unwrap(), "servers: []\n");
+    }
+
+    #[test]
+    fn agent_keys_the_form_does_not_edit_are_kept() {
+        let mut doc = yaml("agent:\n  provider: claude\n  directories:\n    reporting: /srv/app\n");
+        let patch = SettingsPatch {
+            agent_provider: Some(Change::Unset),
+            ..Default::default()
+        };
+        apply_patch(&mut doc, &patch, &[]).unwrap();
+        assert_eq!(
+            serde_yaml::to_string(&doc).unwrap(),
+            "agent:\n  directories:\n    reporting: /srv/app\n"
+        );
+        // An overridden section cannot be changed here, and a non-mapping is not replaced
+        let errors = apply_patch(&mut doc, &SettingsPatch { agent_provider: set("codex".into()), ..Default::default() }, &["agent".into()]).unwrap_err();
+        assert_eq!(errors[0].field, "agent.provider");
+        let mut legacy = yaml("agent: claude\n");
+        let errors = apply_patch(&mut legacy, &SettingsPatch { agent_provider: set("codex".into()), ..Default::default() }, &[]).unwrap_err();
+        assert_eq!(errors[0].field, "agent");
+    }
+
+    #[test]
+    fn agent_directory_must_be_absolute() {
+        // What counts as absolute is the platform's rule (a path starting with `/` has no
+        // drive on Windows and is not absolute there)
+        #[cfg(unix)]
+        assert!(validate_agent_directory("/srv/app").is_ok());
+        #[cfg(windows)]
+        assert!(validate_agent_directory("C:\\repos\\app").is_ok());
+        assert!(validate_agent_directory("~/repos/app").is_ok());
+        assert!(validate_agent_directory("~").is_ok());
+        assert!(validate_agent_directory("repos/app").is_err());
+        assert!(validate_agent_directory("~user/app").is_err());
+        assert!(validate_agent_directory(" ").is_err());
+        assert!(validate_agent_directory("~/a\nb").is_err());
     }
 
     #[test]

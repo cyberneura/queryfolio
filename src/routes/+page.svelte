@@ -34,6 +34,9 @@
   import RunLogConfirmModal from "$lib/components/RunLogConfirmModal.svelte";
   import SearchModal from "$lib/components/SearchModal.svelte";
   import ChatPane from "$lib/components/ChatPane.svelte";
+  import AgentChatPane from "$lib/components/AgentChatPane.svelte";
+  import { setPromptBuilder } from "$lib/agentChat/conversations.svelte";
+  import { chatPrompt } from "$lib/agentChat/context";
   import ProcessListPane from "$lib/components/ProcessListPane.svelte";
   import HelpPane from "$lib/components/HelpPane.svelte";
   import PaneDivider from "$lib/components/PaneDivider.svelte";
@@ -501,6 +504,22 @@
     // Auto-reload / merge when an open query file is changed externally
     appStore.startFileWatcher();
 
+    // What the agent chat sends with each message: the request plus the editor context (the
+    // connection, the open query file, the statement at the cursor; the table list with the
+    // first message). Built when the message is actually sent, which can be later than when it
+    // was typed (queued messages)
+    setPromptBuilder(async (connection, request, first) => {
+      const snapshot = await appStore.agentEditorContext(
+        connection,
+        editor?.getCurrentStatement() ?? "",
+      );
+      // The connection is not the selected one any more: send the request without the editor
+      // context of another connection
+      return snapshot
+        ? chatPrompt(request, snapshot.context, first ? snapshot.schema : "")
+        : chatPrompt(request, null);
+    });
+
     // Reload on notification from the Reload config file menu item
     const unlistenPromise = listen("menu-reload-config", async () => {
       if (await appStore.reloadConnections()) {
@@ -757,6 +776,7 @@
           showReplaceMultiline={hasMultilineSelection &&
             appStore.selectedFile !== null}
           onReplaceMultiline={openReplacePane}
+          getStatement={() => editor?.getCurrentStatement() ?? ""}
         />
       {/if}
       <div
@@ -859,11 +879,19 @@
         onDragEnd={() => saveLayoutValue("chatWidth", chatWidth)}
       />
       <div class="shrink-0" style="width: {chatWidth}px">
-        <ChatPane
-          supportsAi={selectedCapabilities?.supports_ai ?? false}
-          onClose={() => setChatOpen(false)}
-          onInsert={(sql) => appStore.insertSqlSnippet(sql)}
-        />
+        {#if appStore.agentInfo?.provider}
+          <!-- A coding agent is configured (`agent:`): the pane talks to Claude Code / Codex -->
+          <AgentChatPane
+            onClose={() => setChatOpen(false)}
+            onInsert={(sql) => appStore.insertSqlSnippet(sql)}
+          />
+        {:else}
+          <ChatPane
+            supportsAi={selectedCapabilities?.supports_ai ?? false}
+            onClose={() => setChatOpen(false)}
+            onInsert={(sql) => appStore.insertSqlSnippet(sql)}
+          />
+        {/if}
       </div>
     {/if}
 

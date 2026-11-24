@@ -44,7 +44,21 @@ export interface FormValues {
   apiKeyInput: string;
   /// Remove the key stored in config.yml on save
   removeStoredApiKey: boolean;
+  /// Coding agent for the chat pane and the inline AI field: "" = none (the built-in
+  /// assistant), "claude" or "codex" (agent.provider)
+  agentProvider: string;
+  /// agent.directory. Empty = each connection's query file folder
+  agentDirectory: string;
+  /// agent.auto_accept_edits (absent = true)
+  agentAutoAcceptEdits: boolean;
 }
+
+/// Choices for agent.provider ("" = key absent)
+export const AGENT_PROVIDER_CHOICES: { value: string; label: string }[] = [
+  { value: "", label: "None (built-in assistant, OpenAI API)" },
+  { value: "claude", label: "Claude Code" },
+  { value: "codex", label: "Codex" },
+];
 
 export function initialValues(local: LocalSettings): FormValues {
   return {
@@ -59,7 +73,29 @@ export function initialValues(local: LocalSettings): FormValues {
     apiKeyMode: local.ai.api_key_set ? "direct" : "op",
     apiKeyInput: "",
     removeStoredApiKey: false,
+    agentProvider: normalizeAgentProvider(local.agent.provider),
+    agentDirectory: local.agent.directory ?? "",
+    agentAutoAcceptEdits: local.agent.auto_accept_edits ?? true,
   };
+}
+
+/// The provider as the form's select holds it. The file may spell Claude Code as
+/// `claude-code` (agent.rs accepts it); anything unknown is shown as it is, so that saving
+/// another field does not silently rewrite it.
+export function normalizeAgentProvider(value: string | null): string {
+  const provider = (value ?? "").trim().toLowerCase();
+  if (provider === "" || provider === "none") return "";
+  if (provider === "claude-code" || provider === "claude_code") return "claude";
+  return provider;
+}
+
+export function validateAgentDirectory(text: string): string | null {
+  const value = text.trim();
+  if (value === "") return null;
+  if (!singleLine(value)) return "The directory must be a single line";
+  const absolute =
+    value === "~" || value.startsWith("~/") || value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
+  return absolute ? null : "Enter an absolute path (it may start with ~/)";
 }
 
 /// Whether `field` (dotted path) gets its value from config_override_command
@@ -168,6 +204,11 @@ export function validate(
   if (values.apiKeyMode === "direct") {
     add("ai.api_key", values.apiKeyInput.trim() !== "", validateApiKey(values.apiKeyInput));
   }
+  add(
+    "agent.directory",
+    changed(values.agentDirectory, initial.agentDirectory),
+    validateAgentDirectory(values.agentDirectory),
+  );
   return errors;
 }
 
@@ -214,6 +255,21 @@ export function buildPatch(
     } else if (values.apiKeyMode === "direct" && typed !== "") {
       patch.ai_api_key = { op: "set", value: typed };
     }
+  }
+  if (editable("agent.provider")) {
+    patch.agent_provider = textChange(values.agentProvider, initial.agentProvider);
+  }
+  if (editable("agent.directory")) {
+    patch.agent_directory = textChange(values.agentDirectory, initial.agentDirectory);
+  }
+  if (
+    editable("agent.auto_accept_edits") &&
+    values.agentAutoAcceptEdits !== initial.agentAutoAcceptEdits
+  ) {
+    // true is the default: remove the key instead of writing it
+    patch.agent_auto_accept_edits = values.agentAutoAcceptEdits
+      ? { op: "unset" }
+      : { op: "set", value: false };
   }
   for (const key of Object.keys(patch) as (keyof SettingsPatch)[]) {
     if (patch[key] === undefined) delete patch[key];

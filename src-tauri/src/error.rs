@@ -73,6 +73,10 @@ pub enum AppError {
     /// Dumping with mysqldump / pg_dump failed (dump.rs)
     #[error("Dump error: {0}")]
     Dump(String),
+
+    /// A coding agent (Claude Code / Codex) could not be started or failed (agent_process.rs)
+    #[error("Agent error: {0}")]
+    Agent(String),
 }
 
 impl From<redis::RedisError> for AppError {

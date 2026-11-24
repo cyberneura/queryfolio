@@ -873,6 +873,12 @@ impl AppConfig {
         self.doc.get("ai").cloned()
     }
 
+    /// The `agent:` section (coding agent for the chat pane and the inline AI field).
+    /// Parsed by agent::AgentConfig::from_value
+    pub fn agent(&self) -> Option<serde_yaml::Value> {
+        self.doc.get("agent").cloned()
+    }
+
     /// Resolves the list of connection servers.
     /// Does no fetching (applying config_override_command is already done in load_merged).
     pub fn resolve_servers(&self) -> Result<Vec<ServerConfig>, AppError> {

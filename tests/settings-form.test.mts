@@ -24,6 +24,7 @@ const local = (over: Partial<LocalSettings> = {}): LocalSettings => ({
     tool_reasoning_effort: null,
     api_key_set: false,
   },
+  agent: { provider: null, directory: null, auto_accept_edits: null, directories: 0 },
   invalid: [],
   ...over,
 });
@@ -112,4 +113,49 @@ test("override paths cover their children only", () => {
   assert.ok(isOverridden(["ai.api_key"], "ai.api_key"));
   assert.ok(!isOverridden(["ai.api_key"], "ai.model"));
   assert.ok(!isOverridden(["ai"], "aim"));
+});
+
+test("agent settings: only what changed is written, and true is the default", async () => {
+  const { normalizeAgentProvider, validateAgentDirectory } = await import("../src/lib/settingsForm.ts");
+  const initial = initialValues(local());
+  assert.equal(initial.agentProvider, "");
+  assert.equal(initial.agentAutoAcceptEdits, true);
+  assert.deepEqual(buildPatch({ ...initial }, initial, []), {});
+  assert.deepEqual(
+    buildPatch(
+      { ...initial, agentProvider: "claude", agentDirectory: " ~/repos/app ", agentAutoAcceptEdits: false },
+      initial,
+      [],
+    ),
+    {
+      agent_provider: { op: "set", value: "claude" },
+      agent_directory: { op: "set", value: "~/repos/app" },
+      agent_auto_accept_edits: { op: "set", value: false },
+    },
+  );
+  // Back to the defaults: the keys are removed, not written
+  const stored = initialValues(
+    local({ agent: { provider: "Claude-Code", directory: "/srv/app", auto_accept_edits: false, directories: 1 } }),
+  );
+  assert.equal(stored.agentProvider, "claude");
+  assert.deepEqual(
+    buildPatch({ ...stored, agentProvider: "", agentDirectory: "", agentAutoAcceptEdits: true }, stored, []),
+    {
+      agent_provider: { op: "unset" },
+      agent_directory: { op: "unset" },
+      agent_auto_accept_edits: { op: "unset" },
+    },
+  );
+  // An overridden section is never part of the patch
+  assert.deepEqual(buildPatch({ ...initial, agentProvider: "codex" }, initial, ["agent"]), {});
+  assert.equal(normalizeAgentProvider(null), "");
+  assert.equal(normalizeAgentProvider("none"), "");
+  assert.equal(normalizeAgentProvider("gemini"), "gemini");
+  assert.equal(validateAgentDirectory(""), null);
+  assert.equal(validateAgentDirectory("~/repos/app"), null);
+  assert.equal(validateAgentDirectory("C:\\repos\\app"), null);
+  assert.notEqual(validateAgentDirectory("repos/app"), null);
+  assert.deepEqual(validate({ ...initial, agentDirectory: "repos/app" }, initial, []), {
+    "agent.directory": "Enter an absolute path (it may start with ~/)",
+  });
 });
