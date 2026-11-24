@@ -97,6 +97,10 @@ let initializing: Promise<void> | null = null;
 /// the agent; before that it only has to drop the dispatch)
 const sentToAgent = new WeakSet<InFlight>();
 
+/// Result summaries of a turn that completed normally (Claude Code: "success · …",
+/// Codex: "completed · …"); anything else is an error, a failure or an interruption
+const RESULT_SUCCESS = /^(?:success|completed)\b/;
+
 const byProcess = (id: number): Conversation | undefined =>
   [...conversations.values()].find((c) => c.process === id);
 
@@ -188,6 +192,13 @@ const start = async (c: Conversation, resume: string | null = null): Promise<voi
       c.items.push(item);
       if (item.kind === "result") {
         c.inFlight = null;
+        // A turn that ended in an error (a Claude Code error result, a failed or interrupted
+        // Codex turn) holds the queue: the instructions waiting behind it usually depend on
+        // it, and it may have edited only part of the files. The turn itself was accepted, so
+        // it is not put back; the user resumes when they have looked
+        if (!RESULT_SUCCESS.test(item.summary)) {
+          c.queueHeld = true;
+        }
       }
     },
     note(text, level) {
