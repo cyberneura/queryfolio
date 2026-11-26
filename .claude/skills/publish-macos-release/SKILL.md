@@ -1,30 +1,30 @@
 ---
 name: publish-macos-release
-description: Queryfolio をビルドして GitHub Release として公開 (サイトで配布) する手順。「mac 版をリリース」「アプリを公開」「新しいバージョンを配布」「release the mac app」「publish a new build」と言及された時に使う。`pnpm release` で version 採番 → GitHub Actions で macOS dmg (署名 + 公証) と Windows インストーラをビルド → 全プラットフォーム成功時に自動公開 → 公開された成果物の署名・公証を検証してダウンロード導線を確認する、一連の作業を扱う。
+description: The procedure for building Queryfolio and publishing it as a GitHub Release (distributed on the site). Use when someone mentions "release the mac app", "publish the app", "distribute a new version", "publish a new build" (or the Japanese phrasings 「mac 版をリリース」「アプリを公開」「新しいバージョンを配布」). Covers the whole sequence: assign the version with `pnpm release` → GitHub Actions builds the macOS dmg (signed + notarized) and the Windows installer → automatic publication when all platforms succeed → verify the signature and notarization of the published artifacts and check the download path.
 ---
 
-# Queryfolio のリリース手順
+# Queryfolio release procedure
 
-macOS 版 (universal dmg) と Windows 版 (NSIS インストーラ) を GitHub Actions でビルドし、
-GitHub Release としてサイト (ダウンロードページ) で公開するまでの runbook。
-ビルドは `.github/workflows/release.yml`。**main の `src-tauri/tauri.conf.json` の
-version を変えて push すると始まる** (`plan` ジョブが「その version がリリース済みか」を
-訊き、未リリースの時だけビルドへ進む)。version の採番と push は `scripts/release.sh`
-(`pnpm release` / `fab release`)。構成の設計判断はグローバルスキル
-`tauri-github-actions-release` に書いてある。
+A runbook for building the macOS version (universal dmg) and the Windows version (NSIS installer) with GitHub Actions
+and publishing them as a GitHub Release on the site (download page).
+The build is `.github/workflows/release.yml`. **It starts when the version in `src-tauri/tauri.conf.json` on main
+is changed and pushed** (the `plan` job asks "has this version already been released?"
+and proceeds to the build only when it has not). Version assignment and the push are done by `scripts/release.sh`
+(`pnpm release` / `fab release`). The design decisions behind this setup are written in the global skill
+`tauri-github-actions-release`.
 
-## 前提
+## Prerequisites
 
-- `gh` が `ytyng` アカウントで認証済みで、リポジトリは `cyberneura/queryfolio`
-  (`ytyng` は cyberneura org の admin なので、この 1 アカウントで release まで通る)。
-- 署名・公証用の GitHub Secrets が 6 つとも設定済み (下記「初回セットアップ」)。
-  **1 つでも未設定なら macOS ジョブは "Check macOS signing secrets" ステップで失敗する**
-  (ad-hoc 署名や公証なしの dmg が黙って公開されるのを防ぐための preflight。フォールバックは無い)。
-- `main` がクリーンで `origin/main` と一致していること (スクリプトが検証して弾く)。
+- `gh` is authenticated with the `ytyng` account, and the repository is `cyberneura/queryfolio`
+  (`ytyng` is an admin of the cyberneura org, so this one account gets all the way through the release).
+- All 6 GitHub Secrets for signing and notarization are set (see "First-time setup" below).
+  **If even one is missing, the macOS job fails at the "Check macOS signing secrets" step**
+  (a preflight to prevent an ad-hoc signed or un-notarized dmg from being published silently. There is no fallback).
+- `main` is clean and matches `origin/main` (the script checks this and refuses otherwise).
 
-## リリース手順
+## Release steps
 
-### 1. version 採番 → ビルド → 公開 (1 コマンド)
+### 1. Assign the version → build → publish (one command)
 
 ```shell
 pnpm release           # 0.1.0 -> 0.1.1 (patch)
@@ -32,28 +32,28 @@ pnpm release minor     # 0.1.0 -> 0.2.0
 pnpm release major     # 0.1.0 -> 1.0.0
 ```
 
-`scripts/release.sh` が以下を行う:
+`scripts/release.sh` does the following:
 
-1. `gh` の認証、`main` ブランチ・クリーンツリー・`HEAD == origin/main` を検証
-2. `src-tauri/tauri.conf.json` の version を bump し、`package.json` にも同期
-3. `chore: release v<version>` として commit → `origin/main` へ push
-4. その push で始まった run を探し、`gh run watch --exit-status` で追う
-   (リリースを始めるのは push であってスクリプトではない)
+1. Checks `gh` authentication, the `main` branch, a clean tree, and `HEAD == origin/main`
+2. Bumps the version in `src-tauri/tauri.conf.json` and syncs it to `package.json` as well
+3. Commits as `chore: release v<version>` → pushes to `origin/main`
+4. Finds the run started by that push and follows it with `gh run watch --exit-status`
+   (what starts the release is the push, not the script)
 
-ワークフローは `draft` ジョブで `v<version>` の **draft** Release を 1 つ用意し、matrix で
-macOS (universal dmg / .app と dmg の両方を Developer ID 署名 + 公証 + staple) と Windows (NSIS exe / 署名なし) を
-並列ビルドしてその draft にアップロードする。全プラットフォームが成功すると `publish` ジョブが
-公開直前にリリース判定をやり直し、draft を公開する (tag はその run の commit に作られる)。
-所要 15〜25 分程度。
+The workflow prepares one **draft** Release for `v<version>` in the `draft` job, builds in a matrix
+macOS (universal dmg / both the .app and the dmg are Developer ID signed + notarized + stapled) and Windows (NSIS exe / unsigned)
+in parallel, and uploads them to that draft. When all platforms succeed, the `publish` job
+repeats the release decision right before publishing and publishes the draft (the tag is created on that run's commit).
+It takes roughly 15–25 minutes.
 
-> どれかのプラットフォームが失敗した場合、Release は **draft のまま残る**。原因を直して
-> main に push すれば、同じ version のまま次の run がその draft を再利用して公開する
-> (version は未公開のままなので上げなくてよい)。version を上げて出し直すなら、残った
-> draft は消しておく: `gh release delete v<version> --yes`
+> If any platform fails, the Release **stays a draft**. Fix the cause and
+> push to main, and the next run reuses that draft with the same version and publishes it
+> (the version is still unpublished, so you do not need to bump it). If you bump the version and release again instead, delete the leftover
+> draft: `gh release delete v<version> --yes`
 
-### 2. 成果物を検証する (公開後 / 初回は必ず)
+### 2. Verify the artifacts (after publication / always the first time)
 
-DMG を落として署名・公証・universal を実機確認する:
+Download the DMG and confirm the signature, notarization, and universal binary on a real machine:
 
 ```shell
 VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
@@ -66,68 +66,68 @@ APP=/Volumes/Queryfolio/Queryfolio.app
 codesign -dv --verbose=2 "$APP"      # Authority=Developer ID Application: Cyberneura K.K. (2YN5TLNQ9J) / flags=...runtime
 spctl -a -vvv "$APP"                 # → accepted / source=Notarized Developer ID
 xcrun stapler validate "$APP"        # → The validate action worked!
-# バンドル内の実行バイナリは crate 名のまま小文字。tauri は mainBinaryName を
-# 指定しない限り cargo の出力バイナリ名をそのまま使うので、productName
-# (Queryfolio) ではない。ここを productName に揃えるとファイルが無くて落ちる
-# (CYBERNEURA-DEV-805 の時点で、元から大文字で書かれていて落ちる状態だった)。
+# The executable binary inside the bundle keeps the crate name in lowercase. tauri uses
+# cargo's output binary name as-is unless mainBinaryName is specified, so it is not
+# productName (Queryfolio). Aligning this with productName fails because the file does not exist
+# (as of CYBERNEURA-DEV-805, it had been written in uppercase from the start and was failing).
 lipo -archs "$APP/Contents/MacOS/queryfolio"   # → x86_64 arm64
 hdiutil detach -quiet /Volumes/Queryfolio
 ```
 
-`source=Notarized Developer ID` と staple 成功が出れば、ユーザーがダウンロードして開いても
-Gatekeeper 警告は出ない。ここが `Developer ID` 止まり (Notarized でない) なら公証が
-効いていないので、`APPLE_ID` / `APPLE_PASSWORD` (app 用パスワード) / `APPLE_TEAM_ID` を疑う。
+If you see `source=Notarized Developer ID` and a successful staple, users will not get a
+Gatekeeper warning when they download and open it. If it stops at `Developer ID` (not Notarized), notarization
+is not taking effect, so suspect `APPLE_ID` / `APPLE_PASSWORD` (app-specific password) / `APPLE_TEAM_ID`.
 
-### 3. 配布導線を確認・更新する
+### 3. Check and update the distribution path
 
 ```shell
 gh release view "v${VERSION}" --json assets --jq '.assets[].name'
 ```
 
-- `https://github.com/cyberneura/queryfolio/releases/latest` が新バージョンを指していること。
-- dmg / exe の公開 URL が匿名 (未ログイン) で落とせること。
-- README の Download セクションは `releases/latest` を指す固定リンクなので、通常は更新不要。
-- 告知が必要なら ytyng-blog (`ytyng-blog-cli` スキル) に BlogPost / Achievement を作る。
+- `https://github.com/cyberneura/queryfolio/releases/latest` points at the new version.
+- The public URLs of the dmg / exe can be downloaded anonymously (not logged in).
+- The README's Download section is a fixed link pointing at `releases/latest`, so it normally needs no update.
+- If an announcement is needed, create a BlogPost / Achievement on ytyng-blog (the `ytyng-blog-cli` skill).
 
-## 初回セットアップ (署名・公証 Secrets)
+## First-time setup (signing and notarization Secrets)
 
-ローカルの署名 ID を CI に持ち込むため、`.p12` を書き出して Secrets に登録する。1 回だけでよい。
-公証には Apple ID と app 用パスワードも要る。
+To bring the local signing identity into CI, export a `.p12` and register it in Secrets. This only needs to be done once.
+Notarization also needs an Apple ID and an app-specific password.
 
 ```shell
 security find-identity -v -p codesigning | grep "Developer ID Application: Cyberneura"
-# → キーチェーンアクセスで該当の証明書 + 秘密鍵を .p12 として書き出す (例: queryfolio-signing.p12)
+# → In Keychain Access, export the matching certificate + private key as a .p12 (e.g. queryfolio-signing.p12)
 
 base64 -i queryfolio-signing.p12 | gh secret set APPLE_CERTIFICATE
-gh secret set APPLE_CERTIFICATE_PASSWORD   # .p12 のパスワードを入力
+gh secret set APPLE_CERTIFICATE_PASSWORD   # Enter the .p12 password
 printf 'Developer ID Application: Cyberneura K.K. (2YN5TLNQ9J)' | gh secret set APPLE_SIGNING_IDENTITY
-gh secret set APPLE_ID                     # Apple Developer のメール
-gh secret set APPLE_PASSWORD               # app 用パスワード (appleid.apple.com で発行。通常のパスワードは不可)
+gh secret set APPLE_ID                     # The Apple Developer email
+gh secret set APPLE_PASSWORD               # App-specific password (issued at appleid.apple.com; the regular password does not work)
 printf '2YN5TLNQ9J' | gh secret set APPLE_TEAM_ID
 ```
 
-登録確認: `gh secret list` (上記 6 つ)。keychain のパスワードはワークフロー内で
-`openssl rand` から生成するので Secret は不要 (旧構成の `KEYCHAIN_PASSWORD` は廃止)。
+Check the registration: `gh secret list` (the 6 above). The keychain password is generated inside the workflow
+from `openssl rand`, so no Secret is needed for it (`KEYCHAIN_PASSWORD` from the old setup has been retired).
 
-## トラブルシューティング
+## Troubleshooting
 
-- **`draft` ジョブが "found N draft releases" で失敗する** → 同じ tag の draft が複数残っている
-  (この構成になる前の run の残骸)。どれに上げるか決められないので止めている。
-  `gh api repos/cyberneura/queryfolio/releases --jq '.[] | select(.draft) | [.id, .tag_name, .created_at] | @tsv'`
-  で確認し、不要な方を `gh api -X DELETE repos/cyberneura/queryfolio/releases/<id>` で消して再実行する。
-- **push したのにリリースされない (plan が release=false)** → その version が公開済みか、
-  公開中の最新より古い。plan ジョブのログに理由が出る。
-- **`spctl` が `source=Developer ID` / `Unnotarized Developer ID` (Notarized でない)** → 公証が走っていない。
-  .app なら macOS ジョブの "Build" ステップ (tauri CLI の notarize)、dmg なら "Notarize the dmg"
-  ステップのログ (`notarytool` の結果と、Invalid の時の `notarytool log`) を確認し、
-  `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` を疑う。
-  app 用パスワードは通常の Apple ID パスワードでは代用できない。
-- **macOS ジョブが署名で失敗する** → `APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` 未設定か、
-  `.p12` に秘密鍵が入っていない。"Import Apple Developer certificate" ステップの
-  `security find-identity` の出力に Developer ID が出ているか見る。
-- **Windows ジョブだけ失敗して Release が draft のまま** → Release は公開されない (仕様)。
-  原因を直して push (または Actions の "Re-run failed jobs") すれば同じ draft に上げ直して公開する。
-  急ぐなら手で `gh release edit v<version> --draft=false --latest` で macOS 分だけ公開できる。
-- **`pnpm release` が "working tree is not clean" / "does not match origin/main" で止まる** →
-  ビルドは origin/main の内容で走るため、ローカルとズレたままリリースさせない安全弁。
-  commit / push してから再実行する。
+- **The `draft` job fails with "found N draft releases"** → multiple drafts with the same tag are left over
+  (remnants of runs from before this setup). It stops because it cannot decide which one to upload to.
+  Check with `gh api repos/cyberneura/queryfolio/releases --jq '.[] | select(.draft) | [.id, .tag_name, .created_at] | @tsv'`,
+  delete the unneeded ones with `gh api -X DELETE repos/cyberneura/queryfolio/releases/<id>`, and re-run.
+- **Pushed but nothing was released (plan returned release=false)** → that version is already published, or it is
+  older than the latest published one. The reason appears in the plan job's log.
+- **`spctl` shows `source=Developer ID` / `Unnotarized Developer ID` (not Notarized)** → notarization did not run.
+  For the .app, check the log of the macOS job's "Build" step (the tauri CLI's notarize); for the dmg, check the log of the "Notarize the dmg"
+  step (the `notarytool` result, and `notarytool log` when Invalid), and
+  suspect `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID`.
+  The app-specific password cannot be substituted with the regular Apple ID password.
+- **The macOS job fails at signing** → `APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` is not set, or
+  the `.p12` does not contain the private key. Check whether the Developer ID appears in the output of
+  `security find-identity` in the "Import Apple Developer certificate" step.
+- **Only the Windows job fails and the Release stays a draft** → the Release is not published (by design).
+  Fix the cause and push (or use "Re-run failed jobs" in Actions), and it uploads to the same draft again and publishes it.
+  If you are in a hurry, you can publish just the macOS part by hand with `gh release edit v<version> --draft=false --latest`.
+- **`pnpm release` stops with "working tree is not clean" / "does not match origin/main"** →
+  the build runs on the contents of origin/main, so this is a safety valve that refuses to release while local is out of sync.
+  Commit / push, then run it again.
