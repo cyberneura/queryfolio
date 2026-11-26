@@ -55,8 +55,11 @@ the settings it has"** (unknown engine, a bad `ssl_mode` on mysql / postgres, an
 `ssl_root_cert` paired with a mode that never verifies it) — not "there is a stray value in
 the config".
 
-On macOS call the binary inside the bundle; `open -a Queryfolio --args --list-servers` gives
-you no output back:
+The examples call `queryfolio` from the PATH. On macOS that command exists only after the
+user chose **Queryfolio › Install Command Line Tools…** (a symlink at
+`/usr/local/bin/queryfolio`). If `command -v queryfolio` finds nothing, call the binary inside
+the bundle instead — it takes the same arguments — and suggest the menu item to the user.
+`open -a Queryfolio --args --list-servers` gives you no output back:
 
 ```bash
 /Applications/Queryfolio.app/Contents/MacOS/queryfolio --list-servers
