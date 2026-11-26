@@ -11,6 +11,10 @@ import type {
 } from "$lib/api";
 import { merge3 } from "$lib/mergeText";
 import { sessionStatementReason } from "$lib/batchSession";
+import { resetConversations } from "$lib/agentChat/conversations.svelte";
+import { oncePrompt, schemaSummary } from "$lib/agentChat/context";
+import type { AgentEditorContext } from "$lib/agentChat/context";
+import { changesSchema, sameSchemaMap } from "$lib/editor/sqlCompletion";
 import {
   RUN_LOG_FETCH_MAX_ROWS,
   planRunLogWrite,
@@ -146,6 +150,13 @@ let aiInfo = $state<AiInfo | null>(null);
 let aiError = $state<string | null>(null);
 /// Generating SQL with AI (button spinner, prevents double submit)
 let aiGenerating = $state(false);
+/// Coding agent settings (null until loaded or when the `agent:` section is invalid)
+let agentInfo = $state<api.AgentInfo | null>(null);
+/// Why the agent settings could not be resolved (shown where the agent would be used)
+let agentError = $state<string | null>(null);
+/// ID of the one-shot agent run started from the inline AI field (null when none is running)
+let agentRunId = $state<string | null>(null);
+let nextAgentRunSeq = 0;
 /// Explaining the execution plan with AI (button spinner, prevents double submit)
 let aiAnalyzing = $state(false);
 /// Markdown of the AI execution plan explanation (non-null only while the modal is shown)
@@ -258,6 +269,38 @@ const getActiveEditorTab = (): EditorTab | null =>
 /// switches, only the result of the latest request is applied even if an old response resolves later.
 let schemaMapGeneration = 0;
 
+/// Schema maps fetched so far, by connection + active schema (CYBERNEURA-DEV-1355). Selecting a
+/// connection clears the editor's map and re-fetches it; with this cache the completion of a
+/// connection seen before works at once (stale-while-revalidate) instead of being empty until the
+/// catalog query returns. Showing it opens no connection. Cleared by a settings reload.
+const schemaMapCache = new Map<string, Record<string, string[]>>();
+const schemaMapCacheKey = (connection: string, schema: string | null) =>
+  `${connection}\u0001${schema ?? ""}`;
+
+/// Guards on writing a fetched map into schemaMapCache: the latest request per key wins (an
+/// older fetch resolving late must not overwrite the result of a refresh after a DDL), and
+/// nothing fetched before a settings reload is kept (the same connection name may now point at
+/// another server).
+const schemaMapRequestSeq = new Map<string, number>();
+let schemaMapCacheEpoch = 0;
+
+/// Connections whose backend schema cache is known to be stale (a DDL ran but the catalog was
+/// not re-read because the connection was about to be closed). The next fetch for them asks
+/// the backend to discard its cache first.
+const staleSchemaConnections = new Set<string>();
+
+const dropSchemaMapCache = (connection: string) => {
+  for (const key of [...schemaMapCache.keys()]) {
+    if (key.startsWith(`${connection}\u0001`)) {
+      schemaMapCache.delete(key);
+    }
+  }
+};
+
+/// Delays before retrying a failed schema map fetch. A failure used to leave the editor without
+/// completion until the next connection / schema switch
+const SCHEMA_MAP_RETRY_DELAYS_MS = [2_000, 10_000];
+
 /// Generation number of the running applyConnectionContext. On successive connection switches, checks
 /// before commit whether this is the latest generation, so that the response of a slow connection resolving later
 /// does not overwrite the new connection's files / schemas / activeSchema (same intent as schemaMapGeneration)
@@ -310,6 +353,144 @@ const loadAiInfo = async () => {
     aiInfo = null;
     aiError = toErrorMessage(e);
   }
+  try {
+    agentInfo = await api.getAgentInfo();
+    agentError = null;
+  } catch (e) {
+    agentInfo = null;
+    agentError = toErrorMessage(e);
+  }
+};
+
+/// What a coding agent is told about the editor, as one consistent snapshot: the connection,
+/// the open query file (as an absolute path), `statement` (the statement at the cursor, which
+/// the caller reads from the editor in the same tick as this call) and the table list.
+/// null when `connection` is not the selected one.
+///
+/// **The open file is saved first**, so that the agent reads what the editor shows; the agent
+/// then edits the file on disk and the external-change watcher brings the edit back.
+///
+/// Everything is captured before the first await and checked after the last one: the user can
+/// switch tabs or connections while the file is being saved, and the statement of one file must
+/// not be sent with the path of another, nor the tables of another connection.
+const agentEditorContext = async (
+  connection: string,
+  statement: string,
+): Promise<{ context: AgentEditorContext; schema: string } | null> => {
+  if (connection !== selectedConnection) {
+    return null;
+  }
+  const tab = getActiveEditorTab();
+  const openTab = tab && tab.connection === connection ? tab : null;
+  const database = activeSchema;
+  const schema = schemaSummary(schemaMap);
+  const info = connections.find((c) => c.name === connection);
+  const saved = await flushPendingSave();
+  let filePath: string | null = null;
+  if (openTab) {
+    try {
+      filePath = await api.queryFilePath(connection, openTab.file);
+    } catch {
+      // The path is context only; the message is still worth sending without it
+    }
+  }
+  // The tab was closed meanwhile: there is no open file to talk about any more
+  const stillOpen = openTab !== null && editorTabs.some((t) => t.id === openTab.id);
+  return {
+    context: {
+      connection,
+      engine: info?.engine ?? "sql",
+      database,
+      filePath: stillOpen ? filePath : null,
+      statement: stillOpen ? statement : "",
+      unsaved: stillOpen && (!saved || openTab.dirty || openTab.conflicted === true),
+    },
+    schema,
+  };
+};
+
+/// Run the configured agent once from the inline AI field: it edits the open query file as
+/// instructed and its final message is shown in a toast. Returns true on success (used to
+/// decide whether to close the input field).
+const runAgentOnce = async (instruction: string, statement: string): Promise<boolean> => {
+  const connection = selectedConnection;
+  if (!connection) {
+    toast.warning("Select a connection first");
+    return false;
+  }
+  if (!getActiveEditorTab()) {
+    toast.warning("Select or create a query file first");
+    return false;
+  }
+  if (!instruction.trim()) {
+    toast.warning("Enter an instruction for the agent");
+    return false;
+  }
+  if (aiGenerating) {
+    return false;
+  }
+  aiGenerating = true;
+  const runId = `once-${Date.now()}-${++nextAgentRunSeq}`;
+  agentRunId = runId;
+  const agentName = agentInfo?.provider_name ?? "The agent";
+  try {
+    const snapshot = await agentEditorContext(connection, statement);
+    if (!snapshot || !snapshot.context.filePath) {
+      toast.warning("Select or create a query file first");
+      return false;
+    }
+    if (snapshot.context.unsaved) {
+      // The agent edits the file on disk. Editing an older copy than the editor shows would
+      // end in a conflict, or in losing one side
+      toast.warning("Save the query file first", {
+        description: "The editor has changes that could not be saved (or a conflict to resolve).",
+      });
+      return false;
+    }
+    if (agentRunId !== runId) {
+      // Cancelled while the file was being saved
+      return false;
+    }
+    const result = await api.agentRunOnce(
+      runId,
+      connection,
+      oncePrompt(instruction, snapshot.context, snapshot.schema),
+    );
+    // Bring the agent's edit into the editor now instead of at the next watcher tick
+    await fileWatchTick();
+    toast.success(`${agentName} finished`, {
+      description: result.output || "(no message)",
+      duration: 15_000,
+    });
+    return true;
+  } catch (e) {
+    const message = toErrorMessage(e);
+    // The agent may have edited the file before it was stopped or failed
+    await fileWatchTick();
+    if (message === api.CANCELLED_ERROR_MESSAGE) {
+      toast.info(`${agentName} was stopped`);
+    } else {
+      toast.error(`${agentName} failed`, { description: message, duration: 15_000 });
+    }
+    return false;
+  } finally {
+    if (agentRunId === runId) {
+      agentRunId = null;
+    }
+    aiGenerating = false;
+  }
+};
+
+/// Stop the one-shot agent run started from the inline AI field
+const cancelAgentOnce = () => {
+  const runId = agentRunId;
+  if (runId) {
+    // Clearing the ID also stops a run that has not been sent yet (runAgentOnce checks it
+    // after preparing the context); the backend remembers the cancellation for a run whose
+    // command is still on its way
+    agentRunId = null;
+    void api.agentCancelOnce(runId).catch(() => {});
+  }
 };
 
 /// Reload the connection settings (pools and SSH tunnels are discarded too).
@@ -360,6 +541,10 @@ const reloadConnectionsUnguarded = async (): Promise<boolean> => {
     }
   }
   stopBatchErrorPrompts(() => true);
+  // The backend ends the chat agents in reset_connections (their provider, directories and
+  // connections may all have changed); drop their conversations with them
+  resetConversations();
+  cancelAgentOnce();
   try {
     await api.resetConnections();
   } catch (e) {
@@ -410,12 +595,18 @@ const reloadConnectionsUnguarded = async (): Promise<boolean> => {
   activeSchema = null;
   aiInfo = null;
   aiError = null;
+  agentInfo = null;
+  agentError = null;
   aiAnalysis = null;
   aiExplanation = null;
   // Chat abort and discard were done before resetConnections (clearChat)
   // Advance the generation and discard so that an in-flight fetch cannot later write an old map
   schemaMapGeneration++;
   schemaMap = null;
+  // The reloaded settings may point the same connection name at another server
+  schemaMapCache.clear();
+  schemaMapCacheEpoch++;
+  staleSchemaConnections.clear();
   await loadConnections();
   if (errorMessage) {
     return false;
@@ -430,24 +621,89 @@ const reloadConnectionsUnguarded = async (): Promise<boolean> => {
 };
 
 /// Re-fetch the schema map for SQL completion in the background.
-/// Completion is only an aid, so on failure continue without completion and do not notify.
-const loadSchemaMap = async () => {
+/// Completion is only an aid, so on failure continue without completion and do not notify
+/// (it is retried a couple of times, see SCHEMA_MAP_RETRY_DELAYS_MS).
+/// refresh: also discard the backend cache (after a statement that changed the schema).
+const loadSchemaMap = async (refresh = false, attempt = 0) => {
   const connection = selectedConnection;
   const generation = ++schemaMapGeneration;
   if (!connection) {
     schemaMap = null;
     return;
   }
-  // Clear first so that candidates from the old schema are not offered while fetching
-  schemaMap = null;
+  const cacheKey = schemaMapCacheKey(connection, activeSchema);
+  // Offer what was fetched for this connection + schema before while fetching; never the
+  // candidates of another schema
+  const cached = schemaMapCache.get(cacheKey) ?? null;
+  if (!sameSchemaMap(schemaMap, cached)) {
+    schemaMap = cached;
+  }
+  const wasStale = staleSchemaConnections.has(connection);
+  const requestSeq = (schemaMapRequestSeq.get(cacheKey) ?? 0) + 1;
+  schemaMapRequestSeq.set(cacheKey, requestSeq);
+  const epoch = schemaMapCacheEpoch;
   try {
-    const map = await api.getSchemaMap(connection);
-    // If a newer request has started, discard the old response
-    if (generation === schemaMapGeneration) {
+    const map = await api.getSchemaMap(connection, refresh || wasStale);
+    if (
+      epoch === schemaMapCacheEpoch &&
+      schemaMapRequestSeq.get(cacheKey) === requestSeq
+    ) {
+      schemaMapCache.set(cacheKey, map);
+      if (wasStale) {
+        staleSchemaConnections.delete(connection);
+      }
+    }
+    // If a newer request has started, discard the old response. An unchanged map is not
+    // reassigned: that would rebuild the editor's completion for nothing
+    if (generation === schemaMapGeneration && !sameSchemaMap(schemaMap, map)) {
       schemaMap = map;
     }
   } catch {
-    // Continue silently without completion (neither toast nor errorMessage)
+    // Continue silently without completion (neither toast nor errorMessage), and try again
+    // later unless something else has started a fetch or the connection has been closed
+    const delay = SCHEMA_MAP_RETRY_DELAYS_MS[attempt];
+    if (delay !== undefined) {
+      setTimeout(() => {
+        if (
+          generation === schemaMapGeneration &&
+          selectedConnection === connection &&
+          resourcesLoaded.has(connection)
+        ) {
+          void loadSchemaMap(refresh, attempt + 1);
+        }
+      }, delay);
+    }
+  }
+};
+
+/// Call after a statement ran successfully.
+///
+/// - A connection that is in use by an editor tab but not established (its first attempt
+///   failed and the query then reconnected by itself) gets its schema list / completion map now.
+/// - If the statement may have changed the tables / columns (CREATE / ALTER / DROP / RENAME),
+///   re-fetch the completion candidates so that the new table completes right away.
+///
+/// **Nothing is fetched for a connection without an editor tab**: it is about to be
+/// disconnected (maybeDisconnectIfIdle runs right after this), and a catalog query arriving
+/// after the disconnect would reopen its tunnel with nothing left to close it. Its caches are
+/// only marked stale, and the next fetch refreshes them.
+const refreshSchemaAfterStatement = (connection: string, sql: string) => {
+  const schemaChanged = changesSchema(sql);
+  const inUse = editorTabs.some((t) => t.connection === connection);
+  if (schemaChanged) {
+    dropSchemaMapCache(connection);
+    staleSchemaConnections.add(connection);
+  }
+  if (!inUse || connection !== selectedConnection) {
+    return;
+  }
+  if (!resourcesLoaded.has(connection)) {
+    // loadSchemaMap (run by the import) sees the stale mark and refreshes
+    void ensureConnectionResources(connection);
+    return;
+  }
+  if (schemaChanged) {
+    void loadSchemaMap(true);
   }
 };
 
@@ -553,9 +809,11 @@ const applyConnectionContext = async (name: string): Promise<boolean> => {
   // import the full list and completion map via ensureConnectionResources when a file is loaded into the
   // editor / the schema browser is opened.
   schemas = schema ? [schema] : [];
-  // Clear the completion candidates for the new connection (also advance the generation to prevent a late write from an old fetch)
+  // Swap the completion candidates for the new connection's (also advance the generation to prevent
+  // a late write from an old fetch). A map fetched for this connection + schema before is offered
+  // at once — that opens no connection; it is re-fetched when the connection is established
   schemaMapGeneration++;
-  schemaMap = null;
+  schemaMap = schemaMapCache.get(schemaMapCacheKey(name, schema)) ?? null;
   if (resourcesLoaded.has(name)) {
     // When an already established connection is re-selected, the tunnel is still open, so re-fetch the schema
     // list / completion map reset above and restore the UI (dropdown / completion). This does not newly open
@@ -642,6 +900,33 @@ const ensureConnectionResources = async (connection: string) => {
   if (connection !== selectedConnection || resourcesLoaded.has(connection)) {
     return;
   }
+  // One import per connection lifecycle at a time: several triggers arrive together (opening a
+  // file activates its tab first), and each would issue its own catalog requests. The key
+  // carries the lifecycle / reset generations: an import that started before a disconnect is
+  // rejected when it completes (loadConnectionSchemaResources), so a tab reopened meanwhile must
+  // start its own instead of joining that one. A failed import leaves no entry, so the next
+  // trigger retries
+  const key = [
+    connection,
+    connectionLifecycleGen.get(connection) ?? 0,
+    connectionsResetGen,
+  ].join("\u0001");
+  const running = resourceImports.get(key);
+  if (running) {
+    return running;
+  }
+  const run = importConnectionResources(connection).finally(() => {
+    if (resourceImports.get(key) === run) {
+      resourceImports.delete(key);
+    }
+  });
+  resourceImports.set(key, run);
+  return run;
+};
+
+const resourceImports = new Map<string, Promise<void>>();
+
+const importConnectionResources = async (connection: string) => {
   // Registering before success would mistake a failed connection for "established" and miss retries, so
   // register after listSchemas (which opens the connection) succeeds. If a disconnect intervened during the import,
   // loadConnectionSchemaResources returns false (and closes the reopened tunnel again),
@@ -786,6 +1071,14 @@ const activateEditorTab = async (id: number, viaCycle = false) => {
   lastActiveTabByConnection.set(tab.connection, id);
   if (!tabCycle) {
     touchTabMru(id);
+  }
+  // A connection whose first attempt failed (VPN down, tunnel timeout) is not established, and
+  // nothing fetched its schema list / completion map again until another file was opened. Coming
+  // back to one of its tabs is an opportunity to use the connection, like opening a file
+  // (no-op when already established). Not when the tab was closed while this was awaiting:
+  // closing the last tab disconnects, and this would open the connection again
+  if (editorTabs.some((t) => t.id === id)) {
+    void ensureConnectionResources(tab.connection);
   }
 };
 
@@ -1748,18 +2041,20 @@ const isBatchRunning = (connection: string): boolean =>
 /// If there is an active non-pinned tab that is not running, reuse it; otherwise create a new tab.
 /// On reaching the limit, discard the oldest non-pinned tab that is not running.
 /// Returns null when no room can be made (already notified by toast).
-const prepareTargetTab = (): ResultTab | null => {
+const prepareTargetTab = (newTab = false): ResultTab | null => {
   const current = resultTabs.find((t) => t.id === activeTabId);
   // A running tab is not reused: queries on different connections run in parallel, so
   // the active tab may still be running another connection's query. Reusing it would
-  // overwrite that query's result, so the new query gets its own tab
-  if (current && !current.pinned && !current.running) {
+  // overwrite that query's result, so the new query gets its own tab.
+  // newTab: always open a new tab (following a foreign key keeps the result it came from)
+  if (!newTab && current && !current.pinned && !current.running) {
     return current;
   }
   if (resultTabs.length >= MAX_RESULT_TABS) {
-    // A running tab is not discarded either (its result would be thrown away on completion)
+    // A running tab is not discarded either (its result would be thrown away on completion).
+    // With newTab the active tab is the result being navigated from, so it stays too
     const oldest = resultTabs
-      .filter((t) => !t.pinned && !t.running)
+      .filter((t) => !t.pinned && !t.running && !(newTab && t.id === activeTabId))
       .reduce<ResultTab | null>(
         (acc, t) => (acc === null || t.executedAt < acc.executedAt ? t : acc),
         null,
@@ -1846,6 +2141,9 @@ const executeTab = async (
   tab.result = result;
   tab.error = error;
   tab.cancelled = cancelled;
+  if (result) {
+    refreshSchemaAfterStatement(tab.connection, tab.sql);
+  }
   // If `\c` switched the active schema, make the display follow
   // (the switch itself is already done in the backend)
   if (result?.switched_schema) {
@@ -2004,6 +2302,11 @@ const fetchResultWithoutDefaultLimit = async (
 const runQuery = (sql: string): Promise<QueryResult | null> =>
   runQueryInTab(sql);
 
+/// Run SQL in a new result tab, keeping the active one (CYBERNEURA-DEV-1319: following a
+/// foreign key from a result cell). Same guards and history as runQuery
+const runQueryInNewTab = (sql: string): Promise<QueryResult | null> =>
+  runQueryInTab(sql, undefined, true);
+
 /// What the Run and Log re-fetch produced (see runQueryForLog).
 /// shown = the displayed result is the whole result, or the statement is not safe to run again
 /// (log the displayed one) / full = the result fetched without default_limit /
@@ -2082,6 +2385,7 @@ const runQueryInTab = async (
     connection: string,
     schema: string | null,
   ) => Promise<void>,
+  newTab = false,
 ): Promise<QueryResult | null> => {
   // Fix the target connection before the await. Even if the connection switches during later awaits (save,
   // dangerous-statement confirmation modal), the confirmed connection and the executing connection must not diverge
@@ -2123,7 +2427,7 @@ const runQueryInTab = async (
     return null;
   }
   errorMessage = null;
-  const tab = prepareTargetTab();
+  const tab = prepareTargetTab(newTab);
   if (!tab) {
     return null;
   }
@@ -2311,6 +2615,7 @@ const executeBatchInTab = async (tab: ResultTab, statements: string[]) => {
         tab.schema = result.switched_schema;
         applySwitchedSchema(connection, result.switched_schema);
       }
+      refreshSchemaAfterStatement(connection, statement);
       outcomes[i] = {
         status: "ok",
         rows: result ? (result.affected_rows ?? result.row_count) : null,
@@ -3201,6 +3506,16 @@ export default {
   get aiGenerating() {
     return aiGenerating;
   },
+  get agentInfo() {
+    return agentInfo;
+  },
+  get agentError() {
+    return agentError;
+  },
+  /// Whether a one-shot agent run (inline AI field) is in progress and can be stopped
+  get agentRunning() {
+    return agentRunId !== null;
+  },
   get aiAnalyzing() {
     return aiAnalyzing;
   },
@@ -3261,6 +3576,12 @@ export default {
   loadConnections,
   loadAiInfo,
   generateSql,
+  runAgentOnce,
+  cancelAgentOnce,
+  agentEditorContext,
+  /// Check the open query files for changes made outside the editor right now (an agent
+  /// finished a turn) instead of waiting for the next watcher tick
+  checkOpenFilesForExternalChanges: () => fileWatchTick(),
   loadSchemaMap,
   ensureConnectionResources,
   reloadConnections,
@@ -3290,6 +3611,7 @@ export default {
   dismissFixSuggestion,
   isConnectionRunning,
   runQuery,
+  runQueryInNewTab,
   runBatch,
   fetchResultWithoutDefaultLimit,
   explainQuery,

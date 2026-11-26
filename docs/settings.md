@@ -21,6 +21,7 @@ in the repository root.
 - [Overriding config from an external source (`config_override_command`)](#overriding-config-from-an-external-source-config_override_command)
 - [Fetching a password at connect time (`password_command`)](#fetching-a-password-at-connect-time-password_command)
 - [AI features (`ai`)](#ai-features-ai)
+- [Coding agent (`agent`)](#coding-agent-agent)
 - [Auto `LIMIT` (`default_limit`)](#auto-limit-default_limit)
 - [Query file storage (`sqlfiles_dir`, `folder_name`)](#query-file-storage-sqlfiles_dir-folder_name)
 - [Environment variable override (`QUERYFOLIO_CONFIG_YAML`)](#environment-variable-override-queryfolio_config_yaml)
@@ -45,7 +46,62 @@ save. (On Windows, the platform's default file permissions apply.)
 
 ## Editing the config
 
-You can edit the file with any text editor, or from inside the app:
+You can edit the file with any text editor, or from inside the app.
+
+### Settings window
+
+Menu bar **Config → Settings…** (Cmd/Ctrl+,) — also the gear button in the
+toolbar — opens a form for the settings that are not connections:
+`default_limit`, `sqlfiles_dir`, `config_override_command`, the `ai:`
+section and the `agent:` section (provider, working directory, accepting
+edits; per-connection directories are edited in the YAML). It also lists your connection templates and the query file folder of
+each connection (read-only; edit those in the YAML). Each field has a one-line
+explanation and a **Reset to default** button (which removes the key from the
+file), and invalid values are shown next to the field and are not saved.
+
+- **It only writes your local config file.** Values that
+  `config_override_command` provides (for example an API key kept in
+  1Password) are shown as *Overridden by 1Password (config_override_command)*,
+  cannot be edited here, and are never copied into config.yml.
+- **API keys are never displayed.** For the AI API key you choose between
+  *Get it from 1Password (recommended)* — the window shows the YAML to store in
+  1Password and an `op read "op://<vault>/<item>/<field>"` command to put in
+  `config_override_command`, both with a Copy button — and *Enter it here*,
+  which stores it in config.yml as plain text.
+- **Test** next to `config_override_command` runs the command and tells you
+  how many values it would override. The values themselves are not shown.
+- Saving rewrites the whole file from its structure, so **comments are
+  removed**. If the file has comments, you are asked once before the first
+  such save. Before the first overwrite, the previous file is kept next to it
+  as `config.yml.bak`. Use **Edit as text** (or Config → Edit config.yml) if
+  you want to keep your comments.
+- If config.yml is a symlink (dotfiles), the file it points to is updated and
+  the link is kept.
+- While `QUERYFOLIO_CONFIG_YAML` is set, or the file cannot be parsed, the
+  window is read-only.
+
+### Connection editor
+
+The pencil button in the CONNECTIONS header (or right-click a connection, or
+**Add a connection…** when there are none) opens a list of your connections
+with a form: add, edit, duplicate, delete, reorder, and put connections into
+groups. The form shows only the fields the chosen engine uses.
+
+- Passwords are never shown. Choose **Get it with a command — password_command
+  (1Password recommended)**, e.g. `op read "op://<vault>/<item>/password"`, or
+  **Enter it here** (stored as plain text in config.yml). The same warning as
+  [below](#fetching-a-password-at-connect-time-password_command) applies: the
+  command runs on your Mac.
+- **Test connection** connects once with the settings in the form, without
+  saving them.
+- If `config_override_command` provides `servers`, that list replaces the local
+  one, so the editor is read-only and points you to **View override YAML**.
+- Saving rewrites config.yml like the Settings window does (comments are
+  removed after you confirm; `config.yml.bak` is kept before the first
+  overwrite). If config.yml changed while the editor was open, the save is
+  refused; reopen the editor.
+
+### Text editor
 
 - Menu bar **Config → Edit config.yml** opens a built-in editor (with YAML
   syntax highlighting and lint errors shown inline). While there are no
@@ -758,6 +814,41 @@ not leave a query running.
 Every query it ran is listed above the answer,
 so you can check what it looked at. The conversation is cleared when you switch
 connections (the schema in the prompt changes) and is not persisted to disk.
+
+## Coding agent (`agent`)
+
+Use Claude Code or Codex for the **Chat** pane and the **AI** field above the
+editor, instead of the built-in assistant of the `ai` section. Queryfolio starts
+the `claude` / `codex` command you have installed and uses its own login (your
+subscription); there is no API key to configure. How it works, what the agent is
+told and how approvals are handled: [agent-chat.md](agent-chat.md).
+
+```yaml
+agent:
+  provider: claude            # claude | codex
+  directory: ~/repos/my-app   # optional
+  directories:                # optional, by connection name
+    reporting: ~/repos/reporting
+  auto_accept_edits: true     # optional (default: true)
+```
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `provider` | yes | `claude` (Claude Code) or `codex`. Without it (or with `none`) no agent is used and the Chat pane stays the built-in assistant. An unknown value is an error. |
+| `directory` | no | Working directory of the agent for every connection: an absolute path, `~` allowed. Default: the query file folder of the connection. Set it to a clone of the application's repository to let the agent read the code; the query file folder stays reachable. |
+| `directories` | no | Working directory per connection name. Wins over `directory`. |
+| `auto_accept_edits` | no | Default `true`: Claude Code applies file edits inside its directories without asking (its `acceptEdits` mode). Commands always ask for approval in the Chat pane. `false`: every edit asks too. Codex follows its own `~/.codex/config.toml`. |
+
+The directory must exist when the agent starts. A relative path is an error.
+
+On macOS / Linux `claude` / `codex` are started through your login shell (so the
+PATH of your terminal applies, including what `.zshrc` adds). On Windows they are
+looked up on PATH (`.exe` / `.cmd`); the Windows side has not been tried on a real
+machine. The agent settings can also
+come from `config_override_command`, like any other key.
+
+With an agent configured, the other AI helpers (Explain SQL, Fix with AI,
+EXPLAIN analysis) keep using the `ai` section.
 
 ## Auto `LIMIT` (`default_limit`)
 

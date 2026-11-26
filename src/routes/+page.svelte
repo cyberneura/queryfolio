@@ -24,7 +24,8 @@
   import EditorTabs from "$lib/components/EditorTabs.svelte";
   import ReplaceMultilinePane from "$lib/components/ReplaceMultilinePane.svelte";
   import ResultsPane from "$lib/components/ResultsPane.svelte";
-  import ConfigInfoModal from "$lib/components/ConfigInfoModal.svelte";
+  import SettingsModal from "$lib/components/SettingsModal.svelte";
+  import ConnectionsModal from "$lib/components/ConnectionsModal.svelte";
   import ConfigEditorModal from "$lib/components/ConfigEditorModal.svelte";
   import LicensesModal from "$lib/components/LicensesModal.svelte";
   import AiAnalysisModal from "$lib/components/AiAnalysisModal.svelte";
@@ -33,11 +34,16 @@
   import RunLogConfirmModal from "$lib/components/RunLogConfirmModal.svelte";
   import SearchModal from "$lib/components/SearchModal.svelte";
   import ChatPane from "$lib/components/ChatPane.svelte";
+  import AgentChatPane from "$lib/components/AgentChatPane.svelte";
+  import { setPromptBuilder } from "$lib/agentChat/conversations.svelte";
+  import { chatPrompt } from "$lib/agentChat/context";
   import ProcessListPane from "$lib/components/ProcessListPane.svelte";
   import HelpPane from "$lib/components/HelpPane.svelte";
   import PaneDivider from "$lib/components/PaneDivider.svelte";
 
   let showSettings = $state(false);
+  /// Connection editor (CYBERNEURA-DEV-1299). undefined = closed; a name = open on that connection
+  let connectionsEditor = $state<{ name: string | null } | null>(null);
   let showSearch = $state(false);
   /// License list opened from the Third-Party Licenses menu item
   let showLicenses = $state(false);
@@ -67,6 +73,7 @@
   const isModalOpen = () =>
     showSearch ||
     showSettings ||
+    connectionsEditor !== null ||
     showLicenses ||
     configEditorMode !== null ||
     appStore.aiAnalysis !== null ||
@@ -497,6 +504,22 @@
     // Auto-reload / merge when an open query file is changed externally
     appStore.startFileWatcher();
 
+    // What the agent chat sends with each message: the request plus the editor context (the
+    // connection, the open query file, the statement at the cursor; the table list with the
+    // first message). Built when the message is actually sent, which can be later than when it
+    // was typed (queued messages)
+    setPromptBuilder(async (connection, request, first) => {
+      const snapshot = await appStore.agentEditorContext(
+        connection,
+        editor?.getCurrentStatement() ?? "",
+      );
+      // The connection is not the selected one any more: send the request without the editor
+      // context of another connection
+      return snapshot
+        ? chatPrompt(request, snapshot.context, first ? snapshot.schema : "")
+        : chatPrompt(request, null);
+    });
+
     // Reload on notification from the Reload config file menu item
     const unlistenPromise = listen("menu-reload-config", async () => {
       if (await appStore.reloadConnections()) {
@@ -516,6 +539,15 @@
       openConfigEditor("source");
     });
     // Third-Party Licenses menu item (app menu on macOS, directly under About in Help elsewhere)
+    // Config > Settings… (Cmd+, / Ctrl+,): the form for the general settings
+    const unlistenSettingsPromise = listen("menu-open-settings", () => {
+      // The text editor would be covered by the form; let it finish first
+      if (configEditorMode !== null) {
+        toast.warning("Close the config editor first");
+        return;
+      }
+      showSettings = true;
+    });
     const unlistenLicensesPromise = listen("menu-show-licenses", () => {
       showLicenses = true;
     });
@@ -617,6 +649,7 @@
       void unlistenEditPromise.then((unlisten) => unlisten());
       void unlistenEditSourcePromise.then((unlisten) => unlisten());
       void unlistenLicensesPromise.then((unlisten) => unlisten());
+      void unlistenSettingsPromise.then((unlisten) => unlisten());
       void unlistenCloseTabPromise.then((unlisten) => unlisten());
       void unlistenOpenFilePromise.then((unlisten) => unlisten());
       void unlistenOpenFileErrPromise.then((unlisten) => unlisten());
@@ -661,7 +694,16 @@
        only one axis makes the other compute to auto, so hidden is set explicitly) -->
   <div class="flex min-h-0 flex-1 overflow-x-auto overflow-y-hidden">
     <div class="shrink-0" style="width: {connectionsWidth}px">
-      <ConnectionsPane onEditConfig={() => openConfigEditor("config")} />
+      <ConnectionsPane
+        onEditConfig={() => openConfigEditor("config")}
+        onManageConnections={(name) => {
+          if (configEditorMode !== null) {
+            toast.warning("Close the config editor first");
+            return;
+          }
+          connectionsEditor = { name: name ?? null };
+        }}
+      />
     </div>
     <PaneDivider
       direction="vertical"
@@ -734,6 +776,7 @@
           showReplaceMultiline={hasMultilineSelection &&
             appStore.selectedFile !== null}
           onReplaceMultiline={openReplacePane}
+          getStatement={() => editor?.getCurrentStatement() ?? ""}
         />
       {/if}
       <div
@@ -836,11 +879,19 @@
         onDragEnd={() => saveLayoutValue("chatWidth", chatWidth)}
       />
       <div class="shrink-0" style="width: {chatWidth}px">
-        <ChatPane
-          supportsAi={selectedCapabilities?.supports_ai ?? false}
-          onClose={() => setChatOpen(false)}
-          onInsert={(sql) => appStore.insertSqlSnippet(sql)}
-        />
+        {#if appStore.agentInfo?.provider}
+          <!-- A coding agent is configured (`agent:`): the pane talks to Claude Code / Codex -->
+          <AgentChatPane
+            onClose={() => setChatOpen(false)}
+            onInsert={(sql) => appStore.insertSqlSnippet(sql)}
+          />
+        {:else}
+          <ChatPane
+            supportsAi={selectedCapabilities?.supports_ai ?? false}
+            onClose={() => setChatOpen(false)}
+            onInsert={(sql) => appStore.insertSqlSnippet(sql)}
+          />
+        {/if}
       </div>
     {/if}
 
@@ -909,10 +960,31 @@
   />
 {/if}
 
+{#if connectionsEditor !== null}
+  <ConnectionsModal
+    initialName={connectionsEditor.name}
+    onClose={() => {
+      connectionsEditor = null;
+    }}
+    onViewOverride={() => {
+      connectionsEditor = null;
+      openConfigEditor("source");
+    }}
+    onEditAsText={() => {
+      connectionsEditor = null;
+      openConfigEditor("config");
+    }}
+  />
+{/if}
+
 {#if showSettings}
-  <ConfigInfoModal
+  <SettingsModal
     onClose={() => {
       showSettings = false;
+    }}
+    onEditAsText={() => {
+      showSettings = false;
+      openConfigEditor("config");
     }}
   />
 {/if}

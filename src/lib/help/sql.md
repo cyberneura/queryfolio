@@ -31,8 +31,19 @@ psql-style shortcuts, translated to whichever catalog the engine uses:
 \l          -- databases
 \dt         -- tables
 \dv         -- views
-\d users    -- one table's columns, types and indexes
+\d users    -- one table's columns and types
+\d+ users   -- its definition: indexes, foreign keys, CREATE statement
 ```
+
+`\d+` shows what the engine can tell about the table as it is defined. MySQL
+returns the `SHOW CREATE TABLE` statement (indexes and foreign keys are in it).
+SQLite returns the CREATE statements of the table, its indexes and triggers,
+and one row per foreign key. PostgreSQL has no CREATE TABLE to return, so you
+get one row per index and constraint (primary key, unique, foreign key, check)
+with its definition, plus the foreign keys of other tables that point here.
+For a view it is the view's query. The same thing is on the right-click menu of
+a table in the TABLES pane ("Show definition"). It only reads the catalog, so
+it works with Writable off.
 
 Two more exist, but not everywhere: `\dn` (schemas) is PostgreSQL only, and
 `\du` (roles) is PostgreSQL and MySQL. Asking an engine for one it does not

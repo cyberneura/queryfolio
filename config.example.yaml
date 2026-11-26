@@ -306,6 +306,21 @@ server_templates:
     user: shared_user
     password: shared_password
 
+# --- Coding agent for the Chat pane and the AI field above the editor (optional) ---
+# Uses the `claude` (Claude Code) or `codex` command installed on this machine, with the login
+# that command already has (your subscription). No API key is configured here.
+# The agent is told which query file is open and edits it directly. See docs/agent-chat.md.
+# agent:
+#   provider: claude            # claude | codex
+#   # Working directory. Default: the query file folder of the connection. Point it at a clone
+#   # of the application's repository to let the agent read the code while it writes queries.
+#   directory: ~/repos/my-app
+#   # Working directory per connection name (wins over `directory`)
+#   directories:
+#     reporting: ~/repos/reporting
+#   # Default true: Claude Code applies file edits without asking each time (commands still ask)
+#   auto_accept_edits: true
+
 # --- AI (natural language -> SQL generation) settings (optional) ---
 # Can be written here (top level of the local config.yml) or at the top level of the YAML
 # fetched by config_override_command. After merging, the fetched YAML takes precedence

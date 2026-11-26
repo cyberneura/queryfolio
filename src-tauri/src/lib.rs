@@ -1,8 +1,11 @@
+mod agent;
+mod agent_process;
 mod ai;
 mod cli;
 mod cli_install;
 mod color;
 mod config;
+mod connections;
 mod db;
 mod dump;
 mod engines;
@@ -16,6 +19,7 @@ mod query_files;
 mod router;
 mod run_log_output;
 mod schema_info;
+mod settings;
 mod third_party_notices;
 mod tunnel;
 mod update_check;
@@ -389,6 +393,7 @@ impl AppState {
         if mysql_without_database(server, schema_key) {
             return Ok(Default::default());
         }
+        let epoch = self.schema_cache.epoch();
         let all = self
             .db
             .with_pool(server, db::PasswordRetry::Idempotent, |pool| async move {
@@ -405,9 +410,44 @@ impl AppState {
             })
             .collect();
         self.schema_cache
-            .put_all_columns(&server.name, schema_key, all)
+            .put_all_columns_if_current(&server.name, schema_key, all, epoch)
             .await;
         Ok(map)
+    }
+
+    /// Resolves the coding agent settings (None: no `agent:` provider, the built-in assistant
+    /// is used). Parsed from the merged config every time: it is cheap, and a separate cache
+    /// would be one more thing reset_connections has to clear.
+    async fn resolve_agent_config(&self) -> Result<Option<agent::AgentConfig>, AppError> {
+        agent::AgentConfig::from_value(self.resolve_config().await?.agent().as_ref())
+    }
+
+    /// Resolves what is needed to start the agent of a connection: the settings and the
+    /// directories. The connection's query file folder is created if it does not exist (the
+    /// agent runs there by default) and gets its `_queryfolio.md`, which tells the agent which
+    /// database the folder is for.
+    async fn resolve_agent_launch(
+        &self,
+        connection: &str,
+        chosen_directory: Option<&str>,
+    ) -> Result<(agent::AgentConfig, agent::AgentDirectories), AppError> {
+        let config = self.resolve_agent_config().await?.ok_or_else(|| {
+            AppError::Agent(
+                "No agent is configured. Add an 'agent:' section (provider: claude or codex) \
+                 to config.yml"
+                    .into(),
+            )
+        })?;
+        let server = self.find_server(connection).await?;
+        let query_dir = query_files::ensure_connection_dir(
+            &self.resolve_sqlfiles_dir().await?,
+            &server.sqlfiles_folder_name(),
+        )?;
+        let query_dir = std::path::absolute(&query_dir).unwrap_or(query_dir);
+        // Best effort: a failure to write the meta file does not stop the agent
+        let _ = self.refresh_folder_meta(&server).await;
+        let dirs = agent::resolve_directories(&config, connection, &query_dir, chosen_directory)?;
+        Ok((config, dirs))
     }
 
     /// Resolves the context common to AI commands (SQL generation / error fixing):
@@ -475,6 +515,9 @@ async fn reset_connections(
     *state.ai.lock().await = None;
     state.db.reset().await;
     state.schema_cache.clear().await;
+    // The agent provider, its directories and the connections may all have changed: end the
+    // running chat agents (the frontend drops its conversations on reload too)
+    agent_process::stop_all_chats(&app);
     // Editing the config can change whether config_override_command exists, so
     // re-determine whether the menu item for the copy view (not saveable) is needed
     rebuild_menu(&app);
@@ -1375,13 +1418,22 @@ async fn list_columns(
 
 /// Returns a map of table name -> column name list (to enhance SQL completion).
 /// If the cache lacks columns for all tables, fetches them in bulk and caches them.
+/// With refresh = true, discards the cache of the active schema and fetches again.
 #[tauri::command]
 async fn get_schema_map(
     state: tauri::State<'_, AppState>,
     connection: String,
+    refresh: Option<bool>,
 ) -> Result<std::collections::BTreeMap<String, Vec<String>>, AppError> {
     let server = state.find_server(&connection).await?;
     let schema_key = state.active_schema_key(&server).await;
+    if refresh.unwrap_or(false) {
+        // A statement that changed the schema just ran: the cached tables / columns are stale
+        state
+            .schema_cache
+            .invalidate_schema(&connection, &schema_key)
+            .await;
+    }
     state.resolve_schema_map(&server, &schema_key).await
 }
 
@@ -1420,6 +1472,24 @@ async fn get_primary_keys(
         .await
 }
 
+/// Returns the single-column foreign keys of a table (for following a reference from a result
+/// cell to the referenced row, CYBERNEURA-DEV-1319). Empty for engines without them.
+#[tauri::command]
+async fn get_foreign_keys(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    table: String,
+) -> Result<Vec<schema_info::ForeignKeyInfo>, AppError> {
+    let server = state.find_server(&connection).await?;
+    let table = &table;
+    state
+        .db
+        .with_pool(&server, db::PasswordRetry::Idempotent, |pool| async move {
+            schema_info::fetch_foreign_keys(&pool, table).await
+        })
+        .await
+}
+
 /// Applies cell edits in the result grid as a group of UPDATEs in one transaction.
 /// The resolution of writable is the same as run_query (config readonly takes precedence, then the switch).
 /// Returns the total number of affected rows.
@@ -1445,6 +1515,15 @@ async fn run_statements(
             db::run_statements(&pool, statements, readonly_guard, allow_dangerous).await
         })
         .await
+}
+
+/// Returns the coding agent settings the frontend needs (which provider, if any).
+/// If the `agent:` section is invalid (unknown provider etc.), an error is returned.
+#[tauri::command]
+async fn get_agent_info(state: tauri::State<'_, AppState>) -> Result<agent::AgentInfo, AppError> {
+    Ok(agent::AgentInfo::from_config(
+        state.resolve_agent_config().await?.as_ref(),
+    ))
 }
 
 /// Returns information on the AI config (configured / model). Does not include the api_key.
@@ -1983,6 +2062,194 @@ fn add_file_connection(path: String) -> Result<config::FileConnection, AppError>
     config::add_file_connection(&path)
 }
 
+/// The Settings window's view of the general settings (CYBERNEURA-DEV-1298, settings.rs).
+/// Which keys the override provides comes from the cached merged config, so opening the window
+/// does not run config_override_command again.
+#[tauri::command]
+async fn get_general_settings(
+    state: tauri::State<'_, AppState>,
+) -> Result<config::GeneralSettingsView, AppError> {
+    let merged = state.resolve_config().await;
+    config::general_settings_view(merged.as_deref())
+}
+
+/// Saves the Settings window's changes to the local config file. Keys the override provides
+/// are rejected (they are never written locally). The frontend reloads the config afterwards.
+#[tauri::command]
+async fn save_general_settings(
+    state: tauri::State<'_, AppState>,
+    patch: settings::SettingsPatch,
+    allow_drop_comments: bool,
+) -> Result<settings::SaveOutcome, AppError> {
+    // One save at a time from deciding the override keys to writing: otherwise a save that
+    // changes config_override_command could land between another save's decision and its
+    // write, which would then write a key with the stale decision
+    static SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _save = SAVE_LOCK.lock().await;
+    // If the merged config cannot be built while the file has config_override_command, which
+    // keys it provides is unknown, and everything but the command is treated as overridden
+    // (config::settings_override_keys)
+    let merged = state.resolve_config().await;
+    let override_keys = config::settings_override_keys(merged.as_deref());
+    config::save_general_settings(&patch, &override_keys, allow_drop_comments)
+}
+
+/// The connection editor's view (CYBERNEURA-DEV-1299, connections.rs). No secrets.
+#[derive(serde::Serialize)]
+struct ConnectionsEditorView {
+    config_path: String,
+    editable: bool,
+    readonly_reason: Option<String>,
+    /// config_override_command provides `servers` (the list is replaced wholesale), so the local
+    /// list has no effect
+    servers_overridden: bool,
+    override_error: Option<String>,
+    has_comments: bool,
+    backup_path: String,
+    backup_exists: bool,
+    local: Option<connections::LocalServers>,
+    /// Connection templates (local + override): name and engine, so the form can show the
+    /// fields of an engine inherited from a template
+    templates: Vec<TemplateRef>,
+    /// Engine names the form offers
+    engines: Vec<&'static str>,
+}
+
+#[derive(serde::Serialize)]
+struct TemplateRef {
+    name: String,
+    engine: Option<String>,
+}
+
+/// Connection templates for validation: from the merged config when it could be built
+/// (templates can live in the override), else from the local file.
+fn editor_templates(
+    merged: Result<&AppConfig, &AppError>,
+    local: &serde_yaml::Mapping,
+) -> Vec<serde_yaml::Value> {
+    let from = |doc: Option<&serde_yaml::Value>| {
+        doc.and_then(|v| v.as_sequence())
+            .cloned()
+            .unwrap_or_default()
+    };
+    match merged {
+        Ok(config) => from(config.raw("server_templates")),
+        Err(_) => from(local.get("server_templates")),
+    }
+}
+
+#[tauri::command]
+async fn get_connections_editor(
+    state: tauri::State<'_, AppState>,
+) -> Result<ConnectionsEditorView, AppError> {
+    let merged = state.resolve_config().await;
+    let override_keys = config::settings_override_keys(merged.as_deref());
+    let (path, text) = config::local_config_text()?;
+    let target = settings::resolve_write_target(&path).unwrap_or_else(|_| path.clone());
+    let backup = settings::backup_path_for(&target);
+    let mut view = ConnectionsEditorView {
+        config_path: path.display().to_string(),
+        editable: false,
+        readonly_reason: None,
+        servers_overridden: settings::is_overridden(&override_keys, "servers"),
+        override_error: merged.as_ref().err().map(|e| e.to_string()),
+        has_comments: settings::has_comments(&text),
+        backup_exists: backup.exists(),
+        backup_path: backup.display().to_string(),
+        local: None,
+        templates: Vec::new(),
+        engines: vec![
+            "postgres",
+            "mysql",
+            "mssql",
+            "sqlite",
+            "duckdb",
+            "redis",
+            "elasticsearch",
+            "dynamodb",
+        ],
+    };
+    match settings::parse_local(&text).and_then(|doc| {
+        let local = connections::read_local_servers(&doc)?;
+        Ok((doc, local))
+    }) {
+        Ok((doc, local)) => {
+            view.templates = editor_templates(merged.as_deref(), &doc)
+                .iter()
+                .filter_map(|t| {
+                    Some(TemplateRef {
+                        name: t.get("name")?.as_str()?.to_string(),
+                        engine: t.get("engine").and_then(|e| e.as_str()).map(str::to_string),
+                    })
+                })
+                .collect();
+            view.local = Some(local);
+            view.editable = !view.servers_overridden;
+            if view.servers_overridden {
+                view.readonly_reason = Some(
+                    "config_override_command provides servers, which replaces the whole list, so connections saved here would have no effect".into(),
+                );
+            }
+        }
+        Err(e) => view.readonly_reason = Some(e.to_string()),
+    }
+    Ok(view)
+}
+
+/// Saves the connection editor's list (replaces `servers`). The frontend reloads afterwards.
+#[tauri::command]
+async fn save_connections(
+    state: tauri::State<'_, AppState>,
+    patch: connections::ConnectionsPatch,
+    allow_drop_comments: bool,
+) -> Result<settings::SaveOutcome, AppError> {
+    static SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _save = SAVE_LOCK.lock().await;
+    let merged = state.resolve_config().await;
+    let override_keys = config::settings_override_keys(merged.as_deref());
+    if settings::is_overridden(&override_keys, "servers") {
+        return Err(AppError::Config(
+            "config_override_command provides servers, so connections cannot be saved here".into(),
+        ));
+    }
+    let (path, _) = config::local_config_text()?;
+    let merged_ref = merged.as_deref();
+    settings::save_doc_change(&path, allow_drop_comments, |doc| {
+        let templates = editor_templates(merged_ref, doc);
+        connections::apply_connections(doc, &patch, &templates)
+    })
+}
+
+/// "Test connection": connects with the edited (unsaved) entry and returns only whether it
+/// worked. Secrets of the entry it was read from are filled in on this side.
+#[tauri::command]
+async fn test_connection(
+    state: tauri::State<'_, AppState>,
+    server: connections::ServerEdit,
+    revision: String,
+) -> Result<String, AppError> {
+    let merged = state.resolve_config().await;
+    let (_, text) = config::local_config_text()?;
+    let doc = settings::parse_local(&text)?;
+    let templates = editor_templates(merged.as_deref(), &doc);
+    let server = connections::server_for_test(&server, &revision, &doc, &templates)?;
+    db::test_connection(&server).await?;
+    Ok(format!("Connected to {}", server.name))
+}
+
+/// "Show config file" in the Settings window: the same as Config > Reveal config folder.
+#[tauri::command]
+fn reveal_config_file() -> Result<(), AppError> {
+    reveal_config_folder()
+}
+
+/// Runs a config_override_command from the Settings window and returns only how many values it
+/// would override (never the values).
+#[tauri::command]
+async fn test_config_override_command(command: String) -> Result<usize, AppError> {
+    config::test_override_command(&command).await
+}
+
 /// Returns the raw YAML fetched by running config_override_command
 /// (for the copy view. It can be edited at the display destination but is not saved).
 #[tauri::command]
@@ -2276,6 +2543,11 @@ fn about_metadata(app: &tauri::AppHandle) -> tauri::menu::AboutMetadata<'_> {
 fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 
+    // The form for the general settings (CYBERNEURA-DEV-1298). Cmd+, is the platform's
+    // usual Settings shortcut; nothing else in the app uses it
+    let settings_item = MenuItemBuilder::with_id("open_settings", "Settings…")
+        .accelerator("CmdOrCtrl+,")
+        .build(app)?;
     let edit_config_item =
         MenuItemBuilder::with_id("edit_config_file", "Edit config.yml").build(app)?;
     let edit_source_item = MenuItemBuilder::with_id(
@@ -2372,7 +2644,9 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
     let reveal_item =
         MenuItemBuilder::with_id("reveal_config_folder", "Reveal config folder").build(app)?;
     let config_menu = {
-        let mut builder = SubmenuBuilder::new(app, "Config").item(&edit_config_item);
+        let mut builder = SubmenuBuilder::new(app, "Config")
+            .item(&settings_item)
+            .item(&edit_config_item);
         if show_source_item {
             builder = builder.item(&edit_source_item);
         }
@@ -2752,6 +3026,11 @@ pub fn run() {
                     eprintln!("[menu] {e}");
                 }
             }
+            "open_settings" => {
+                if let Err(e) = app.emit("menu-open-settings", ()) {
+                    eprintln!("[menu] failed to emit open settings event: {e}");
+                }
+            }
             "edit_config_file" => {
                 if let Err(e) = app.emit("menu-edit-config", ()) {
                     eprintln!("[menu] failed to emit edit config event: {e}");
@@ -2778,6 +3057,7 @@ pub fn run() {
             _ => {}
         })
         .manage(AppState::with_config(preflight_config))
+        .manage(agent_process::AgentState::default())
         .setup(|app| {
             use tauri::Manager;
             use tauri_plugin_deep_link::DeepLinkExt;
@@ -2841,6 +3121,7 @@ pub fn run() {
             list_columns,
             get_schema_map,
             get_primary_keys,
+            get_foreign_keys,
             list_processes,
             run_statements,
             get_ai_info,
@@ -2855,6 +3136,13 @@ pub fn run() {
             ai_fix_sql,
             ai_chat,
             cancel_ai_chat,
+            get_agent_info,
+            agent_process::agent_reset,
+            agent_process::agent_start,
+            agent_process::agent_write,
+            agent_process::agent_stop,
+            agent_process::agent_run_once,
+            agent_process::agent_cancel_once,
             get_config_info,
             third_party_notices,
             ensure_config_file,
@@ -2862,6 +3150,13 @@ pub fn run() {
             write_config_file,
             add_file_connection,
             read_override_config_yaml,
+            get_general_settings,
+            save_general_settings,
+            test_config_override_command,
+            reveal_config_file,
+            get_connections_editor,
+            save_connections,
+            test_connection,
             write_export_file,
             get_dump_info,
             preview_dump_command,
@@ -2869,8 +3164,15 @@ pub fn run() {
             cancel_dump,
             frontend_ready,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            // End the chat agents with the app. Waits (bounded) for them to exit, so that the
+            // SIGKILL fallback has run and no agent process outlives Queryfolio
+            if let tauri::RunEvent::Exit = event {
+                agent_process::stop_all_and_wait(app);
+            }
+        });
 }
 
 #[cfg(test)]

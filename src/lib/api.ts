@@ -33,6 +33,8 @@ export interface EngineCapabilities {
   supports_dump: boolean;
   /// Whether the PROCESS LIST pane is supported (mysql / postgres)
   supports_process_list: boolean;
+  /// Whether `\d+ <table>` (indexes, foreign keys, CREATE statement) is supported
+  supports_table_definition: boolean;
 }
 
 export interface ConnectionInfo {
@@ -326,8 +328,9 @@ export const listColumns = (connection: string, table: string) =>
   invoke<ColumnInfo[]>("list_columns", { connection, table });
 
 /// Returns a map of table name -> column name list (for SQL completion).
-export const getSchemaMap = (connection: string) =>
-  invoke<Record<string, string[]>>("get_schema_map", { connection });
+/// With refresh = true the backend discards its cache for the active schema first (after a DDL).
+export const getSchemaMap = (connection: string, refresh = false) =>
+  invoke<Record<string, string[]>>("get_schema_map", { connection, refresh });
 
 /// One column of a process row as returned by the server (for the detail view)
 export interface ProcessField {
@@ -364,6 +367,20 @@ export const listProcesses = (connection: string) =>
 export const getPrimaryKeys = (connection: string, table: string) =>
   invoke<string[]>("get_primary_keys", { connection, table });
 
+/// A single-column foreign key (corresponds to schema_info::ForeignKeyInfo)
+export interface ForeignKeyInfo {
+  column: string;
+  /// Schema / database of the referenced table (null for the main SQLite database)
+  ref_schema: string | null;
+  ref_table: string;
+  ref_column: string;
+}
+
+/// Returns the single-column foreign keys of a table (MySQL / PostgreSQL / SQLite; empty for
+/// the other engines). For following a reference from a result cell (CYBERNEURA-DEV-1319).
+export const getForeignKeys = (connection: string, table: string) =>
+  invoke<ForeignKeyInfo[]>("get_foreign_keys", { connection, table });
+
 /// Apply the result-grid cell edits as a group of UPDATEs in a single transaction.
 /// writable means the same as in runQuery (unspecified / false is read-only).
 /// Returns the total number of affected rows.
@@ -372,6 +389,27 @@ export const runStatements = (
   statements: string[],
   writable?: boolean,
 ) => invoke<number>("run_statements", { connection, statements, writable });
+
+/// Coding agent settings (corresponds to agent::AgentInfo in the backend)
+export interface AgentInfo {
+  /// null when no agent is configured (the chat pane uses the built-in assistant)
+  provider: "claude" | "codex" | null;
+  provider_name: string | null;
+  auto_accept_edits: boolean;
+}
+
+/// Returns the coding agent settings. Rejects if the `agent:` section is invalid.
+export const getAgentInfo = () => invoke<AgentInfo>("get_agent_info");
+
+/// Run the configured agent once in the connection's agent directory with `prompt` and return
+/// its final message (the inline AI field above the editor). The agent may edit files there
+/// (Claude Code has only its file tools; Codex is confined by its workspace-write sandbox).
+/// Rejects with CANCELLED_ERROR_MESSAGE when cancelled by runId.
+export const agentRunOnce = (runId: string, connection: string, prompt: string) =>
+  invoke<{ output: string; cwd: string }>("agent_run_once", { runId, connection, prompt });
+
+export const agentCancelOnce = (runId: string) =>
+  invoke<void>("agent_cancel_once", { runId });
 
 /// Returns the AI settings info. configured: false if there is no `ai:` section.
 /// Rejects if the section exists but is invalid (unknown provider, etc.).
@@ -580,3 +618,94 @@ export const runDump = (
 
 export const cancelDump = (dumpId: string) =>
   invoke<boolean>("cancel_dump", { dumpId });
+
+/// One message about a settings field (dotted key path such as `ai.model`).
+export interface FieldMessage {
+  field: string;
+  message: string;
+}
+
+/// The local `ai:` section as the Settings window shows it. The API key itself never comes back.
+export interface AiSettings {
+  present: boolean;
+  provider: string | null;
+  model: string | null;
+  base_url: string | null;
+  tool_reasoning_effort: string | null;
+  api_key_set: boolean;
+}
+
+/// The local `agent:` section as the Settings window shows it (settings.rs AgentSettings)
+export interface AgentSettings {
+  provider: string | null;
+  directory: string | null;
+  auto_accept_edits: boolean | null;
+  /// Number of per-connection entries in `agent.directories` (edited in the text editor)
+  directories: number;
+}
+
+/// Values of the general settings in the local config file (not the merged config).
+export interface LocalSettings {
+  default_limit: number | null;
+  sqlfiles_dir: string | null;
+  config_override_command: string | null;
+  ai: AiSettings;
+  agent: AgentSettings;
+  invalid: FieldMessage[];
+}
+
+/// Everything the Settings window shows (CYBERNEURA-DEV-1298, settings.rs). No secrets.
+export interface GeneralSettingsView {
+  config_path: string;
+  editable: boolean;
+  readonly_reason: string | null;
+  has_comments: boolean;
+  backup_path: string;
+  backup_exists: boolean;
+  local: LocalSettings;
+  /// Dotted paths that config_override_command provides (read-only in the form)
+  overridden: string[];
+  override_error: string | null;
+  effective_default_limit: number | null;
+  effective_sqlfiles_dir: string | null;
+  templates: { name: string; engine: string | null }[];
+  folders: { connection: string; folder: string; explicit: boolean }[];
+}
+
+/// One field of a save: write the value, or remove the key (= back to the default).
+/// A field that is absent from the patch is left as it is.
+export type Change<T> = { op: "set"; value: T } | { op: "unset" };
+
+export interface SettingsPatch {
+  default_limit?: Change<number>;
+  sqlfiles_dir?: Change<string>;
+  config_override_command?: Change<string>;
+  ai_provider?: Change<string>;
+  ai_model?: Change<string>;
+  ai_base_url?: Change<string>;
+  ai_tool_reasoning_effort?: Change<string>;
+  ai_api_key?: Change<string>;
+  agent_provider?: Change<string>;
+  agent_directory?: Change<string>;
+  agent_auto_accept_edits?: Change<boolean>;
+}
+
+export type SaveOutcome =
+  | { status: "saved"; path: string; changed: boolean; backup_created: string | null }
+  | { status: "needs_comment_confirmation" };
+
+export const getGeneralSettings = () =>
+  invoke<GeneralSettingsView>("get_general_settings");
+
+/// Save the Settings window's changes. With allowDropComments false, a file that has comments is
+/// not written and `needs_comment_confirmation` comes back (ask the user, then save again).
+export const saveGeneralSettings = (patch: SettingsPatch, allowDropComments: boolean) =>
+  invoke<SaveOutcome>("save_general_settings", { patch, allowDropComments });
+
+/// Run a config_override_command (saved or not) and return how many values it would override.
+/// The values themselves are never returned.
+export const testConfigOverrideCommand = (command: string) =>
+  invoke<number>("test_config_override_command", { command });
+
+/// Show config.yml in Finder / Explorer (same as Config > Reveal config folder).
+export const revealConfigFile = () => invoke<void>("reveal_config_file");

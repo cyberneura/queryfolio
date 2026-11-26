@@ -47,6 +47,18 @@ pub(crate) fn connection_dir(
     Ok(sqlfiles_dir.join(connection))
 }
 
+/// Return the connection's query file directory, creating it (0700, like the directories
+/// created for query files) if it does not exist yet. Used as the working directory of a
+/// coding agent, which needs an existing directory even before the first query file is saved.
+pub(crate) fn ensure_connection_dir(
+    sqlfiles_dir: &Path,
+    connection: &str,
+) -> Result<PathBuf, AppError> {
+    let dir = connection_dir(sqlfiles_dir, connection)?;
+    ensure_dir_700(&dir)?;
+    Ok(dir)
+}
+
 fn file_path(
     sqlfiles_dir: &Path,
     connection: &str,

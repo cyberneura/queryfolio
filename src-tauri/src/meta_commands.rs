@@ -275,6 +275,12 @@ pub(crate) fn validate_relation_name(name: &str) -> Result<&str, AppError> {
     Ok(name)
 }
 
+/// `\\d+` without a table name. psql lists all relations with extra columns there; here
+/// `\\d+` only shows one table's definition, so say what is missing instead of "unsupported".
+fn definition_needs_table() -> AppError {
+    AppError::Config("\\d+ requires a table name (usage: \\d+ <table>)".into())
+}
+
 fn unsupported(command: &str, supported: &str) -> AppError {
     AppError::Config(format!(
         "Unsupported meta command: {command} (supported: {supported})"
@@ -308,6 +314,8 @@ fn postgres_meta(command: &str, arg: Option<&str>) -> Result<String, AppError> {
                  ORDER BY a.attnum"
             )
         }
+        ("\\d+", Some(name)) => postgres_definition_sql(validate_relation_name(name)?),
+        ("\\d+", None) => return Err(definition_needs_table()),
         ("\\dn", _) => "SELECT n.nspname AS name, \
              pg_catalog.pg_get_userbyid(n.nspowner) AS owner \
              FROM pg_catalog.pg_namespace n \
@@ -322,11 +330,70 @@ fn postgres_meta(command: &str, arg: Option<&str>) -> Result<String, AppError> {
         _ => {
             return Err(unsupported(
                 command,
-                "\\l \\list \\dt \\dv \\dn \\du \\d [table] \\c <database>",
+                "\\l \\list \\dt \\dv \\dn \\du \\d [table] \\d+ <table> \\c <database>",
             ));
         }
     };
     Ok(sql)
+}
+
+/// `\d+ <table>` for PostgreSQL: indexes, constraints (primary key / unique / foreign key /
+/// check / exclusion), the foreign keys of other tables that reference this one, and for a
+/// view its definition, as one result of kind / name / definition.
+///
+/// PostgreSQL has no function that returns a CREATE TABLE statement, so the definition is
+/// assembled from the catalog functions psql itself uses (pg_get_indexdef /
+/// pg_get_constraintdef / pg_get_viewdef). The columns are what `\d <table>` already shows.
+///
+/// The name is resolved exactly as written first (every part double-quoted): the TABLES pane
+/// passes the stored name, and a table created as "Users" must not be confused with a
+/// `users` that also exists. If there is no such relation, it is resolved the way psql and
+/// `\d <table>` do (unquoted, folded to lower case), so `\d+ USERS` typed by hand still works.
+/// The fallback is a cast of a text value, not of a literal: `'x'::regclass` is resolved when
+/// the statement is parsed and would fail even when the first lookup succeeds, while the
+/// text cast runs only when COALESCE gets to it (and then reports the missing relation).
+/// `name` has passed validate_relation_name, so it contains neither quotes nor `;` and is
+/// safe to embed.
+fn postgres_definition_sql(name: &str) -> String {
+    let quoted = quote_parts(name, '"');
+    format!(
+        "SELECT d.kind, d.name, d.definition \
+         FROM (SELECT COALESCE(pg_catalog.to_regclass('{quoted}'), \
+           CAST('{name}'::text AS regclass)) AS rel) t \
+         CROSS JOIN LATERAL (\
+           SELECT 0 AS ord, 'view' AS kind, c.relname::text AS name, \
+             pg_catalog.pg_get_viewdef(c.oid, true) AS definition \
+           FROM pg_catalog.pg_class c \
+           WHERE c.oid = t.rel AND c.relkind IN ('v','m') \
+           UNION ALL \
+           SELECT 1, 'index', ic.relname::text, pg_catalog.pg_get_indexdef(x.indexrelid) \
+           FROM pg_catalog.pg_index x \
+           JOIN pg_catalog.pg_class ic ON ic.oid = x.indexrelid \
+           WHERE x.indrelid = t.rel \
+           UNION ALL \
+           SELECT 2, CASE con.contype WHEN 'p' THEN 'primary key' WHEN 'u' THEN 'unique' \
+               WHEN 'f' THEN 'foreign key' WHEN 'c' THEN 'check' WHEN 'x' THEN 'exclusion' \
+               ELSE con.contype::text END, \
+             con.conname::text, pg_catalog.pg_get_constraintdef(con.oid) \
+           FROM pg_catalog.pg_constraint con \
+           WHERE con.conrelid = t.rel \
+           UNION ALL \
+           SELECT 3, 'referenced by', con.conname::text, \
+             con.conrelid::regclass::text || ': ' || pg_catalog.pg_get_constraintdef(con.oid) \
+           FROM pg_catalog.pg_constraint con \
+           WHERE con.confrelid = t.rel AND con.contype = 'f'\
+         ) d \
+         ORDER BY d.ord, d.kind, d.name"
+    )
+}
+
+/// Quotes every part of a validated `schema.table` name with `quote` (`"a"."b"`).
+/// Only for names that passed validate_relation_name (no quote character can occur in them).
+fn quote_parts(name: &str, quote: char) -> String {
+    name.split('.')
+        .map(|part| format!("{quote}{part}{quote}"))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Postgres relation listing SQL (narrowed by a set of relkind).
@@ -355,20 +422,21 @@ fn mysql_meta(command: &str, arg: Option<&str>) -> Result<String, AppError> {
         ("\\d", Some(name)) => {
             let name = validate_relation_name(name)?;
             // Quote schema.table as `schema`.`table`
-            let quoted = name
-                .split('.')
-                .map(|part| format!("`{part}`"))
-                .collect::<Vec<_>>()
-                .join(".");
-            format!("DESCRIBE {quoted}")
+            format!("DESCRIBE {}", quote_parts(name, '`'))
         }
+        // The CREATE statement carries the indexes and foreign keys (for a view: CREATE VIEW)
+        ("\\d+", Some(name)) => {
+            let name = validate_relation_name(name)?;
+            format!("SHOW CREATE TABLE {}", quote_parts(name, '`'))
+        }
+        ("\\d+", None) => return Err(definition_needs_table()),
         ("\\du", _) => {
             "SELECT User AS user, Host AS host FROM mysql.user ORDER BY 1, 2".to_string()
         }
         _ => {
             return Err(unsupported(
                 command,
-                "\\l \\list \\dt \\dv \\du \\d [table] \\c <database>",
+                "\\l \\list \\dt \\dv \\du \\d [table] \\d+ <table> \\c <database>",
             ));
         }
     };
@@ -392,11 +460,57 @@ fn sqlite_meta(command: &str, arg: Option<&str>) -> Result<String, AppError> {
             let name = validate_relation_name(name)?;
             format!("PRAGMA table_info(\"{name}\")")
         }
+        ("\\d+", Some(name)) => sqlite_definition_sql(validate_relation_name(name)?),
+        ("\\d+", None) => return Err(definition_needs_table()),
         _ => {
-            return Err(unsupported(command, "\\l \\list \\dt \\dv \\d [table]"));
+            return Err(unsupported(
+                command,
+                "\\l \\list \\dt \\dv \\d [table] \\d+ <table>",
+            ));
         }
     };
     Ok(sql)
+}
+
+/// `\d+ <table>` for SQLite: the CREATE statements of the table (or view), its indexes and
+/// triggers from sqlite_master, followed by its foreign keys (`pragma_foreign_key_list`), as
+/// one result of kind / name / definition.
+///
+/// Indexes SQLite creates by itself for PRIMARY KEY / UNIQUE (`sqlite_autoindex_*`) have no
+/// SQL; they are listed with a NULL definition so that the unique constraints stay visible.
+/// `schema.table` reads that attached database's sqlite_master. Names are compared with
+/// NOCASE, as SQLite itself does. `pragma_foreign_key_list` returns one row per column, so
+/// the rows of one constraint (same `id`) are put back together in `seq` order: a composite
+/// key is one foreign key, not several.
+fn sqlite_definition_sql(name: &str) -> String {
+    let (schema, table) = match name.split_once('.') {
+        Some((schema, table)) => (Some(schema), table),
+        None => (None, name),
+    };
+    let master = match schema {
+        Some(schema) => format!("\"{schema}\".sqlite_master"),
+        None => "sqlite_master".to_string(),
+    };
+    let foreign_keys = match schema {
+        Some(schema) => format!("pragma_foreign_key_list('{table}', '{schema}')"),
+        None => format!("pragma_foreign_key_list('{table}')"),
+    };
+    format!(
+        "SELECT d.kind, d.name, d.definition FROM (\
+           SELECT CASE m.type WHEN 'table' THEN 0 WHEN 'view' THEN 0 WHEN 'index' THEN 1 \
+               ELSE 2 END AS ord, \
+             m.type AS kind, m.name AS name, m.sql AS definition \
+           FROM {master} m WHERE m.tbl_name = '{table}' COLLATE NOCASE \
+           UNION ALL \
+           SELECT 3, 'foreign key', group_concat(f.\"from\", ', '), \
+             'FOREIGN KEY (' || group_concat(f.\"from\", ', ') || ') REFERENCES ' || \
+             f.\"table\" || \
+             CASE WHEN count(f.\"to\") = 0 THEN '' \
+               ELSE ' (' || group_concat(f.\"to\", ', ') || ')' END || \
+             ' ON UPDATE ' || f.on_update || ' ON DELETE ' || f.on_delete \
+           FROM (SELECT * FROM {foreign_keys} ORDER BY id, seq) f GROUP BY f.id\
+         ) d ORDER BY d.ord, d.name"
+    )
 }
 
 /// DuckDB has both information_schema and PRAGMA (sqlite-compatible).
@@ -423,14 +537,52 @@ fn duckdb_meta(command: &str, arg: Option<&str>) -> Result<String, AppError> {
             let name = validate_relation_name(name)?;
             format!("PRAGMA table_info('{name}')")
         }
+        ("\\d+", Some(name)) => duckdb_definition_sql(validate_relation_name(name)?),
+        ("\\d+", None) => return Err(definition_needs_table()),
         _ => {
             return Err(unsupported(
                 command,
-                "\\l \\list \\dt \\dv \\dn \\d [table]",
+                "\\l \\list \\dt \\dv \\dn \\d [table] \\d+ <table>",
             ));
         }
     };
     Ok(sql)
+}
+
+/// `\d+ <table>` for DuckDB: the CREATE statement of the table (or view) from duckdb_tables()
+/// / duckdb_views(), its indexes from duckdb_indexes() and its constraints (primary key /
+/// unique / foreign key / check / not null) from duckdb_constraints(), as one result of
+/// kind / name / definition.
+///
+/// A name without a schema means the `main` schema, like everywhere else in the DuckDB engine
+/// (engines/duckdb.rs split_qualified: the TABLES pane leaves `main` out of the qualified
+/// name). Only the current database is searched (an attached database can hold a table of
+/// the same name). DuckDB identifiers are case-insensitive while the catalog functions
+/// return them as created, so the names are compared in lower case.
+fn duckdb_definition_sql(name: &str) -> String {
+    let (schema, table) = match name.split_once('.') {
+        Some((schema, table)) => (schema, table),
+        None => ("main", name),
+    };
+    let scope =
+        format!("database_name = current_database() AND lower(schema_name) = lower('{schema}')");
+    let table = format!("lower('{table}')");
+    format!(
+        "SELECT d.kind, d.name, d.definition FROM (\
+           SELECT 0 AS ord, 'table' AS kind, table_name AS name, sql AS definition \
+           FROM duckdb_tables() WHERE {scope} AND lower(table_name) = {table} \
+           UNION ALL \
+           SELECT 0, 'view', view_name, sql \
+           FROM duckdb_views() WHERE {scope} AND lower(view_name) = {table} \
+           UNION ALL \
+           SELECT 1, 'index', index_name, sql \
+           FROM duckdb_indexes() WHERE {scope} AND lower(table_name) = {table} \
+           UNION ALL \
+           SELECT 2, lower(constraint_type), array_to_string(constraint_column_names, ', '), \
+             constraint_text \
+           FROM duckdb_constraints() WHERE {scope} AND lower(table_name) = {table}\
+         ) d ORDER BY d.ord, d.kind, d.name"
+    )
 }
 
 /// SQL Server has both INFORMATION_SCHEMA (ANSI) and the sys.* catalogs.
@@ -824,5 +976,154 @@ mod tests {
         // The sqlite schema is a DB file path, so it is not a switch target
         let err = translate(Engine::Sqlite, "\\c other").unwrap_err();
         assert!(err.to_string().contains("not supported for SQLite"));
+    }
+
+    #[test]
+    fn test_definition_postgres() {
+        let sql = sql_of(Engine::Postgres, "\\d+ users");
+        // Resolved as written (case-sensitive) first, then the way psql folds it
+        assert!(sql.contains("COALESCE(pg_catalog.to_regclass('\"users\"'), "));
+        assert!(sql.contains("CAST('users'::text AS regclass)) AS rel"));
+        // A literal regclass cast would be resolved at parse time, whatever COALESCE picks
+        assert!(!sql.contains("'::regclass"));
+        assert!(sql.contains("pg_get_indexdef"));
+        assert!(sql.contains("pg_get_constraintdef"));
+        assert!(sql.contains("pg_get_viewdef"));
+        assert!(sql.contains("con.confrelid = t.rel"));
+        let sql = sql_of(Engine::Postgres, "\\d+ sales.Orders;");
+        assert!(sql.contains("to_regclass('\"sales\".\"Orders\"'), "));
+        assert!(sql.contains("CAST('sales.Orders'::text AS regclass)"));
+        // `\d <table>` keeps listing the columns
+        assert!(sql_of(Engine::Postgres, "\\d users").contains("pg_attribute"));
+    }
+
+    #[test]
+    fn test_definition_mysql() {
+        assert_eq!(
+            sql_of(Engine::MySql, "\\d+ users"),
+            "SHOW CREATE TABLE `users`"
+        );
+        assert_eq!(
+            sql_of(Engine::MySql, "\\d+ shop.order_items ;"),
+            "SHOW CREATE TABLE `shop`.`order_items`"
+        );
+        assert_eq!(sql_of(Engine::MySql, "\\d users"), "DESCRIBE `users`");
+    }
+
+    #[test]
+    fn test_definition_sqlite() {
+        let sql = sql_of(Engine::Sqlite, "\\d+ users");
+        assert!(sql.contains("FROM sqlite_master m WHERE m.tbl_name = 'users' COLLATE NOCASE"));
+        assert!(sql.contains("FROM (SELECT * FROM pragma_foreign_key_list('users') ORDER BY id, seq) f GROUP BY f.id"));
+        let sql = sql_of(Engine::Sqlite, "\\d+ aux.users");
+        assert!(sql.contains("FROM \"aux\".sqlite_master m WHERE m.tbl_name = 'users'"));
+        assert!(sql.contains("FROM pragma_foreign_key_list('users', 'aux') ORDER BY id, seq"));
+    }
+
+    #[test]
+    fn test_definition_duckdb() {
+        let sql = sql_of(Engine::DuckDb, "\\d+ users");
+        for source in [
+            "duckdb_tables()",
+            "duckdb_views()",
+            "duckdb_indexes()",
+            "duckdb_constraints()",
+        ] {
+            assert!(sql.contains(source), "{source}");
+        }
+        assert!(sql
+            .contains("lower(schema_name) = lower('main') AND lower(table_name) = lower('users')"));
+        let sql = sql_of(Engine::DuckDb, "\\d+ analytics.events");
+        assert!(sql.contains(
+            "lower(schema_name) = lower('analytics') AND lower(view_name) = lower('events')"
+        ));
+        assert!(!sql.contains("'main'"));
+    }
+
+    #[test]
+    fn test_definition_rejects_unsafe_names() {
+        let engines = [
+            Engine::Postgres,
+            Engine::MySql,
+            Engine::Sqlite,
+            Engine::DuckDb,
+        ];
+        let names = [
+            "users'",
+            "\"users\"",
+            "`users`",
+            "users;DROP",
+            "users;--",
+            "a.b.c",
+            "users)",
+            "1users",
+            "us-ers",
+            "users'||(SELECT/**/1)||'",
+        ];
+        for engine in engines {
+            for name in names {
+                let err = translate(engine, &format!("\\d+ {name}")).unwrap_err();
+                assert!(
+                    err.to_string().contains("Invalid table name"),
+                    "{name}: {err}"
+                );
+            }
+            // A second statement after the name is not silently dropped into the SQL either
+            let err = translate(engine, "\\d+ users; DROP TABLE users").unwrap_err();
+            assert!(err.to_string().contains("Invalid table name"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_definition_needs_a_table() {
+        for engine in [
+            Engine::Postgres,
+            Engine::MySql,
+            Engine::Sqlite,
+            Engine::DuckDb,
+        ] {
+            let err = translate(engine, "\\d+").unwrap_err();
+            assert!(
+                err.to_string().contains("\\d+ requires a table name"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_definition_is_not_offered_for_sql_server() {
+        let err = translate(Engine::MsSql, "\\d+ users").unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported meta command: \\d+"),
+            "{err}"
+        );
+    }
+
+    /// `\d+` has to work with the Writable switch off, on `readonly: true` connections and
+    /// from the AI agent: the translated SQL must pass every statement-level guard
+    /// (it is one read-only statement, never auto-limited into something invalid)
+    #[test]
+    fn test_definition_sql_passes_the_guards() {
+        let cases = [
+            (Engine::Postgres, "\\d+ public.users"),
+            (Engine::MySql, "\\d+ shop.users"),
+            (Engine::Sqlite, "\\d+ users"),
+            (Engine::Sqlite, "\\d+ aux.users"),
+            (Engine::DuckDb, "\\d+ users"),
+            (Engine::DuckDb, "\\d+ main.users"),
+        ];
+        for (engine, input) in cases {
+            let sql = sql_of(engine, input);
+            assert!(crate::db::is_readonly_allowed(&sql, engine), "{sql}");
+            assert!(crate::db::dangerous_reason(&sql, engine).is_none(), "{sql}");
+            assert!(
+                !crate::db::contains_multiple_statements(&sql, engine),
+                "{sql}"
+            );
+            assert!(
+                crate::db::agent_rejection_reason(&sql, engine).is_none(),
+                "{sql}"
+            );
+        }
     }
 }

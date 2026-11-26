@@ -1213,6 +1213,22 @@ mod tests {
             .collect();
         assert_eq!(columns, vec!["id", "name", "score", "tags", "created_at"]);
 
+        // \d+ <table>: CREATE statement, indexes and constraints as kind / name / definition
+        let result = run(&handle, "\\d+ users", 100, None, ReadonlyGuard::Switch, false)
+            .await
+            .unwrap();
+        assert_eq!(result.columns, vec!["kind", "name", "definition"]);
+        assert_eq!(result.rows[0][0], serde_json::json!("table"));
+        assert_eq!(result.rows[0][1], serde_json::json!("users"));
+        assert!(result.rows[0][2]
+            .as_str()
+            .is_some_and(|sql| sql.starts_with("CREATE TABLE")));
+        // The schema can be given, and a view shows its CREATE VIEW
+        let result = run(&handle, "\\d+ main.user_names", 100, None, ReadonlyGuard::Switch, false)
+            .await
+            .unwrap();
+        assert_eq!(result.rows[0][0], serde_json::json!("view"));
+
         // \c is an error
         let err = run(&handle, "\\c other", 100, None, ReadonlyGuard::Switch, false)
             .await

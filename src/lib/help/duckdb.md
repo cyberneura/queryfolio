@@ -81,6 +81,9 @@ SELECT * FROM duckdb_columns() WHERE table_name = 'orders';
 ```
 
 `\l`, `\dt`, `\d orders` work as well and map onto the same catalog queries.
+`\d+ orders` (or "Show definition" on the right-click menu of a table in the
+TABLES pane) puts the CREATE statement, the indexes and the constraints of one
+table into a single result.
 
 ## What is blocked, and why
 

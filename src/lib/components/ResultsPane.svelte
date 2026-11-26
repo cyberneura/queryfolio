@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { writeText } from "@tauri-apps/plugin-clipboard-manager";
   import { save } from "@tauri-apps/plugin-dialog";
   import { toast } from "svelte-sonner";
@@ -10,6 +11,8 @@
     toCsvRange,
     toJson,
     toJsonRange,
+    MARKDOWN_MAX_CELL_CHARS,
+    toMarkdownTable,
     toTsv,
     toTsvRange,
     type CellRange,
@@ -17,18 +20,25 @@
   import {
     singleTableSelectTable,
     buildUpdateStatements,
+    literalFromValue,
     normalizeEngine,
     normalizeTableName,
     type NormalizedEngine,
     type CellEdit,
   } from "$lib/editableResult";
+  import { nextSort, sortedRowOrder, type SortState } from "$lib/resultSort";
   import {
-    nextSort,
-    reorderRows,
-    sortedRowOrder,
-    type SortState,
-  } from "$lib/resultSort";
+    buildSearchIndex,
+    filterRowOrder,
+    MAX_CELL_SEARCH_CHARS,
+    visibleRows,
+  } from "$lib/resultFilter";
+  import { filterTerms } from "$lib/paneFilter";
+  import { stepRow } from "$lib/rowDetail";
+  import { insertTarget, toInsertStatements } from "$lib/insertStatements";
+  import { foreignKeyLookupTable, referencedRowSql } from "$lib/foreignKeys";
   import CellInspector from "./CellInspector.svelte";
+  import RowDetailPanel from "./RowDetailPanel.svelte";
   import AiAnalysisModal from "./AiAnalysisModal.svelte";
 
   interface Props {
@@ -39,10 +49,29 @@
   let { onOpenProcessList }: Props = $props();
 
   // Output format shared by Copy / Export / Cmd+C copy.
-  type CopyFormat = "csv" | "tsv" | "json";
+  // "insert" (SQL INSERT statements, CYBERNEURA-DEV-1318) is offered only for the engines
+  // whose SQL dialect cell editing already speaks, and works only for a single-table SELECT
+  const COPY_FORMATS = ["tsv", "csv", "json", "markdown", "insert"] as const;
+  type CopyFormat = (typeof COPY_FORMATS)[number];
+  // File extension (and save dialog filter name) of each format
+  const EXPORT_FILE_TYPES: Record<CopyFormat, { ext: string; name: string }> = {
+    tsv: { ext: "tsv", name: "TSV" },
+    csv: { ext: "csv", name: "CSV" },
+    json: { ext: "json", name: "JSON" },
+    markdown: { ext: "md", name: "Markdown" },
+    insert: { ext: "sql", name: "SQL" },
+  };
+  // Label of each format in the format selector
+  const COPY_FORMAT_LABELS: Record<CopyFormat, string> = {
+    tsv: "TSV",
+    csv: "CSV",
+    json: "JSON",
+    markdown: "MARKDOWN",
+    insert: "SQL INSERT",
+  };
   const COPY_FORMAT_KEY = "queryfolio.results.copyFormat";
   const isCopyFormat = (v: string): v is CopyFormat =>
-    v === "csv" || v === "tsv" || v === "json";
+    (COPY_FORMATS as readonly string[]).includes(v);
   function loadCopyFormat(): CopyFormat {
     try {
       const v = localStorage.getItem(COPY_FORMAT_KEY);
@@ -94,9 +123,127 @@
     }
     return { colIndex: sort.colIndex, direction: sort.direction };
   });
-  // Display position -> original row index
-  const rowOrder = $derived(
+
+  // ---- Client-side filter of the fetched rows (CYBERNEURA-DEV-1266) ----
+  // One filter per result tab, kept while the tab shows the same result: like the sort it is
+  // keyed by executedAt, so a re-run drops it. Unlike the sort it survives switching tabs
+  // (coming back to a tab shows the rows that were being looked at).
+  // `input` is what is in the text box, `query` the debounced value the rows are filtered by.
+  interface TabFilter {
+    executedAt: number;
+    input: string;
+    query: string;
+  }
+  const FILTER_DEBOUNCE_MS = 150;
+  let filters = $state<Record<number, TabFilter>>({});
+  const filterTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  let filterInputEl = $state<HTMLInputElement | null>(null);
+  const activeFilter = $derived.by<TabFilter | null>(() => {
+    const tab = activeTab;
+    const filter = tab ? filters[tab.id] : undefined;
+    return tab && filter && filter.executedAt === tab.executedAt ? filter : null;
+  });
+  const filterOpen = $derived(activeFilter !== null);
+  const filterQuery = $derived(activeFilter?.query ?? "");
+  const activeFilterTerms = $derived(filterTerms(filterQuery));
+  const filterActive = $derived(activeFilterTerms.length > 0);
+  // The search text of every row, built once per result while the filter is open and reused
+  // for every keystroke (it does not depend on the query)
+  const searchIndex = $derived.by(() =>
+    filterOpen ? buildSearchIndex(activeTab?.result?.rows ?? []) : undefined,
+  );
+  const dropFilter = (tabId: number) => {
+    const timer = filterTimers.get(tabId);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      filterTimers.delete(tabId);
+    }
+    delete filters[tabId];
+  };
+  // Open the filter of the active tab (or focus it when it is already open)
+  const openFilter = () => {
+    const tab = activeTab;
+    if (!tab?.result || tab.result.columns.length === 0) {
+      return;
+    }
+    if (activeFilter) {
+      filterInputEl?.focus();
+      filterInputEl?.select();
+      return;
+    }
+    filters[tab.id] = { executedAt: tab.executedAt, input: "", query: "" };
+  };
+  // Close the filter of the active tab and show all rows again
+  const closeFilter = () => {
+    const tab = activeTab;
+    if (!tab) {
+      return;
+    }
+    const hadFocus = document.activeElement === filterInputEl;
+    dropFilter(tab.id);
+    if (hadFocus) {
+      // Keep the keyboard on the result pane (Cmd+F / Cmd+C / Cmd+A are handled only there)
+      gridEl?.focus({ preventScroll: true });
+    }
+  };
+  const onFilterInput = (value: string) => {
+    const tab = activeTab;
+    const filter = activeFilter;
+    if (!tab || !filter) {
+      return;
+    }
+    filter.input = value;
+    const tabId = tab.id;
+    const executedAt = tab.executedAt;
+    clearTimeout(filterTimers.get(tabId));
+    // Debounced: filtering walks every fetched row, which is too much to do per keystroke
+    // on a result fetched without default_limit
+    filterTimers.set(
+      tabId,
+      setTimeout(() => {
+        filterTimers.delete(tabId);
+        const current = filters[tabId];
+        if (current && current.executedAt === executedAt) {
+          current.query = current.input;
+        }
+      }, FILTER_DEBOUNCE_MS),
+    );
+  };
+  // Forget the filters of closed tabs and of replaced results (re-run), so that they neither
+  // pile up nor come back
+  $effect(() => {
+    const live = new Map(appStore.resultTabs.map((tab) => [tab.id, tab.executedAt]));
+    for (const [key, filter] of Object.entries(filters)) {
+      const tabId = Number(key);
+      if (live.get(tabId) !== filter.executedAt) {
+        dropFilter(tabId);
+      }
+    }
+  });
+  // Focus the input when the filter is opened by the button or Cmd+F. Coming back to a tab
+  // whose filter is open must not steal the focus, so this is requested explicitly
+  let filterFocusPending = false;
+  $effect(() => {
+    if (filterInputEl && filterFocusPending) {
+      filterFocusPending = false;
+      filterInputEl.focus();
+    }
+  });
+  const openFilterAndFocus = () => {
+    filterFocusPending = !activeFilter;
+    openFilter();
+  };
+
+  // All fetched rows in sorted order. Kept apart from the filter so that typing in the filter
+  // does not sort again
+  const sortedOrder = $derived(
     sortedRowOrder(activeTab?.result?.rows ?? [], activeSort),
+  );
+  // Display position -> original row index: the rows that pass the filter, in sorted order
+  const rowOrder = $derived(
+    filterActive && searchIndex
+      ? filterRowOrder(sortedOrder, searchIndex, activeFilterTerms)
+      : sortedOrder,
   );
   // Original row index -> display position (the inverse of rowOrder)
   const rowToDisplay = $derived.by(() => {
@@ -105,10 +252,17 @@
     return map;
   });
   // The result in display order, for the operations that follow what is on screen
-  // (Cmd+C of a selection). Same object as the result when not sorted
-  const displayedResult = $derived(
-    activeTab?.result ? reorderRows(activeTab.result, activeSort) : null,
-  );
+  // (Cmd+C of a selection). Same object as the result when neither sorted nor filtered
+  const displayedResult = $derived.by(() => {
+    const result = activeTab?.result;
+    if (!result) {
+      return null;
+    }
+    if (!activeSort && !filterActive) {
+      return result;
+    }
+    return { ...result, rows: rowOrder.map((i) => result.rows[i]) };
+  });
   const toggleSort = (colIndex: number) => {
     const tab = activeTab;
     if (!tab?.result) {
@@ -230,7 +384,8 @@
   // The sticky header height is offset by "distance from the content top" and "amount hidden by the header",
   // so it does not enter the computation of start
   const rowWindow = $derived.by(() => {
-    const total = activeTab?.result?.rows.length ?? 0;
+    // The rows on screen (fewer than result.rows while a filter is active)
+    const total = rowOrder.length;
     const h = rowHeight > 0 ? rowHeight : DEFAULT_ROW_HEIGHT;
     if (total === 0) {
       return { start: 0, end: 0, padTop: 0, padBottom: 0 };
@@ -376,6 +531,8 @@
     selectedCell = null;
     selection = null;
     sort = null;
+    rowDetail = null;
+    contextMenu = null;
   });
 
   // When showing a different result, return to the top (computing the row window with the previous result's
@@ -385,6 +542,9 @@
   $effect(() => {
     void appStore.activeTabId;
     void activeTab?.executedAt;
+    // Also when the filter changes the rows on screen (the scroll amount of the previous row set
+    // means nothing for the new one)
+    void filterQuery;
     if (gridEl) {
       gridEl.scrollTop = 0;
       // Also reset the horizontal position. Otherwise, when switching to another result after scrolling a horizontally wide result to the right,
@@ -392,6 +552,15 @@
       gridEl.scrollLeft = 0;
     }
     gridScrollTop = 0;
+  });
+
+  // The rectangular selection is a range of display positions and the inspector shows one row:
+  // when the filter changes which rows are on screen, both would point at other rows
+  // (or at a hidden one), so drop them
+  $effect(() => {
+    void filterQuery;
+    selectedCell = null;
+    selection = null;
   });
 
   // Clamp the selection to the result size and normalize it (fix min/max).
@@ -405,7 +574,8 @@
     if (!result) {
       return null;
     }
-    const maxRow = result.rows.length - 1;
+    // Display positions: the last row on screen, not the last fetched row
+    const maxRow = rowOrder.length - 1;
     const maxCol = result.columns.length - 1;
     if (maxRow < 0 || maxCol < 0) {
       return null;
@@ -458,7 +628,7 @@
   };
   const isColHeaderSelected = (colIndex: number): boolean => {
     const r = selectedRange;
-    const rows = activeTab?.result?.rows.length ?? 0;
+    const rows = rowOrder.length;
     return (
       r !== null &&
       r.rowStart === 0 &&
@@ -528,12 +698,23 @@
     if (!range || !result) {
       return;
     }
-    const text =
-      copyFormat === "csv"
-        ? toCsvRange(result, range, copyWithHeaders)
-        : copyFormat === "tsv"
-          ? toTsvRange(result, range, copyWithHeaders)
-          : toJsonRange(result, range, copyWithHeaders);
+    let text: string;
+    if (copyFormat === "insert") {
+      const sql = insertText(activeInsertTarget, result, range);
+      if (sql === null) {
+        return;
+      }
+      text = sql;
+    } else {
+      text =
+        copyFormat === "markdown"
+          ? markdownText(result, range)
+          : { csv: toCsvRange, tsv: toTsvRange, json: toJsonRange }[copyFormat](
+              result,
+              range,
+              copyWithHeaders,
+            );
+    }
     await writeText(text);
     selectionCopied = true;
     setTimeout(() => {
@@ -564,7 +745,7 @@
     if (
       !tab ||
       !result ||
-      result.rows.length === 0 ||
+      rowOrder.length === 0 ||
       result.columns.length === 0
     ) {
       return false;
@@ -574,7 +755,7 @@
       mode: "cell",
       anchorRow: 0,
       anchorCol: 0,
-      focusRow: result.rows.length - 1,
+      focusRow: rowOrder.length - 1,
       focusCol: result.columns.length - 1,
     };
     return true;
@@ -583,10 +764,36 @@
   // Cmd+C (Ctrl+C) copies the selection as CSV, Cmd+A (Ctrl+A) selects the whole table.
   // Both are handled only while the result grid has focus
   const handleWindowKeydown = (e: KeyboardEvent) => {
+    if (handleRowDetailKeydown(e)) {
+      return;
+    }
+    if (e.key === "Escape") {
+      // Esc on the grid closes the filter (Esc in the filter input is handled by the input).
+      // Something else that already handled the key (a modal, the cell editor) wins
+      if (filterOpen && !e.defaultPrevented && isGridKeyTarget()) {
+        e.preventDefault();
+        closeFilter();
+      }
+      return;
+    }
     if (!(e.metaKey || e.ctrlKey)) {
       return;
     }
     const key = e.key.toLowerCase();
+    if (key === "f") {
+      // Cmd+F (Ctrl+F) opens the row filter only while the result pane has the focus (the grid
+      // or the filter input itself). In the SQL editor the same key is CodeMirror's search,
+      // which handles it there; this handler must not react to it
+      if (
+        !e.altKey &&
+        !e.shiftKey &&
+        (isGridKeyTarget() || document.activeElement === filterInputEl)
+      ) {
+        e.preventDefault();
+        openFilterAndFocus();
+      }
+      return;
+    }
     if (key !== "c" && key !== "a") {
       return;
     }
@@ -604,6 +811,216 @@
     }
     e.preventDefault();
     void copySelection();
+  };
+
+  // ---- Row detail panel (CYBERNEURA-DEV-1317) ----
+  // One row shown as a vertical "column : value" list. Keyed by tab + executedAt like the
+  // sort, so a re-run closes it; rowIndex is the original index into result.rows (the data),
+  // and ↑ / ↓ walk rowOrder (the display order after the sort and the filter).
+  let rowDetail = $state<{
+    tabId: number;
+    executedAt: number;
+    rowIndex: number;
+  } | null>(null);
+  let rowDetailEl = $state<HTMLDivElement | null>(null);
+  const rowDetailView = $derived.by(() => {
+    const tab = activeTab;
+    const result = tab?.result;
+    if (
+      !rowDetail ||
+      !tab ||
+      !result ||
+      tab.batch !== null ||
+      rowDetail.tabId !== tab.id ||
+      rowDetail.executedAt !== tab.executedAt
+    ) {
+      return null;
+    }
+    const displayIndex = rowToDisplay.get(rowDetail.rowIndex);
+    const row = result.rows[rowDetail.rowIndex];
+    if (displayIndex === undefined || !row) {
+      return null;
+    }
+    return { columns: result.columns, row, displayIndex, total: rowOrder.length };
+  });
+  // Drop a row detail that no longer shows anything (re-run, the row filtered out), so that
+  // it does not come back by itself later
+  $effect(() => {
+    if (rowDetail && !rowDetailView) {
+      rowDetail = null;
+    }
+  });
+
+  const openRowDetail = (rowIndex: number) => {
+    const tab = activeTab;
+    if (!tab?.result || tab.batch !== null || tab.result.columns.length === 0) {
+      return;
+    }
+    rowDetail = { tabId: tab.id, executedAt: tab.executedAt, rowIndex };
+  };
+  const closeRowDetail = () => {
+    const hadFocus = rowDetailEl?.contains(document.activeElement) ?? false;
+    rowDetail = null;
+    if (hadFocus) {
+      gridEl?.focus({ preventScroll: true });
+    }
+  };
+
+  // The row Space opens: the cell open in the inspector, else the first row of the selection
+  const rowForSpace = (): number | null => {
+    const tab = activeTab;
+    if (!tab) {
+      return null;
+    }
+    if (selectedCell && selectedCell.tabId === tab.id) {
+      return selectedCell.rowIndex;
+    }
+    const range = selectedRange;
+    return range ? (rowOrder[range.rowStart] ?? null) : null;
+  };
+
+  // Scroll the grid so that the row at a display position is visible below the sticky header
+  const revealDisplayRow = (displayIndex: number) => {
+    const el = gridEl;
+    if (!el) {
+      return;
+    }
+    const h = rowHeight > 0 ? rowHeight : DEFAULT_ROW_HEIGHT;
+    const headerHeight = el.querySelector("thead")?.getBoundingClientRect().height ?? 0;
+    const top = displayIndex * h;
+    if (top < el.scrollTop) {
+      el.scrollTop = top;
+    } else if (headerHeight + top + h > el.scrollTop + el.clientHeight) {
+      el.scrollTop = headerHeight + top + h - el.clientHeight;
+    }
+  };
+
+  // Move the panel to the previous / next row on screen. The grid selection and the
+  // inspector follow, so that the highlighted row is the one shown in the panel
+  const stepRowDetail = (delta: number) => {
+    const tab = activeTab;
+    if (!rowDetail || !tab) {
+      return;
+    }
+    const next = stepRow(rowOrder, rowDetail.rowIndex, delta);
+    if (next === null || next === rowDetail.rowIndex) {
+      return;
+    }
+    rowDetail = { ...rowDetail, rowIndex: next };
+    const displayIndex = rowToDisplay.get(next) ?? 0;
+    const colCount = tab.result?.columns.length ?? 1;
+    selection = {
+      tabId: tab.id,
+      mode: "row",
+      anchorRow: displayIndex,
+      anchorCol: 0,
+      focusRow: displayIndex,
+      focusCol: colCount - 1,
+    };
+    if (selectedCell && selectedCell.tabId === tab.id) {
+      selectedCell = { ...selectedCell, rowIndex: next };
+    }
+    revealDisplayRow(displayIndex);
+  };
+
+  const focusInRowDetail = (): boolean =>
+    rowDetailEl !== null && rowDetailEl.contains(document.activeElement);
+  const focusInTextInput = (): boolean =>
+    document.activeElement instanceof HTMLInputElement ||
+    document.activeElement instanceof HTMLTextAreaElement;
+
+  // Space presses that opened / closed the panel: their keyup must not click the focused
+  // cell button as well (buttons activate on the keyup of Space)
+  let spaceHandled = false;
+  const handleWindowKeyup = (e: KeyboardEvent) => {
+    if (e.key === " " && spaceHandled) {
+      spaceHandled = false;
+      e.preventDefault();
+    }
+  };
+
+  /// Keys of the row detail panel. Returns true when the key was handled here.
+  /// Space toggles the panel while the grid has the focus; with the panel open, ↑ / ↓ move
+  /// between rows and Esc closes it (from the grid or from inside the panel)
+  const handleRowDetailKeydown = (e: KeyboardEvent): boolean => {
+    if (e.defaultPrevented || e.isComposing) {
+      return false;
+    }
+    const plain = !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey;
+    if (e.key === " " && plain && isGridKeyTarget()) {
+      if (rowDetailView) {
+        e.preventDefault();
+        spaceHandled = true;
+        closeRowDetail();
+        return true;
+      }
+      const rowIndex = rowForSpace();
+      if (rowIndex === null) {
+        return false;
+      }
+      e.preventDefault();
+      spaceHandled = true;
+      openRowDetail(rowIndex);
+      return true;
+    }
+    if (!rowDetailView) {
+      return false;
+    }
+    const inScope = isGridKeyTarget() || (focusInRowDetail() && !focusInTextInput());
+    if ((e.key === "ArrowUp" || e.key === "ArrowDown") && plain && inScope) {
+      e.preventDefault();
+      stepRowDetail(e.key === "ArrowUp" ? -1 : 1);
+      return true;
+    }
+    if (e.key === "Escape" && (isGridKeyTarget() || focusInRowDetail())) {
+      // With the cell inspector open, Esc closes the inspector first (it listens itself)
+      if (inspectedCell) {
+        return false;
+      }
+      e.preventDefault();
+      closeRowDetail();
+      return true;
+    }
+    return false;
+  };
+
+  // Right-click menu of a row (cell or row number): Show row
+  let contextMenu = $state<{ x: number; y: number; rowIndex: number } | null>(
+    null,
+  );
+  const openContextMenu = (e: MouseEvent, rowIndex: number) => {
+    const tab = activeTab;
+    if (!tab?.result || tab.batch !== null) {
+      return;
+    }
+    e.preventDefault();
+    // Keep the menu inside the window (a row at the bottom / right edge)
+    const MENU_WIDTH = 180;
+    const MENU_HEIGHT = 40;
+    contextMenu = {
+      x: Math.max(0, Math.min(e.clientX, window.innerWidth - MENU_WIDTH)),
+      y: Math.max(0, Math.min(e.clientY, window.innerHeight - MENU_HEIGHT)),
+      rowIndex,
+    };
+  };
+
+  // Show row from the right-click menu: also select the row, and give the keyboard back to
+  // the grid (the menu button had the focus), so that ↑ / ↓ / Esc / Space work right away
+  const showRowFromMenu = (rowIndex: number) => {
+    const tab = activeTab;
+    const displayIndex = rowToDisplay.get(rowIndex);
+    if (tab?.result && displayIndex !== undefined) {
+      selection = {
+        tabId: tab.id,
+        mode: "row",
+        anchorRow: displayIndex,
+        anchorCol: 0,
+        focusRow: displayIndex,
+        focusCol: tab.result.columns.length - 1,
+      };
+    }
+    openRowDetail(rowIndex);
+    gridEl?.focus({ preventScroll: true });
   };
 
   // Value passed to the inspector. null (= hidden) when the result is replaced, e.g. by re-execution,
@@ -702,19 +1119,102 @@
     return "";
   };
 
+  // The Markdown table of a result (or of a range of it). Unlike the other formats it cuts
+  // long cells (see MARKDOWN_MAX_CELL_CHARS in $lib/export.ts), so say so when that happened
+  const markdownText = (result: api.QueryResult, range?: CellRange): string => {
+    const { text, truncatedCells } = toMarkdownTable(result, range);
+    if (truncatedCells > 0) {
+      toast.warning(
+        `${truncatedCells.toLocaleString()} cell(s) longer than ${MARKDOWN_MAX_CELL_CHARS.toLocaleString()} characters were cut in the Markdown table. Use CSV / TSV / JSON for the full values.`,
+      );
+    }
+    return text;
+  };
+
+  // ---- SQL INSERT format (CYBERNEURA-DEV-1318) ----
+  // Offered only where cell editing works (MySQL / PostgreSQL / SQLite): the statements are
+  // built with the same identifier / literal quoting. Redis / Elasticsearch / DynamoDB /
+  // DuckDB / SQL Server do not get the option at all (capability-based, like the other UI)
+  const activeTabCapabilities = $derived(
+    activeTab
+      ? (appStore.connections.find((c) => c.name === activeTab.connection)
+          ?.capabilities ?? null)
+      : null,
+  );
+  const insertFormatOffered = $derived(
+    activeTabCapabilities?.supports_editable_cells ?? false,
+  );
+  // Whether the active result can be written as INSERT statements (the table it came from),
+  // or why not. A batch tab holds a per-statement summary, not rows of a table
+  const activeInsertTarget = $derived.by(() => {
+    const tab = activeTab;
+    const engine = activeEngine;
+    if (!tab?.result || !engine || !insertFormatOffered) {
+      return null;
+    }
+    if (tab.batch !== null) {
+      return {
+        ok: false as const,
+        reason: "SQL INSERT is not available for the summary of a multi-statement run",
+      };
+    }
+    return insertTarget(engine, tab.sql, tab.result.columns);
+  });
+  // The selector only lists the formats the active result can use. A stored "insert" stays
+  // selected but is disabled with the reason in its title (and Copy / Export say why)
+  // (also kept, disabled, when it is the stored choice on a connection that does not offer it,
+  // so that the selector never shows an empty value)
+  const selectableFormats = $derived(
+    COPY_FORMATS.filter(
+      (f) => f !== "insert" || insertFormatOffered || copyFormat === "insert",
+    ),
+  );
+  type InsertTargetSnapshot = typeof activeInsertTarget;
+  // INSERT statements for a result (whole, or a range of it). null after telling the user why
+  // the format cannot be used for this result. `target` is the active result's target taken
+  // by the caller **before any await** (Copy / Export re-fetch the rows first; by then another
+  // tab, table or dialect can be active)
+  const insertText = (
+    target: InsertTargetSnapshot,
+    result: api.QueryResult,
+    range?: CellRange,
+  ): string | null => {
+    if (!target || !target.ok) {
+      toast.warning(
+        target?.reason ?? "SQL INSERT is not available for this connection",
+      );
+      return null;
+    }
+    const built = toInsertStatements(
+      target.engine,
+      target.table,
+      result.columns,
+      result.rows,
+      range,
+    );
+    if (!built.ok) {
+      toast.warning(built.reason);
+      return null;
+    }
+    return built.text;
+  };
+
   // Stringify the whole result table in the selected format (shared by Copy / Export).
+  // insertTarget: the snapshot of activeInsertTarget taken before the re-fetch
   const serializeResult = (
     format: CopyFormat,
     result: api.QueryResult | null | undefined,
+    insertTarget: InsertTargetSnapshot,
   ): string | null => {
     if (!result) {
       return null;
     }
-    return format === "csv"
-      ? toCsv(result)
-      : format === "tsv"
-        ? toTsv(result)
-        : toJson(result);
+    if (format === "insert") {
+      return insertText(insertTarget, result);
+    }
+    return format === "markdown"
+      ? markdownText(result)
+      : { csv: toCsv, tsv: toTsv, json: toJson }[format](result);
   };
 
   // Prepare the result to output for Copy / Export.
@@ -732,6 +1232,7 @@
     // Take the sort of the result being output now: the refetch below awaits, and the tab or
     // the sort can change meanwhile (the output must follow what was on screen when it started)
     const sortAtStart = activeSort;
+    const filterAtStart = filterQuery;
     let full: api.QueryResult | null = null;
     preparingOutput = true;
     try {
@@ -750,9 +1251,10 @@
         `The output was truncated at ${result.row_count.toLocaleString()} rows.`,
       );
     }
-    // Copy / Export follow the order on screen. A refetched full result is sorted by the same
-    // column (still "within the fetched rows": whatever was fetched is what gets sorted)
-    return reorderRows(result, sortAtStart);
+    // Copy / Export follow what is on screen: the rows that pass the filter, in the sorted order.
+    // A refetched full result is filtered by the same terms and sorted by the same column
+    // (still "within the fetched rows": whatever was fetched is what gets filtered and sorted)
+    return visibleRows(result, sortAtStart, filterAtStart);
   };
 
   // Copy button: copy the whole result table to the clipboard in the selected format.
@@ -760,7 +1262,10 @@
     if (preparingOutput) {
       return;
     }
-    const text = serializeResult(copyFormat, await resultForOutput());
+    // Take the format and the INSERT target before the re-fetch awaits (see insertText)
+    const format = copyFormat;
+    const target = activeInsertTarget;
+    const text = serializeResult(format, await resultForOutput(), target);
     if (text === null) {
       return;
     }
@@ -780,12 +1285,22 @@
     if (!activeTab?.result || preparingOutput) {
       return;
     }
-    const ext = copyFormat;
+    // Take the format and the INSERT target before the dialog and the re-fetch await
+    const format = copyFormat;
+    const target = activeInsertTarget;
+    // Say why before the save dialog rather than after the user picked a path
+    if (format === "insert" && !target?.ok) {
+      toast.warning(
+        target?.reason ?? "SQL INSERT is not available for this connection",
+      );
+      return;
+    }
+    const { ext, name } = EXPORT_FILE_TYPES[format];
     let path: string | null;
     try {
       path = await save({
         defaultPath: `result.${ext}`,
-        filters: [{ name: ext.toUpperCase(), extensions: [ext] }],
+        filters: [{ name, extensions: [ext] }],
       });
     } catch (e) {
       toast.error(`Export failed: ${e}`);
@@ -796,7 +1311,7 @@
       return;
     }
     // Do the refetch and serialization after the path is confirmed (avoids wasted work on cancel)
-    const text = serializeResult(copyFormat, await resultForOutput());
+    const text = serializeResult(format, await resultForOutput(), target);
     if (text === null) {
       return;
     }
@@ -1209,6 +1724,159 @@
     clearPending();
     previewStatements = null;
   };
+
+  // ------- Following a foreign key from a cell (CYBERNEURA-DEV-1319) -------
+  // For a single-table SELECT on MySQL / PostgreSQL / SQLite (the engines cell editing
+  // supports), the single-column foreign keys of the table put an arrow on their cells, which
+  // runs `SELECT * FROM <referenced table> WHERE <referenced column> = <value>` in a new result
+  // tab (also pasted into the editor and kept in the history). Only offered while the tab's
+  // connection and database are the selected ones: the SELECT runs there.
+
+  // Foreign keys per result tab, keyed by fkColumnKey of the column name
+  let foreignKeys = $state(
+    new Map<number, { executedAt: number; byColumn: Map<string, api.ForeignKeyInfo> }>(),
+  );
+  // Catalog lookups, once per connection + database + table (shared across tabs and re-runs).
+  // A failed lookup is not cached, so the next result tries again
+  const foreignKeyCache = new Map<string, Promise<api.ForeignKeyInfo[]>>();
+  // Bumped on every reload of the connections, so that a lookup started before it is dropped
+  let foreignKeyGeneration = 0;
+  $effect(() => {
+    // Forget everything when the connections are reloaded: another database may be behind
+    // the same connection name, and a tab's result would otherwise keep the old keys
+    void appStore.connections;
+    foreignKeyGeneration++;
+    foreignKeyCache.clear();
+    // untrack: this effect must depend on the connections only, not on the map it clears
+    // (otherwise every lookup that fills the map would clear it again)
+    untrack(() => {
+      if (foreignKeys.size > 0) {
+        foreignKeys = new Map();
+      }
+    });
+  });
+  // How a result column is matched with the catalog's column name. PostgreSQL returns the
+  // exact (case-sensitive) name in both, and `"Customer_ID"` and `customer_id` can be two
+  // columns there; MySQL / SQLite compare column names case-insensitively, and the result
+  // label is spelled as written in the SELECT list
+  const fkColumnKey = (engine: NormalizedEngine, column: string): string =>
+    engine === "postgres" ? column : column.toLowerCase();
+
+  const canFollowForeignKeys = $derived(
+    activeTab !== null &&
+      activeTab.batch === null &&
+      activeTab.connection === appStore.selectedConnection &&
+      activeTab.schema === appStore.activeSchema &&
+      (appStore.selectedCapabilities?.supports_editable_cells ?? false),
+  );
+  const activeForeignKeys = $derived.by(() => {
+    const tab = activeTab;
+    if (!tab || !canFollowForeignKeys) {
+      return null;
+    }
+    const entry = foreignKeys.get(tab.id);
+    return entry && entry.executedAt === tab.executedAt ? entry.byColumn : null;
+  });
+
+  $effect(() => {
+    const tab = activeTab;
+    const engine = activeEngine;
+    if (!tab?.result || !engine || !canFollowForeignKeys) {
+      return;
+    }
+    const existing = foreignKeys.get(tab.id);
+    if (existing && existing.executedAt === tab.executedAt) {
+      return;
+    }
+    const table = foreignKeyLookupTable(engine, tab.sql, tab.result.columns);
+    if (!table) {
+      return;
+    }
+    void loadForeignKeys(tab, table, engine);
+  });
+
+  async function loadForeignKeys(
+    tab: ResultTab,
+    table: string,
+    engine: NormalizedEngine,
+  ) {
+    const generation = foreignKeyGeneration;
+    // Snapshot before the await: a re-run reuses the same (unpinned) ResultTab object, so
+    // tab.executedAt would read the new run's timestamp afterwards
+    const executedAt = tab.executedAt;
+    const key = `${tab.connection}\u0001${tab.schema ?? ""}\u0001${table}`;
+    let pending = foreignKeyCache.get(key);
+    if (!pending) {
+      pending = api.getForeignKeys(tab.connection, table);
+      foreignKeyCache.set(key, pending);
+    }
+    let keys: api.ForeignKeyInfo[];
+    try {
+      keys = await pending;
+    } catch {
+      // No arrows when the catalog cannot be read (the result itself is unaffected)
+      if (generation === foreignKeyGeneration) {
+        foreignKeyCache.delete(key);
+      }
+      keys = [];
+    }
+    // Drop a stale answer (the result was replaced, the tab closed, or the connections were
+    // reloaded meanwhile)
+    const current = appStore.resultTabs.find((t) => t.id === tab.id);
+    if (
+      generation !== foreignKeyGeneration ||
+      !current ||
+      current.executedAt !== executedAt
+    ) {
+      return;
+    }
+    const byColumn = new Map<string, api.ForeignKeyInfo>();
+    for (const k of keys) {
+      const columnKey = fkColumnKey(engine, k.column);
+      // The backend keeps one key per column; keep the first if two names fold together
+      if (!byColumn.has(columnKey)) {
+        byColumn.set(columnKey, k);
+      }
+    }
+    foreignKeys.set(tab.id, { executedAt, byColumn });
+    foreignKeys = new Map(foreignKeys);
+  }
+
+  // The foreign key a cell can follow: its column has one and the value is a scalar
+  // (NULL references nothing; a JSON cell is not a key)
+  const foreignKeyOf = (
+    colIndex: number,
+    value: unknown,
+  ): api.ForeignKeyInfo | null => {
+    const keys = activeForeignKeys;
+    const engine = activeEngine;
+    const column = activeTab?.result?.columns[colIndex];
+    if (
+      !keys ||
+      !engine ||
+      column === undefined ||
+      value === null ||
+      value === undefined
+    ) {
+      return null;
+    }
+    if (typeof value === "object") {
+      return null;
+    }
+    return keys.get(fkColumnKey(engine, column)) ?? null;
+  };
+
+  const followForeignKey = (fk: api.ForeignKeyInfo, value: unknown) => {
+    const engine = activeEngine;
+    if (!engine) {
+      return;
+    }
+    const sql = referencedRowSql(engine, fk, literalFromValue(engine, value));
+    // Keep what ran visible: paste it into the editor (when a query file is open) and run it
+    // in a new tab, so the result it came from stays where it was
+    appStore.insertSqlSnippet(`${sql};`);
+    void appStore.runQueryInNewTab(sql);
+  };
 </script>
 
 <!-- Drag selection is tracked via the cell's pointerenter, so
@@ -1217,6 +1885,7 @@
   onpointerup={endDrag}
   onpointercancel={endDrag}
   onkeydown={handleWindowKeydown}
+  onkeyup={handleWindowKeyup}
 />
 
 <div class="flex h-full min-h-0 flex-col bg-zinc-900">
@@ -1332,7 +2001,16 @@
             {result.affected_rows} rows affected
           </span>
         {:else}
-          <span data-annotate="text-row-count">{result.row_count} rows</span>
+          {#if filterActive}
+            <span
+              data-annotate="text-row-count"
+              title="Rows matching the filter / fetched rows"
+            >
+              {rowOrder.length} of {result.rows.length} rows
+            </span>
+          {:else}
+            <span data-annotate="text-row-count">{result.row_count} rows</span>
+          {/if}
           {#if result.applied_limit !== null}
             <span
               class="text-zinc-500"
@@ -1406,6 +2084,58 @@
           </button>
         {/if}
         {#if activeTab.result && activeTab.result.columns.length > 0}
+          <!-- Filter the fetched rows (nothing is sent to the database) -->
+          {#if activeFilter}
+            <span class="relative inline-flex items-center">
+              <i
+                class="bi bi-search pointer-events-none absolute left-1.5 text-[10px] text-zinc-500"
+                aria-hidden="true"
+              ></i>
+              <input
+                bind:this={filterInputEl}
+                class="w-44 rounded border border-zinc-600 bg-zinc-800 py-0.5 pl-5 pr-5 text-xs text-zinc-200 outline-none placeholder:text-zinc-500 focus:border-blue-400"
+                type="text"
+                spellcheck="false"
+                autocomplete="off"
+                placeholder="Filter rows"
+                aria-label="Filter the fetched rows"
+                title="Show only the fetched rows that contain every word (case-insensitive, in any cell). The query is not re-run. Cells are matched on their first {MAX_CELL_SEARCH_CHARS.toLocaleString()} characters"
+                data-annotate="input-filter-result"
+                value={activeFilter.input}
+                oninput={(e) => onFilterInput(e.currentTarget.value)}
+                onkeydown={(e) => {
+                  // WebKit can deliver the key that commits an IME composition after
+                  // compositionend, with isComposing already false; keyCode 229 still marks it
+                  if (e.isComposing || e.keyCode === 229) {
+                    return;
+                  }
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    closeFilter();
+                  }
+                }}
+              />
+              <button
+                class="absolute right-1 text-zinc-500 hover:text-zinc-200"
+                title="Close the filter and show all rows (Esc)"
+                aria-label="Close the filter"
+                data-annotate="button-close-filter-result"
+                onclick={closeFilter}
+              >
+                <i class="bi bi-x" aria-hidden="true"></i>
+              </button>
+            </span>
+          {:else}
+            <button
+              class="rounded border border-zinc-700 px-1.5 py-0.5 hover:bg-zinc-700 hover:text-zinc-200"
+              title="Filter the fetched rows (Cmd+F / Ctrl+F while the result has the focus)"
+              aria-label="Filter the fetched rows"
+              data-annotate="button-filter-result"
+              onclick={openFilterAndFocus}
+            >
+              <i class="bi bi-search" aria-hidden="true"></i>
+            </button>
+          {/if}
           {#if selectionCopied}
             <span class="text-emerald-400" data-annotate="text-selection-copied">
               Copied
@@ -1413,7 +2143,7 @@
           {/if}
           <label
             class="flex cursor-pointer items-center gap-1 select-none hover:text-zinc-200"
-            title="Include column headers when copying a cell selection with Cmd+C (Ctrl+C)"
+            title="Include column headers when copying a cell selection with Cmd+C (Ctrl+C). CSV / TSV only: JSON always has keys and a Markdown table always has its header row"
           >
             <input
               type="checkbox"
@@ -1430,13 +2160,26 @@
             data-annotate="select-copy-format"
             bind:value={copyFormat}
           >
-            {#each ["tsv", "csv", "json"] as const as format (format)}
-              <option value={format}>{format.toUpperCase()}</option>
+            {#each selectableFormats as format (format)}
+              {#if format === "insert"}
+                <option
+                  value={format}
+                  disabled={!activeInsertTarget?.ok}
+                  title={activeInsertTarget?.ok
+                    ? `INSERT INTO ${activeInsertTarget.table} statements, one per row (not executed)`
+                    : (activeInsertTarget?.reason ?? "")}
+                  >{COPY_FORMAT_LABELS[format]}</option
+                >
+              {:else}
+                <option value={format}>{COPY_FORMAT_LABELS[format]}</option>
+              {/if}
             {/each}
           </select>
           <button
             class="rounded border border-zinc-700 px-1.5 py-0.5 hover:bg-zinc-700 hover:text-zinc-200"
-            title="Copy the whole result to the clipboard in the selected format"
+            title={filterActive
+              ? "Copy the rows matching the filter to the clipboard in the selected format"
+              : "Copy the whole result to the clipboard in the selected format"}
             data-annotate="button-copy-result"
             onclick={copyResult}
           >
@@ -1446,7 +2189,9 @@
           <span class="relative inline-flex">
             <button
               class="rounded-l border border-zinc-700 px-1.5 py-0.5 hover:bg-zinc-700 hover:text-zinc-200"
-              title="Export the whole result to a file in the selected format (UTF-8)"
+              title={filterActive
+                ? "Export the rows matching the filter to a file in the selected format (UTF-8)"
+                : "Export the whole result to a file in the selected format (UTF-8)"}
               data-annotate="button-export-result"
               onclick={() => void exportResult("utf-8")}
             >
@@ -1762,6 +2507,7 @@
                     data-annotate="button-result-row-header-{displayIndex}"
                     onpointerdown={(e) => beginSelect("row", displayIndex, 0, e)}
                     onpointerenter={(e) => extendSelect("row", displayIndex, 0, e)}
+                    oncontextmenu={(e) => openContextMenu(e, rowIndex)}
                   >
                     {displayIndex + 1}
                   </button>
@@ -1769,6 +2515,7 @@
                 {#each row as value, colIndex (colIndex)}
                   {@const pending = pendingInput(rowIndex, colIndex)}
                   {@const editable = isCellEditable(rowIndex, colIndex)}
+                  {@const fk = foreignKeyOf(colIndex, value)}
                   <!-- Click opens the cell inspector, drag does rectangular selection,
                        double-click edits (non-editable cells get a read-only view).
                        For truncate, the button/input is laid over the whole cell -->
@@ -1807,7 +2554,9 @@
                       {/if}
                     {:else}
                       <button
-                        class="block w-full truncate px-2 py-0.5 text-left {editable
+                        class="block w-full truncate px-2 py-0.5 text-left {fk
+                          ? 'pr-5'
+                          : ''} {editable
                           ? 'cursor-cell'
                           : 'cursor-pointer'} {pending !== null
                           ? 'text-amber-200'
@@ -1822,11 +2571,39 @@
                           beginSelect("cell", displayIndex, colIndex, e)}
                         onpointerenter={(e) =>
                           extendSelect("cell", displayIndex, colIndex, e)}
-                        onclick={() => onCellClick(rowIndex, colIndex)}
+                        onclick={(e) => {
+                          // Cmd+click (Ctrl+click) on a foreign key cell follows it
+                          if (fk && (e.metaKey || e.ctrlKey)) {
+                            followForeignKey(fk, value);
+                            return;
+                          }
+                          onCellClick(rowIndex, colIndex);
+                        }}
                         ondblclick={() => beginCellEdit(rowIndex, colIndex)}
+                        oncontextmenu={(e) => openContextMenu(e, rowIndex)}
                       >
                         {pending !== null ? pending : cellText(value)}
                       </button>
+                      {#if fk}
+                        <!-- Follow the foreign key: the referenced row in a new result tab.
+                             Left of the copy icon of the active cell -->
+                        <button
+                          class="absolute top-1/2 -translate-y-1/2 rounded px-0.5 text-zinc-500 hover:bg-zinc-700 hover:text-sky-300 {isSelectedCell(
+                            rowIndex,
+                            colIndex,
+                          )
+                            ? 'right-6'
+                            : 'right-0.5'}"
+                          title="Open the referenced row: {fk.ref_schema
+                            ? `${fk.ref_schema}.`
+                            : ''}{fk.ref_table}.{fk.ref_column} = {cellText(value)} (new result tab; Cmd+click the cell does the same)"
+                          aria-label="Open the referenced row in {fk.ref_table}"
+                          data-annotate="button-follow-fk-{displayIndex}-{colIndex}"
+                          onclick={() => followForeignKey(fk, value)}
+                        >
+                          <i class="bi bi-box-arrow-up-right text-[0.65rem]" aria-hidden="true"></i>
+                        </button>
+                      {/if}
                       {#if isSelectedCell(rowIndex, colIndex)}
                         {@const copied =
                           copiedCellKey === `${rowIndex}:${colIndex}`}
@@ -1865,6 +2642,14 @@
             {/if}
           </tbody>
         </table>
+        {#if filterActive && rowOrder.length === 0}
+          <p
+            class="px-3 py-2 text-xs text-zinc-500"
+            data-annotate="text-filter-no-match"
+          >
+            No fetched rows match the filter.
+          </p>
+        {/if}
       {:else if activeTab?.result}
         {@const result = activeTab.result}
         <pre
@@ -1877,6 +2662,29 @@
       {/if}
     </div>
 
+    <!-- Row detail panel (Space / right-click > Show row) -->
+    {#if rowDetailView}
+      <RowDetailPanel
+        columns={rowDetailView.columns}
+        row={rowDetailView.row}
+        displayIndex={rowDetailView.displayIndex}
+        total={rowDetailView.total}
+        onprev={() => stepRowDetail(-1)}
+        onnext={() => stepRowDetail(1)}
+        onclose={closeRowDetail}
+        oninspect={(colIndex) => {
+          if (activeTab && rowDetail) {
+            selectedCell = {
+              tabId: activeTab.id,
+              rowIndex: rowDetail.rowIndex,
+              colIndex,
+            };
+          }
+        }}
+        bind:panelEl={rowDetailEl}
+      />
+    {/if}
+
     <!-- Cell inspector (shown only while a cell is selected) -->
     {#if inspectedCell}
       <CellInspector
@@ -1888,6 +2696,40 @@
     {/if}
   </div>
 </div>
+
+<!-- Right-click menu of a result row -->
+{#if contextMenu}
+  <button
+    class="fixed inset-0 z-40 cursor-default"
+    aria-label="Close menu"
+    data-annotate="result-row-menu-backdrop"
+    onclick={() => (contextMenu = null)}
+    oncontextmenu={(e) => {
+      e.preventDefault();
+      contextMenu = null;
+    }}
+  ></button>
+  <div
+    class="fixed z-50 min-w-40 rounded border border-zinc-700 bg-zinc-800 py-1 text-xs text-zinc-300 shadow-lg"
+    style="left:{contextMenu.x}px; top:{contextMenu.y}px"
+    role="menu"
+  >
+    <button
+      class="block w-full px-3 py-1 text-left hover:bg-zinc-700 hover:text-zinc-100"
+      role="menuitem"
+      data-annotate="menu-result-show-row"
+      onclick={() => {
+        const rowIndex = contextMenu?.rowIndex;
+        contextMenu = null;
+        if (rowIndex !== undefined) {
+          showRowFromMenu(rowIndex);
+        }
+      }}
+    >
+      Show row <span class="ml-2 text-zinc-500">Space</span>
+    </button>
+  </div>
+{/if}
 
 <!-- Modal for the AI explanation of the execution plan -->
 {#if appStore.aiAnalysis !== null}

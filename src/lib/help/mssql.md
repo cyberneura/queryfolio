@@ -42,6 +42,9 @@ button does the same.
 \d sales.orders -- one table's columns (dbo when the schema is omitted)
 ```
 
+`\d+` (the table definition) is not available for SQL Server; query
+`sys.indexes` / `sys.foreign_keys` instead.
+
 Switching database is `\c reporting` or `USE reporting` (also `USE [reporting]`).
 Both reconnect to that database, so the TABLES pane and completion follow.
 

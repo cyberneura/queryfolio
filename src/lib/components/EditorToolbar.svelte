@@ -21,6 +21,9 @@
     showReplaceMultiline: boolean;
     /// Handler for pressing the Replace Multiline button (+page.svelte opens the pane)
     onReplaceMultiline: () => void;
+    /// The statement at the editor cursor (or the selection). Given to the coding agent as
+    /// context when the inline AI field is handled by an agent
+    getStatement: () => string;
   }
 
   let {
@@ -32,6 +35,7 @@
     onFormat,
     showReplaceMultiline,
     onReplaceMultiline,
+    getStatement,
   }: Props = $props();
 
   const isSqlite = $derived(
@@ -51,9 +55,24 @@
 
   const aiConfigured = $derived(appStore.aiInfo?.configured ?? false);
 
+  /// The coding agent configured in `agent:` (CYBERNEURA-DEV-1354). When there is one, the
+  /// inline AI field hands the instruction to it instead of the built-in SQL generation: the
+  /// agent edits the open query file and its reply is shown in a toast. It works on files, so
+  /// it is offered for every engine (the built-in generation needs supports_ai)
+  const agentName = $derived(
+    appStore.agentInfo?.provider ? (appStore.agentInfo.provider_name ?? "Agent") : null,
+  );
+  /// Whether the inline AI field can be used at all
+  const aiFieldAvailable = $derived(agentName !== null || (supportsAi && aiConfigured));
+
   /// Title of the AI button (explains how to configure when unset or on error)
   const aiButtonTitle = $derived(
-    aiConfigured
+    agentName
+      ? `Ask ${agentName} to change this query file. It edits the file directly, ` +
+          "and its reply is shown as a notification."
+      : appStore.agentError
+        ? `The agent is unavailable: ${appStore.agentError}`
+        : aiConfigured
       ? `Generate SQL with AI (${appStore.aiInfo?.model})`
       : appStore.aiError
         ? `AI is unavailable: ${appStore.aiError}`
@@ -85,7 +104,10 @@
     if (appStore.aiGenerating) {
       return;
     }
-    if (await appStore.generateSql(aiInstruction)) {
+    const done = agentName
+      ? await appStore.runAgentOnce(aiInstruction, getStatement())
+      : await appStore.generateSql(aiInstruction);
+    if (done) {
       aiInstruction = "";
       showAiInput = false;
     }
@@ -278,7 +300,7 @@
         {/if}
       </button>
     {/if}
-    {#if !supportsAi}
+    {#if !supportsAi && agentName === null}
       <!-- The AI UI is not shown for this engine -->
     {:else if showAiInput}
       <form
@@ -290,7 +312,9 @@
           bind:value={aiInstruction}
           class="w-72 max-w-full rounded border border-zinc-600 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-200 outline-none placeholder:text-zinc-500 focus:border-blue-400"
           data-annotate="input-ai-instruction"
-          placeholder="Describe the query in natural language..."
+          placeholder={agentName
+            ? `Tell ${agentName} what to change in this file...`
+            : "Describe the query in natural language..."}
           disabled={appStore.aiGenerating}
           onkeydown={onAiInputKeydown}
         />
@@ -306,11 +330,23 @@
               class="inline-block size-3 animate-spin rounded-full border-2 border-blue-300 border-t-transparent"
               data-annotate="spinner-ai-generating"
             ></span>
-            Generating...
+            {agentName ? "Working..." : "Generating..."}
           {:else}
-            Generate
+            {agentName ? "Ask" : "Generate"}
           {/if}
         </button>
+        {#if appStore.agentRunning}
+          <!-- The agent can take a while; let the user stop it (edits it already made stay) -->
+          <button
+            type="button"
+            class="flex items-center gap-1 rounded border border-zinc-600 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-800"
+            data-annotate="button-ai-agent-stop"
+            title="Stop the agent"
+            onclick={() => appStore.cancelAgentOnce()}
+          >
+            <i class="bi bi-stop-fill" aria-hidden="true"></i> Stop
+          </button>
+        {/if}
         <button
           type="button"
           class="rounded px-1.5 py-0.5 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-50"
@@ -331,8 +367,8 @@
         class="rounded border border-zinc-600 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
         data-annotate="button-ai-toggle"
         title={aiButtonTitle}
-        aria-label="Generate SQL with AI"
-        disabled={!aiConfigured}
+        aria-label={agentName ? `Ask ${agentName}` : "Generate SQL with AI"}
+        disabled={!aiFieldAvailable}
         onclick={() => {
           showAiInput = true;
         }}
