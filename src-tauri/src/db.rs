@@ -6389,11 +6389,10 @@ mod tests {
     async fn test_manual_transaction_sqlite() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tx.db");
-        let yaml = format!(
-            "name: lite\nengine: sqlite\nschema: \"{}\"\n",
-            path.display().to_string().replace('"', "\\\"")
-        );
-        let server: ServerConfig = serde_yaml::from_str(&yaml).unwrap();
+        // The path is set after parsing: a Windows path's backslashes are escapes in YAML
+        let mut server: ServerConfig =
+            serde_yaml::from_str("name: lite\nengine: sqlite\n").unwrap();
+        server.schema = Some(path.display().to_string());
         {
             let pool = SqlitePoolOptions::new()
                 .max_connections(1)
