@@ -1454,6 +1454,39 @@ async fn list_processes(
         .await
 }
 
+/// Cancels another session's statement or closes its connection (the PROCESS LIST pane,
+/// CYBERNEURA-DEV-1399). It changes the server's state, so it follows the same rule as writes:
+/// refused on a config `readonly: true` connection and while the Writable switch is OFF.
+/// Returns false when PostgreSQL did not signal the process (it was already gone).
+#[tauri::command]
+async fn signal_process(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    id: String,
+    action: process_list::ProcessAction,
+    writable: Option<bool>,
+) -> Result<bool, AppError> {
+    let server = state.find_server(&connection).await?;
+    if server.readonly {
+        return Err(AppError::Readonly(
+            "This connection is readonly in the config; it cannot cancel or kill processes".into(),
+        ));
+    }
+    if !writable.unwrap_or(false) {
+        return Err(AppError::Readonly(
+            "Turn on the Writable switch to cancel or kill processes".into(),
+        ));
+    }
+    let id = &id;
+    state
+        .db
+        // Cancelling / killing runs no user code and is safe to send again (PasswordRetry docs)
+        .with_pool(&server, db::PasswordRetry::Idempotent, |pool| async move {
+            process_list::signal_process(&pool, id, action).await
+        })
+        .await
+}
+
 /// Returns the column names that make up the table's primary key (for cell editing in the result grid).
 /// Returns empty for a table with no primary key.
 #[tauri::command]
@@ -3123,6 +3156,7 @@ pub fn run() {
             get_primary_keys,
             get_foreign_keys,
             list_processes,
+            signal_process,
             run_statements,
             get_ai_info,
             ai_generate_sql,

@@ -96,6 +96,80 @@ async fn fetch_mysql(pool: &sqlx::MySqlPool) -> Result<Vec<ProcessInfo>, AppErro
         .collect())
 }
 
+/// What to do to another session from the PROCESS LIST pane (CYBERNEURA-DEV-1399).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessAction {
+    /// Stop the statement the session is running; the connection stays
+    /// (MySQL `KILL QUERY` / PostgreSQL `pg_cancel_backend`)
+    CancelQuery,
+    /// Close the session's connection (MySQL `KILL` / PostgreSQL `pg_terminate_backend`)
+    KillConnection,
+}
+
+/// The id as a number, or an error. **The MySQL statement is built from this number**, never from
+/// the string the frontend sent (KILL does not take a placeholder), so anything that is not a plain
+/// decimal is rejected here.
+fn parse_process_id(id: &str) -> Result<u64, AppError> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(AppError::Config(format!("Invalid process id: {id}")));
+    }
+    trimmed
+        .parse::<u64>()
+        .map_err(|_| AppError::Config(format!("Invalid process id: {id}")))
+}
+
+/// The MySQL statement for the action. `id` is already a number, so the formatted string cannot
+/// carry anything else.
+fn mysql_signal_sql(action: ProcessAction, id: u64) -> String {
+    match action {
+        ProcessAction::CancelQuery => format!("KILL QUERY {id}"),
+        ProcessAction::KillConnection => format!("KILL {id}"),
+    }
+}
+
+/// Cancels the statement of / terminates another session. Runs on a pooled connection that is
+/// not registered with `QueryRuns`, like the list itself.
+///
+/// Returns false when PostgreSQL reports that it did not signal the process (the pid is gone).
+/// Errors (no such thread on MySQL, missing privilege on either) are returned as they are, so the
+/// pane can show the server's message.
+pub async fn signal_process(
+    pool: &DbPool,
+    id: &str,
+    action: ProcessAction,
+) -> Result<bool, AppError> {
+    let id = parse_process_id(id)?;
+    match pool {
+        DbPool::MySql(p) => {
+            // KILL is not supported by the prepared statement protocol on every server version;
+            // send it as a plain text query (the same reason as SHOW FULL PROCESSLIST above)
+            let mut conn = p.acquire().await?;
+            (&mut *conn)
+                .execute(sqlx::raw_sql(&mysql_signal_sql(action, id)))
+                .await?;
+            Ok(true)
+        }
+        DbPool::Postgres(p) => {
+            // pid is int4 on the server
+            let pid = i32::try_from(id)
+                .map_err(|_| AppError::Config(format!("Invalid process id: {id}")))?;
+            // Qualified with pg_catalog: a same-named function in a schema earlier in the
+            // search_path would otherwise run instead, with this role's privileges
+            let sql = match action {
+                ProcessAction::CancelQuery => "SELECT pg_catalog.pg_cancel_backend($1)",
+                ProcessAction::KillConnection => "SELECT pg_catalog.pg_terminate_backend($1)",
+            };
+            let row = sqlx::query(sql).bind(pid).fetch_one(p).await?;
+            Ok(row.try_get::<bool, _>(0)?)
+        }
+        _ => Err(AppError::Config(
+            "The process list is only available for MySQL and PostgreSQL connections".into(),
+        )),
+    }
+}
+
 /// Builds a ProcessInfo from the columns of a SHOW FULL PROCESSLIST row
 /// (Id, User, Host, db, Command, Time, State, Info; MariaDB adds Progress).
 fn mysql_process(fields: Vec<ProcessField>) -> ProcessInfo {
@@ -373,6 +447,47 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_process_id_accepts_only_decimal() {
+        assert_eq!(parse_process_id("42").unwrap(), 42);
+        assert_eq!(parse_process_id(" 7 ").unwrap(), 7);
+        assert_eq!(parse_process_id("18446744073709551615").unwrap(), u64::MAX);
+        for bad in [
+            "",
+            " ",
+            "-1",
+            "+1",
+            "1e3",
+            "0x10",
+            "1; DROP TABLE t",
+            "1 2",
+            "18446744073709551616",
+        ] {
+            assert!(parse_process_id(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_mysql_signal_sql() {
+        assert_eq!(
+            mysql_signal_sql(ProcessAction::CancelQuery, 12),
+            "KILL QUERY 12"
+        );
+        assert_eq!(
+            mysql_signal_sql(ProcessAction::KillConnection, 12),
+            "KILL 12"
+        );
+    }
+
+    #[test]
+    fn test_process_action_from_frontend() {
+        let a: ProcessAction = serde_json::from_str("\"cancel_query\"").unwrap();
+        assert_eq!(a, ProcessAction::CancelQuery);
+        let a: ProcessAction = serde_json::from_str("\"kill_connection\"").unwrap();
+        assert_eq!(a, ProcessAction::KillConnection);
+        assert!(serde_json::from_str::<ProcessAction>("\"kill\"").is_err());
+    }
+
+    #[test]
     fn test_json_to_text() {
         assert_eq!(json_to_text(serde_json::Value::Null), None);
         assert_eq!(json_to_text(serde_json::json!("x")), Some("x".into()));
@@ -458,5 +573,108 @@ mod tests {
             .iter()
             .any(|p| p.info.as_deref() == Some("SHOW FULL PROCESSLIST")));
         sleeping.await.unwrap().unwrap();
+    }
+
+    fn unique_marker() -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("qf-cancel-probe-{}-{nanos}", std::process::id())
+    }
+
+    /// Finds the probe query in the list (waits up to 5 seconds for it to show up)
+    async fn find_probe(pool: &DbPool, marker: &str) -> ProcessInfo {
+        for _ in 0..50 {
+            let processes = fetch_processes(pool).await.unwrap();
+            if let Some(p) = processes
+                .into_iter()
+                .find(|p| p.info.as_deref().is_some_and(|q| q.contains(marker)))
+            {
+                return p;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("the probe query should be listed");
+    }
+
+    /// Cancel query stops another session's pg_sleep(30) (QUERYFOLIO_TEST_PG_URL, skipped otherwise).
+    #[tokio::test]
+    async fn test_signal_process_against_postgres() {
+        use sqlx::Connection;
+        let Ok(url) = std::env::var("QUERYFOLIO_TEST_PG_URL") else {
+            return;
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .connect(&url)
+            .await
+            .unwrap();
+        let db = DbPool::Postgres(pool.clone());
+
+        // Cancel query: the statement fails, the connection stays
+        let sleeper = pool.clone();
+        let started = std::time::Instant::now();
+        // A marker unique to this run, so a parallel run's probe is never picked
+        let marker = unique_marker();
+        let probe_sql = format!("SELECT pg_sleep(30), '{marker}'");
+        let sleeping = tokio::spawn(async move { sqlx::query(&probe_sql).execute(&sleeper).await });
+        let probe = find_probe(&db, &marker).await;
+        assert!(signal_process(&db, &probe.id, ProcessAction::CancelQuery)
+            .await
+            .unwrap());
+        let result = sleeping.await.unwrap();
+        assert!(result.is_err(), "the cancelled statement should fail");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+
+        // Kill connection: the backend goes away
+        let mut victim = sqlx::PgConnection::connect(&url).await.unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut victim)
+            .await
+            .unwrap();
+        assert!(
+            signal_process(&db, &pid.to_string(), ProcessAction::KillConnection)
+                .await
+                .unwrap()
+        );
+        // A pid that does not exist is reported as false (PostgreSQL only warns)
+        assert!(
+            !signal_process(&db, "2147483000", ProcessAction::CancelQuery)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Cancel query stops another session's SLEEP(30) (QUERYFOLIO_TEST_MYSQL_URL, skipped otherwise).
+    #[tokio::test]
+    async fn test_signal_process_against_mysql() {
+        let Ok(url) = std::env::var("QUERYFOLIO_TEST_MYSQL_URL") else {
+            return;
+        };
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(3)
+            .connect(&url)
+            .await
+            .unwrap();
+        let db = DbPool::MySql(pool.clone());
+        let sleeper = pool.clone();
+        let started = std::time::Instant::now();
+        let marker = unique_marker();
+        let probe_sql = format!("SELECT SLEEP(30), '{marker}'");
+        let sleeping = tokio::spawn(async move { sqlx::query(&probe_sql).execute(&sleeper).await });
+        let probe = find_probe(&db, &marker).await;
+        assert!(signal_process(&db, &probe.id, ProcessAction::CancelQuery)
+            .await
+            .unwrap());
+        // SLEEP() returns 1 when interrupted (or the statement fails, depending on the version)
+        let _ = sleeping.await.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        // KILL of a thread that does not exist is an error from the server
+        assert!(
+            signal_process(&db, "4000000000", ProcessAction::KillConnection)
+                .await
+                .is_err()
+        );
     }
 }
