@@ -348,15 +348,20 @@ export type FillResult = { ok: true; sql: string } | { ok: false; missing: strin
 export function fillParams(
   sql: string,
   uses: readonly ParamUse[],
-  values: Readonly<Record<string, string>>,
+  values: Readonly<Record<string, string>> | ReadonlyMap<string, string>,
 ): FillResult {
-  // Own properties only: `:constructor` must not find Object.prototype.constructor
-  const missing = paramNames(uses).filter((n) => !Object.hasOwn(values, n));
+  // A Map, or own properties only: `:constructor` must not find Object.prototype.constructor
+  const get = (n: string): string | undefined => {
+    if (values instanceof Map) return values.get(n);
+    const record = values as Readonly<Record<string, string>>;
+    return Object.hasOwn(record, n) ? record[n] : undefined;
+  };
+  const missing = paramNames(uses).filter((n) => get(n) === undefined);
   if (missing.length > 0) return { ok: false, missing };
   let out = "";
   let last = 0;
   for (const u of uses) {
-    out += sql.slice(last, u.from) + values[u.name];
+    out += sql.slice(last, u.from) + get(u.name);
     last = u.to;
   }
   return { ok: true, sql: out + sql.slice(last) };

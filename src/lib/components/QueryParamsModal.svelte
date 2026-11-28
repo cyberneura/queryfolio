@@ -7,12 +7,14 @@
   interface Props {
     /// The names to ask for, in order of first appearance
     names: string[];
-    /// Initial values (the values used last time for this query file)
-    initial: Record<string, ParamInput>;
+    /// Initial values (the values used last time for this query file). A Map, not an object:
+    /// a parameter may be named `__proto__`
+    initial: ReadonlyMap<string, ParamInput>;
     /// Names already defined in the file with `-- @set` (shown for reference, not editable)
     defined: { name: string; value: string }[];
     /// `remember`: keep the values for the next run of this query file (localStorage, plain text)
-    onSubmit: (values: Record<string, ParamInput>, remember: boolean) => void;
+    /// The values in the order of `names`
+    onSubmit: (values: [string, ParamInput][], remember: boolean) => void;
     onCancel: () => void;
   }
 
@@ -20,22 +22,25 @@
 
   // Copied once: the dialog keeps its own working values
   // svelte-ignore state_referenced_locally
-  let values = $state<Record<string, ParamInput>>(
-    Object.fromEntries(
-      names.map((n) => [n, { value: initial[n]?.value ?? "", raw: initial[n]?.raw ?? false }]),
-    ),
+  // Kept by position (not keyed by name, for the same reason as `initial`)
+  let values = $state<ParamInput[]>(
+    names.map((n) => ({ value: initial.get(n)?.value ?? "", raw: initial.get(n)?.raw ?? false })),
   );
 
   let remember = $state(true);
 
   const errors = $derived(
-    Object.fromEntries(names.map((n) => [n, invalidParamInput(values[n])])),
+    values.map((v) => invalidParamInput(v)),
   );
-  const hasError = $derived(names.some((n) => errors[n] !== null));
+  const hasError = $derived(errors.some((e) => e !== null));
 
   function submit() {
     if (hasError) return;
-    onSubmit($state.snapshot(values), remember);
+    const snapshot = $state.snapshot(values);
+    onSubmit(
+      names.map((n, i) => [n, snapshot[i]]),
+      remember,
+    );
   }
 </script>
 
@@ -82,16 +87,16 @@
                 <!-- svelte-ignore a11y_autofocus -->
                 <input
                   type="text"
-                  class="w-full rounded border bg-zinc-950 px-2 py-1 font-mono text-xs text-zinc-200 outline-none focus:border-blue-500 {errors[name]
+                  class="w-full rounded border bg-zinc-950 px-2 py-1 font-mono text-xs text-zinc-200 outline-none focus:border-blue-500 {errors[i]
                     ? 'border-red-600'
                     : 'border-zinc-600'}"
                   data-annotate="input-query-param"
                   aria-label="Value of :{name}"
                   autofocus={i === 0}
-                  bind:value={values[name].value}
+                  bind:value={values[i].value}
                 />
-                {#if errors[name]}
-                  <p class="mt-0.5 text-[10px] text-red-400">{errors[name]}</p>
+                {#if errors[i]}
+                  <p class="mt-0.5 text-[10px] text-red-400">{errors[i]}</p>
                 {/if}
               </td>
               <td class="py-1 pl-2">
@@ -100,7 +105,7 @@
                     type="checkbox"
                     class="accent-blue-500"
                     data-annotate="toggle-query-param-raw"
-                    bind:checked={values[name].raw}
+                    bind:checked={values[i].raw}
                   />
                   raw
                 </label>

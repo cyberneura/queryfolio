@@ -163,34 +163,39 @@
   /// The dialog waiting for an answer
   let queryParamsPrompt = $state<{
     names: string[];
-    initial: Record<string, ParamInput>;
+    initial: Map<string, ParamInput>;
     defined: { name: string; value: string }[];
-    resolve: (answer: { values: Record<string, ParamInput>; remember: boolean } | null) => void;
+    resolve: (answer: { values: [string, ParamInput][]; remember: boolean } | null) => void;
   } | null>(null);
 
   const QUERY_PARAMS_KEY = "queryfolio.queryParams";
 
-  /// Values typed last time, per connection + query file (so re-running asks with the same values)
-  function loadParamValues(fileKey: string): Record<string, ParamInput> {
+  /// Values typed last time, per connection + query file (so re-running asks with the same values).
+  /// Stored as `[name, value]` pairs and read into a Map: a parameter may be named `__proto__`
+  function loadParamValues(fileKey: string): Map<string, ParamInput> {
+    const out = new Map<string, ParamInput>();
     try {
       const all = JSON.parse(localStorage.getItem(QUERY_PARAMS_KEY) ?? "{}");
-      const saved = all?.[fileKey];
-      if (!saved || typeof saved !== "object") return {};
-      const out: Record<string, ParamInput> = {};
-      for (const [name, v] of Object.entries(saved as Record<string, unknown>)) {
-        const r = v as { value?: unknown; raw?: unknown };
-        if (typeof r?.value === "string") out[name] = { value: r.value, raw: r.raw === true };
+      const saved: unknown = all && Object.hasOwn(all, fileKey) ? all[fileKey] : null;
+      if (!Array.isArray(saved)) return out;
+      for (const entry of saved) {
+        if (!Array.isArray(entry) || typeof entry[0] !== "string") continue;
+        const r = entry[1] as { value?: unknown; raw?: unknown } | null;
+        if (typeof r?.value === "string") out.set(entry[0], { value: r.value, raw: r.raw === true });
       }
-      return out;
     } catch {
-      return {};
+      // Unreadable storage: start empty
     }
+    return out;
   }
 
-  function saveParamValues(fileKey: string, values: Record<string, ParamInput>) {
+  function saveParamValues(fileKey: string, values: [string, ParamInput][]) {
     try {
       const all = JSON.parse(localStorage.getItem(QUERY_PARAMS_KEY) ?? "{}") ?? {};
-      all[fileKey] = { ...(all[fileKey] ?? {}), ...values };
+      const merged = loadParamValues(fileKey);
+      for (const [name, v] of values) merged.set(name, v);
+      // The key always contains \u0001, so it is never a special property name
+      all[fileKey] = [...merged];
       localStorage.setItem(QUERY_PARAMS_KEY, JSON.stringify(all));
     } catch {
       // The run itself does not depend on remembering the values
@@ -217,35 +222,36 @@
     // unedited CRLF file still has CRLF in `content`, so normalize the same way before counting
     const defs = parseDefinitions((tab?.content ?? "").replace(/\r\n?/g, "\n"), engine);
     // Per statement: names the file defines (the definition above that statement wins)
+    // Maps, not objects: a parameter may be named `__proto__`
     const fromFile = uses.map((u, i) => {
-      const values: Record<string, string> = {};
+      const values = new Map<string, string>();
       for (const name of paramNames(u)) {
         // Measured from the SQL body: leading comment lines of the range (with a `-- @set`) still
         // come before the statement
         const d = definitionFor(defs, name, (starts[i] ?? 0) + sqlBodyOffset(statements[i], engine));
-        if (d) values[name] = d.value;
+        if (d) values.set(name, d.value);
       }
       return values;
     });
     const ask = [
       ...new Set(
-        uses.flatMap((u, i) => paramNames(u).filter((n) => !Object.hasOwn(fromFile[i], n))),
+        uses.flatMap((u, i) => paramNames(u).filter((n) => !fromFile[i].has(n))),
       ),
     ];
-    let typed: Record<string, ParamInput> = {};
+    let typed = new Map<string, ParamInput>();
     if (ask.length > 0) {
       const fileKey = `${connection ?? ""}\u0001${tab?.file ?? ""}`;
       const defined = [
         ...new Map(
           uses.flatMap((u, i) =>
             paramNames(u)
-              .filter((n) => Object.hasOwn(fromFile[i], n))
-              .map((n) => [n, { name: n, value: fromFile[i][n] }] as const),
+              .filter((n) => fromFile[i].has(n))
+              .map((n) => [n, { name: n, value: fromFile[i].get(n) ?? "" }] as const),
           ),
         ).values(),
       ];
       const answer = await new Promise<{
-        values: Record<string, ParamInput>;
+        values: [string, ParamInput][];
         remember: boolean;
       } | null>((resolve) => {
         queryParamsPrompt = { names: ask, initial: loadParamValues(fileKey), defined, resolve };
@@ -253,15 +259,14 @@
       queryParamsPrompt = null;
       if (answer === null) return null;
       if (answer.remember) saveParamValues(fileKey, answer.values);
-      typed = answer.values;
+      typed = new Map(answer.values);
     }
     const filled: string[] = [];
     for (let i = 0; i < statements.length; i++) {
-      const values: Record<string, string> = { ...fromFile[i] };
+      const values = new Map(fromFile[i]);
       for (const name of paramNames(uses[i])) {
-        if (!Object.hasOwn(values, name) && Object.hasOwn(typed, name)) {
-          values[name] = paramInputSql(engine, typed[name]);
-        }
+        const input = typed.get(name);
+        if (!values.has(name) && input) values.set(name, paramInputSql(engine, input));
       }
       const result = fillParams(statements[i], uses[i], values);
       if (!result.ok) {

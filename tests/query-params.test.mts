@@ -142,3 +142,12 @@ test("review round 3: struct key positions, nested comments on SQL Server", () =
   assert.deepEqual(names("SELECT {a: 1, b: :v}", "duckdb"), ["v"]);
   assert.deepEqual(names("SELECT 1 /* outer /* inner */ :hidden */, :yes", "mssql"), ["yes"]);
 });
+
+test("review round 4: __proto__ as a parameter name", () => {
+  const sql = "SELECT :__proto__";
+  const uses = findParams(sql, "postgres");
+  assert.deepEqual(paramNames(uses), ["__proto__"]);
+  assert.deepEqual(fillParams(sql, uses, new Map([["__proto__", "42"]])), { ok: true, sql: "SELECT 42" });
+  assert.deepEqual(fillParams(sql, uses, new Map()), { ok: false, missing: ["__proto__"] });
+  assert.deepEqual(parseDefinitions("-- @set __proto__ = 42\n", "postgres").map((d) => d.name), ["__proto__"]);
+});
