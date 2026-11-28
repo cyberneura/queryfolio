@@ -275,6 +275,10 @@ SELECT * FROM orders WHERE created_at >= '2026-10-01';
   the Writable switch says) and only happens for statements judged read-only — otherwise, or
   when it fails (a `SELECT nextval(...)` is refused), the rows shown are logged with the
   `(the query was limited to N rows)` note. The table itself keeps showing at most 500 rows.
+  **While the connection is in a manual transaction (Manual in the editor toolbar) there is no
+  second run**: the read-only re-run cannot nest in the open transaction, so the rows shown are
+  logged with the same note. A log with that note is not the whole result — switch the
+  connection back to Auto (or add a `LIMIT` of your own) when you need every row.
 - Results larger than **200 rows** trigger a confirmation dialog first: write everything /
   write only the first 200 rows / write nothing (the dialog counts the re-fetched rows, so a
   2,000-row result offers "Write all 2,000 rows"). On top of that the body is capped at roughly
