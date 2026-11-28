@@ -160,15 +160,65 @@ const NAME_CHAR = /[A-Za-z0-9_]/;
  * identifier or number, e.g. slices `arr[1:2]`, time literals already being strings), and anything
  * inside literals / comments / quoted identifiers.
  */
+/** Index of the last non-whitespace character before `i` (-1 if none) */
+function prevNonSpace(text: string, i: number): number {
+  let j = i - 1;
+  while (j >= 0 && /\s/.test(text[j])) j--;
+  return j;
+}
+
+/**
+ * Whether the `[` at `bracket` is a subscript (`arr[...]`, `f(x)[...]`, `a[1][...]`) rather than an
+ * array / list constructor (`ARRAY[...]`, DuckDB `[...]`).
+ */
+function isSubscriptBracket(code: string, bracket: number): boolean {
+  // A subscript is written right after its operand; after whitespace (`SELECT [:a]`, `ARRAY [`)
+  // the bracket starts a constructor
+  const j = bracket - 1;
+  if (j < 0 || /\s/.test(code[j])) return false;
+  const c = code[j];
+  if (c === ")" || c === "]") return true;
+  if (!/[A-Za-z0-9_$"]/.test(c)) return false;
+  let k = j;
+  while (k >= 0 && /[A-Za-z0-9_$]/.test(code[k])) k--;
+  return code.slice(k + 1, j + 1).toLowerCase() !== "array";
+}
+
+/** Depth of `{` … `}` at each offset (DuckDB struct / map literals) */
+function braceDepths(code: string): number[] {
+  const depths: number[] = [];
+  let depth = 0;
+  for (const ch of code) {
+    if (ch === "{") depth++;
+    depths.push(depth);
+    if (ch === "}" && depth > 0) depth--;
+  }
+  return depths;
+}
+
 export function findParams(sql: string, engine: ParamEngine): ParamUse[] {
   const code = blankNonCode(sql, engine);
+  const braces = engine === "duckdb" ? braceDepths(code) : null;
   const uses: ParamUse[] = [];
   for (let i = 0; i < code.length; i++) {
     if (code[i] !== ":") continue;
     const prev = i > 0 ? code[i - 1] : "";
     if (prev === ":" || /[A-Za-z0-9_$\]).]/.test(prev)) continue;
-    // PostgreSQL / DuckDB array slices with an omitted lower bound: `arr[:upper]`
-    if (prev === "[" && (engine === "postgres" || engine === "duckdb")) continue;
+    // A colon right after a string / quoted identifier is a key separator (DuckDB `{'k':v}`),
+    // never a placeholder (`'x' :y` is not valid SQL)
+    const before = prevNonSpace(sql, i);
+    if (before >= 0 && code[before] !== sql[before] && /['"`\]]/.test(sql[before])) continue;
+    // DuckDB struct keys may also be bare identifiers: `{a: x}`
+    if (braces && braces[i] > 0 && before >= 0 && /[A-Za-z0-9_$]/.test(code[before])) continue;
+    // PostgreSQL / DuckDB slices with an omitted lower bound: `arr[:upper]` (but `ARRAY[:id]` and
+    // DuckDB `[:id]` construct arrays and keep their placeholders)
+    if (
+      prev === "[" &&
+      (engine === "postgres" || engine === "duckdb") &&
+      isSubscriptBracket(code, i - 1)
+    ) {
+      continue;
+    }
     if (!NAME_START.test(code[i + 1] ?? "")) continue;
     let j = i + 2;
     while (j < code.length && NAME_CHAR.test(code[j])) j++;
@@ -181,6 +231,17 @@ export function findParams(sql: string, engine: ParamEngine): ParamUse[] {
 /** Distinct parameter names in order of first appearance */
 export function paramNames(uses: readonly ParamUse[]): string[] {
   return [...new Set(uses.map((u) => u.name))];
+}
+
+/**
+ * Offset of the SQL body in a statement (after leading whitespace and comments). The editor's
+ * statement range can start with comment lines (a bare `--` line makes lang-sql fold the comments
+ * after it into the statement), and a `-- @set` among them still comes before the SQL.
+ */
+export function sqlBodyOffset(sql: string, engine: ParamEngine): number {
+  const code = blankNonCode(sql, engine);
+  const m = /\S/.exec(code);
+  return m ? m.index : sql.length;
 }
 
 /** A `-- @set name = value` line of the query file */

@@ -10,6 +10,7 @@ import {
   paramNames,
   parseDefinitions,
   quoteParamString,
+  sqlBodyOffset,
 } from "../src/lib/queryParams.ts";
 
 const names = (sql: string, engine: Parameters<typeof findParams>[1] = "postgres") =>
@@ -117,4 +118,21 @@ test("-- @set only counts as a real line comment", () => {
 test("fillParams ignores inherited properties", () => {
   const uses = findParams("SELECT :constructor", "postgres");
   assert.deepEqual(fillParams("SELECT :constructor", uses, {}), { ok: false, missing: ["constructor"] });
+});
+
+test("review round 2: struct keys, array constructors, definitions before the SQL body", () => {
+  assert.deepEqual(names("SELECT {'active':true}", "duckdb"), []);
+  assert.deepEqual(names("SELECT {'a': :v, b: c}", "duckdb"), ["v"]);
+  assert.deepEqual(names("SELECT ARRAY[:id, :other]"), ["id", "other"]);
+  assert.deepEqual(names("SELECT [:id, :other]", "duckdb"), ["id", "other"]);
+  assert.deepEqual(names("SELECT arr[:n], f(x)[:m], a[1][:k]"), []);
+  // CASE WHEN :x keeps working outside braces
+  assert.deepEqual(names("SELECT CASE WHEN :x THEN 1 END", "duckdb"), ["x"]);
+  // A bare `--` line folds the comments after it into the statement range
+  const doc = "-- @set n = 1\nSELECT :n;\n--\n-- @set n = 2\nSELECT :n;\n";
+  const start = doc.indexOf("--\n");
+  const stmt = doc.slice(start);
+  const defs = parseDefinitions(doc, "postgres");
+  assert.equal(definitionFor(defs, "n", start)?.value, "1");
+  assert.equal(definitionFor(defs, "n", start + sqlBodyOffset(stmt, "postgres"))?.value, "2");
 });

@@ -41,6 +41,7 @@
     paramInputSql,
     paramNames,
     parseDefinitions,
+    sqlBodyOffset,
     type ParamInput,
   } from "$lib/queryParams";
   import SearchModal from "$lib/components/SearchModal.svelte";
@@ -219,7 +220,9 @@
     const fromFile = uses.map((u, i) => {
       const values: Record<string, string> = {};
       for (const name of paramNames(u)) {
-        const d = definitionFor(defs, name, starts[i] ?? 0);
+        // Measured from the SQL body: leading comment lines of the range (with a `-- @set`) still
+        // come before the statement
+        const d = definitionFor(defs, name, (starts[i] ?? 0) + sqlBodyOffset(statements[i], engine));
         if (d) values[name] = d.value;
       }
       return values;
