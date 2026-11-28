@@ -53,7 +53,8 @@
     onRun: (target: RunTarget) => void;
     /// Called instead of onRun when the selection spans two or more SQL statements.
     /// The statements are passed in document order and run one by one
-    onRunBatch: (statements: string[]) => void;
+    /// `starts` are the statements' offsets in the document (for `-- @set` parameter definitions)
+    onRunBatch: (statements: string[], starts: number[]) => void;
     /// Called every time the selection changes. Notifies whether it spans multiple lines (the display
     /// condition of the Replace Multiline button). The selected text itself is snapshotted with
     /// getMainSelection() at the time the dialog opens, so it is not passed here
@@ -594,7 +595,10 @@
       batch = batchTargetRanges(state, tree);
     }
     if (batch) {
-      onRunBatch(batch.map((range) => state.sliceDoc(range.from, range.to)));
+      onRunBatch(
+        batch.map((range) => state.sliceDoc(range.from, range.to)),
+        batch.map((range) => range.from),
+      );
       return;
     }
     const target = runTargetAt(state);

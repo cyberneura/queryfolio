@@ -32,6 +32,18 @@
   import DangerousConfirmModal from "$lib/components/DangerousConfirmModal.svelte";
   import BatchErrorModal from "$lib/components/BatchErrorModal.svelte";
   import RunLogConfirmModal from "$lib/components/RunLogConfirmModal.svelte";
+  import QueryParamsModal from "$lib/components/QueryParamsModal.svelte";
+  import {
+    definitionFor,
+    fillParams,
+    findParams,
+    paramEngineOf,
+    paramInputSql,
+    paramNames,
+    parseDefinitions,
+    sqlBodyOffset,
+    type ParamInput,
+  } from "$lib/queryParams";
   import SearchModal from "$lib/components/SearchModal.svelte";
   import ChatPane from "$lib/components/ChatPane.svelte";
   import AgentChatPane from "$lib/components/AgentChatPane.svelte";
@@ -71,6 +83,7 @@
   /// aiAnalysis (the AI explanation of EXPLAIN) is rendered by ResultsPane rather than this file,
   /// but it covers the screen the same way, so it is checked here.
   const isModalOpen = () =>
+    queryParamsPrompt !== null ||
     showSearch ||
     showSettings ||
     connectionsEditor !== null ||
@@ -141,6 +154,146 @@
   /// Run from the editor. For a statement carrying `-- 📝 <label>`, after execution the result is
   /// written back below it as a TSV block comment (Run and Log).
   /// Display in the results table happens as usual regardless of whether anything is written back.
+  // --- Named parameters (`:name`, CYBERNEURA-DEV-1400) ---
+  //
+  // Filled in right before running, from `-- @set name = value` lines of the query file and, for the
+  // rest, the dialog. Only the text sent to run_query changes: the editor keeps the placeholders,
+  // and Run and Log still matches the target range against the editor's text (`target`).
+
+  /// The dialog waiting for an answer
+  let queryParamsPrompt = $state<{
+    names: string[];
+    initial: Map<string, ParamInput>;
+    defined: { name: string; value: string }[];
+    resolve: (answer: { values: [string, ParamInput][]; remember: boolean } | null) => void;
+  } | null>(null);
+
+  const QUERY_PARAMS_KEY = "queryfolio.queryParams";
+
+  /// Values typed last time, per connection + query file (so re-running asks with the same values).
+  /// Stored as `[name, value]` pairs and read into a Map: a parameter may be named `__proto__`
+  function loadParamValues(fileKey: string): Map<string, ParamInput> {
+    const out = new Map<string, ParamInput>();
+    try {
+      const all = JSON.parse(localStorage.getItem(QUERY_PARAMS_KEY) ?? "{}");
+      const saved: unknown = all && Object.hasOwn(all, fileKey) ? all[fileKey] : null;
+      if (!Array.isArray(saved)) return out;
+      for (const entry of saved) {
+        if (!Array.isArray(entry) || typeof entry[0] !== "string") continue;
+        const r = entry[1] as { value?: unknown; raw?: unknown } | null;
+        if (typeof r?.value === "string") out.set(entry[0], { value: r.value, raw: r.raw === true });
+      }
+    } catch {
+      // Unreadable storage: start empty
+    }
+    return out;
+  }
+
+  function saveParamValues(fileKey: string, values: [string, ParamInput][]) {
+    try {
+      const all = JSON.parse(localStorage.getItem(QUERY_PARAMS_KEY) ?? "{}") ?? {};
+      const merged = loadParamValues(fileKey);
+      for (const [name, v] of values) merged.set(name, v);
+      // The key always contains \u0001, so it is never a special property name
+      all[fileKey] = [...merged];
+      localStorage.setItem(QUERY_PARAMS_KEY, JSON.stringify(all));
+    } catch {
+      // The run itself does not depend on remembering the values
+    }
+  }
+
+  /**
+   * Returns the statements with their `:name` parameters filled in (unchanged when there are none
+   * or the engine has no parameters), or null when the dialog was cancelled.
+   * `starts` are the statements' offsets in the active editor tab (for `-- @set` lookup).
+   */
+  async function fillQueryParams(statements: string[], starts: number[]): Promise<string[] | null> {
+    // One dialog at a time (a second run started from behind the dialog would orphan the first)
+    if (queryParamsPrompt !== null) return null;
+    const connection = appStore.selectedConnection;
+    const engine = paramEngineOf(
+      appStore.connections.find((c) => c.name === connection)?.engine ?? "",
+    );
+    if (engine === null) return statements;
+    const uses = statements.map((sql) => findParams(sql, engine));
+    if (uses.every((u) => u.length === 0)) return statements;
+    const tab = appStore.editorTabs.find((t) => t.id === appStore.activeEditorTabId);
+    // The statement offsets come from the editor, which normalizes line endings to LF; an
+    // unedited CRLF file still has CRLF in `content`, so normalize the same way before counting
+    const defs = parseDefinitions((tab?.content ?? "").replace(/\r\n?/g, "\n"), engine);
+    // Per statement: names the file defines (the definition above that statement wins)
+    // Maps, not objects: a parameter may be named `__proto__`
+    const fromFile = uses.map((u, i) => {
+      const values = new Map<string, string>();
+      for (const name of paramNames(u)) {
+        // Measured from the SQL body: leading comment lines of the range (with a `-- @set`) still
+        // come before the statement
+        const d = definitionFor(defs, name, (starts[i] ?? 0) + sqlBodyOffset(statements[i], engine));
+        if (d) values.set(name, d.value);
+      }
+      return values;
+    });
+    const ask = [
+      ...new Set(
+        uses.flatMap((u, i) => paramNames(u).filter((n) => !fromFile[i].has(n))),
+      ),
+    ];
+    let typed = new Map<string, ParamInput>();
+    if (ask.length > 0) {
+      const fileKey = `${connection ?? ""}\u0001${tab?.file ?? ""}`;
+      const defined = [
+        ...new Map(
+          uses.flatMap((u, i) =>
+            paramNames(u)
+              .filter((n) => fromFile[i].has(n))
+              .map((n) => [n, { name: n, value: fromFile[i].get(n) ?? "" }] as const),
+          ),
+        ).values(),
+      ];
+      const answer = await new Promise<{
+        values: [string, ParamInput][];
+        remember: boolean;
+      } | null>((resolve) => {
+        queryParamsPrompt = { names: ask, initial: loadParamValues(fileKey), defined, resolve };
+      });
+      queryParamsPrompt = null;
+      if (answer === null) return null;
+      if (answer.remember) saveParamValues(fileKey, answer.values);
+      typed = new Map(answer.values);
+    }
+    const filled: string[] = [];
+    for (let i = 0; i < statements.length; i++) {
+      const values = new Map(fromFile[i]);
+      for (const name of paramNames(uses[i])) {
+        const input = typed.get(name);
+        if (!values.has(name) && input) values.set(name, paramInputSql(engine, input));
+      }
+      const result = fillParams(statements[i], uses[i], values);
+      if (!result.ok) {
+        toast.warning(`No value for :${result.missing.join(", :")}`);
+        return null;
+      }
+      filled.push(result.sql);
+    }
+    return filled;
+  }
+
+  /// Where a run was started: the dialog can stay open for a while, and the run must not go to
+  /// another tab, connection or database chosen in the meantime
+  const runContext = () =>
+    `${appStore.activeEditorTabId}\u0001${appStore.selectedConnection}\u0001${appStore.activeSchema}`;
+
+  async function runStatements(statements: string[], starts: number[]) {
+    const context = runContext();
+    const filled = await fillQueryParams(statements, starts);
+    if (filled === null) return;
+    if (runContext() !== context) {
+      toast.info("The tab, connection or database changed while entering parameters — not run.");
+      return;
+    }
+    await appStore.runBatch(filled);
+  }
+
   async function runStatement(target: RunTarget) {
     // Remember the editor tab where the run started. SqlEditor is rebuilt on every tab switch by
     // {#key appStore.activeEditorTabId}, so the editor reference always points at "the file open now".
@@ -154,8 +307,24 @@
     // Also remember the connection used for the run (when writing to a tab that has become
     // inactive, check that the tab has not moved to a different connection)
     const connection = appStore.selectedConnection;
+    // The SQL that is run (parameters filled in). `target` stays as the editor's text: Run and Log
+    // checks the range against it before writing back
+    const filled = await fillQueryParams([target.sql], [target.from]);
+    if (filled === null) {
+      return;
+    }
+    // The dialog may have been open for a while: do not run on another tab / connection / database
+    if (
+      appStore.activeEditorTabId !== tabId ||
+      appStore.selectedConnection !== connection ||
+      appStore.activeSchema !== schema
+    ) {
+      toast.info("The tab, connection or database changed while entering parameters — not run.");
+      return;
+    }
+    const sql = filled[0];
     if (target.logLabel === null) {
-      await appStore.runQuery(target.sql);
+      await appStore.runQuery(sql);
       return;
     }
     // `out=<name>` in the label sends the whole result to a file next to the query file and
@@ -165,7 +334,7 @@
     // (CYBERNEURA-DEV-1167): if the displayed result was cut, the run fetches it again without the
     // limit. A statement involving writes is not run again, and the displayed result is logged with
     // its "limited" note, as before
-    const ran = await appStore.runQueryForLog(target.sql, output);
+    const ran = await appStore.runQueryForLog(sql, output);
     if (!ran) {
       return;
     }
@@ -803,7 +972,7 @@
                     schemaMap={appStore.schemaMap}
                     onChange={(content) => appStore.updateEditorContent(content)}
                     onRun={(target) => void runStatement(target)}
-                    onRunBatch={(statements) => void appStore.runBatch(statements)}
+                    onRunBatch={(statements, starts) => void runStatements(statements, starts)}
                     onSelectionChange={(info) => {
                       hasMultilineSelection = info.hasMultilineSelection;
                     }}
@@ -1035,6 +1204,17 @@
     error={appStore.batchErrorPrompt.error}
     onStop={() => appStore.resolveBatchErrorPrompt(false)}
     onIgnoreErrors={() => appStore.resolveBatchErrorPrompt(true)}
+  />
+{/if}
+
+{#if queryParamsPrompt}
+  {@const prompt = queryParamsPrompt}
+  <QueryParamsModal
+    names={prompt.names}
+    initial={prompt.initial}
+    defined={prompt.defined}
+    onSubmit={(values, remember) => prompt.resolve({ values, remember })}
+    onCancel={() => prompt.resolve(null)}
   />
 {/if}
 
