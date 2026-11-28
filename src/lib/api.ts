@@ -362,6 +362,20 @@ export interface ProcessInfo {
 export const listProcesses = (connection: string) =>
   invoke<ProcessInfo[]>("list_processes", { connection });
 
+/// What to do to another session from the PROCESS LIST pane (CYBERNEURA-DEV-1399)
+export type ProcessAction = "cancel_query" | "kill_connection";
+
+/// Cancels another session's statement (MySQL KILL QUERY / PostgreSQL pg_cancel_backend) or
+/// closes its connection (KILL / pg_terminate_backend). Refused on a config readonly connection and
+/// while `writable` (the Writable switch) is false. Resolves to false when PostgreSQL reports it did
+/// not signal the process (it was already gone)
+export const signalProcess = (
+  connection: string,
+  id: string,
+  action: ProcessAction,
+  writable: boolean,
+) => invoke<boolean>("signal_process", { connection, id, action, writable });
+
 /// Returns the column names that make up the table's primary key (for cell editing in the result grid).
 /// An empty array for a table with no primary key.
 export const getPrimaryKeys = (connection: string, table: string) =>
