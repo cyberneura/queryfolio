@@ -112,6 +112,15 @@ struct DbManagerInner {
 }
 
 impl DbManagerInner {
+    /// Forgets manual transactions whose session was closed after a statement
+    /// (run_query_in_transaction: the database stopped answering), so that the connection is
+    /// back in Auto for the frontend and Manual can start a new one. A session locked by a
+    /// running statement is still open
+    fn prune_closed_transactions(&mut self) {
+        self.transactions
+            .retain(|_, tx| tx.conn.try_lock().map(|conn| conn.is_some()).unwrap_or(true));
+    }
+
     fn generation(&self, connection: &str) -> (u64, u64) {
         (
             self.reset_epoch,
@@ -534,7 +543,8 @@ impl DbManager {
             ));
         }
         let generation = {
-            let inner = self.inner.lock().await;
+            let mut inner = self.inner.lock().await;
+            inner.prune_closed_transactions();
             if let Some(existing) = inner.transactions.get(&server.name) {
                 return Ok(existing.id);
             }
@@ -557,6 +567,7 @@ impl DbManager {
             ));
         }
         // Lost a race with another begin: keep that one (this connection closes on drop)
+        inner.prune_closed_transactions();
         if let Some(existing) = inner.transactions.get(&server.name) {
             return Ok(existing.id);
         }
@@ -643,15 +654,16 @@ impl DbManager {
 
     /// The connection's open manual transaction, if any
     pub async fn transaction(&self, connection: &str) -> Option<ManualTransaction> {
-        self.inner.lock().await.transactions.get(connection).cloned()
+        let mut inner = self.inner.lock().await;
+        inner.prune_closed_transactions();
+        inner.transactions.get(connection).cloned()
     }
 
     /// Every open manual transaction as (connection, id), sorted by connection name
     pub async fn open_transactions(&self) -> Vec<(String, u64)> {
-        let mut open: Vec<(String, u64)> = self
-            .inner
-            .lock()
-            .await
+        let mut inner = self.inner.lock().await;
+        inner.prune_closed_transactions();
+        let mut open: Vec<(String, u64)> = inner
             .transactions
             .iter()
             .map(|(name, tx)| (name.clone(), tx.id))
@@ -6317,7 +6329,7 @@ mod tests {
 
         // The agent's read-only wrapper never runs inside the transaction (it would open and
         // roll back a second one)
-        let id = manager.begin_transaction(server).await.unwrap();
+        manager.begin_transaction(server).await.unwrap();
         let tx = manager.transaction(&server.name).await.unwrap();
         let agent = run_query_in_transaction(
             &tx,
@@ -6331,6 +6343,14 @@ mod tests {
         )
         .await;
         assert!(matches!(agent, Err(AppError::Session(_))));
+
+        // A session closed after a statement (the database stopped answering) is forgotten:
+        // the connection is back in Auto and Manual starts a new transaction
+        *tx.conn.lock().await = None;
+        assert!(manager.open_transactions().await.is_empty());
+        assert!(manager.transaction(&server.name).await.is_none());
+        let id = manager.begin_transaction(server).await.unwrap();
+        let tx = manager.transaction(&server.name).await.unwrap();
 
         // Disconnecting drops the transaction: nothing of it is committed
         in_tx(&tx, update(4)).await.unwrap();
