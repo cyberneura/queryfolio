@@ -84,6 +84,12 @@ pub struct DbManager {
     /// Failed password refreshes per pool, keyed by the pool's current connect options
     /// (ConnectOptionsSnapshot::key; see refresh_password)
     password_refresh_failures: std::sync::Mutex<HashMap<usize, u64>>,
+    /// Numbers the manual transactions (ManualTransaction::id), so that a stale id held by the
+    /// frontend never matches a later transaction of the same connection
+    next_transaction_id: AtomicU64,
+    /// COMMIT / ROLLBACKs in flight (end_transaction). The transaction has left the map by
+    /// then, so quitting checks this too: the user has not seen whether the commit worked
+    transactions_ending: AtomicU64,
 }
 
 #[derive(Default)]
@@ -99,6 +105,10 @@ struct DbManagerInner {
     /// Per-connection counter bumped whenever its pool / tunnel / schema override
     /// is dropped or replaced (disconnect, schema switch, rollback)
     generations: HashMap<String, u64>,
+    /// Open manual transactions per connection (at most one each, CYBERNEURA-DEV-1398).
+    /// Dropped together with the connection's pool: the held connection is set to close on
+    /// drop, so the server rolls the transaction back
+    transactions: HashMap<String, ManualTransaction>,
 }
 
 impl DbManagerInner {
@@ -396,6 +406,7 @@ impl DbManager {
         inner.pools.clear();
         inner.tunnels.clear();
         inner.schema_overrides.clear();
+        inner.transactions.clear();
         inner.reset_epoch += 1;
         drop(inner);
         self.password_refresh_failures.lock().unwrap().clear();
@@ -412,6 +423,7 @@ impl DbManager {
         let mut inner = self.inner.lock().await;
         inner.pools.remove(connection);
         inner.tunnels.remove(connection);
+        inner.transactions.remove(connection);
         inner.bump_generation(connection);
     }
 
@@ -420,14 +432,30 @@ impl DbManager {
     /// (switching by rebuilding the pool rather than SQL USE prevents session
     /// state from diverging between connections in the pool).
     /// The SSH tunnel is kept because the target host does not change.
-    pub async fn set_schema_override(&self, connection: &str, schema: String) {
-        self.replace_schema_override(connection, Some(schema)).await;
+    ///
+    /// Refused while the connection has a manual transaction (dropping the pool would roll it
+    /// back), checked under the same lock as the switch so a BEGIN cannot slip in between
+    pub async fn set_schema_override(
+        &self,
+        connection: &str,
+        schema: String,
+    ) -> Result<(), AppError> {
+        self.replace_schema_override(connection, Some(schema)).await
     }
 
     /// Sets or clears the active schema override.
     /// Passing None goes back to the schema in the config file.
-    async fn replace_schema_override(&self, connection: &str, schema: Option<String>) {
+    async fn replace_schema_override(
+        &self,
+        connection: &str,
+        schema: Option<String>,
+    ) -> Result<(), AppError> {
         let mut inner = self.inner.lock().await;
+        if inner.transactions.contains_key(connection) {
+            return Err(AppError::Session(
+                "Commit or roll back the manual transaction before switching the database".into(),
+            ));
+        }
         match schema {
             Some(schema) => {
                 inner.schema_overrides.insert(connection.to_string(), schema);
@@ -437,7 +465,9 @@ impl DbManager {
             }
         }
         inner.pools.remove(connection);
+        inner.transactions.remove(connection);
         inner.bump_generation(connection);
+        Ok(())
     }
 
     /// When switching fails (e.g. a nonexistent database was specified), restores
@@ -469,6 +499,7 @@ impl DbManager {
             }
         }
         inner.pools.remove(connection);
+        inner.transactions.remove(connection);
         inner.bump_generation(connection);
         true
     }
@@ -476,6 +507,157 @@ impl DbManager {
     /// Returns the active schema override of a connection (None if there is none).
     pub async fn schema_override(&self, connection: &str) -> Option<String> {
         self.inner.lock().await.schema_overrides.get(connection).cloned()
+    }
+
+    /// Starts a manual transaction on the connection (CYBERNEURA-DEV-1398): takes one
+    /// connection out of the pool for the transaction's whole life and sends BEGIN on it.
+    /// Every statement of the connection then runs on that session (run_query routes it), so
+    /// `UPDATE` → `SELECT` → Rollback sees and undoes its own changes. The other pool
+    /// connections stay with the process list, completion and the AI chat, which never see the
+    /// uncommitted changes.
+    ///
+    /// Returns the transaction's id. If the connection already has one, its id is returned
+    /// (one per connection: holding more would starve the pool of 3).
+    ///
+    /// The connection is marked to close on drop instead of going back to the pool: whatever
+    /// ends the transaction abnormally (disconnect, config reload, schema switch, a discarded
+    /// pool after a failed cancel, app exit) closes the session, and the server rolls back.
+    /// BEGIN goes through sqlx's TransactionManager so that sqlx knows the depth: a nested
+    /// `begin` on this connection becomes a SAVEPOINT, and the agent guard's
+    /// `begin_with("BEGIN READ ONLY")` fails instead of opening (and later rolling back) a
+    /// second transaction.
+    pub async fn begin_transaction(&self, server: &ServerConfig) -> Result<u64, AppError> {
+        if !supports_manual_transaction(parse_engine(&server.engine)?) {
+            return Err(AppError::Config(
+                "Manual transactions are available for MySQL, PostgreSQL and SQLite connections"
+                    .into(),
+            ));
+        }
+        let generation = {
+            let inner = self.inner.lock().await;
+            if let Some(existing) = inner.transactions.get(&server.name) {
+                return Ok(existing.id);
+            }
+            inner.generation(&server.name)
+        };
+        let (conn, pool, session) = self
+            .with_pool(server, PasswordRetry::BeforeStatement, |pool: DbPool| async move {
+                let mut conn = DbConnection::acquire(&pool).await?;
+                conn.close_on_drop();
+                let session = conn.begin_manual().await?;
+                Ok((conn, pool, session))
+            })
+            .await?;
+        let mut inner = self.inner.lock().await;
+        // A disconnect / schema switch / reload while connecting dropped the pool this
+        // connection came from: do not keep a transaction the rest of the app no longer knows
+        if inner.generation(&server.name) != generation {
+            return Err(AppError::Config(
+                "The connection was reset while the transaction was starting. Try again.".into(),
+            ));
+        }
+        // Lost a race with another begin: keep that one (this connection closes on drop)
+        if let Some(existing) = inner.transactions.get(&server.name) {
+            return Ok(existing.id);
+        }
+        let id = self.next_transaction_id.fetch_add(1, Ordering::SeqCst) + 1;
+        inner.transactions.insert(
+            server.name.clone(),
+            ManualTransaction {
+                id,
+                conn: Arc::new(tokio::sync::Mutex::new(Some(conn))),
+                pool,
+                session,
+            },
+        );
+        Ok(id)
+    }
+
+    /// Commits (commit = true) or rolls back the connection's manual transaction `id`.
+    ///
+    /// The transaction is taken out of the map first, so statements arriving meanwhile get
+    /// "no longer open" instead of running on a session that is ending. It then waits for a
+    /// statement still running on the session. Whatever the outcome, the session is closed
+    /// afterwards (close on drop): a failed COMMIT / ROLLBACK leaves nothing open on the server.
+    pub async fn end_transaction(
+        &self,
+        connection: &str,
+        id: u64,
+        commit: bool,
+    ) -> Result<(), AppError> {
+        let tx = {
+            let mut inner = self.inner.lock().await;
+            match inner.transactions.get(connection) {
+                Some(tx) if tx.id == id => inner.transactions.remove(connection),
+                _ => None,
+            }
+        };
+        let Some(tx) = tx else {
+            return Err(AppError::TransactionEnded);
+        };
+        self.transactions_ending.fetch_add(1, Ordering::SeqCst);
+        let result = Self::finish(tx, commit).await;
+        self.transactions_ending.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+
+    /// Whether a COMMIT / ROLLBACK is in flight
+    pub fn transaction_ending(&self) -> bool {
+        self.transactions_ending.load(Ordering::SeqCst) > 0
+    }
+
+    async fn finish(tx: ManualTransaction, commit: bool) -> Result<(), AppError> {
+        // Taken out so that a statement that got hold of this transaction before it left the
+        // map, and locks it after this, finds it ended instead of running auto-committed
+        let Some(mut conn) = tx.conn.lock().await.take() else {
+            return Err(AppError::TransactionEnded);
+        };
+        conn.end_manual(commit).await.map_err(|e| {
+            if let AppError::Session(_) = e {
+                return e;
+            }
+            let action = if commit { "COMMIT" } else { "ROLLBACK" };
+            AppError::Config(format!(
+                "{action} failed: {e}\nThe transaction's connection was closed, so the server \
+                 rolls back whatever was not committed."
+            ))
+        })
+    }
+
+    /// Rolls back every open manual transaction (app exit). Each ROLLBACK is bounded so an
+    /// unreachable server does not hold the exit; closing the connection rolls back anyway
+    pub async fn rollback_all_transactions(&self) {
+        let transactions: Vec<ManualTransaction> = {
+            let mut inner = self.inner.lock().await;
+            inner.transactions.drain().map(|(_, tx)| tx).collect()
+        };
+        for tx in transactions {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                if let Some(mut conn) = tx.conn.lock().await.take() {
+                    let _ = conn.end_manual(false).await;
+                }
+            })
+            .await;
+        }
+    }
+
+    /// The connection's open manual transaction, if any
+    pub async fn transaction(&self, connection: &str) -> Option<ManualTransaction> {
+        self.inner.lock().await.transactions.get(connection).cloned()
+    }
+
+    /// Every open manual transaction as (connection, id), sorted by connection name
+    pub async fn open_transactions(&self) -> Vec<(String, u64)> {
+        let mut open: Vec<(String, u64)> = self
+            .inner
+            .lock()
+            .await
+            .transactions
+            .iter()
+            .map(|(name, tx)| (name.clone(), tx.id))
+            .collect();
+        open.sort();
+        open
     }
 }
 
@@ -529,6 +711,121 @@ impl DbConnection {
             DbConnection::Sqlite(_) => Engine::Sqlite,
         }
     }
+
+    /// Close the connection when it is dropped instead of returning it to the pool
+    fn close_on_drop(&mut self) {
+        match self {
+            DbConnection::MySql(c) => c.close_on_drop(),
+            DbConnection::Postgres(c) => c.close_on_drop(),
+            DbConnection::Sqlite(c) => c.close_on_drop(),
+        }
+    }
+
+    /// BEGIN of a manual transaction, through sqlx's TransactionManager (see begin_transaction).
+    /// Returns the session's id for cancelling (PostgreSQL backend PID / MySQL CONNECTION_ID),
+    /// read once here: once a statement fails, PostgreSQL refuses every statement of the
+    /// transaction, `SELECT pg_backend_pid()` included, so reading it per statement (as
+    /// run_query_cancellable does) would also block the `ROLLBACK TO SAVEPOINT` that recovers.
+    ///
+    /// MySQL also gets `autocommit = 0`: DDL, LOCK TABLES and a deadlock end a MySQL
+    /// transaction by themselves, and with autocommit on the statements after them would
+    /// commit one by one while Queryfolio still shows the transaction. With it off, the next
+    /// statement opens a new transaction that the toolbar's Commit / Rollback ends (the
+    /// connection is closed afterwards, so the setting does not outlive it)
+    async fn begin_manual(&mut self) -> Result<Option<i64>, AppError> {
+        use sqlx::TransactionManager;
+        let session = match self {
+            DbConnection::MySql(c) => {
+                let row = sqlx::query("SELECT CONNECTION_ID()").fetch_one(&mut **c).await?;
+                let id = match row.try_get::<u64, _>(0) {
+                    Ok(id) => id as i64,
+                    Err(_) => row.try_get::<i64, _>(0)?,
+                };
+                (&mut **c).execute("SET autocommit = 0").await?;
+                <sqlx::mysql::MySqlTransactionManager as TransactionManager>::begin(&mut **c, None)
+                    .await?;
+                Some(id)
+            }
+            DbConnection::Postgres(c) => {
+                <sqlx::postgres::PgTransactionManager as TransactionManager>::begin(&mut **c, None)
+                    .await?;
+                // After BEGIN: behind a transaction-pooling PgBouncer the server session is
+                // only pinned from here on
+                let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                    .fetch_one(&mut **c)
+                    .await?;
+                Some(i64::from(pid))
+            }
+            DbConnection::Sqlite(c) => {
+                <sqlx::sqlite::SqliteTransactionManager as TransactionManager>::begin(
+                    &mut **c, None,
+                )
+                .await?;
+                None
+            }
+        };
+        Ok(session)
+    }
+
+    /// COMMIT / ROLLBACK of a manual transaction.
+    ///
+    /// PostgreSQL answers COMMIT of a failed transaction (a statement raised an error and it
+    /// was not rolled back to a savepoint) with a ROLLBACK, and sqlx reports success. So a
+    /// statement is tried first: in a failed transaction it is refused, and the commit becomes
+    /// an explicit rollback reported as not committed
+    async fn end_manual(&mut self, commit: bool) -> Result<(), AppError> {
+        use sqlx::mysql::MySqlTransactionManager as My;
+        use sqlx::postgres::PgTransactionManager as Pg;
+        use sqlx::sqlite::SqliteTransactionManager as Lite;
+        use sqlx::TransactionManager;
+        if let (DbConnection::Postgres(c), true) = (&mut *self, commit) {
+            if let Err(e) = (&mut **c).execute("SELECT 1").await {
+                <Pg as TransactionManager>::rollback(&mut **c).await?;
+                return Err(AppError::Session(format!(
+                    "Not committed: the transaction had failed ({e}), so it was rolled back. \
+                     Roll back to a savepoint after an error to keep the earlier changes."
+                )));
+            }
+        }
+        match (self, commit) {
+            (DbConnection::MySql(c), true) => <My as TransactionManager>::commit(&mut **c).await?,
+            (DbConnection::MySql(c), false) => {
+                <My as TransactionManager>::rollback(&mut **c).await?
+            }
+            (DbConnection::Postgres(c), true) => {
+                <Pg as TransactionManager>::commit(&mut **c).await?
+            }
+            (DbConnection::Postgres(c), false) => {
+                <Pg as TransactionManager>::rollback(&mut **c).await?
+            }
+            (DbConnection::Sqlite(c), true) => {
+                <Lite as TransactionManager>::commit(&mut **c).await?
+            }
+            (DbConnection::Sqlite(c), false) => {
+                <Lite as TransactionManager>::rollback(&mut **c).await?
+            }
+        }
+        Ok(())
+    }
+}
+
+/// An open manual transaction (CYBERNEURA-DEV-1398, DbManager::begin_transaction): the
+/// connection taken out of the pool for it, and that pool (cancellation sends
+/// pg_cancel_backend / KILL QUERY from another of its connections)
+#[derive(Clone)]
+pub struct ManualTransaction {
+    pub id: u64,
+    /// None once end_transaction took it (see there)
+    conn: Arc<tokio::sync::Mutex<Option<DbConnection>>>,
+    pool: DbPool,
+    /// The session's id for cancelling, read before BEGIN (begin_manual)
+    session: Option<i64>,
+}
+
+/// Engines with manual transactions: the pooled sqlx engines. SQL Server and DuckDB already
+/// run every statement on their single connection, and the others have no transactions
+pub(crate) fn supports_manual_transaction(engine: Engine) -> bool {
+    matches!(engine, Engine::MySql | Engine::Postgres | Engine::Sqlite)
 }
 
 /// A rejected login while acquiring becomes AppError::ConnectAuth: nothing was sent yet, so
@@ -1374,14 +1671,193 @@ pub async fn run_query_cancellable(
     }
 
     let mut conn = DbConnection::acquire(pool).await?;
+    run_on_connection_cancellable(
+        &mut conn,
+        pool,
+        None,
+        registry,
+        connection_name,
+        sql,
+        max_rows,
+        auto_limit,
+        readonly,
+        allow_dangerous,
+    )
+    .await
+}
+
+/// run_query_cancellable on the connection of an open manual transaction (CYBERNEURA-DEV-1398).
+/// Waits for a statement still running on it (the frontend runs one at a time per connection,
+/// so this only queues a Copy / Export re-fetch behind the displayed run)
+#[allow(clippy::too_many_arguments)]
+pub async fn run_query_in_transaction(
+    tx: &ManualTransaction,
+    registry: &CancelRegistry,
+    connection_name: &str,
+    sql: &str,
+    max_rows: usize,
+    auto_limit: Option<u64>,
+    readonly: ReadonlyGuard,
+    allow_dangerous: bool,
+) -> Result<QueryResult, AppError> {
+    // The agent guard wraps the statement in its own read-only transaction, which cannot nest
+    // in this one (lib.rs refuses the Run and Log re-fetch first; this keeps it fail-closed)
+    if readonly == ReadonlyGuard::Agent {
+        return Err(AppError::Session(
+            "Read-only re-runs are not available during a manual transaction".into(),
+        ));
+    }
+    let mut guard = tx.conn.lock().await;
+    let Some(conn) = guard.as_mut() else {
+        return Err(AppError::TransactionEnded);
+    };
+    let result = run_on_connection_cancellable(
+        conn,
+        &tx.pool,
+        tx.session,
+        registry,
+        connection_name,
+        sql,
+        max_rows,
+        auto_limit,
+        readonly,
+        allow_dangerous,
+    )
+    .await;
+    // InnoDB rolls the whole transaction back on a deadlock (1213) and, with
+    // innodb_rollback_on_timeout, on a lock wait timeout (1205): the next Commit would only
+    // keep what ran after it
+    let result = result.map_err(|e| match &e {
+        AppError::Db(sqlx::Error::Database(db))
+            if matches!(conn, DbConnection::MySql(_))
+                && matches!(db.code().as_deref(), Some("40001")) =>
+        {
+            AppError::Session(format!(
+                "{e}\nMySQL rolled back the whole manual transaction (deadlock); the changes \
+                 before this statement are gone."
+            ))
+        }
+        _ => e,
+    });
+    match ensure_still_in_transaction(conn).await {
+        Ok(None) => result,
+        Ok(Some(note)) => match result {
+            Err(e) => Err(AppError::Session(format!("{e}\n{note}"))),
+            // The statement's result stands, but the user must learn that what came before
+            // it is gone (or committed): report it as the error of this run
+            Ok(_) => Err(AppError::Session(note)),
+        },
+        // The session cannot even answer: close it (end_transaction / the next run find it
+        // gone) rather than risk a statement running outside the transaction
+        Err(e) => {
+            *guard = None;
+            Err(AppError::Session(format!(
+                "{}\nThe manual transaction's connection did not answer ({e}) and was closed; \
+                 the server rolls back what was not committed.",
+                match result {
+                    Err(e) => e.to_string(),
+                    Ok(_) => "The statement ran.".to_string(),
+                }
+            )))
+        }
+    }
+}
+
+/// After a statement of a manual transaction: confirms on the database that the session is
+/// still inside a transaction, and if a statement ended it (MySQL: `SET autocommit = 1` in any
+/// spelling; PostgreSQL: `PREPARE TRANSACTION`, `COMMIT` inside a function call; SQLite:
+/// `INSERT OR ROLLBACK`, `RAISE(ROLLBACK)`), opens a new one at once so that nothing after it
+/// commits on its own, and returns what to tell the user. The keyword checks in lib.rs only
+/// stop the plain spellings; this is the part that does not depend on parsing SQL.
+/// Ok(None) = still in the transaction
+async fn ensure_still_in_transaction(conn: &mut DbConnection) -> Result<Option<String>, AppError> {
+    use sqlx::TransactionManager;
+    const ENDED: &str = "That ended the manual transaction (uncommitted changes before it may be \
+                         committed or rolled back, depending on the statement); a new \
+                         transaction was started.";
+    match conn {
+        DbConnection::Sqlite(c) => {
+            // Inside a transaction BEGIN fails; outside it succeeds and opens a new one
+            if (&mut **c).execute("BEGIN").await.is_ok() {
+                return Ok(Some(
+                    "SQLite rolled back the manual transaction (a conflict clause or \
+                     RAISE(ROLLBACK)); a new transaction was started."
+                        .into(),
+                ));
+            }
+            Ok(None)
+        }
+        DbConnection::Postgres(c) => {
+            // SAVEPOINT is refused outside a transaction block (25P01) and in a failed one
+            // (25P02, which is still a transaction: the user rolls back to a savepoint)
+            match (&mut **c).execute("SAVEPOINT queryfolio_probe").await {
+                Ok(_) => {
+                    (&mut **c).execute("RELEASE SAVEPOINT queryfolio_probe").await?;
+                    Ok(None)
+                }
+                Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("25P01") => {
+                    // sqlx still counts depth 1, so a raw BEGIN keeps its bookkeeping right
+                    (&mut **c).execute("BEGIN").await?;
+                    Ok(Some(ENDED.into()))
+                }
+                Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("25P02") => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        }
+        DbConnection::MySql(c) => {
+            // With autocommit = 0 a transaction is always open; a statement that turned it on
+            // committed, and every statement after it would commit on its own
+            let autocommit: i64 = sqlx::query_scalar("SELECT @@autocommit")
+                .fetch_one(&mut **c)
+                .await?;
+            if autocommit != 0 {
+                (&mut **c).execute("SET autocommit = 0").await?;
+                if <sqlx::mysql::MySqlTransactionManager as TransactionManager>::get_transaction_depth(&**c)
+                    == 0
+                {
+                    <sqlx::mysql::MySqlTransactionManager as TransactionManager>::begin(&mut **c, None)
+                        .await?;
+                }
+                return Ok(Some(
+                    "autocommit was turned on, which committed the manual transaction; it is \
+                     off again and a new transaction was started."
+                        .into(),
+                ));
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// The sqlx part of run_query_cancellable, on an acquired connection: registers the
+/// cancellation target, runs, and cleans up the SQLite progress handler
+#[allow(clippy::too_many_arguments)]
+async fn run_on_connection_cancellable(
+    conn: &mut DbConnection,
+    pool: &DbPool,
+    // The session's cancel id when already known (a manual transaction's, see begin_manual)
+    known_session: Option<i64>,
+    registry: &CancelRegistry,
+    connection_name: &str,
+    sql: &str,
+    max_rows: usize,
+    auto_limit: Option<u64>,
+    readonly: ReadonlyGuard,
+    allow_dangerous: bool,
+) -> Result<QueryResult, AppError> {
     let cancelled = Arc::new(AtomicBool::new(false));
 
     // Note the cancellation target before execution
-    let target = match (&mut conn, pool) {
+    let target = match (&mut *conn, pool) {
         (DbConnection::Postgres(c), DbPool::Postgres(p)) => {
-            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-                .fetch_one(&mut **c)
-                .await?;
+            let pid: i32 = match known_session.and_then(|id| i32::try_from(id).ok()) {
+                Some(pid) => pid,
+                None => {
+                    sqlx::query_scalar("SELECT pg_backend_pid()")
+                        .fetch_one(&mut **c)
+                        .await?
+                }
+            };
             CancelTarget::Postgres {
                 pid,
                 pool: p.clone(),
@@ -1390,12 +1866,17 @@ pub async fn run_query_cancellable(
         (DbConnection::MySql(c), DbPool::MySql(p)) => {
             // CONNECTION_ID() is BIGINT UNSIGNED, but fall back to decoding
             // as i64 as well to allow for implementation differences
-            let row = sqlx::query("SELECT CONNECTION_ID()")
-                .fetch_one(&mut **c)
-                .await?;
-            let connection_id: u64 = match row.try_get::<u64, _>(0) {
-                Ok(id) => id,
-                Err(_) => row.try_get::<i64, _>(0)? as u64,
+            let connection_id: u64 = match known_session {
+                Some(id) => id as u64,
+                None => {
+                    let row = sqlx::query("SELECT CONNECTION_ID()")
+                        .fetch_one(&mut **c)
+                        .await?;
+                    match row.try_get::<u64, _>(0) {
+                        Ok(id) => id,
+                        Err(_) => row.try_get::<i64, _>(0)? as u64,
+                    }
+                }
             };
             CancelTarget::MySql {
                 connection_id,
@@ -1417,8 +1898,7 @@ pub async fn run_query_cancellable(
     };
 
     let guard = registry.register(connection_name, target, cancelled);
-    let result =
-        run_query_on(&mut conn, sql, max_rows, auto_limit, readonly, allow_dangerous).await;
+    let result = run_query_on(conn, sql, max_rows, auto_limit, readonly, allow_dangerous).await;
     let was_cancelled = guard.was_cancelled();
     drop(guard);
 
@@ -1427,7 +1907,7 @@ pub async fn run_query_cancellable(
     // query on this connection is aborted immediately.
     // (lock_handle fails only when the worker thread is dead, in which case
     //  the connection itself is unusable and is discarded on the pool side)
-    if let DbConnection::Sqlite(c) = &mut conn {
+    if let DbConnection::Sqlite(c) = &mut *conn {
         if let Ok(mut handle) = c.lock_handle().await {
             handle.remove_progress_handler();
         }
@@ -1943,6 +2423,99 @@ pub(crate) fn leading_keyword(sql: &str) -> String {
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
         .collect::<String>()
         .to_ascii_lowercase()
+}
+
+/// The first `n` words of the statement, lowercased, with comments and literals skipped
+/// (scan_sql's cleaned text: `START /* x */ TRANSACTION` is two words). A word is a run of
+/// identifier characters plus `@` and `.` (so MySQL's `@@global.x` stays one word)
+fn leading_words(sql: &str, engine: Engine, n: usize) -> Vec<String> {
+    scan_sql(sql, engine)
+        .cleaned
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '@' | '.')))
+        .filter(|word| !word.is_empty())
+        .take(n)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Why a statement must not run on a pooled connection (MySQL / PostgreSQL / SQLite) in the
+/// current transaction mode (None = it can run). CYBERNEURA-DEV-1398.
+///
+/// - Outside a manual transaction, every statement takes a pooled connection of its own, so a
+///   statement whose effect lasts for the session (BEGIN, SAVEPOINT, a session SET, LOCK)
+///   only changes the connection it happened to land on: after `BEGIN` the next `UPDATE`
+///   may run (and auto-commit) on another connection, while the connection with the open
+///   transaction goes back to the pool. Refused with a pointer to the manual mode.
+///   `SET GLOBAL` / `SET PERSIST` / `SET PASSWORD` (MySQL) are server- or account-wide and
+///   still run.
+/// - Inside one, the transaction is ended only by the toolbar's Commit / Rollback, which
+///   also gives the connection back: a typed COMMIT / ROLLBACK / BEGIN would leave the app
+///   showing a transaction that is no longer there. `ROLLBACK TO [SAVEPOINT]`, SAVEPOINT and
+///   RELEASE keep the transaction and are allowed, as is SET, except MySQL's `SET
+///   autocommit`, which commits. (lib.rs also refuses several statements in one run there:
+///   only the first is looked at here.)
+pub(crate) fn session_statement_rejection(
+    sql: &str,
+    engine: Engine,
+    in_transaction: bool,
+) -> Option<String> {
+    let words = leading_words(sql, engine, 3);
+    let word = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
+    let rolls_back_to_savepoint = word(0) == "rollback"
+        && (word(1) == "to" || (matches!(word(1), "work" | "transaction") && word(2) == "to"));
+    let ends_or_starts = match word(0) {
+        "begin" | "commit" | "end" | "abort" => true,
+        "start" => word(1) == "transaction",
+        // PostgreSQL: detaches the transaction from the session
+        "prepare" => word(1) == "transaction",
+        "rollback" => !rolls_back_to_savepoint,
+        _ => false,
+    };
+    let keyword = match word(0) {
+        "start" => "START TRANSACTION".to_string(),
+        "prepare" if word(1) == "transaction" => "PREPARE TRANSACTION".to_string(),
+        other => other.to_ascii_uppercase(),
+    };
+    if in_transaction {
+        if ends_or_starts {
+            return Some(format!(
+                "{keyword} is not run inside a manual transaction: use Commit / Rollback in \
+                 the editor toolbar (they also end the transaction in Queryfolio). Statement \
+                 was not executed."
+            ));
+        }
+        // Anywhere in the SET (`SET LOCAL autocommit`, `SET x = 1, autocommit = 1`), outside
+        // strings and comments
+        let sets_autocommit = word(0) == "set"
+            && scan_sql(sql, engine)
+                .cleaned
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|word| word == "autocommit");
+        if sets_autocommit {
+            return Some(
+                "SET autocommit would commit the manual transaction. Use Commit / Rollback in \
+                 the editor toolbar. Statement was not executed."
+                    .into(),
+            );
+        }
+        return None;
+    }
+    let server_wide_set = word(0) == "set"
+        && (matches!(word(1), "global" | "persist" | "persist_only" | "password")
+            || word(1).starts_with("@@global.")
+            || word(1).starts_with("@@persist"));
+    let session_only = ends_or_starts
+        || rolls_back_to_savepoint
+        || matches!(word(0), "savepoint" | "release" | "lock" | "unlock" | "reset")
+        || (word(0) == "set" && !server_wide_set);
+    session_only.then(|| {
+        format!(
+            "{keyword} only affects the pooled connection it happens to run on: the next \
+             statement may run on another connection (after BEGIN, outside the transaction and \
+             committed at once). Switch this connection to a manual transaction (Manual in the \
+             editor toolbar) to run statements on one session. Statement was not executed."
+        )
+    })
 }
 
 /// Returns the remainder after skipping leading whitespace and comments (`--` / `#` / `/* */`).
@@ -3292,13 +3865,13 @@ mod tests {
         let manager = DbManager::default();
 
         // Switch from the state where the original is None (config default) and fail -> cleared
-        manager.set_schema_override("conn", "tried".to_string()).await;
+        manager.set_schema_override("conn", "tried".to_string()).await.unwrap();
         assert!(manager.rollback_schema_override("conn", "tried", None).await);
         assert_eq!(manager.schema_override("conn").await, None);
 
         // Switch from the state where the original has a value and fail -> back to the original value
-        manager.set_schema_override("conn", "before".to_string()).await;
-        manager.set_schema_override("conn", "tried".to_string()).await;
+        manager.set_schema_override("conn", "before".to_string()).await.unwrap();
+        manager.set_schema_override("conn", "tried".to_string()).await.unwrap();
         assert!(
             manager
                 .rollback_schema_override("conn", "tried", Some("before".to_string()))
@@ -3310,8 +3883,8 @@ mod tests {
         );
 
         // If the user changed it to a different value during the switch, it is not rolled back
-        manager.set_schema_override("conn", "tried".to_string()).await;
-        manager.set_schema_override("conn", "chosen".to_string()).await;
+        manager.set_schema_override("conn", "tried".to_string()).await.unwrap();
+        manager.set_schema_override("conn", "chosen".to_string()).await.unwrap();
         assert!(
             !manager
                 .rollback_schema_override("conn", "tried", Some("before".to_string()))
@@ -3328,7 +3901,7 @@ mod tests {
         let manager = DbManager::default();
         // Even if disconnected with an active schema selected, the selection is kept
         // (so that the next reconnect uses the same schema).
-        manager.set_schema_override("conn", "chosen".to_string()).await;
+        manager.set_schema_override("conn", "chosen".to_string()).await.unwrap();
         manager.disconnect("conn").await;
         assert_eq!(
             manager.schema_override("conn").await,
@@ -5588,5 +6161,405 @@ mod tests {
         manager.reset().await;
         kick().await;
         exec(format!("DROP USER '{user}'@'%'")).await;
+    }
+
+    #[test]
+    fn test_session_statement_rejection_outside_a_transaction() {
+        for sql in [
+            "BEGIN",
+            "begin;",
+            "-- open it\nBEGIN TRANSACTION",
+            "START TRANSACTION",
+            "START TRANSACTION READ ONLY",
+            "COMMIT",
+            "END",
+            "ROLLBACK",
+            "ROLLBACK TO SAVEPOINT a",
+            "SAVEPOINT a",
+            "RELEASE SAVEPOINT a",
+            "SET search_path TO app",
+            "SET @x = 1",
+            "set session sql_mode = ''",
+            "LOCK TABLES t WRITE",
+            "UNLOCK TABLES",
+            "RESET ALL",
+        ] {
+            let reason = session_statement_rejection(sql, Engine::MySql, false);
+            assert!(reason.is_some(), "{sql} should be refused outside a transaction");
+            assert!(reason.unwrap().contains("Manual"), "{sql}: the message points at Manual");
+        }
+        for sql in [
+            "SELECT 1",
+            "UPDATE t SET v = 1 WHERE id = 1",
+            "START SLAVE",
+            "SET GLOBAL max_connections = 200",
+            "SET PERSIST max_connections = 200",
+            "SET @@global.max_connections = 200",
+            "SET PASSWORD = 'x'",
+            "-- BEGIN\nSELECT 'BEGIN'",
+            "\\dt",
+            "settings_table",
+        ] {
+            assert_eq!(session_statement_rejection(sql, Engine::MySql, false), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_session_statement_rejection_inside_a_transaction() {
+        for sql in [
+            "BEGIN",
+            "START TRANSACTION",
+            "COMMIT",
+            "commit work",
+            "END",
+            "ABORT",
+            "ROLLBACK",
+            "ROLLBACK WORK",
+            "SET autocommit = 1",
+            "SET @@autocommit = 0",
+            "SET LOCAL autocommit = 1",
+            "SET @x = 1, autocommit = 1",
+            "START /* comment */ TRANSACTION",
+            "PREPARE TRANSACTION 'x'",
+        ] {
+            assert!(session_statement_rejection(sql, Engine::MySql, true).is_some(), "{sql}");
+        }
+        for sql in [
+            "SELECT 1",
+            "UPDATE t SET v = 1 WHERE id = 1",
+            "SAVEPOINT a",
+            "RELEASE SAVEPOINT a",
+            "ROLLBACK TO SAVEPOINT a",
+            "ROLLBACK TO a",
+            "ROLLBACK WORK TO SAVEPOINT a",
+            "ROLLBACK TRANSACTION TO SAVEPOINT a",
+            "SET search_path TO app",
+            "SET @x = 1",
+            "SET @note = 'autocommit'",
+            "LOCK TABLE t IN SHARE MODE",
+        ] {
+            assert_eq!(session_statement_rejection(sql, Engine::MySql, true), None, "{sql}");
+        }
+    }
+
+    /// The (still percent-encoded) password of a `scheme://user:password@host/...` test URL
+    fn url_password(url: &str) -> Option<String> {
+        let userinfo = url.split_once("://")?.1.rsplit_once('@')?.0;
+        userinfo.split_once(':').map(|(_, password)| password.to_string())
+    }
+
+    /// The single value in the first cell of a result
+    fn single_value(result: &QueryResult) -> serde_json::Value {
+        result.rows[0][0].clone()
+    }
+
+    /// UPDATE → SELECT → Rollback / Commit on a manual transaction (CYBERNEURA-DEV-1398), through
+    /// the paths the app uses (DbManager::begin_transaction, run_query_in_transaction, the pool
+    /// for everything else). `table` must exist with the row (id 1, v 1)
+    async fn check_manual_transaction(server: &ServerConfig, table: &str) {
+        let manager = DbManager::default();
+        let registry = CancelRegistry::default();
+        let in_tx = |tx: &ManualTransaction, sql: String| {
+            let registry = &registry;
+            let tx = tx.clone();
+            async move {
+                run_query_in_transaction(
+                    &tx,
+                    registry,
+                    &server.name,
+                    &sql,
+                    10,
+                    None,
+                    ReadonlyGuard::Off,
+                    false,
+                )
+                .await
+            }
+        };
+        let on_pool = |sql: String| {
+            let manager = &manager;
+            async move {
+                manager
+                    .with_pool(server, PasswordRetry::BeforeStatement, |pool| {
+                        let sql = sql.clone();
+                        async move { run_query(&pool, &sql, 10, None, false, false).await }
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        let select = format!("SELECT v FROM {table} WHERE id = 1");
+        let update = |v: i32| format!("UPDATE {table} SET v = {v} WHERE id = 1");
+
+        // Rollback undoes the update, which its own session saw and the pool did not
+        let id = manager.begin_transaction(server).await.unwrap();
+        assert_eq!(manager.begin_transaction(server).await.unwrap(), id, "one per connection");
+        let tx = manager.transaction(&server.name).await.unwrap();
+        let updated = in_tx(&tx, update(2)).await.unwrap();
+        assert_eq!(updated.affected_rows, Some(1));
+        assert_eq!(single_value(&in_tx(&tx, select.clone()).await.unwrap()), 2);
+        assert_eq!(single_value(&on_pool(select.clone()).await), 1);
+        manager.end_transaction(&server.name, id, false).await.unwrap();
+        assert!(manager.open_transactions().await.is_empty());
+        assert_eq!(single_value(&on_pool(select.clone()).await), 1);
+        // The ended id is gone, also for statements still holding the old transaction's id
+        assert!(matches!(
+            manager.end_transaction(&server.name, id, true).await,
+            Err(AppError::TransactionEnded)
+        ));
+
+        // Commit keeps it
+        let id = manager.begin_transaction(server).await.unwrap();
+        let tx = manager.transaction(&server.name).await.unwrap();
+        in_tx(&tx, update(3)).await.unwrap();
+        manager.end_transaction(&server.name, id, true).await.unwrap();
+        assert_eq!(single_value(&on_pool(select.clone()).await), 3);
+
+        // The agent's read-only wrapper never runs inside the transaction (it would open and
+        // roll back a second one)
+        let id = manager.begin_transaction(server).await.unwrap();
+        let tx = manager.transaction(&server.name).await.unwrap();
+        let agent = run_query_in_transaction(
+            &tx,
+            &registry,
+            &server.name,
+            &select,
+            10,
+            None,
+            ReadonlyGuard::Agent,
+            false,
+        )
+        .await;
+        assert!(matches!(agent, Err(AppError::Session(_))));
+
+        // Disconnecting drops the transaction: nothing of it is committed
+        in_tx(&tx, update(4)).await.unwrap();
+        drop(tx);
+        manager.disconnect(&server.name).await;
+        assert!(manager.open_transactions().await.is_empty());
+        assert!(matches!(
+            manager.end_transaction(&server.name, id, false).await,
+            Err(AppError::TransactionEnded)
+        ));
+        assert_eq!(single_value(&on_pool(select.clone()).await), 3);
+        manager.reset().await;
+    }
+
+    /// Runs one statement on the connection's open manual transaction
+    async fn run_in_open_transaction(
+        manager: &DbManager,
+        server: &ServerConfig,
+        sql: &str,
+    ) -> Result<QueryResult, AppError> {
+        let tx = manager.transaction(&server.name).await.unwrap();
+        run_query_in_transaction(
+            &tx,
+            &CancelRegistry::default(),
+            &server.name,
+            sql,
+            10,
+            None,
+            ReadonlyGuard::Off,
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_manual_transaction_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx.db");
+        let yaml = format!(
+            "name: lite\nengine: sqlite\nschema: \"{}\"\n",
+            path.display().to_string().replace('"', "\\\"")
+        );
+        let server: ServerConfig = serde_yaml::from_str(&yaml).unwrap();
+        {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(
+                    SqliteConnectOptions::new().filename(&path).create_if_missing(true),
+                )
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE tx_probe (id INTEGER PRIMARY KEY, v INTEGER)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO tx_probe VALUES (1, 1)").execute(&pool).await.unwrap();
+            pool.close().await;
+        }
+        check_manual_transaction(&server, "tx_probe").await;
+
+        // A conflict clause that rolls back ends SQLite's transaction by itself: the error
+        // says so, and a new transaction is open, so the next update does not auto-commit
+        let manager = DbManager::default();
+        let id = manager.begin_transaction(&server).await.unwrap();
+        run_in_open_transaction(&manager, &server, "UPDATE tx_probe SET v = 5 WHERE id = 1")
+            .await
+            .unwrap();
+        let conflict =
+            run_in_open_transaction(&manager, &server, "INSERT OR ROLLBACK INTO tx_probe VALUES (1, 9)")
+                .await;
+        match conflict {
+            Err(AppError::Session(message)) => assert!(message.contains("rolled back"), "{message}"),
+            other => panic!("expected the rollback note, got {other:?}"),
+        }
+        run_in_open_transaction(&manager, &server, "UPDATE tx_probe SET v = 6 WHERE id = 1")
+            .await
+            .unwrap();
+        manager.end_transaction(&server.name, id, false).await.unwrap();
+        let fresh = DbManager::default();
+        let value = fresh
+            .with_pool(&server, PasswordRetry::BeforeStatement, |pool| async move {
+                run_query(&pool, "SELECT v FROM tx_probe WHERE id = 1", 10, None, false, false)
+                    .await
+            })
+            .await
+            .unwrap();
+        assert_eq!(single_value(&value), 3, "neither update was committed");
+    }
+
+    #[test]
+    fn test_manual_transaction_engines() {
+        for engine in [Engine::MySql, Engine::Postgres, Engine::Sqlite] {
+            assert!(supports_manual_transaction(engine));
+            assert!(crate::engines::capabilities(engine).supports_manual_transaction);
+        }
+        for engine in [
+            Engine::MsSql,
+            Engine::DuckDb,
+            Engine::Redis,
+            Engine::Elasticsearch,
+            Engine::DynamoDb,
+        ] {
+            assert!(!supports_manual_transaction(engine));
+            assert!(!crate::engines::capabilities(engine).supports_manual_transaction);
+        }
+    }
+
+    /// check_manual_transaction against a real PostgreSQL. Skipped unless QUERYFOLIO_TEST_PG_URL
+    /// is set (pgserver works, see AGENTS.md)
+    #[tokio::test]
+    async fn test_manual_transaction_postgres() {
+        use std::str::FromStr;
+        let Ok(url) = std::env::var("QUERYFOLIO_TEST_PG_URL") else {
+            return;
+        };
+        let admin = PgPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+        let target = PgConnectOptions::from_str(&url).unwrap();
+        let table = format!("qf_tx_probe_{}", std::process::id());
+        sqlx::query(&format!("CREATE TABLE {table} (id int PRIMARY KEY, v int)"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        sqlx::query(&format!("INSERT INTO {table} VALUES (1, 1)"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let yaml = format!(
+            "name: pgtx\nengine: postgres\nhost: {}\nport: {}\nschema: {}\nuser: {}\n\
+             ssl_mode: disable\n",
+            target.get_host(),
+            target.get_port(),
+            target.get_database().unwrap_or("postgres"),
+            target.get_username(),
+        );
+        let mut server: ServerConfig = serde_yaml::from_str(&yaml).unwrap();
+        server.password = url_password(&url);
+        check_manual_transaction(&server, &table).await;
+
+        // After an error PostgreSQL refuses the transaction's statements; ROLLBACK TO SAVEPOINT
+        // still reaches it (the cancel target is not read per statement), and committing a
+        // failed transaction is reported as not committed
+        let manager = DbManager::default();
+        let id = manager.begin_transaction(&server).await.unwrap();
+        let run = |sql: String| {
+            let manager = &manager;
+            let server = &server;
+            async move { run_in_open_transaction(manager, server, &sql).await }
+        };
+        run(format!("UPDATE {table} SET v = 7 WHERE id = 1")).await.unwrap();
+        run("SAVEPOINT before_error".into()).await.unwrap();
+        assert!(run("SELECT 1 / 0".into()).await.is_err());
+        run("ROLLBACK TO SAVEPOINT before_error".into()).await.unwrap();
+        assert_eq!(
+            single_value(&run(format!("SELECT v FROM {table} WHERE id = 1")).await.unwrap()),
+            7
+        );
+        assert!(run("SELECT 1 / 0".into()).await.is_err());
+        match manager.end_transaction(&server.name, id, true).await {
+            Err(AppError::Session(message)) => assert!(message.contains("Not committed")),
+            other => panic!("expected not committed, got {other:?}"),
+        }
+        let v: i32 = sqlx::query_scalar(&format!("SELECT v FROM {table} WHERE id = 1"))
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+        assert_eq!(v, 3);
+
+        // A COMMIT that slips past the keyword checks (here: a second statement with every
+        // guard off) is caught on the database: the run reports it and a new transaction is
+        // open, so the next update does not auto-commit
+        let id = manager.begin_transaction(&server).await.unwrap();
+        let tx = manager.transaction(&server.name).await.unwrap();
+        let slipped = run_query_in_transaction(
+            &tx,
+            &CancelRegistry::default(),
+            &server.name,
+            &format!("UPDATE {table} SET v = 8 WHERE id = 1; COMMIT"),
+            10,
+            None,
+            ReadonlyGuard::Off,
+            true,
+        )
+        .await;
+        match slipped {
+            Err(AppError::Session(message)) => {
+                assert!(message.contains("ended the manual transaction"), "{message}")
+            }
+            other => panic!("expected the ended note, got {other:?}"),
+        }
+        run(format!("UPDATE {table} SET v = 9 WHERE id = 1")).await.unwrap();
+        manager.end_transaction(&server.name, id, false).await.unwrap();
+        let v: i32 = sqlx::query_scalar(&format!("SELECT v FROM {table} WHERE id = 1"))
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+        assert_eq!(v, 8, "the slipped COMMIT kept 8, the update after it was rolled back");
+        sqlx::query(&format!("DROP TABLE {table}")).execute(&admin).await.unwrap();
+    }
+
+    /// check_manual_transaction against a real MySQL. Skipped unless QUERYFOLIO_TEST_MYSQL_URL
+    /// is set
+    #[tokio::test]
+    async fn test_manual_transaction_mysql() {
+        use std::str::FromStr;
+        let Ok(url) = std::env::var("QUERYFOLIO_TEST_MYSQL_URL") else {
+            return;
+        };
+        let admin = MySqlPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+        let target = sqlx::mysql::MySqlConnectOptions::from_str(&url).unwrap();
+        let table = format!("qf_tx_probe_{}", std::process::id());
+        sqlx::query(&format!("CREATE TABLE {table} (id int PRIMARY KEY, v int) ENGINE=InnoDB"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        sqlx::query(&format!("INSERT INTO {table} VALUES (1, 1)"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let yaml = format!(
+            "name: mytx\nengine: mysql\nhost: {}\nport: {}\nschema: {}\nuser: {}\n\
+             ssl_mode: disable\n",
+            target.get_host(),
+            target.get_port(),
+            target.get_database().unwrap_or(""),
+            target.get_username(),
+        );
+        let mut server: ServerConfig = serde_yaml::from_str(&yaml).unwrap();
+        server.password = url_password(&url);
+        check_manual_transaction(&server, &table).await;
+        sqlx::query(&format!("DROP TABLE {table}")).execute(&admin).await.unwrap();
     }
 }

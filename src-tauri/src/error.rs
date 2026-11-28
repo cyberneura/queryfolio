@@ -37,6 +37,17 @@ pub enum AppError {
     #[error("{0}")]
     Explain(String),
 
+    /// A statement that does not fit the connection's transaction mode (CYBERNEURA-DEV-1398:
+    /// BEGIN / SET outside a manual transaction, COMMIT inside one)
+    #[error("{0}")]
+    Session(String),
+
+    /// The manual transaction the frontend expected is no longer open (ended by a disconnect,
+    /// config reload or a discarded pool). The frontend matches this string to drop its
+    /// "transaction open" state
+    #[error("The manual transaction on this connection is no longer open (it was rolled back). Statement was not executed.")]
+    TransactionEnded,
+
     /// The query was aborted by a user cancel request.
     /// The frontend matches this string ("Query cancelled") to show it as a
     /// cancellation rather than an error.

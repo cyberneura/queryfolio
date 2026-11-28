@@ -47,6 +47,19 @@
   const supportsExplain = $derived(capabilities?.supports_explain ?? true);
   const supportsFormat = $derived(capabilities?.supports_format ?? true);
   const supportsAi = $derived(capabilities?.supports_ai ?? true);
+  /// Manual transactions (CYBERNEURA-DEV-1398). Not offered until the capabilities are known
+  const supportsManualTransaction = $derived(
+    capabilities?.supports_manual_transaction ?? false,
+  );
+  const txConnection = $derived(appStore.selectedConnection);
+  const txOpen = $derived(
+    txConnection !== null && appStore.transactionOf(txConnection) !== null,
+  );
+  const txBusy = $derived(
+    txConnection === null ||
+      appStore.isTransactionPending(txConnection) ||
+      appStore.selectedConnectionRunningTab !== null,
+  );
 
   /// Visibility state and input content of the inline input field for AI generation
   let showAiInput = $state(false);
@@ -231,6 +244,70 @@
           <option value={schema}>{schema}</option>
         {/each}
       </select>
+    {/if}
+  {/if}
+
+  <!-- Manual transaction (CYBERNEURA-DEV-1398): one pooled connection held for the
+       connection's statements until Commit / Rollback -->
+  {#if supportsManualTransaction && txConnection}
+    <button
+      type="button"
+      class="rounded border px-2 py-0.5 text-xs disabled:cursor-not-allowed disabled:opacity-50 {txOpen
+        ? 'border-amber-500/60 bg-amber-500/15 text-amber-300 hover:bg-amber-500/25'
+        : 'border-zinc-600 bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}"
+      data-annotate="toggle-manual-transaction"
+      aria-pressed={txOpen}
+      title={txOpen
+        ? "Manual transaction: statements run on one session until Commit / Rollback. " +
+          "Click to go back to Auto (rolls back)."
+        : "Auto-commit: each statement commits on its own. Click for a manual transaction " +
+          "(BEGIN now, then Commit / Rollback from here)."}
+      disabled={txBusy}
+      onclick={() => {
+        if (txConnection) {
+          void appStore.setManualTransaction(txConnection, !txOpen);
+        }
+      }}
+    >
+      <i class="bi {txOpen ? 'bi-lock-fill' : 'bi-unlock'}" aria-hidden="true"></i>
+      {txOpen ? "Manual" : "Auto"}
+    </button>
+    {#if txOpen}
+      <span
+        class="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] tracking-wide text-amber-400"
+        title="Changes are not visible to other sessions until committed"
+        data-annotate="badge-transaction-open"
+      >
+        transaction open
+      </span>
+      <button
+        type="button"
+        class="rounded border border-emerald-500/50 bg-emerald-500/15 px-2 py-0.5 text-xs text-emerald-300 hover:bg-emerald-500/25 disabled:cursor-not-allowed disabled:opacity-50"
+        data-annotate="button-transaction-commit"
+        title="COMMIT, then start a new transaction"
+        disabled={txBusy}
+        onclick={() => {
+          if (txConnection) {
+            void appStore.commitTransaction(txConnection);
+          }
+        }}
+      >
+        <i class="bi bi-check2" aria-hidden="true"></i> Commit
+      </button>
+      <button
+        type="button"
+        class="rounded border border-zinc-600 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
+        data-annotate="button-transaction-rollback"
+        title="ROLLBACK, then start a new transaction"
+        disabled={txBusy}
+        onclick={() => {
+          if (txConnection) {
+            void appStore.rollbackTransaction(txConnection);
+          }
+        }}
+      >
+        <i class="bi bi-arrow-counterclockwise" aria-hidden="true"></i> Rollback
+      </button>
     {/if}
   {/if}
 

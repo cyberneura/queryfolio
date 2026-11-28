@@ -33,6 +33,8 @@ export interface EngineCapabilities {
   supports_dump: boolean;
   /// Whether the PROCESS LIST pane is supported (mysql / postgres)
   supports_process_list: boolean;
+  /// Manual transactions (Auto / Manual in the editor toolbar; mysql / postgres / sqlite)
+  supports_manual_transaction: boolean;
   /// Whether `\d+ <table>` (indexes, foreign keys, CREATE statement) is supported
   supports_table_definition: boolean;
 }
@@ -151,6 +153,7 @@ export const runQuery = (
   writable?: boolean,
   applyDefaultLimit?: boolean,
   logRefetch?: { expectedSchema: string | null },
+  transaction?: number | null,
 ) =>
   invoke<QueryResult>("run_query", {
     connection,
@@ -159,7 +162,33 @@ export const runQuery = (
     writable,
     applyDefaultLimit,
     logRefetch: logRefetch ?? null,
+    transaction: transaction ?? null,
   });
+
+/// Start a manual transaction on the connection (CYBERNEURA-DEV-1398) and return its id. The
+/// backend holds one pooled connection for it, and every run_query of the connection then runs
+/// on that session. Returns the open one's id if the connection already has one
+export const beginTransaction = (connection: string) =>
+  invoke<number>("begin_transaction", { connection });
+
+/// Commit (commit = true) or roll back the connection's manual transaction. The transaction
+/// ends either way, also when this rejects (the backend closes its connection)
+export const endTransaction = (connection: string, transaction: number, commit: boolean) =>
+  invoke<void>("end_transaction", { connection, transaction, commit });
+
+export interface OpenTransaction {
+  connection: string;
+  id: number;
+}
+
+/// Every open manual transaction (the backend's state is the source of truth: a disconnect or a
+/// discarded pool ends one without the frontend asking)
+export const listTransactions = () => invoke<OpenTransaction[]>("list_transactions");
+
+/// The start of the backend's AppError::TransactionEnded: run_query was given a transaction id
+/// that is no longer open, and ran nothing
+export const TRANSACTION_ENDED_ERROR_PREFIX =
+  "The manual transaction on this connection is no longer open";
 
 /// Request cancellation of the query running on a connection. false if nothing is running.
 /// The cancelled run_query returns with an error of CANCELLED_ERROR_MESSAGE.
