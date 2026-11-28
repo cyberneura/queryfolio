@@ -3,6 +3,7 @@
   import { writeText } from "@tauri-apps/plugin-clipboard-manager";
   import * as api from "$lib/api";
   import appStore from "$lib/stores/app.svelte";
+  import { mysqlKillMayDamageTable, targetChangedReason } from "$lib/processSignal";
 
   interface Props {
     /// The connection whose server processes are listed (null = none selected)
@@ -63,6 +64,110 @@
     processes.find((p) => p.id === selectedId) ?? null,
   );
 
+  // --- Cancel query / Kill connection (CYBERNEURA-DEV-1399) ---
+  //
+  // Changes the server's state, so it follows the write rules: not offered on a config
+  // `readonly: true` connection, and needs the Writable switch (which belongs to the selected
+  // connection; for any other connection it counts as OFF, like effectiveWritable in the store).
+  // The backend checks both again.
+  const readonlyConnection = $derived(
+    appStore.connections.find((c) => c.name === connection)?.readonly === true,
+  );
+  const writableHere = $derived(
+    connection !== null &&
+      connection === appStore.selectedConnection &&
+      appStore.writable,
+  );
+  /// Right-click menu on a row
+  let rowMenu = $state<{ x: number; y: number; process: api.ProcessInfo } | null>(
+    null,
+  );
+  /// The action waiting for confirmation. A snapshot of the row, so the dialog does not change
+  /// (or disappear) when auto refresh replaces the list underneath it
+  let pendingSignal = $state<{
+    connection: string;
+    process: api.ProcessInfo;
+    action: api.ProcessAction;
+  } | null>(null);
+  let signalBusy = $state(false);
+  let signalNotice = $state<string | null>(null);
+  /// The last cancel / kill failure. Kept apart from `error` (the list fetch), so the refresh right
+  /// after the attempt does not wipe it before it can be read
+  let signalError = $state<string | null>(null);
+  const isMysql = $derived(
+    /^(mysql|mariadb)$/i.test(
+      appStore.connections.find((c) => c.name === connection)?.engine ?? "",
+    ),
+  );
+
+  const ACTION_LABEL: Record<api.ProcessAction, string> = {
+    cancel_query: "Cancel query",
+    kill_connection: "Kill connection",
+  };
+
+  function askSignal(process: api.ProcessInfo, action: api.ProcessAction) {
+    rowMenu = null;
+    if (connection === null || readonlyConnection || !writableHere) return;
+    pendingSignal = { connection, process, action };
+  }
+
+  async function confirmSignal() {
+    const target = pendingSignal;
+    if (!target || signalBusy) return;
+    signalBusy = true;
+    try {
+      // The server only takes the id. Fetch the list again and make sure the session (and, for
+      // Cancel query, the statement) is still the one shown in the dialog
+      const current = await api.listProcesses(target.connection);
+      const changed = targetChangedReason(
+        target.process,
+        current.find((p) => p.id === target.process.id),
+        target.action,
+      );
+      if (changed) {
+        if (target.connection === connection) {
+          signalNotice = null;
+          signalError = `Not sent: ${changed}. Check the list and try again.`;
+        }
+        return;
+      }
+      // The switch may have been turned off while the dialog was open; read it again here
+      const writableNow =
+        target.connection === appStore.selectedConnection && appStore.writable;
+      const signalled = await api.signalProcess(
+        target.connection,
+        target.process.id,
+        target.action,
+        writableNow,
+      );
+      if (target.connection !== connection) return;
+      signalError = null;
+      signalNotice = signalled
+        ? `${ACTION_LABEL[target.action]}: sent to #${target.process.id}`
+        : `#${target.process.id} was not signalled (it may have already ended)`;
+    } catch (e) {
+      if (target.connection !== connection) return;
+      signalNotice = null;
+      signalError = String(e);
+    } finally {
+      signalBusy = false;
+      pendingSignal = null;
+    }
+    await refresh();
+  }
+
+  function openRowMenu(e: MouseEvent, process: api.ProcessInfo) {
+    e.preventDefault();
+    selectedId = process.id;
+    rowMenu = { x: e.clientX, y: e.clientY, process };
+  }
+
+  function statementHead(text: string | null): string {
+    if (!text) return "-";
+    const flat = text.replace(/\s+/g, " ").trim();
+    return flat.length > 160 ? `${flat.slice(0, 160)}…` : flat;
+  }
+
   function refresh(): Promise<void> {
     if (inFlight) {
       return inFlight;
@@ -110,6 +215,10 @@
     processes = [];
     selectedId = null;
     error = null;
+    signalNotice = null;
+    signalError = null;
+    rowMenu = null;
+    pendingSignal = null;
     fetchedAt = null;
     loading = false;
     void refresh();
@@ -256,6 +365,24 @@
       </span>
     </div>
 
+    {#if signalError}
+      <p
+        class="mx-3 my-2 whitespace-pre-wrap rounded border border-red-500/40 bg-red-500/10 px-2 py-1 text-xs leading-relaxed text-red-300"
+        data-annotate="text-process-signal-error"
+      >
+        {signalError}
+      </p>
+    {/if}
+
+    {#if signalNotice}
+      <p
+        class="mx-3 my-2 rounded border border-emerald-600/40 bg-emerald-500/10 px-2 py-1 text-xs leading-relaxed text-emerald-300"
+        data-annotate="text-process-signal-notice"
+      >
+        {signalNotice}
+      </p>
+    {/if}
+
     {#if error}
       <p
         class="mx-3 my-2 whitespace-pre-wrap rounded border border-red-500/40 bg-red-500/10 px-2 py-1 text-xs leading-relaxed text-red-300"
@@ -288,6 +415,7 @@
           onclick={() => {
             selectedId = selectedId === process.id ? null : process.id;
           }}
+          oncontextmenu={(e) => openRowMenu(e, process)}
         >
           <span class="flex items-center gap-2">
             <span class="w-14 shrink-0 truncate text-right {timeClass(process)}">
@@ -319,6 +447,33 @@
         >
           <span class="font-semibold text-zinc-300">Process #{selected.id}</span>
           <span class="ml-auto flex items-center gap-1">
+            {#if !readonlyConnection}
+              <!-- Disabled (not hidden) while Writable is OFF, so it is clear why it does not work -->
+              <button
+                type="button"
+                class="rounded border border-amber-700/70 px-1.5 py-0.5 text-[10px] text-amber-300 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-40"
+                data-annotate="button-process-cancel-query"
+                title={writableHere
+                  ? "Stop the statement this session is running"
+                  : "Turn on the Writable switch to cancel queries"}
+                disabled={!writableHere || signalBusy}
+                onclick={() => askSignal(selected, "cancel_query")}
+              >
+                Cancel query
+              </button>
+              <button
+                type="button"
+                class="rounded border border-red-800 px-1.5 py-0.5 text-[10px] text-red-300 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-40"
+                data-annotate="button-process-kill-connection"
+                title={writableHere
+                  ? "Close this session's connection"
+                  : "Turn on the Writable switch to kill connections"}
+                disabled={!writableHere || signalBusy}
+                onclick={() => askSignal(selected, "kill_connection")}
+              >
+                Kill
+              </button>
+            {/if}
             {#if selected.info}
               <button
                 type="button"
@@ -383,3 +538,152 @@
     {/if}
   {/if}
 </div>
+
+<svelte:window
+  onkeydown={(e) => {
+    if (e.key !== "Escape") return;
+    if (pendingSignal && !signalBusy) {
+      e.preventDefault();
+      pendingSignal = null;
+    } else if (rowMenu) {
+      e.preventDefault();
+      rowMenu = null;
+    }
+  }}
+/>
+
+{#if rowMenu}
+  {@const menu = rowMenu}
+  <!-- Full-screen layer: any click or right-click outside the menu closes it (same as TablesPane) -->
+  <div
+    class="fixed inset-0 z-20"
+    role="presentation"
+    onclick={() => (rowMenu = null)}
+    oncontextmenu={(e) => {
+      e.preventDefault();
+      rowMenu = null;
+    }}
+  >
+    <div
+      class="fixed min-w-44 rounded border border-zinc-700 bg-zinc-800 py-1 text-xs text-zinc-200 shadow-xl"
+      style="left: {Math.min(menu.x, window.innerWidth - 220)}px; top: {Math.min(menu.y, window.innerHeight - 96)}px"
+      role="menu"
+    >
+      {#if readonlyConnection}
+        <p class="px-3 py-1 text-zinc-500">
+          This connection is readonly; processes cannot be cancelled or killed.
+        </p>
+      {:else}
+        {#each ["cancel_query", "kill_connection"] as const as action (action)}
+          <button
+            class="flex w-full items-center gap-2 px-3 py-1 text-left hover:bg-zinc-700 disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
+            role="menuitem"
+            title={writableHere ? undefined : "Turn on the Writable switch first"}
+            disabled={!writableHere || signalBusy}
+            data-annotate={action === "cancel_query"
+              ? "menu-process-cancel-query"
+              : "menu-process-kill-connection"}
+            onclick={(e) => {
+              e.stopPropagation();
+              askSignal(menu.process, action);
+            }}
+          >
+            <i
+              class="bi {action === 'cancel_query'
+                ? 'bi-stop-circle text-amber-300'
+                : 'bi-plug text-red-300'}"
+              aria-hidden="true"
+            ></i>
+            {ACTION_LABEL[action]} #{menu.process.id}
+          </button>
+        {/each}
+        {#if !writableHere}
+          <p class="px-3 py-1 text-[10px] text-zinc-500">
+            Needs the Writable switch (for the selected connection).
+          </p>
+        {/if}
+      {/if}
+    </div>
+  </div>
+{/if}
+
+{#if pendingSignal}
+  {@const target = pendingSignal}
+  {@const isKill = target.action === "kill_connection"}
+  <div
+    class="fixed inset-0 z-30 flex items-center justify-center bg-black/60"
+    role="presentation"
+    data-modal
+    data-annotate="backdrop-process-signal-modal"
+    onclick={(e) => {
+      if (e.target === e.currentTarget && !signalBusy) pendingSignal = null;
+    }}
+  >
+    <div
+      class="flex w-[480px] flex-col gap-3 rounded-lg border bg-zinc-900 p-4 shadow-xl {isKill
+        ? 'border-red-800'
+        : 'border-amber-700'}"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="process-signal-title"
+    >
+      <h2
+        id="process-signal-title"
+        class="flex items-center gap-2 text-sm font-semibold {isKill
+          ? 'text-red-400'
+          : 'text-amber-300'}"
+      >
+        <i class="bi bi-exclamation-triangle-fill" aria-hidden="true"></i>
+        {ACTION_LABEL[target.action]} #{target.process.id}?
+      </h2>
+      <table class="w-full font-mono text-[11px]" data-annotate="table-process-signal-target">
+        <tbody>
+          <tr><th class="w-20 py-0.5 text-left font-normal text-zinc-500">Connection</th><td class="break-all text-zinc-300">{target.connection}</td></tr>
+          <tr><th class="py-0.5 text-left font-normal text-zinc-500">User</th><td class="break-all text-zinc-300">{target.process.user ?? "-"}</td></tr>
+          <tr><th class="py-0.5 text-left font-normal text-zinc-500">Host</th><td class="break-all text-zinc-300">{target.process.host ?? "-"}</td></tr>
+          <tr><th class="py-0.5 text-left font-normal text-zinc-500">Database</th><td class="break-all text-zinc-300">{target.process.db ?? "-"}</td></tr>
+          <tr><th class="py-0.5 text-left font-normal text-zinc-500">Elapsed</th><td class="text-zinc-300">{formatDuration(target.process.time_secs)}</td></tr>
+          <tr class="align-top"><th class="py-0.5 text-left font-normal text-zinc-500">Statement</th><td class="break-all text-zinc-300">{statementHead(target.process.info)}</td></tr>
+        </tbody>
+      </table>
+      <p class="text-xs text-zinc-400">
+        {isKill
+          ? "The session's connection is closed. Its open transaction is rolled back."
+          : "The running statement is stopped. The connection stays open."}
+        This affects another session on the server.
+      </p>
+      {#if isMysql && mysqlKillMayDamageTable(target.process.info)}
+        <p
+          class="rounded border border-red-500/40 bg-red-500/10 px-2 py-1 text-xs leading-relaxed text-red-300"
+          data-annotate="text-process-signal-table-warning"
+        >
+          This is a REPAIR / OPTIMIZE / ALTER TABLE. Interrupting it can leave a MyISAM (or other
+          non-transactional) table unusable until it is repaired.
+        </p>
+      {/if}
+      <div class="flex justify-end gap-2">
+        <!-- Cancel is the default (focused) button, so Enter does not run it -->
+        <!-- svelte-ignore a11y_autofocus -->
+        <button
+          class="rounded border border-zinc-600 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
+          data-annotate="button-process-signal-cancel"
+          autofocus
+          disabled={signalBusy}
+          onclick={() => (pendingSignal = null)}
+        >
+          Cancel
+        </button>
+        <button
+          class="rounded px-3 py-1 text-xs text-white disabled:opacity-50 {isKill
+            ? 'bg-red-600 hover:bg-red-500'
+            : 'bg-amber-600 hover:bg-amber-500'}"
+          data-annotate="button-process-signal-confirm"
+          disabled={signalBusy}
+          onclick={() => void confirmSignal()}
+        >
+          {signalBusy ? "Sending…" : ACTION_LABEL[target.action]}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
