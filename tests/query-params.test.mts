@@ -136,3 +136,9 @@ test("review round 2: struct keys, array constructors, definitions before the SQ
   assert.equal(definitionFor(defs, "n", start)?.value, "1");
   assert.equal(definitionFor(defs, "n", start + sqlBodyOffset(stmt, "postgres"))?.value, "2");
 });
+
+test("review round 3: struct key positions, nested comments on SQL Server", () => {
+  assert.deepEqual(names("SELECT {'result': CASE WHEN :enabled THEN 1 ELSE 0 END}", "duckdb"), ["enabled"]);
+  assert.deepEqual(names("SELECT {a: 1, b: :v}", "duckdb"), ["v"]);
+  assert.deepEqual(names("SELECT 1 /* outer /* inner */ :hidden */, :yes", "mssql"), ["yes"]);
+});

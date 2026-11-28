@@ -103,8 +103,8 @@ export function blankNonCode(sql: string, engine: ParamEngine, keepLineComments 
       end = j < 0 ? n : j;
       keep = keepLineComments;
     } else if (c === "/" && next === "*") {
-      if (engine === "postgres") {
-        // PostgreSQL block comments nest
+      if (engine === "postgres" || engine === "mssql") {
+        // PostgreSQL and SQL Server block comments nest
         let depth = 1;
         let j = i + 2;
         while (j < n && depth > 0) {
@@ -208,8 +208,14 @@ export function findParams(sql: string, engine: ParamEngine): ParamUse[] {
     // never a placeholder (`'x' :y` is not valid SQL)
     const before = prevNonSpace(sql, i);
     if (before >= 0 && code[before] !== sql[before] && /['"`\]]/.test(sql[before])) continue;
-    // DuckDB struct keys may also be bare identifiers: `{a: x}`
-    if (braces && braces[i] > 0 && before >= 0 && /[A-Za-z0-9_$]/.test(code[before])) continue;
+    // DuckDB struct keys may also be bare identifiers: `{a: x}`. Only in a key position (the word
+    // right after `{` or `,`), so `{'r': CASE WHEN :x THEN 1 END}` still finds `x`
+    if (braces && braces[i] > 0 && before >= 0 && /[A-Za-z0-9_$]/.test(code[before])) {
+      let k = before;
+      while (k >= 0 && /[A-Za-z0-9_$]/.test(code[k])) k--;
+      const lead = prevNonSpace(code, k + 1);
+      if (lead >= 0 && (code[lead] === "{" || code[lead] === ",")) continue;
+    }
     // PostgreSQL / DuckDB slices with an omitted lower bound: `arr[:upper]` (but `ARRAY[:id]` and
     // DuckDB `[:id]` construct arrays and keep their placeholders)
     if (
