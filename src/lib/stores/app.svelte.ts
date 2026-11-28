@@ -1,5 +1,6 @@
 import { toast } from "svelte-sonner";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { ask } from "@tauri-apps/plugin-dialog";
 import * as api from "$lib/api";
 import type { LoadedTables } from "$lib/searchItems";
 import type {
@@ -111,6 +112,18 @@ let selectedConnection = $state<string | null>(null);
 /// SELECT/SHOW can be run (enforced by the backend). To prevent accidents it starts OFF
 /// in every session and is not persisted (a restart never silently makes it writable).
 let writable = $state(false);
+/// Open manual transactions (CYBERNEURA-DEV-1398): connection name → the backend's transaction
+/// id. One per connection. While a connection has one, every statement run on it goes to the
+/// transaction's session (the backend routes it; the id is passed so that a run expecting a
+/// transaction that already ended runs nothing instead of auto-committing)
+/// Maps, replaced on every change (`$state.raw`): connection names are arbitrary text, and a
+/// plain object would not hold `__proto__` / `constructor` as keys
+let transactions = $state.raw(new Map<string, number>());
+/// Connections whose transaction is being started / committed / rolled back
+let transactionPending = $state.raw(new Set<string>());
+/// Advanced whenever this side starts or ends a transaction, so that a listTransactions answer
+/// read before the change does not overwrite it (syncTransactions)
+let transactionsVersion = 0;
 /// List for the FILES pane (descending by modified time, with timestamps and sizes)
 let fileEntries = $state<api.QueryFileEntry[]>([]);
 /// Advanced every time fileEntries is rewritten. Prevents a stale fetch result that resolves later
@@ -528,6 +541,29 @@ const reloadConnectionsUnguarded = async (): Promise<boolean> => {
   if (!(await saveAllDirtyTabs())) {
     return false;
   }
+  // The backend reset closes every pool, and the manual transactions with them
+  const open = [...transactions.keys()];
+  if (open.length > 0) {
+    if (
+      !(await confirmRollback(
+        `Reloading the config rolls back the open manual transaction on: ${open.join(", ")}.`,
+        "Roll Back and Reload",
+      ))
+    ) {
+      errorMessage = "Reload cancelled: a manual transaction is open.";
+      return false;
+    }
+    for (const connection of open) {
+      await finishTransaction(connection, false, false);
+    }
+    const left = [...transactions.keys()];
+    if (left.length > 0) {
+      errorMessage =
+        `Reload cancelled: could not roll back the transaction on ${left.join(", ")} ` +
+        "while a query runs on it. Wait for it or cancel it, then reload.";
+      return false;
+    }
+  }
   // Abort a chat awaiting a response **before** resetConnections and wait until the request
   // arrives. If deferred / fire-and-forget, an agent still holding the pre-reload connection config
   // could reopen the discarded pool and keep running tools with stale credentials / schema.
@@ -552,6 +588,9 @@ const reloadConnectionsUnguarded = async (): Promise<boolean> => {
     errorMessage = toErrorMessage(e);
     return false;
   }
+  // The reset ended any transaction started meanwhile
+  transactionsVersion++;
+  transactions = new Map();
   // The backend swap is done, so the chat transition is over
   // (round trips sent from now on run with the new settings)
   endChatTransition();
@@ -946,6 +985,11 @@ const maybeDisconnectIfIdle = (connection: string) => {
   if (editorTabs.some((t) => t.connection === connection)) {
     return;
   }
+  // Disconnecting would roll the manual transaction back. Closing the last tab asks first
+  // (removeEditorTab), so a transaction left here is one the user chose to keep
+  if (transactionOf(connection) !== null) {
+    return;
+  }
   if (isConnectionRunning(connection)) {
     return;
   }
@@ -1148,6 +1192,11 @@ const changeActiveSchema = async (schema: string): Promise<boolean> => {
   // a switch would send the rest of the batch to another database
   if (isBatchRunning(connection)) {
     toast.warning("Wait for the running statements to finish before switching the database.");
+    return false;
+  }
+  // Switching rebuilds the pool, which would roll the manual transaction back
+  if (transactionOf(connection) !== null) {
+    errorMessage = "Commit or roll back the manual transaction before switching the database.";
     return false;
   }
   // Save unsaved tabs best-effort (a failure does not stop the schema switch)
@@ -1388,7 +1437,30 @@ const removeEditorTab = async (id: number, save: boolean) => {
       return;
     }
   }
-  // The array may have changed during the save await, so re-obtain the position
+  // Closing the connection's last tab disconnects it, which ends its manual transaction: ask,
+  // and roll back explicitly (the default) rather than leave it to the closed connection.
+  // After the save, so that a failed save does not leave the transaction rolled back for a
+  // tab that stays open
+  if (
+    transactionOf(tab.connection) !== null &&
+    !editorTabs.some((t) => t.id !== id && t.connection === tab.connection)
+  ) {
+    if (
+      !(await confirmRollback(
+        `"${tab.file}" is the last tab of ${tab.connection}, which has an open manual ` +
+          "transaction. Closing it rolls the transaction back.",
+        "Roll Back and Close",
+      ))
+    ) {
+      return;
+    }
+    await finishTransaction(tab.connection, false, false);
+    // Refused (a query is running): keep the tab, the transaction is still open
+    if (transactionOf(tab.connection) !== null) {
+      return;
+    }
+  }
+  // The array may have changed during the awaits above, so re-obtain the position
   const index = editorTabs.findIndex((t) => t.id === id);
   if (index < 0) {
     return;
@@ -2002,12 +2074,196 @@ let queryCompletions = $state(0);
 /// to suppress parallel execution on the same connection, as with query execution.
 let applyingConnections = $state(new Set<string>());
 
+/// The id of the connection's open manual transaction (null = Auto)
+const transactionOf = (connection: string): number | null =>
+  transactions.get(connection) ?? null;
+
+const isTransactionPending = (connection: string): boolean => transactionPending.has(connection);
+
+/// Connections that ran DDL inside their transaction: the completion map was re-read on another
+/// connection, which does not see uncommitted DDL, so it is read again after the commit
+const schemaChangedInTransaction = new Set<string>();
+
+const setTransaction = (connection: string, id: number | null) => {
+  transactionsVersion++;
+  const next = new Map(transactions);
+  if (id === null) {
+    next.delete(connection);
+  } else {
+    next.set(connection, id);
+  }
+  transactions = next;
+};
+
+const setTransactionPending = (connection: string, pending: boolean) => {
+  const next = new Set(transactionPending);
+  if (pending) {
+    next.add(connection);
+  } else {
+    next.delete(connection);
+  }
+  transactionPending = next;
+};
+
+/// Whether the connection's transaction changed since a run was asked for (the run then does
+/// not happen: a statement meant for the transaction must not run auto-committed, and one meant
+/// for Auto must not land in a transaction)
+const transactionChangedSince = (connection: string, expected: number | null): boolean => {
+  if (transactionOf(connection) === expected) {
+    return false;
+  }
+  toast.warning(
+    `The transaction mode of ${connection} changed while the run was being prepared. ` +
+      "Run it again.",
+  );
+  return true;
+};
+
+/// Ask before something that rolls the connection's manual transaction back. Resolves to false
+/// when the dialog cannot be shown (keep the transaction)
+const confirmRollback = (message: string, okLabel: string): Promise<boolean> =>
+  ask(message, {
+    title: "Manual transaction",
+    kind: "warning",
+    okLabel,
+    cancelLabel: "Cancel",
+  }).catch(() => false);
+
+/// Re-read the open transactions from the backend, the source of truth: a cancel that could
+/// not stop its statement discards the connection's pool, and the transaction with it. Warns
+/// about a transaction that ended without the user ending it
+const syncTransactions = async () => {
+  const version = transactionsVersion;
+  let open: api.OpenTransaction[];
+  try {
+    open = await api.listTransactions();
+  } catch {
+    return;
+  }
+  if (version !== transactionsVersion) {
+    return;
+  }
+  const next = new Map<string, number>();
+  for (const tx of open) {
+    next.set(tx.connection, tx.id);
+  }
+  for (const [connection, id] of transactions) {
+    if (next.get(connection) !== id) {
+      toast.warning(`The manual transaction on ${connection} ended`, {
+        description:
+          "Its connection was closed, so the server rolled it back. Switch to Manual to " +
+          "start a new one.",
+      });
+    }
+  }
+  transactions = next;
+};
+
+/// Start a manual transaction on the connection (Manual in the editor toolbar)
+const startTransaction = async (connection: string): Promise<boolean> => {
+  if (isTransactionPending(connection) || transactionOf(connection) !== null) {
+    return false;
+  }
+  // The reload asked about the transactions open when it started; one begun meanwhile would
+  // be dropped by its reset without asking
+  if (reloadsInProgress > 0) {
+    toast.warning("The config is reloading. Switch to Manual once it finishes.");
+    return false;
+  }
+  setTransactionPending(connection, true);
+  try {
+    setTransaction(connection, await api.beginTransaction(connection));
+    return true;
+  } catch (e) {
+    toast.error("Could not start the transaction", { description: toErrorMessage(e) });
+    return false;
+  } finally {
+    setTransactionPending(connection, false);
+  }
+};
+
+/// Commit or roll back the connection's transaction. restart = stay in Manual with a new
+/// transaction (the toolbar's Commit / Rollback); otherwise the connection goes back to Auto.
+/// The transaction ends even when this fails (the backend closes its connection, and the server
+/// rolls back what was not committed)
+const finishTransaction = async (
+  connection: string,
+  commit: boolean,
+  restart: boolean,
+): Promise<boolean> => {
+  const id = transactionOf(connection);
+  if (id === null) {
+    return true;
+  }
+  if (isTransactionPending(connection)) {
+    return false;
+  }
+  // The running statement holds the session; ending under it would wait for it, and a Commit
+  // must not take in a statement whose result the user has not seen
+  if (isConnectionRunning(connection)) {
+    toast.warning("A query is running on this connection. Wait for it or cancel it first.");
+    return false;
+  }
+  setTransactionPending(connection, true);
+  let ok = true;
+  // Whether the transaction ended. The backend ends it even when COMMIT / ROLLBACK fails, but
+  // a failed call may not have reached it: then ask, and keep it if it is (or may be) open
+  let ended = true;
+  try {
+    await api.endTransaction(connection, id, commit);
+  } catch (e) {
+    ok = false;
+    toast.error(commit ? "Commit failed" : "Rollback failed", {
+      description: toErrorMessage(e),
+    });
+    const open = await api.listTransactions().catch(() => null);
+    ended = open !== null && !open.some((t) => t.connection === connection && t.id === id);
+  }
+  if (ended) {
+    setTransaction(connection, null);
+  }
+  setTransactionPending(connection, false);
+  if (schemaChangedInTransaction.delete(connection) && commit && ok) {
+    refreshSchemaAfterStatement(connection, "ALTER");
+  }
+  if (ok) {
+    toast.success(commit ? `Committed (${connection})` : `Rolled back (${connection})`);
+    if (restart) {
+      await startTransaction(connection);
+    }
+  }
+  maybeDisconnectIfIdle(connection);
+  return ok;
+};
+
+/// Switch the connection between Auto and Manual. Leaving Manual rolls the open transaction
+/// back, after asking
+const setManualTransaction = async (connection: string, manual: boolean): Promise<boolean> => {
+  if (manual) {
+    return startTransaction(connection);
+  }
+  if (transactionOf(connection) === null) {
+    return true;
+  }
+  if (
+    !(await confirmRollback(
+      `Switching ${connection} back to Auto rolls back the open transaction.`,
+      "Roll Back",
+    ))
+  ) {
+    return false;
+  }
+  return finishTransaction(connection, false, false);
+};
+
 /// Return whether any tab is running a query on the given connection.
 /// The backend's cancel registry manages only the last execution per connection,
 /// so parallel execution on the same connection is suppressed on the frontend side
 /// (allowing it would mix up or miss cancel targets).
 /// Cell-edit application (applyingConnections) is also treated as running.
 const isConnectionRunning = (connection: string): boolean =>
+  // Between ending a transaction and the next BEGIN, a statement would run auto-committed
+  isTransactionPending(connection) ||
   resultTabs.some((t) => t.running && t.connection === connection) ||
   applyingConnections.has(connection) ||
   // AI chat tool execution also uses this connection's pool. If it is cut during execution,
@@ -2112,12 +2368,16 @@ const executeTab = async (
   let result: QueryResult | null = null;
   let error: string | null = null;
   let cancelled = false;
+  const transaction = transactionOf(tab.connection);
   try {
     result = await api.runQuery(
       tab.connection,
       tab.sql,
       undefined,
       effectiveWritable(tab.connection),
+      undefined,
+      undefined,
+      transaction,
     );
     if (afterRun) {
       await afterRun(result);
@@ -2133,6 +2393,10 @@ const executeTab = async (
   }
   tab.running = false;
   queryCompletions += 1;
+  // A cancel that could not stop the statement discards the pool, and the transaction with it
+  if (transaction !== null) {
+    void syncTransactions();
+  }
   // If the tab was discarded during execution (settings reload etc.),
   // discard the result instead of writing to a nonexistent tab (a detached object)
   if (!resultTabs.some((t) => t.id === tab.id)) {
@@ -2143,6 +2407,9 @@ const executeTab = async (
   tab.cancelled = cancelled;
   if (result) {
     refreshSchemaAfterStatement(tab.connection, tab.sql);
+    if (transaction !== null && changesSchema(tab.sql)) {
+      schemaChangedInTransaction.add(tab.connection);
+    }
   }
   // If `\c` switched the active schema, make the display follow
   // (the switch itself is already done in the backend)
@@ -2293,6 +2560,9 @@ const fetchResultWithoutDefaultLimit = async (
     // Run with the same privileges as the original execution (judged read-only, so no writes happen)
     effectiveWritable(tab.connection),
     false,
+    undefined,
+    // Inside a manual transaction, on its session: the rows have to include its own changes
+    transactionOf(tab.connection),
   );
 };
 
@@ -2342,6 +2612,11 @@ const runQueryForLog = async (
     schema: string | null,
   ) => {
     if (!runLogNeedsFullFetch(result)) {
+      return;
+    }
+    // The re-fetch runs in a read-only transaction of its own, which cannot nest in a manual
+    // transaction (the backend refuses it): log the displayed result
+    if (transactionOf(connection) !== null) {
       return;
     }
     try {
@@ -2407,6 +2682,8 @@ const runQueryInTab = async (
     );
     return null;
   }
+  // The transaction the run was asked for (checked again after the awaits)
+  const transaction = transactionOf(connection);
   // Save unsaved tabs best-effort (a failure does not stop execution. The SQL is the in-memory value)
   await flushPendingSave();
   // Dangerous statements (UPDATE/DELETE without WHERE, DROP/TRUNCATE) are confirmed before execution even on
@@ -2424,6 +2701,9 @@ const runQueryInTab = async (
     toast.warning(
       "A query is already running on this connection. Cancel it or wait for it to finish.",
     );
+    return null;
+  }
+  if (transactionChangedSince(connection, transaction)) {
     return null;
   }
   errorMessage = null;
@@ -2528,6 +2808,9 @@ const batchCancelRequests = new Set<number>();
 const executeBatchInTab = async (tab: ResultTab, statements: string[]) => {
   const tabExists = () => resultTabs.some((t) => t.id === tab.id);
   const connection = tab.connection;
+  // Every statement is sent with the transaction the batch started in: if it ends meanwhile,
+  // the rest fail (TransactionEnded) instead of running auto-committed
+  const batchTransaction = transactionOf(connection);
   const outcomes: BatchOutcome[] = [];
   const publish = () => {
     tab.result = batchSummary(statements, outcomes);
@@ -2575,6 +2858,9 @@ const executeBatchInTab = async (tab: ResultTab, statements: string[]) => {
           statement,
           undefined,
           effectiveWritable(connection),
+          undefined,
+          undefined,
+          batchTransaction,
         );
       } catch (e) {
         error = toErrorMessage(e);
@@ -2616,6 +2902,9 @@ const executeBatchInTab = async (tab: ResultTab, statements: string[]) => {
         applySwitchedSchema(connection, result.switched_schema);
       }
       refreshSchemaAfterStatement(connection, statement);
+      if (batchTransaction !== null && changesSchema(statement)) {
+        schemaChangedInTransaction.add(connection);
+      }
       outcomes[i] = {
         status: "ok",
         rows: result ? (result.affected_rows ?? result.row_count) : null,
@@ -2627,6 +2916,9 @@ const executeBatchInTab = async (tab: ResultTab, statements: string[]) => {
   } finally {
     batchCancelRequests.delete(tab.id);
     tab.running = false;
+    if (batchTransaction !== null) {
+      void syncTransactions();
+    }
   }
   if (!tabExists()) {
     return;
@@ -2662,15 +2954,19 @@ const runBatch = async (statements: string[]) => {
   }
   // Each statement takes its own pooled connection, so a transaction or session setting would
   // not carry over to the next one (BEGIN; UPDATE; ROLLBACK; would commit the UPDATE)
-  const isMssql = /^(mssql|sqlserver)$/i.test(
-    connections.find((c) => c.name === connection)?.engine ?? "",
-  );
-  for (const statement of statements) {
+  const info = connections.find((c) => c.name === connection);
+  const isMssql = /^(mssql|sqlserver)$/i.test(info?.engine ?? "");
+  // In a manual transaction every statement runs on its session, so session settings carry
+  // over (the backend still refuses COMMIT / ROLLBACK / BEGIN there)
+  for (const statement of transactionOf(connection) === null ? statements : []) {
     const reason = sessionStatementReason(statement, isMssql);
     if (reason) {
       toast.warning(
         `A multi-statement run cannot include ${reason}: each statement runs on its own ` +
-          "connection, so transactions and session settings do not carry over.",
+          "connection, so transactions and session settings do not carry over." +
+          (info?.capabilities.supports_manual_transaction
+            ? " Switch the connection to Manual to run them in one transaction."
+            : ""),
       );
       return;
     }
@@ -2681,6 +2977,7 @@ const runBatch = async (statements: string[]) => {
     );
     return;
   }
+  const transaction = transactionOf(connection);
   await flushPendingSave();
   // Same post-await checks as runQuery
   if (selectedConnection !== connection) {
@@ -2690,6 +2987,9 @@ const runBatch = async (statements: string[]) => {
     toast.warning(
       "A query is already running on this connection. Cancel it or wait for it to finish.",
     );
+    return;
+  }
+  if (transactionChangedSince(connection, transaction)) {
     return;
   }
   const blocker = batchStartBlocker(connection);
@@ -3008,6 +3308,7 @@ const rerunTab = async (id: number) => {
     );
     return;
   }
+  const transaction = transactionOf(tab.connection);
   // A batch confirms each statement as it reaches it (executeBatchInTab)
   if (!tab.batch && !(await confirmIfDangerous(tab.connection, tab.sql))) {
     return;
@@ -3025,6 +3326,9 @@ const rerunTab = async (id: number) => {
     toast.warning(
       "A query is already running on this connection. Cancel it or wait for it to finish.",
     );
+    return;
+  }
+  if (transactionChangedSince(tab.connection, transaction)) {
     return;
   }
   if (tab.batch) {
@@ -3374,6 +3678,21 @@ export default {
     return (
       connections.find((c) => c.name === selectedConnection)?.readonly ?? false
     );
+  },
+  /// Manual transactions (CYBERNEURA-DEV-1398): connection → open transaction id
+  get transactions() {
+    return transactions;
+  },
+  isTransactionPending,
+  transactionOf,
+  setManualTransaction,
+  /// Commit and stay in Manual with a new transaction
+  commitTransaction(connection: string) {
+    return finishTransaction(connection, true, true);
+  },
+  /// Roll back and stay in Manual with a new transaction
+  rollbackTransaction(connection: string) {
+    return finishTransaction(connection, false, true);
   },
   /// Toggle the Writable switch. For a config-readonly connection the backend rejects writes,
   /// but the state itself is kept as a session setting across connections

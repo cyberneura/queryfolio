@@ -82,6 +82,11 @@ struct AppState {
     chat_cancels: ChatCancels,
     /// Running dumps (dump ID numbered by the frontend -> its cancel token)
     dumps: std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+    /// Quitting with open manual transactions (CYBERNEURA-DEV-1398): set once the user chose to
+    /// roll them back and quit, so the exit that follows is not held again
+    exit_confirmed: std::sync::atomic::AtomicBool,
+    /// The quit confirmation is showing (a second Cmd+Q / close does not open another)
+    exit_prompt_open: std::sync::atomic::AtomicBool,
 }
 
 /// Upper limit of IDs for which abort requests are remembered (they are kept to guard against
@@ -524,6 +529,8 @@ async fn reset_connections(
     Ok(())
 }
 
+// Each argument is an independent option of the frontend's invoke call
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn run_query(
     state: tauri::State<'_, AppState>,
@@ -538,6 +545,9 @@ async fn run_query(
     apply_default_limit: Option<bool>,
     // The Run and Log re-fetch (CYBERNEURA-DEV-1167): see QueryMode::LogRefetch
     log_refetch: Option<LogRefetch>,
+    // The id of the manual transaction the frontend believes is open on the connection
+    // (CYBERNEURA-DEV-1398). When it is no longer the open one, nothing runs (see run_query_in_mode)
+    transaction: Option<u64>,
 ) -> Result<QueryResult, AppError> {
     let mode = if let Some(LogRefetch { expected_schema }) = log_refetch {
         QueryMode::LogRefetch { expected_schema }
@@ -546,7 +556,7 @@ async fn run_query(
     } else {
         QueryMode::FullFetch
     };
-    run_query_in_mode(&state, connection, sql, max_rows, writable, mode).await
+    run_query_in_mode(&state, connection, sql, max_rows, writable, mode, transaction).await
 }
 
 /// run_query's log_refetch argument
@@ -590,6 +600,7 @@ async fn run_query_in_mode(
     max_rows: Option<usize>,
     writable: Option<bool>,
     mode: QueryMode,
+    expected_transaction: Option<u64>,
 ) -> Result<QueryResult, AppError> {
     // Row handling is separated between the display for the result table (apply_default_limit)
     // and the fetch of all rows (Copy / Export, Run and Log)
@@ -671,9 +682,56 @@ async fn run_query_in_mode(
         // (Reporting meta command parse errors here as well records them in the history as failures)
         // The Run and Log re-fetch never switches: under the agent guard run_query_on rejects it
         let engine = db::parse_engine(&server.engine)?;
-        if let Some(meta_commands::MetaCommand::Connect(schema)) =
-            meta_commands::translate(engine, &sql)?
-        {
+        // Manual transactions (CYBERNEURA-DEV-1398). The backend's state is what counts: an
+        // open transaction takes every statement of the connection, even when the frontend
+        // did not pass its id (running it on the pool would auto-commit behind the user's
+        // back). A passed id that is not the open transaction means the frontend still shows a
+        // transaction that ended: run nothing, or the statement would auto-commit while the
+        // user expects a Rollback to undo it
+        let transaction = state.db.transaction(&connection).await;
+        if let Some(expected) = expected_transaction {
+            if transaction.as_ref().map(|tx| tx.id) != Some(expected) {
+                return Err(AppError::TransactionEnded);
+            }
+        }
+        let switch_to = match meta_commands::translate(engine, &sql)? {
+            Some(meta_commands::MetaCommand::Connect(schema)) => Some(schema),
+            _ => None,
+        };
+        if transaction.is_some() {
+            if switch_to.is_some() {
+                // Switching rebuilds the pool, which would roll the transaction back
+                return Err(AppError::Session(
+                    "Commit or roll back the manual transaction before switching the database. \
+                     Statement was not executed."
+                        .into(),
+                ));
+            }
+            if mode.is_log_refetch() {
+                // The re-fetch runs under the agent's read-only transaction, which cannot nest
+                return Err(AppError::Session(
+                    "Not run again for the log during a manual transaction".into(),
+                ));
+            }
+            // The session checks look at the first statement only, and a later `COMMIT` would
+            // end the transaction behind Queryfolio's back (the multi-statement guard is off
+            // when Writable and allow_dangerous_statements both are)
+            if db::contains_multiple_statements(&sql, engine) {
+                return Err(AppError::Session(
+                    "Run one statement at a time in a manual transaction (select several \
+                     statements to run them one by one). Statement was not executed."
+                        .into(),
+                ));
+            }
+        }
+        if db::supports_manual_transaction(engine) {
+            if let Some(reason) =
+                db::session_statement_rejection(&sql, engine, transaction.is_some())
+            {
+                return Err(AppError::Session(reason));
+            }
+        }
+        if let Some(schema) = switch_to {
             if !mode.is_log_refetch() {
                 return switch_active_schema(state, &server, schema, started, run).await;
             }
@@ -688,6 +746,19 @@ async fn run_query_in_mode(
         };
         let (cancels, connection, sql) = (&state.query_cancels, &cancel_key, &sql);
         let allow_dangerous = server.allow_dangerous_statements;
+        if let Some(tx) = &transaction {
+            let work = db::run_query_in_transaction(
+                tx,
+                cancels,
+                connection,
+                sql,
+                max_rows,
+                auto_limit,
+                readonly_guard,
+                allow_dangerous,
+            );
+            return db::abortable(run, work).await;
+        }
         let work = state
             .db
             .with_pool(&server, db::PasswordRetry::BeforeStatement, |pool: DbPool| async move {
@@ -775,7 +846,7 @@ async fn switch_active_schema(
     run: Option<&db::QueryRunGuard<'_>>,
 ) -> Result<QueryResult, AppError> {
     let previous = state.db.schema_override(&server.name).await;
-    state.db.set_schema_override(&server.name, schema.clone()).await;
+    state.db.set_schema_override(&server.name, schema.clone()).await?;
 
     // Confirm that it can actually connect with the switched connection. If it fails here, roll back.
     // Only this part is abortable: an abort that dropped the whole function would skip the
@@ -1153,6 +1224,7 @@ async fn run_log_to_file(
         Some(RUN_LOG_FILE_MAX_ROWS),
         None,
         QueryMode::LogRefetch { expected_schema },
+        None,
     )
     .await?;
     let rows = run_log_output::RunLogRows {
@@ -1305,7 +1377,8 @@ async fn set_active_schema(
     }
     // Confirm the connection name exists (prevents accumulating overrides for nonexistent connections)
     state.find_server(&connection).await?;
-    state.db.set_schema_override(&connection, schema).await;
+    // Refused while a manual transaction is open (rebuilding the pool would roll it back)
+    state.db.set_schema_override(&connection, schema).await?;
     // Discard the cache per connection so that old schema information is not returned after the switch
     state.schema_cache.invalidate_connection(&connection).await;
     Ok(())
@@ -1338,6 +1411,50 @@ async fn disconnect(
 ) -> Result<(), AppError> {
     state.db.disconnect(&connection).await;
     Ok(())
+}
+
+/// Starts a manual transaction on the connection and returns its id (CYBERNEURA-DEV-1398,
+/// DbManager::begin_transaction). Returns the open one's id if there already is one
+#[tauri::command]
+async fn begin_transaction(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+) -> Result<u64, AppError> {
+    let server = state.find_server(&connection).await?;
+    state.db.begin_transaction(&server).await
+}
+
+/// Commits or rolls back the connection's manual transaction `transaction`
+#[tauri::command]
+async fn end_transaction(
+    state: tauri::State<'_, AppState>,
+    connection: String,
+    transaction: u64,
+    commit: bool,
+) -> Result<(), AppError> {
+    state.db.end_transaction(&connection, transaction, commit).await
+}
+
+/// One open manual transaction, for the frontend to resynchronize its state
+#[derive(serde::Serialize)]
+struct OpenTransaction {
+    connection: String,
+    id: u64,
+}
+
+/// Every open manual transaction (the frontend checks after runs and cancels: a cancel that
+/// could not stop the statement discards the pool, and the transaction with it)
+#[tauri::command]
+async fn list_transactions(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<OpenTransaction>, AppError> {
+    Ok(state
+        .db
+        .open_transactions()
+        .await
+        .into_iter()
+        .map(|(connection, id)| OpenTransaction { connection, id })
+        .collect())
 }
 
 /// Whether this is a MySQL connection with no database selected (neither in the config nor
@@ -1534,6 +1651,13 @@ async fn run_statements(
     writable: Option<bool>,
 ) -> Result<u64, AppError> {
     let server = state.find_server(&connection).await?;
+    // Cell edits apply in their own transaction on another pooled connection: they would
+    // commit apart from the manual transaction and wait on the rows it has locked
+    if state.db.transaction(&connection).await.is_some() {
+        return Err(AppError::Session(
+            "Commit or roll back the manual transaction before applying cell edits".into(),
+        ));
+    }
     let readonly_guard = if server.readonly {
         db::ReadonlyGuard::Config
     } else if writable.unwrap_or(false) {
@@ -2595,6 +2719,16 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
     // Next to them: a manual update check (CYBERNEURA-DEV-1079, update_check.rs)
     let update_item =
         MenuItemBuilder::with_id("check_for_updates", "Check for Updates…").build(app)?;
+    // Quit / Exit as an app item rather than the predefined one, so that it asks first when a
+    // manual transaction is open (hold_exit_for_transactions; CYBERNEURA-DEV-1398)
+    let quit_label = if cfg!(target_os = "macos") {
+        format!("Quit {}", app.package_info().name)
+    } else {
+        "Exit".to_string()
+    };
+    let quit_item = MenuItemBuilder::with_id("quit_app", quit_label)
+        .accelerator("CmdOrCtrl+Q")
+        .build(app)?;
 
     #[cfg(target_os = "macos")]
     let app_menu = {
@@ -2618,7 +2752,7 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
             .hide()
             .hide_others()
             .separator()
-            .quit()
+            .item(&quit_item)
             .build()?
     };
 
@@ -2634,7 +2768,7 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
     let file_menu = {
         let builder = SubmenuBuilder::new(app, "File").item(&close_tab_item);
         #[cfg(not(target_os = "macos"))]
-        let builder = builder.quit();
+        let builder = builder.item(&quit_item);
         builder.build()?
     };
     let edit_menu = SubmenuBuilder::new(app, "Edit")
@@ -3047,6 +3181,13 @@ pub fn run() {
         // installed before that, so it is passed here
         .menu(build_menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
+            // Quit goes through the manual-transaction confirmation (the predefined Quit
+            // terminates the app without ExitRequested on macOS)
+            "quit_app" => {
+                if !hold_exit_for_transactions(app) {
+                    app.exit(0);
+                }
+            }
             "reload_config_file" => {
                 // Reload is tied to the frontend's state (selection / unsaved edits), so
                 // notify by event and leave it to the frontend's reloadConnections
@@ -3197,16 +3338,117 @@ pub fn run() {
             run_dump,
             cancel_dump,
             frontend_ready,
+            begin_transaction,
+            end_transaction,
+            list_transactions,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
-        .run(|app, event| {
+        .run(|app, event| match event {
+            // Quitting (Cmd+Q, closing the last window) with an open manual transaction asks
+            // first. code: None = asked by the user / the OS; app.exit() (Some) is not held
+            tauri::RunEvent::ExitRequested { code: None, api, .. } => {
+                if hold_exit_for_transactions(app) {
+                    api.prevent_exit();
+                }
+            }
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::CloseRequested { api, .. },
+                ..
+            } if label == "main" => {
+                if hold_exit_for_transactions(app) {
+                    api.prevent_close();
+                }
+            }
             // End the chat agents with the app. Waits (bounded) for them to exit, so that the
             // SIGKILL fallback has run and no agent process outlives Queryfolio
-            if let tauri::RunEvent::Exit = event {
-                agent_process::stop_all_and_wait(app);
-            }
+            tauri::RunEvent::Exit => agent_process::stop_all_and_wait(app),
+            _ => {}
         });
+}
+
+/// Label of the quit confirmation's button that rolls back and quits
+const ROLL_BACK_AND_QUIT: &str = "Roll Back and Quit";
+
+/// Whether quitting has to wait because manual transactions are open (CYBERNEURA-DEV-1398).
+/// When it does, shows the confirmation: "Roll Back and Quit" rolls every transaction back and
+/// quits, Cancel keeps the app (and the transactions) open. Rolling back is the only way out:
+/// a commit nobody looked at is not something to do on the way out. If the confirmation cannot
+/// be shown the app stays open, and if the process dies anyway the server rolls back when the
+/// connections drop
+fn hold_exit_for_transactions(app: &tauri::AppHandle) -> bool {
+    use std::sync::atomic::Ordering;
+    use tauri::Manager;
+    let state = app.state::<AppState>();
+    if state.exit_confirmed.load(Ordering::SeqCst) {
+        return false;
+    }
+    let open = tauri::async_runtime::block_on(state.db.open_transactions());
+    let ending = state.db.transaction_ending();
+    if open.is_empty() && !ending {
+        return false;
+    }
+    if state.exit_prompt_open.swap(true, Ordering::SeqCst) {
+        return true;
+    }
+    if open.is_empty() {
+        // Only a COMMIT / ROLLBACK in flight: let it finish, so its outcome is shown
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+            let dialog_app = app.clone();
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                dialog_app
+                    .dialog()
+                    .message(
+                        "A COMMIT or ROLLBACK is still running. Quit again once it has finished.",
+                    )
+                    .title("Quit Queryfolio")
+                    .kind(MessageDialogKind::Info)
+                    .buttons(MessageDialogButtons::Ok)
+                    .blocking_show_with_result()
+            })
+            .await;
+            app.state::<AppState>().exit_prompt_open.store(false, Ordering::SeqCst);
+        });
+        return true;
+    }
+    let names: Vec<String> = open.into_iter().map(|(name, _)| name).collect();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        use tauri_plugin_dialog::{
+            DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
+        };
+        let text = format!(
+            "A manual transaction is open on: {}.\n\nQuitting rolls it back. Commit it from \
+             the editor toolbar first to keep the changes.",
+            names.join(", ")
+        );
+        let dialog_app = app.clone();
+        let choice = tauri::async_runtime::spawn_blocking(move || {
+            dialog_app
+                .dialog()
+                .message(text)
+                .title("Quit Queryfolio")
+                .kind(MessageDialogKind::Warning)
+                .buttons(MessageDialogButtons::OkCancelCustom(
+                    ROLL_BACK_AND_QUIT.into(),
+                    "Cancel".into(),
+                ))
+                .blocking_show_with_result()
+        })
+        .await
+        .unwrap_or_default();
+        let state = app.state::<AppState>();
+        state.exit_prompt_open.store(false, Ordering::SeqCst);
+        if matches!(&choice, MessageDialogResult::Custom(label) if label == ROLL_BACK_AND_QUIT) {
+            state.db.rollback_all_transactions().await;
+            state.exit_confirmed.store(true, Ordering::SeqCst);
+            app.exit(0);
+        }
+    });
+    true
 }
 
 #[cfg(test)]
@@ -3343,7 +3585,7 @@ mod cancel_tests {
         ))
         .unwrap();
         let state = AppState::default();
-        state.db.set_schema_override("stuck", "previous".into()).await;
+        state.db.set_schema_override("stuck", "previous".into()).await.unwrap();
         let run = state.query_runs.start("stuck");
         let ids = state.query_runs.active("stuck");
 

@@ -54,6 +54,10 @@ pub struct EngineCapabilities {
     /// Whether `\d+ <table>` (indexes, foreign keys, CREATE statement; meta_commands.rs) is
     /// supported. The TABLES pane offers "Show definition" only when this is true
     pub supports_table_definition: bool,
+    /// Whether the editor toolbar offers a manual transaction (one pooled connection held for
+    /// it, Commit / Rollback; CYBERNEURA-DEV-1398, db::supports_manual_transaction). Only the
+    /// pooled sqlx engines: SQL Server / DuckDB already keep one connection
+    pub supports_manual_transaction: bool,
 }
 
 /// Common capabilities of the SQL engines (mysql / postgres / sqlite).
@@ -70,6 +74,7 @@ const SQL_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_dump: false,
     supports_process_list: false,
     supports_table_definition: true,
+    supports_manual_transaction: true,
 };
 
 /// MySQL / PostgreSQL additionally have a dump tool (mysqldump / pg_dump) and a process list
@@ -94,6 +99,7 @@ const REDIS_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_dump: false,
     supports_process_list: false,
     supports_table_definition: false,
+    supports_manual_transaction: false,
 };
 
 /// Elasticsearch works with Kibana Console-style request blocks in the editor, and the
@@ -111,6 +117,7 @@ const ELASTICSEARCH_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_dump: false,
     supports_process_list: false,
     supports_table_definition: false,
+    supports_manual_transaction: false,
 };
 
 /// DuckDB is a SQL engine, but the path that applies cell edits (run_statements) assumes
@@ -119,6 +126,8 @@ const DUCKDB_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_editable_cells: false,
     // The "schema" is the database file itself, so there is nothing to choose
     tables_need_schema: false,
+    // One connection behind a Mutex: statements already share the session
+    supports_manual_transaction: false,
     ..SQL_CAPABILITIES
 };
 
@@ -134,6 +143,7 @@ const DYNAMODB_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_ai: false,
     // No meta commands at all (PartiQL has no catalog queries)
     supports_table_definition: false,
+    supports_manual_transaction: false,
     ..SQL_CAPABILITIES
 };
 
@@ -153,6 +163,8 @@ const MSSQL_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     supports_editable_cells: false,
     // `\d+` is not implemented for T-SQL (meta_commands.rs mssql_meta)
     supports_table_definition: false,
+    // One connection behind a Mutex: statements already share the session
+    supports_manual_transaction: false,
     ..SQL_CAPABILITIES
 };
 
