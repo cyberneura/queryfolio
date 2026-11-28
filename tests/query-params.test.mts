@@ -151,3 +151,12 @@ test("review round 4: __proto__ as a parameter name", () => {
   assert.deepEqual(fillParams(sql, uses, new Map()), { ok: false, missing: ["__proto__"] });
   assert.deepEqual(parseDefinitions("-- @set __proto__ = 42\n", "postgres").map((d) => d.name), ["__proto__"]);
 });
+
+test("review round 5: quotes inside comments, slices with whitespace", () => {
+  assert.deepEqual(names("SELECT\n-- the 'enabled'\n:enabled;"), ["enabled"]);
+  assert.deepEqual(names("SELECT\n-- the 'enabled'\n:enabled;", "sqlite"), ["enabled"]);
+  assert.deepEqual(names("SELECT /* x' */ :v"), ["v"]);
+  assert.deepEqual(names("SELECT {'k' : 1}", "duckdb"), []);
+  assert.deepEqual(names("SELECT arr[ :n] FROM t"), []);
+  assert.deepEqual(names("SELECT ARRAY[ :a]"), ["a"]);
+});

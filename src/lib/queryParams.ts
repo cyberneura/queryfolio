@@ -35,8 +35,15 @@ export function paramEngineOf(engine: string): ParamEngine | null {
  *
  * With `keepLineComments`, line comments are skipped but left in place (used to find the real
  * `-- @set` lines: a `--` inside a string or block comment is blanked out, a real one is not).
+ * With `keepLiterals`, strings / quoted identifiers / dollar quotes are left in place and only
+ * comments are blanked (used to tell the end of a literal from a quote inside a comment).
  */
-export function blankNonCode(sql: string, engine: ParamEngine, keepLineComments = false): string {
+export function blankNonCode(
+  sql: string,
+  engine: ParamEngine,
+  keepLineComments = false,
+  keepLiterals = false,
+): string {
   const out = sql.split("");
   const blank = (from: number, to: number) => {
     for (let i = from; i < to && i < out.length; i++) {
@@ -76,6 +83,7 @@ export function blankNonCode(sql: string, engine: ParamEngine, keepLineComments 
         j++;
       }
       end = Math.min(j + 1, n);
+      keep = keepLiterals;
     } else if (c === "[" && (engine === "mssql" || engine === "sqlite")) {
       let j = i + 1;
       while (j < n) {
@@ -89,6 +97,7 @@ export function blankNonCode(sql: string, engine: ParamEngine, keepLineComments 
         j++;
       }
       end = Math.min(j + 1, n);
+      keep = keepLiterals;
     } else if (
       c === "-" &&
       next === "-" &&
@@ -130,6 +139,7 @@ export function blankNonCode(sql: string, engine: ParamEngine, keepLineComments 
         const tag = m[0];
         const j = sql.indexOf(tag, i + tag.length);
         end = j < 0 ? n : j + tag.length;
+        keep = keepLiterals;
       }
     }
     if (end > i) {
@@ -198,6 +208,9 @@ function braceDepths(code: string): number[] {
 
 export function findParams(sql: string, engine: ParamEngine): ParamUse[] {
   const code = blankNonCode(sql, engine);
+  // The same text with only comments blanked: a quote here at a position `code` blanked is the
+  // end of a literal (a quote inside a comment is blanked in both)
+  const noComments = blankNonCode(sql, engine, false, true);
   const braces = engine === "duckdb" ? braceDepths(code) : null;
   const uses: ParamUse[] = [];
   for (let i = 0; i < code.length; i++) {
@@ -206,8 +219,15 @@ export function findParams(sql: string, engine: ParamEngine): ParamUse[] {
     if (prev === ":" || /[A-Za-z0-9_$\]).]/.test(prev)) continue;
     // A colon right after a string / quoted identifier is a key separator (DuckDB `{'k':v}`),
     // never a placeholder (`'x' :y` is not valid SQL)
-    const before = prevNonSpace(sql, i);
-    if (before >= 0 && code[before] !== sql[before] && /['"`\]]/.test(sql[before])) continue;
+    const literalEnd = prevNonSpace(noComments, i);
+    if (
+      literalEnd >= 0 &&
+      code[literalEnd] !== noComments[literalEnd] &&
+      /['"`\]$]/.test(noComments[literalEnd])
+    ) {
+      continue;
+    }
+    const before = prevNonSpace(code, i);
     // DuckDB struct keys may also be bare identifiers: `{a: x}`. Only in a key position (the word
     // right after `{` or `,`), so `{'r': CASE WHEN :x THEN 1 END}` still finds `x`
     if (braces && braces[i] > 0 && before >= 0 && /[A-Za-z0-9_$]/.test(code[before])) {
@@ -218,10 +238,12 @@ export function findParams(sql: string, engine: ParamEngine): ParamUse[] {
     }
     // PostgreSQL / DuckDB slices with an omitted lower bound: `arr[:upper]` (but `ARRAY[:id]` and
     // DuckDB `[:id]` construct arrays and keep their placeholders)
+    // (whitespace after the bracket does not change that: `arr[ :n]`)
     if (
-      prev === "[" &&
+      before >= 0 &&
+      code[before] === "[" &&
       (engine === "postgres" || engine === "duckdb") &&
-      isSubscriptBracket(code, i - 1)
+      isSubscriptBracket(code, before)
     ) {
       continue;
     }
